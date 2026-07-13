@@ -1,0 +1,5 @@
+error: tuple variants are not bridgeable; use named fields (`Variant { … }`) (docs/design/type-system.md §4)
+ --> tests/ui/tuple_enum_variant.rs:5:5
+  |
+5 |     Both(u32, u32),
+  |     ^^^^^^^^^^^^^^

@@ -1,0 +1,29 @@
+[project]
+name = "multi-crate-app"
+version = "0.1.0"
+description = "Python surface of the multi-crate-app crate (rspyts multi-crate example)."
+requires-python = ">=3.13"
+dependencies = ["rspyts", "shared-types", "pydantic>=2.7"]
+
+[dependency-groups]
+dev = ["pytest>=8", "ruff>=0.5"]
+
+[tool.uv.sources]
+rspyts = { path = "../../../../runtimes/python", editable = true }
+shared-types = { path = "../../shared/python", editable = true }
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/multi_crate_app"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 120
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "N", "UP", "RUF"]

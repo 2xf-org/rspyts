@@ -1,0 +1,15 @@
+[package]
+name = "shared-types"
+description = "rspyts multi-crate example: the dependency crate whose types cross crate boundaries."
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+# rlib only, and no `rspyts::export!()`: this crate is linked into other
+# bridged modules, and each compiled module has exactly one exporter. The
+# `module/` crate next door adds the export for standalone codegen.
+[dependencies]
+rspyts = { workspace = true }
+serde = { workspace = true }

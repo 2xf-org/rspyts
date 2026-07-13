@@ -1,0 +1,94 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "x-rspyts": {
+    "version": "0.1.0",
+    "crate": "basic-example",
+    "manifestHash": "sha256:f17eeb3983e7ef2c303839410d5751eb190846d99bdd20c73e69854a89fead86"
+  },
+  "$defs": {
+    "ParsedNumber": {
+      "description": "A number parsed from text.",
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "const": "integer"
+            },
+            "value": {
+              "type": "integer",
+              "minimum": -2147483648,
+              "maximum": 2147483647
+            }
+          },
+          "required": [
+            "type",
+            "value"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "const": "decimal"
+            },
+            "value": {
+              "type": "number"
+            }
+          },
+          "required": [
+            "type",
+            "value"
+          ],
+          "additionalProperties": false
+        }
+      ]
+    },
+    "Rounding": {
+      "description": "Rounding strategy for [`round_value`].",
+      "type": "string",
+      "enum": [
+        "up",
+        "down",
+        "nearest",
+        "halfEven"
+      ]
+    },
+    "Summary": {
+      "description": "Summary statistics for a list of numbers.",
+      "type": "object",
+      "properties": {
+        "itemCount": {
+          "description": "How many values were summarized.",
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4294967295
+        },
+        "total": {
+          "type": "number"
+        },
+        "average": {
+          "type": "number"
+        },
+        "label": {
+          "description": "Optional label passed through untouched.",
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "itemCount",
+        "total",
+        "average"
+      ],
+      "additionalProperties": false
+    }
+  }
+}

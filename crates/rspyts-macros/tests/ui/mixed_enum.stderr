@@ -1,0 +1,5 @@
+error: mixing fieldless and data variants is not supported in v0.1 — give every variant named fields, or make all variants fieldless (docs/design/type-system.md §4)
+ --> tests/ui/mixed_enum.rs:6:5
+  |
+6 |     Fieldless,
+  |     ^^^^^^^^^

@@ -1,0 +1,11 @@
+error: this type cannot be a bridged const — supported: scalars, `&'static str`, arrays and slices of supported types, and owned bridged data types (see the `bridge` macro docs)
+ --> tests/ui/const_unsupported.rs:4:20
+  |
+4 | pub const BAD_REF: &'static f64 = &1.0;
+  |                    ^^^^^^^^^^^^
+
+error: this type cannot be a bridged const — supported: scalars, `&'static str`, arrays and slices of supported types, and owned bridged data types (see the `bridge` macro docs)
+ --> tests/ui/const_unsupported.rs:7:20
+  |
+7 | pub const BAD_PTR: *const u8 = std::ptr::null();
+  |                    ^^^^^^^^^

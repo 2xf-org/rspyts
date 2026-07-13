@@ -1,0 +1,5 @@
+error: `Buf` is return-only; accept `&[T]` (docs/design/abi.md §6)
+ --> tests/ui/buf_param.rs:4:24
+  |
+4 | pub fn consume(values: Buf<f64>) -> f64 {
+  |                        ^^^^^^^^

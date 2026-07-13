@@ -1,0 +1,29 @@
+# Code generation config for the app side of the multi-crate example.
+# Run from anywhere:
+#   rspyts generate --config examples/multi-crate/app/rspyts.toml
+
+[crate]
+path = "rust"
+
+[python]
+enabled = true
+out = "python/src/multi_crate_app/generated"
+# Relative entries resolve against the generated package directory at
+# import time; these reach the workspace target/ dir seven levels up.
+library_search = [
+    "../../../../../../../target/debug",
+    "../../../../../../../target/release",
+]
+
+# Types whose origin is the shared-types crate are imported from its own
+# generated package instead of re-emitted here — that is the point of
+# this example.
+[python.imports]
+"shared-types" = "shared_types.generated"
+
+[typescript]
+enabled = true
+out = "typescript/src/generated"
+
+[typescript.imports]
+"shared-types" = "shared-types-example"

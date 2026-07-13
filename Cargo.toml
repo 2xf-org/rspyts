@@ -1,0 +1,51 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/rspyts-core",
+    "crates/rspyts-macros",
+    "crates/rspyts",
+    "crates/rspyts-cli",
+    "examples/basic/rust",
+    "examples/multi-crate/shared/rust",
+    "examples/multi-crate/shared/module",
+    "examples/multi-crate/app/rust",
+]
+default-members = [
+    "crates/rspyts-core",
+    "crates/rspyts-macros",
+    "crates/rspyts",
+    "crates/rspyts-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT"
+repository = "https://github.com/2xf-org/rspyts"
+homepage = "https://github.com/2xf-org/rspyts"
+authors = ["Felipe Faria", "The rspyts contributors"]
+keywords = ["ffi", "codegen", "python", "typescript", "wasm"]
+categories = ["development-tools::ffi", "wasm"]
+
+[workspace.dependencies]
+rspyts-core = { version = "0.1.0", path = "crates/rspyts-core" }
+rspyts-macros = { version = "0.1.0", path = "crates/rspyts-macros" }
+rspyts = { version = "0.1.0", path = "crates/rspyts" }
+
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+heck = "0.5"
+inventory = "0.3"
+libloading = "0.8"
+proc-macro2 = "1"
+quote = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+similar = "2"
+syn = { version = "2", features = ["full", "extra-traits"] }
+thiserror = "2"
+toml = "0.8"
+
+[profile.release]
+lto = true

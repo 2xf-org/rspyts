@@ -1,0 +1,20 @@
+{
+  "name": "multi-crate-app-example",
+  "version": "0.1.0",
+  "private": true,
+  "description": "TypeScript surface of the multi-crate-app crate (rspyts multi-crate example).",
+  "type": "module",
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "rspyts": "file:../../../../runtimes/typescript",
+    "shared-types-example": "file:../../shared/typescript"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "typescript": "^5.5.0",
+    "vitest": "^3.0.0"
+  }
+}

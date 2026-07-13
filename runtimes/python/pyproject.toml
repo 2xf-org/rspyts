@@ -1,0 +1,42 @@
+[project]
+name = "rspyts"
+version = "0.1.0"
+description = "Python runtime for rspyts: pydantic contracts and a ctypes loader for Rust cdylibs bridged with the rspyts ABI."
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.13"
+dependencies = [
+    "pydantic>=2.7",
+    "numpy>=1.24",
+]
+
+[project.urls]
+Homepage = "https://github.com/2xf-org/rspyts"
+Repository = "https://github.com/2xf-org/rspyts"
+Issues = "https://github.com/2xf-org/rspyts/issues"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[dependency-groups]
+dev = [
+    "pytest>=8",
+    "pytest-cov>=5",
+    "ruff>=0.5",
+    "ty>=0.0.1a1",
+    "vulture>=2",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "--cov=rspyts --cov-report=term-missing --cov-fail-under=90"
+
+[tool.ruff]
+line-length = 120
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "N", "UP", "RUF"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/rspyts"]

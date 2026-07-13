@@ -1,0 +1,23 @@
+# Code generation config for the basic example.
+# Run from anywhere: rspyts generate --config examples/basic/rspyts.toml
+
+[crate]
+path = "rust"
+
+[python]
+enabled = true
+out = "python/src/basic_example/generated"
+# Relative entries resolve against the generated package directory at
+# import time; these reach the workspace target/ dir six levels up.
+library_search = [
+    "../../../../../../target/debug",
+    "../../../../../../target/release",
+]
+
+[typescript]
+enabled = true
+out = "typescript/src/generated"
+
+[schema]
+enabled = true
+out = "schema"

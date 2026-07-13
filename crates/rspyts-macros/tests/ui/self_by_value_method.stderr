@@ -1,0 +1,11 @@
+error: methods must take `&self` or `&mut self`; `self` by value is not supported (docs/design/type-system.md §7)
+  --> tests/ui/self_by_value_method.rs:14:19
+   |
+14 |     pub fn finish(self) -> f64 {
+   |                   ^^^^
+
+error: `constructor` does not apply to this item; it marks the constructor method inside a #[bridge] impl block
+ --> tests/ui/self_by_value_method.rs:9:14
+  |
+9 |     #[bridge(constructor)]
+  |              ^^^^^^^^^^^

@@ -1,0 +1,5 @@
+error: every field of a bridged struct must be `pub` — the whole shape crosses the boundary (docs/design/type-system.md §3)
+ --> tests/ui/non_pub_field.rs:6:5
+  |
+6 |     secret: u32,
+  |     ^^^^^^^^^^^
