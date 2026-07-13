@@ -1,0 +1,17 @@
+error: duplicate #[bridge(constructor)] — a class has exactly one constructor
+  --> tests/ui/two_constructors.rs:13:12
+   |
+13 |     pub fn second() -> Self {
+   |            ^^^^^^
+
+error: `constructor` does not apply to this item; it marks the constructor method inside a #[bridge] impl block
+ --> tests/ui/two_constructors.rs:7:14
+  |
+7 |     #[bridge(constructor)]
+  |              ^^^^^^^^^^^
+
+error: `constructor` does not apply to this item; it marks the constructor method inside a #[bridge] impl block
+  --> tests/ui/two_constructors.rs:12:14
+   |
+12 |     #[bridge(constructor)]
+   |              ^^^^^^^^^^^

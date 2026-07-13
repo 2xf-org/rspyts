@@ -1,0 +1,21 @@
+{
+  "name": "basic-example",
+  "version": "0.1.0",
+  "private": true,
+  "description": "TypeScript surface of the rspyts basic example.",
+  "type": "module",
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:cov": "vitest run --coverage"
+  },
+  "dependencies": {
+    "rspyts": "file:../../../runtimes/typescript"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "@vitest/coverage-v8": "^3.0.0",
+    "typescript": "^5.5.0",
+    "vitest": "^3.0.0"
+  }
+}

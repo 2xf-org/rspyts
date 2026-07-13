@@ -1,0 +1,5 @@
+error: bridged functions cannot be generic — no type parameters, lifetimes, or const generics (docs/design/type-system.md §9)
+ --> tests/ui/generic_fn.rs:4:14
+  |
+4 | pub fn first<T: Clone>(items: Vec<T>) -> T {
+  |              ^^^^^^^^

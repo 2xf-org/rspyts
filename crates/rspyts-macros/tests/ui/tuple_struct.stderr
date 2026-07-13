@@ -1,0 +1,5 @@
+error: bridged structs must have named fields; tuple structs are not bridgeable — name the fields (docs/design/type-system.md §3)
+ --> tests/ui/tuple_struct.rs:4:12
+  |
+4 | pub struct Point(pub f64, pub f64);
+  |            ^^^^^

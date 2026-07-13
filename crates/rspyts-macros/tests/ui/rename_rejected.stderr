@@ -1,0 +1,11 @@
+error: unknown #[bridge] argument; expected `error`, `constructor`, `static`, `tag = "…"`, `rename_all = "…"`, or `target = "…"`
+ --> tests/ui/rename_rejected.rs:7:14
+  |
+7 |     #[bridge(rename = "access.login.succeeded")]
+  |              ^^^^^^
+
+error: expected non-macro attribute, found attribute macro `bridge`
+ --> tests/ui/rename_rejected.rs:7:7
+  |
+7 |     #[bridge(rename = "access.login.succeeded")]
+  |       ^^^^^^ not a non-macro attribute

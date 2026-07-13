@@ -1,0 +1,24 @@
+# Code generation config for the shared-types side of the multi-crate
+# example. Run from anywhere:
+#   rspyts generate --config examples/multi-crate/shared/rspyts.toml
+
+[crate]
+# The leaf crate that adds `rspyts::export!()` on top of shared-types;
+# see module/src/lib.rs for why the types crate cannot export itself.
+path = "module"
+
+[python]
+enabled = true
+out = "python/src/shared_types/generated"
+# Relative entries resolve against the generated package directory at
+# import time; these reach the workspace target/ dir seven levels up.
+# (Nothing here calls the library — the package is types only — but the
+# loader is generated uniformly.)
+library_search = [
+    "../../../../../../../target/debug",
+    "../../../../../../../target/release",
+]
+
+[typescript]
+enabled = true
+out = "typescript/src/generated"

@@ -1,0 +1,11 @@
+error: class has no way to be constructed — mark one method #[bridge(constructor)] or add a #[bridge(static)] factory returning `Self` (docs/design/type-system.md §7)
+  --> tests/ui/ctorless_class.rs:10:6
+   |
+10 | impl Widget {
+   |      ^^^^^^
+
+error: `static` does not apply to free functions; `static` marks a method inside a #[bridge] impl block
+  --> tests/ui/ctorless_class.rs:16:14
+   |
+16 |     #[bridge(static)]
+   |              ^^^^^^

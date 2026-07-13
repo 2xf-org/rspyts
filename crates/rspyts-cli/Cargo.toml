@@ -1,0 +1,30 @@
+[package]
+name = "rspyts-cli"
+description = "The rspyts code generator: emits pydantic models, TypeScript types, and JSON Schema from a bridged Rust crate."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[[bin]]
+name = "rspyts"
+path = "src/main.rs"
+
+[dependencies]
+rspyts-core = { workspace = true }
+anyhow = { workspace = true }
+clap = { workspace = true }
+heck = { workspace = true }
+libloading = { workspace = true }
+serde = { workspace = true }
+# `preserve_order` so schema.json keys come out in authoring order
+# instead of alphabetically.
+serde_json = { workspace = true, features = ["preserve_order"] }
+similar = { workspace = true }
+toml = { workspace = true }
+sha2 = "0.10"

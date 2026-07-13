@@ -1,0 +1,158 @@
+# Release pipeline, triggered by pushing a version tag (v0.1.0, v0.2.0-rc.1, ...).
+#
+#   verify --> { publish-crates, publish-pypi, publish-npm } --> github-release
+#
+# One-time setup required before the first release (details in docs/releasing.md):
+#   - crates.io: a `CARGO_REGISTRY_TOKEN` repository secret with publish scope
+#     for the rspyts-* crates.
+#   - PyPI: a Trusted Publisher registered on pypi.org for this repository,
+#     this workflow file (deploy.yml), and the `pypi` environment. No token.
+#   - npm: an `NPM_TOKEN` repository secret (automation token) allowed to
+#     publish the `rspyts` package.
+#   (Full walkthrough: docs/releasing.md.)
+
+name: Deploy
+
+on:
+  push:
+    tags: ["v*"]
+
+# Serialize releases: two tags pushed in quick succession must not
+# interleave the sequential crates.io publish chain. Never cancel an
+# in-flight publish.
+concurrency:
+  group: deploy
+  cancel-in-progress: false
+
+# Least privilege by default; jobs that publish declare their own grants.
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # Gate: nothing publishes unless the full Rust test suite passes at the tag.
+  # (Runtime and example suites run on every push to main via validation.yml; the tag
+  # commit has already been through them.)
+  verify:
+    name: Verify
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Test
+        run: cargo test --workspace
+
+  publish-crates:
+    name: Publish to crates.io
+    needs: verify
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+
+      # Publish in dependency order: core -> macros -> facade -> CLI. Each
+      # crate must be resolvable on crates.io before its dependents build
+      # there. `cargo publish` already blocks until the version lands in the
+      # sparse index, but CDN propagation can still lag by a few seconds, so
+      # a short sleep between publishes keeps the chain reliable.
+      - name: Publish rspyts-core
+        run: cargo publish -p rspyts-core
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+
+      - name: Wait for index propagation
+        run: sleep 30
+
+      - name: Publish rspyts-macros
+        run: cargo publish -p rspyts-macros
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+
+      - name: Wait for index propagation
+        run: sleep 30
+
+      - name: Publish rspyts
+        run: cargo publish -p rspyts
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+
+      - name: Wait for index propagation
+        run: sleep 30
+
+      - name: Publish rspyts-cli
+        run: cargo publish -p rspyts-cli
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+
+  publish-pypi:
+    name: Publish to PyPI
+    needs: verify
+    runs-on: ubuntu-latest
+    # The environment name is half of the Trusted Publishing handshake; it
+    # must match the environment configured for this publisher on pypi.org.
+    environment: pypi
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+
+      - name: Build sdist and wheel
+        working-directory: runtimes/python
+        run: uv build
+
+      # Trusted Publishing: the action exchanges this job's OIDC token
+      # (id-token: write above) for a short-lived PyPI upload token — no
+      # long-lived secret exists anywhere. Requires the one-time publisher
+      # registration on pypi.org described in RELEASING.md.
+      - name: Publish
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: runtimes/python/dist
+
+  publish-npm:
+    name: Publish to npm
+    needs: verify
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write # npm --provenance attestation
+    steps:
+      - uses: actions/checkout@v4
+
+      # registry-url makes setup-node write an .npmrc that authenticates from
+      # NODE_AUTH_TOKEN, which is only injected on the publish step below.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          registry-url: "https://registry.npmjs.org"
+
+      - name: Build
+        working-directory: runtimes/typescript
+        run: |
+          npm install
+          npm run build
+
+      # --provenance attaches a Sigstore attestation binding the published
+      # tarball to this exact workflow run (uses the workflow-level
+      # id-token: write permission).
+      - name: Publish
+        working-directory: runtimes/typescript
+        run: npm publish --provenance --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+  # Only after every registry has the artifacts: a GitHub release with notes
+  # auto-generated from the merged PRs since the previous tag.
+  github-release:
+    name: GitHub release
+    needs: [publish-crates, publish-pypi, publish-npm]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # create the release and its notes
+    steps:
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true

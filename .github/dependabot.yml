@@ -1,0 +1,30 @@
+# Weekly dependency update PRs for every ecosystem in the repository.
+# Cargo resolves from the workspace root; the Python and npm runtime packages
+# each live under runtimes/ with their own manifests. The example packages
+# depend on the local runtimes by path, so they need no separate entries.
+
+version: 2
+updates:
+  # Rust workspace (crates/* and examples/*, one Cargo.lock at the root).
+  - package-ecosystem: "cargo"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+
+  # Python runtime package (pyproject.toml).
+  - package-ecosystem: "uv"
+    directory: "/runtimes/python"
+    schedule:
+      interval: "weekly"
+
+  # TypeScript runtime package (package.json).
+  - package-ecosystem: "npm"
+    directory: "/runtimes/typescript"
+    schedule:
+      interval: "weekly"
+
+  # Action versions used by validation.yml and deploy.yml.
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"

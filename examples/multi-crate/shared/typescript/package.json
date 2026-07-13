@@ -1,0 +1,19 @@
+{
+  "name": "shared-types-example",
+  "version": "0.1.0",
+  "private": true,
+  "description": "TypeScript surface of the shared-types crate (rspyts multi-crate example).",
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "rspyts": "file:../../../../runtimes/typescript"
+  },
+  "devDependencies": {
+    "typescript": "^5.5.0"
+  }
+}
