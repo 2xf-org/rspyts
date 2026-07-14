@@ -1,4 +1,4 @@
-# Release pipeline, triggered by pushing a version tag (v0.1.0, v0.2.0-rc.1, ...).
+# Release pipeline, triggered by pushing a stable version tag (v0.1.0, v1.2.3, ...).
 #
 #   verify --> { publish-crates, publish-pypi, publish-npm } --> github-release
 #
@@ -7,7 +7,7 @@
 #     for the rspyts-* crates.
 #   - PyPI: a Trusted Publisher registered on pypi.org for this repository,
 #     this workflow file (deploy.yml), and the `pypi` environment. No token.
-#   - npm: an `NPM_TOKEN` repository secret (automation token) allowed to
+#   - npm: an `NPM_TOKEN` repository secret (granular token) allowed to
 #     publish the `rspyts` package.
 #   (Full walkthrough: docs/releasing.md.)
 
@@ -42,6 +42,8 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      - name: Verify release versions
+        run: python3 .github/scripts/verify-release.py
       - name: Test
         run: cargo test --workspace
 
@@ -55,35 +57,33 @@ jobs:
 
       # Publish in dependency order: core -> macros -> facade -> CLI. Each
       # crate must be resolvable on crates.io before its dependents build
-      # there. `cargo publish` already blocks until the version lands in the
-      # sparse index, but CDN propagation can still lag by a few seconds, so
-      # a short sleep between publishes keeps the chain reliable.
+      # there, so the workflow polls the registry API between publishes.
       - name: Publish rspyts-core
-        run: cargo publish -p rspyts-core
+        run: cargo publish --locked -p rspyts-core
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
 
-      - name: Wait for index propagation
-        run: sleep 30
+      - name: Wait for rspyts-core
+        run: .github/scripts/wait-for-crate.sh rspyts-core "${GITHUB_REF_NAME#v}"
 
       - name: Publish rspyts-macros
-        run: cargo publish -p rspyts-macros
+        run: cargo publish --locked -p rspyts-macros
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
 
-      - name: Wait for index propagation
-        run: sleep 30
+      - name: Wait for rspyts-macros
+        run: .github/scripts/wait-for-crate.sh rspyts-macros "${GITHUB_REF_NAME#v}"
 
       - name: Publish rspyts
-        run: cargo publish -p rspyts
+        run: cargo publish --locked -p rspyts
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
 
-      - name: Wait for index propagation
-        run: sleep 30
+      - name: Wait for rspyts
+        run: .github/scripts/wait-for-crate.sh rspyts "${GITHUB_REF_NAME#v}"
 
       - name: Publish rspyts-cli
-        run: cargo publish -p rspyts-cli
+        run: cargo publish --locked -p rspyts-cli
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
 
@@ -94,6 +94,9 @@ jobs:
     # The environment name is half of the Trusted Publishing handshake; it
     # must match the environment configured for this publisher on pypi.org.
     environment: pypi
+    permissions:
+      contents: read
+      id-token: write
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v5
@@ -125,13 +128,13 @@ jobs:
       # NODE_AUTH_TOKEN, which is only injected on the publish step below.
       - uses: actions/setup-node@v4
         with:
-          node-version: "22"
+          node-version: "24"
           registry-url: "https://registry.npmjs.org"
 
       - name: Build
         working-directory: runtimes/typescript
         run: |
-          npm install
+          npm ci
           npm run build
 
       # --provenance attaches a Sigstore attestation binding the published
