@@ -16,9 +16,14 @@ name: Deploy
 on:
   push:
     tags: ["v*"]
-  # Safe preflight: manual runs execute validation and `verify`; every
-  # publishing job below is additionally gated to a tag-push event.
+  # With no version, manual runs are safe preflights. Supplying the exact
+  # workspace version resumes an interrupted release without moving its tag.
   workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to publish (for example, 0.2.0); leave empty for validation only"
+        required: false
+        type: string
 
 # Serialize releases: two tags pushed in quick succession must not
 # interleave the sequential crates.io publish chain. Never cancel an
@@ -33,6 +38,7 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+  RELEASE_VERSION: ${{ github.event_name == 'push' && github.ref_name || inputs.version }}
 
 jobs:
   validation:
@@ -41,14 +47,16 @@ jobs:
     permissions:
       contents: read
 
-  # Release-specific metadata/package gate. The reusable validation job above
-  # proves this exact tag SHA across Rust, both runtimes, and both examples.
+  # Release-specific metadata/package gate. Tag pushes validate their exact
+  # SHA; recovery runs check out the existing tag before packaging it again.
   verify:
     name: Verify
     needs: validation
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          ref: ${{ inputs.version != '' && format('v{0}', inputs.version) || github.ref }}
       - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
       - name: Verify release versions
         run: |
@@ -57,15 +65,19 @@ jobs:
           test "$(sed -n 's/^version = "\([^"]*\)"/\1/p' runtimes/python/pyproject.toml | head -1)" = "$version"
           if [[ "$GITHUB_EVENT_NAME" == push ]]; then
             test "$GITHUB_REF_NAME" = "v$version"
+          elif [[ -n "$RELEASE_VERSION" ]]; then
+            test "$RELEASE_VERSION" = "$version"
           fi
 
   build-runtime-artifacts:
     name: Build runtime artifacts
-    if: github.event_name == 'push'
+    if: github.event_name == 'push' || inputs.version != ''
     needs: verify
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          ref: ${{ inputs.version != '' && format('v{0}', inputs.version) || github.ref }}
       - uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7
       - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
         with:
@@ -90,7 +102,7 @@ jobs:
 
   publish-crates:
     name: Publish to crates.io
-    if: github.event_name == 'push'
+    if: github.event_name == 'push' || inputs.version != ''
     needs: verify
     runs-on: ubuntu-latest
     environment: crates-io
@@ -99,6 +111,8 @@ jobs:
       id-token: write
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          ref: ${{ inputs.version != '' && format('v{0}', inputs.version) || github.ref }}
       - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
       - uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18 # v1
         id: auth
@@ -109,18 +123,24 @@ jobs:
         run: |
           set -euo pipefail
 
-          version=${GITHUB_REF_NAME#v}
+          version=${RELEASE_VERSION#v}
+
+          available() {
+            curl \
+              --user-agent "rspyts-release/$version (https://github.com/2xf-org/rspyts)" \
+              --fail --silent --show-error "$1" >/dev/null 2>&1
+          }
 
           publish() {
-            crate=$1
-            url="https://crates.io/api/v1/crates/$crate/$version"
+            local crate=$1
+            local url="https://crates.io/api/v1/crates/$crate/$version"
 
-            if ! curl --fail --silent --show-error "$url" >/dev/null 2>&1; then
+            if ! available "$url"; then
               cargo publish --locked -p "$crate"
             fi
 
-            for attempt in $(seq 1 30); do
-              if curl --fail --silent --show-error "$url" >/dev/null 2>&1; then
+            for _ in {1..30}; do
+              if available "$url"; then
                 return 0
               fi
               sleep 10
@@ -139,7 +159,7 @@ jobs:
 
   publish-pypi:
     name: Publish to PyPI
-    if: github.event_name == 'push'
+    if: github.event_name == 'push' || inputs.version != ''
     needs: [build-runtime-artifacts, publish-crates]
     runs-on: ubuntu-latest
     # The environment name is half of the Trusted Publishing handshake; it
@@ -166,7 +186,7 @@ jobs:
 
   publish-npm:
     name: Publish to npm
-    if: github.event_name == 'push'
+    if: github.event_name == 'push' || inputs.version != ''
     needs: publish-pypi
     runs-on: ubuntu-latest
     environment: npm
@@ -186,7 +206,7 @@ jobs:
       # --provenance also binds the tarball to this exact workflow run.
       - name: Publish
         run: |
-          version="${GITHUB_REF_NAME#v}"
+          version="${RELEASE_VERSION#v}"
           if npm view "rspyts@${version}" version >/dev/null 2>&1; then
             echo "rspyts ${version} is already published on npm"
           else
@@ -197,7 +217,7 @@ jobs:
   # auto-generated from the merged PRs since the previous tag.
   github-release:
     name: GitHub release
-    if: github.event_name == 'push'
+    if: github.event_name == 'push' || inputs.version != ''
     needs: [publish-crates, publish-pypi, publish-npm]
     runs-on: ubuntu-latest
     permissions:
@@ -206,4 +226,5 @@ jobs:
       - name: Create release
         uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3
         with:
+          tag_name: ${{ github.event_name == 'push' && github.ref_name || format('v{0}', inputs.version) }}
           generate_release_notes: true
