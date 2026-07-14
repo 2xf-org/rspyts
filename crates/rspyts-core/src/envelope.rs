@@ -1,10 +1,12 @@
-//! The response envelope (ABI §4) and allocation primitives (ABI §2).
+//! Request/response envelopes (ABI §4) and allocation primitives (ABI §2).
 //!
-//! Layout of every value returned by a bridged function:
+//! Requests and responses share one byte layout, but deliberately use
+//! direction-specific decoders. A request marker must be zero; a response
+//! status must be one of [`STATUS_OK`], [`STATUS_ERROR`], or [`STATUS_PANIC`].
 //!
 //! ```text
 //! offset  size       field
-//! 0       1          status   (0 ok, 1 error, 2 panic)
+//! 0       1          marker/status
 //! 1       3          reserved (zero)
 //! 4       4          json_len (u32 LE)
 //! 8       4          tail_len (u32 LE)
@@ -17,13 +19,43 @@
 
 use crate::error::BridgeError;
 use serde::Serialize;
+use serde_json::Value;
 use std::cell::RefCell;
+use std::fmt;
+use std::marker::PhantomData;
+use std::rc::Rc;
 
 pub const HEADER_LEN: usize = 12;
 
 pub const STATUS_OK: u8 = 0;
 pub const STATUS_ERROR: u8 = 1;
 pub const STATUS_PANIC: u8 = 2;
+pub const REQUEST_MARKER: u8 = 0;
+
+/// A rejected request or response envelope.
+///
+/// The message is intentionally human-readable rather than a wire contract;
+/// runtimes surface it as a protocol error without trying to classify it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EnvelopeError {
+    message: String,
+}
+
+impl EnvelopeError {
+    fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+        }
+    }
+}
+
+impl fmt::Display for EnvelopeError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for EnvelopeError {}
 
 /// Allocate `len` zeroed bytes for the foreign caller (ABI `rspyts_alloc`).
 ///
@@ -57,10 +89,15 @@ pub unsafe fn dealloc(ptr: *mut u8, len: usize) {
 ///
 /// Callers must have validated the 4 GiB header limits first (see
 /// [`encode_ok`]); this panic is a bug guard, not a reachable path.
-fn seal(status: u8, json: &[u8], tail: &[u8]) -> *mut u8 {
-    let json_len = u32::try_from(json.len()).expect("rspyts: JSON payload exceeds 4 GiB");
-    let tail_len = u32::try_from(tail.len()).expect("rspyts: buffer tail exceeds 4 GiB");
-    let total = HEADER_LEN + json.len() + tail.len();
+fn frame(status: u8, json: &[u8], tail: &[u8]) -> Result<Vec<u8>, EnvelopeError> {
+    let json_len = u32::try_from(json.len())
+        .map_err(|_| EnvelopeError::new("JSON payload exceeds the 4 GiB envelope limit"))?;
+    let tail_len = u32::try_from(tail.len())
+        .map_err(|_| EnvelopeError::new("buffer tail exceeds the 4 GiB envelope limit"))?;
+    let total = HEADER_LEN
+        .checked_add(json.len())
+        .and_then(|total| total.checked_add(tail.len()))
+        .ok_or_else(|| EnvelopeError::new("envelope length overflows this platform"))?;
     let mut buf = Vec::with_capacity(total);
     buf.push(status);
     buf.extend_from_slice(&[0u8; 3]);
@@ -69,6 +106,11 @@ fn seal(status: u8, json: &[u8], tail: &[u8]) -> *mut u8 {
     buf.extend_from_slice(json);
     buf.extend_from_slice(tail);
     debug_assert_eq!(buf.len(), total);
+    Ok(buf)
+}
+
+fn seal(status: u8, json: &[u8], tail: &[u8]) -> *mut u8 {
+    let buf = frame(status, json, tail).expect("rspyts: validated response envelope lengths");
     Box::into_raw(buf.into_boxed_slice()).cast::<u8>()
 }
 
@@ -76,14 +118,142 @@ thread_local! {
     /// Collects `Buf<T>` bytes while a return value is being serialized.
     /// `Some` only inside [`encode_ok`]'s serialization scope; `Buf`
     /// serialized outside that scope falls back to a plain JSON array.
-    static TAIL: RefCell<Option<Vec<u8>>> = const { RefCell::new(None) };
+    static RESPONSE_TAIL: RefCell<Option<Vec<u8>>> = const { RefCell::new(None) };
+
+    /// The request tail visible to `Buf<T>` deserializers on this thread.
+    /// The raw pointer is never exposed and is valid for the lifetime carried
+    /// by the active [`RequestTailGuard`].
+    static REQUEST_TAIL: RefCell<Option<RequestTail>> = const { RefCell::new(None) };
+}
+
+/// Restores the previous response-tail state if serialization returns or
+/// unwinds. Keeping this scope RAII-managed is part of the FFI panic barrier:
+/// a user-provided `Serialize` implementation may panic.
+struct ResponseTailGuard {
+    previous: Option<Vec<u8>>,
+    active: bool,
+}
+
+impl ResponseTailGuard {
+    fn enter() -> Self {
+        let previous = RESPONSE_TAIL.with(|slot| slot.borrow_mut().replace(Vec::new()));
+        Self {
+            previous,
+            active: true,
+        }
+    }
+
+    fn finish(mut self) -> Vec<u8> {
+        let current = RESPONSE_TAIL
+            .with(|slot| std::mem::replace(&mut *slot.borrow_mut(), self.previous.take()));
+        self.active = false;
+        current.expect("rspyts: tail scope vanished")
+    }
+}
+
+impl Drop for ResponseTailGuard {
+    fn drop(&mut self) {
+        if self.active {
+            RESPONSE_TAIL.with(|slot| {
+                *slot.borrow_mut() = self.previous.take();
+            });
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct RequestTail {
+    ptr: *const u8,
+    len: usize,
+}
+
+/// Restores the previous request-tail state when a deserialization scope
+/// exits, including during unwinding.
+///
+/// The guard is thread-bound and borrows its source tail, preventing normal
+/// safe code from moving it to another thread or outliving the bytes.
+pub struct RequestTailGuard<'a> {
+    previous: Option<RequestTail>,
+    _tail: PhantomData<&'a [u8]>,
+    _not_send: PhantomData<Rc<()>>,
+}
+
+impl Drop for RequestTailGuard<'_> {
+    fn drop(&mut self) {
+        REQUEST_TAIL.with(|slot| {
+            *slot.borrow_mut() = self.previous;
+        });
+    }
+}
+
+/// Enter a request-tail deserialization scope.
+///
+/// Scopes may nest; dropping the returned guard restores the exact prior
+/// state. Prefer [`with_request_tail`] when a closure is convenient.
+pub fn request_tail_scope(tail: &[u8]) -> RequestTailGuard<'_> {
+    let current = RequestTail {
+        ptr: tail.as_ptr(),
+        len: tail.len(),
+    };
+    let previous = REQUEST_TAIL.with(|slot| slot.borrow_mut().replace(current));
+    RequestTailGuard {
+        previous,
+        _tail: PhantomData,
+        _not_send: PhantomData,
+    }
+}
+
+/// Run `operation` with `tail` available to request buffer deserializers.
+/// State restoration is guaranteed by [`RequestTailGuard`].
+pub fn with_request_tail<R>(tail: &[u8], operation: impl FnOnce() -> R) -> R {
+    let _guard = request_tail_scope(tail);
+    operation()
+}
+
+/// Read `len` naturally aligned numeric elements from the active request
+/// tail and decode each element from little-endian bytes.
+pub fn request_tail_read<T: crate::bridged::BufElem>(
+    off: usize,
+    len: usize,
+) -> Result<Vec<T>, EnvelopeError> {
+    let width = std::mem::size_of::<T>();
+    let align = std::mem::align_of::<T>();
+    if off % align != 0 {
+        return Err(EnvelopeError::new(format!(
+            "request buffer offset {off} is not aligned to {align} bytes"
+        )));
+    }
+    let byte_len = len
+        .checked_mul(width)
+        .ok_or_else(|| EnvelopeError::new("request buffer length overflows this platform"))?;
+    let end = off
+        .checked_add(byte_len)
+        .ok_or_else(|| EnvelopeError::new("request buffer end overflows this platform"))?;
+
+    REQUEST_TAIL.with(|slot| {
+        let tail = slot.borrow().ok_or_else(|| {
+            EnvelopeError::new("buffer placeholder used outside a request-tail scope")
+        })?;
+        if end > tail.len {
+            return Err(EnvelopeError::new(format!(
+                "request buffer range {off}..{end} exceeds tail length {}",
+                tail.len
+            )));
+        }
+        // SAFETY: `request_tail_scope` ties the stored pointer to the guard's
+        // borrow, the guard is thread-bound, and this copy completes before
+        // the thread-local borrow and active scope can end.
+        let bytes = unsafe { std::slice::from_raw_parts(tail.ptr.add(off), byte_len) };
+        T::from_le_bytes_vec(bytes)
+            .ok_or_else(|| EnvelopeError::new("request buffer has an invalid byte length"))
+    })
 }
 
 /// Append `bytes` to the active tail, zero-padded so the data starts at a
 /// multiple of `align`. Returns the byte offset of the data within the
 /// tail, or `None` when no envelope serialization is in progress.
 pub fn tail_push(bytes: &[u8], align: usize) -> Option<usize> {
-    TAIL.with(|slot| {
+    RESPONSE_TAIL.with(|slot| {
         let mut slot = slot.borrow_mut();
         let tail = slot.as_mut()?;
         let pad = (align - (tail.len() % align)) % align;
@@ -97,17 +267,14 @@ pub fn tail_push(bytes: &[u8], align: usize) -> Option<usize> {
 /// Encode a successful return value: serialize `value` to JSON with the
 /// tail collector active, then seal a status-0 envelope.
 pub fn encode_ok<T: Serialize>(value: &T) -> *mut u8 {
-    let previous = TAIL.with(|slot| slot.borrow_mut().replace(Vec::new()));
+    let tail_scope = ResponseTailGuard::enter();
     let json = serde_json::to_vec(value);
-    let tail = TAIL.with(|slot| {
-        std::mem::replace(&mut *slot.borrow_mut(), previous).expect("rspyts: tail scope vanished")
-    });
+    let tail = tail_scope.finish();
     match json {
         Ok(json) => {
             // The header stores lengths as u32. A >4 GiB payload must become
-            // a status-1 error, not a panic: encode_ok runs AFTER
-            // catch_unwind, so a panic here would unwind across the C
-            // boundary and abort the host process.
+            // a status-1 error rather than relying on the outer shim panic
+            // barrier.
             if json.len() > u32::MAX as usize || tail.len() > u32::MAX as usize {
                 return encode_err(&BridgeError::new(
                     "payloadTooLarge",
@@ -146,6 +313,195 @@ pub struct Decoded<'a> {
     pub tail: &'a [u8],
 }
 
+/// Construct a strict ABI-2 request envelope from JSON and an optional raw
+/// attachment tail.
+///
+/// This helper is primarily useful to native callers and conformance tests;
+/// Python and TypeScript build the identical layout in their own runtimes.
+pub fn encode_request(json: &[u8], tail: &[u8]) -> Result<Vec<u8>, EnvelopeError> {
+    let bytes = frame(REQUEST_MARKER, json, tail)?;
+    decode_request(&bytes)?;
+    Ok(bytes)
+}
+
+/// Decode and validate an ABI-2 request envelope.
+///
+/// Unlike [`decode_response`], byte zero is a request marker and must be
+/// exactly zero.
+pub fn decode_request(bytes: &[u8]) -> Result<Decoded<'_>, EnvelopeError> {
+    let decoded = decode_layout(bytes)?;
+    if decoded.status != REQUEST_MARKER {
+        return Err(EnvelopeError::new(format!(
+            "invalid request marker {}; expected 0",
+            decoded.status
+        )));
+    }
+    let value: Value = serde_json::from_slice(decoded.json)
+        .map_err(|error| EnvelopeError::new(format!("malformed envelope JSON: {error}")))?;
+    validate_placeholders(&value, decoded.tail)?;
+    Ok(decoded)
+}
+
+/// Decode and validate an ABI-2 response envelope.
+///
+/// Response status is closed: only success (0), application error (1), and
+/// caught panic (2) are valid.
+pub fn decode_response(bytes: &[u8]) -> Result<Decoded<'_>, EnvelopeError> {
+    let decoded = decode_layout(bytes)?;
+    if !matches!(decoded.status, STATUS_OK | STATUS_ERROR | STATUS_PANIC) {
+        return Err(EnvelopeError::new(format!(
+            "invalid response status {}; expected 0, 1, or 2",
+            decoded.status
+        )));
+    }
+    let value: Value = serde_json::from_slice(decoded.json)
+        .map_err(|error| EnvelopeError::new(format!("malformed envelope JSON: {error}")))?;
+    if decoded.status == STATUS_OK {
+        validate_placeholders(&value, decoded.tail)?;
+    } else if !decoded.tail.is_empty() {
+        return Err(EnvelopeError::new(
+            "error and panic envelopes must not contain attachment bytes",
+        ));
+    }
+    Ok(decoded)
+}
+
+/// Parse the shared physical layout only. Direction semantics are applied by
+/// [`decode_request`] and [`decode_response`], so there is no public lenient
+/// decoder for foreign bytes.
+fn decode_layout(bytes: &[u8]) -> Result<Decoded<'_>, EnvelopeError> {
+    if bytes.len() < HEADER_LEN {
+        return Err(EnvelopeError::new(format!(
+            "truncated envelope header: expected {HEADER_LEN} bytes, got {}",
+            bytes.len()
+        )));
+    }
+    if bytes[1..4] != [0, 0, 0] {
+        return Err(EnvelopeError::new(
+            "invalid envelope: reserved header bytes must be zero",
+        ));
+    }
+
+    let json_len = usize::try_from(u32::from_le_bytes(bytes[4..8].try_into().unwrap()))
+        .map_err(|_| EnvelopeError::new("JSON length does not fit this platform"))?;
+    let tail_len = usize::try_from(u32::from_le_bytes(bytes[8..12].try_into().unwrap()))
+        .map_err(|_| EnvelopeError::new("tail length does not fit this platform"))?;
+    let expected = HEADER_LEN
+        .checked_add(json_len)
+        .and_then(|total| total.checked_add(tail_len))
+        .ok_or_else(|| EnvelopeError::new("envelope length overflows this platform"))?;
+
+    if bytes.len() < expected {
+        return Err(EnvelopeError::new(format!(
+            "truncated envelope: header declares {expected} bytes, got {}",
+            bytes.len()
+        )));
+    }
+    if bytes.len() > expected {
+        return Err(EnvelopeError::new(format!(
+            "trailing bytes after envelope: header declares {expected} bytes, got {}",
+            bytes.len()
+        )));
+    }
+
+    let json_end = HEADER_LEN + json_len;
+    let json = &bytes[HEADER_LEN..json_end];
+    let tail = &bytes[json_end..expected];
+    Ok(Decoded {
+        status: bytes[0],
+        json,
+        tail,
+    })
+}
+
+fn validate_placeholders(value: &Value, tail: &[u8]) -> Result<(), EnvelopeError> {
+    match value {
+        Value::Array(values) => {
+            for value in values {
+                validate_placeholders(value, tail)?;
+            }
+        }
+        Value::Object(map) => {
+            if map.len() == 1 && map.contains_key(crate::bridged::JSON_WRAPPER_KEY) {
+                // Json is deliberately opaque: marker-shaped user data inside
+                // this wrapper must never be interpreted as an attachment.
+            } else if let Some(body) = map.get(crate::bridged::BUF_PLACEHOLDER_KEY) {
+                if map.len() != 1 {
+                    return Err(EnvelopeError::new(
+                        "buffer placeholder object must contain no sibling fields",
+                    ));
+                }
+                validate_placeholder_body(body, tail)?;
+            } else {
+                for value in map.values() {
+                    validate_placeholders(value, tail)?;
+                }
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn validate_placeholder_body(body: &Value, tail: &[u8]) -> Result<(), EnvelopeError> {
+    let body = body
+        .as_object()
+        .ok_or_else(|| EnvelopeError::new("buffer placeholder body must be an object"))?;
+    if body.len() != 3
+        || !body.contains_key("off")
+        || !body.contains_key("len")
+        || !body.contains_key("dt")
+    {
+        return Err(EnvelopeError::new(
+            "buffer placeholder body must contain exactly off, len, and dt",
+        ));
+    }
+    let off = json_usize(body.get("off").unwrap(), "off")?;
+    let len = json_usize(body.get("len").unwrap(), "len")?;
+    let dt = body
+        .get("dt")
+        .and_then(Value::as_str)
+        .ok_or_else(|| EnvelopeError::new("buffer placeholder dt must be a string"))?;
+    let (size, align) = if dt == "bytes" {
+        (1, 1)
+    } else {
+        let dtype = crate::ir::Dtype::from_wire_name(dt)
+            .ok_or_else(|| EnvelopeError::new(format!("unknown buffer dtype {dt:?}")))?;
+        (dtype.byte_width(), dtype.alignment())
+    };
+    if off % align != 0 {
+        return Err(EnvelopeError::new(format!(
+            "buffer offset {off} is not aligned to {align} bytes for {dt}"
+        )));
+    }
+    let byte_len = len
+        .checked_mul(size)
+        .ok_or_else(|| EnvelopeError::new("buffer attachment length overflows this platform"))?;
+    let end = off
+        .checked_add(byte_len)
+        .ok_or_else(|| EnvelopeError::new("buffer attachment end overflows this platform"))?;
+    if end > tail.len() {
+        return Err(EnvelopeError::new(format!(
+            "buffer attachment range {off}..{end} exceeds tail length {}",
+            tail.len()
+        )));
+    }
+    Ok(())
+}
+
+fn json_usize(value: &Value, field: &str) -> Result<usize, EnvelopeError> {
+    let value = value.as_u64().ok_or_else(|| {
+        EnvelopeError::new(format!(
+            "buffer placeholder {field} must be an unsigned integer"
+        ))
+    })?;
+    usize::try_from(value).map_err(|_| {
+        EnvelopeError::new(format!(
+            "buffer placeholder {field} does not fit this platform"
+        ))
+    })
+}
+
 /// Total allocation length of the envelope starting at `header`.
 ///
 /// # Safety
@@ -159,10 +515,11 @@ pub unsafe fn total_len(header: *const u8) -> usize {
     }
 }
 
-/// Decode an envelope in place.
+/// Decode a trusted, Rust-produced response envelope in place.
 ///
 /// # Safety
-/// `ptr` must point to a complete, valid envelope.
+/// `ptr` must point to a complete, valid envelope. Foreign bytes must first
+/// be passed to [`decode_response`] instead.
 pub unsafe fn decode<'a>(ptr: *const u8) -> Decoded<'a> {
     unsafe {
         let total = total_len(ptr);
@@ -190,6 +547,218 @@ pub(crate) fn decode_owned(ptr: *mut u8) -> (u8, Vec<u8>, Vec<u8>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn valid_request() -> Vec<u8> {
+        encode_request(br#"{"value":1}"#, &[]).unwrap()
+    }
+
+    #[test]
+    fn strict_request_and_response_decoders_are_direction_specific() {
+        let request = valid_request();
+        let decoded = decode_request(&request).unwrap();
+        assert_eq!(decoded.status, REQUEST_MARKER);
+        assert_eq!(decoded.json, br#"{"value":1}"#);
+
+        let response = frame(STATUS_PANIC, br#"{"code":"panic"}"#, &[]).unwrap();
+        assert_eq!(decode_response(&response).unwrap().status, STATUS_PANIC);
+
+        let mut invalid_request = request;
+        invalid_request[0] = STATUS_ERROR;
+        assert_eq!(
+            decode_request(&invalid_request).unwrap_err().to_string(),
+            "invalid request marker 1; expected 0"
+        );
+
+        let invalid_response = frame(3, br#"null"#, &[]).unwrap();
+        assert_eq!(
+            decode_response(&invalid_response).unwrap_err().to_string(),
+            "invalid response status 3; expected 0, 1, or 2"
+        );
+    }
+
+    #[test]
+    fn strict_decoder_rejects_reserved_bytes_truncation_and_trailing_bytes() {
+        let mut reserved = valid_request();
+        reserved[2] = 1;
+        assert!(
+            decode_request(&reserved)
+                .unwrap_err()
+                .to_string()
+                .contains("reserved header bytes")
+        );
+
+        for len in [0, HEADER_LEN - 1, valid_request().len() - 1] {
+            let request = valid_request();
+            assert!(
+                decode_request(&request[..len])
+                    .unwrap_err()
+                    .to_string()
+                    .contains("truncated envelope")
+            );
+        }
+
+        let mut trailing = valid_request();
+        trailing.push(0);
+        assert!(
+            decode_request(&trailing)
+                .unwrap_err()
+                .to_string()
+                .contains("trailing bytes")
+        );
+
+        let mut impossible_lengths = [0u8; HEADER_LEN].to_vec();
+        impossible_lengths[4..8].copy_from_slice(&u32::MAX.to_le_bytes());
+        impossible_lengths[8..12].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert!(
+            decode_request(&impossible_lengths)
+                .unwrap_err()
+                .to_string()
+                .contains("truncated envelope")
+        );
+    }
+
+    #[test]
+    fn strict_decoder_rejects_malformed_json() {
+        let malformed = frame(REQUEST_MARKER, br#"{"#, &[]).unwrap();
+        assert!(
+            decode_request(&malformed)
+                .unwrap_err()
+                .to_string()
+                .contains("malformed envelope JSON")
+        );
+
+        let empty = frame(REQUEST_MARKER, &[], &[]).unwrap();
+        assert!(
+            decode_request(&empty)
+                .unwrap_err()
+                .to_string()
+                .contains("malformed envelope JSON")
+        );
+    }
+
+    #[test]
+    fn strict_decoder_validates_nested_buffer_placeholders() {
+        let json = br#"{"outer":[{"values":{"__rspyts_buf__":{"off":4,"len":2,"dt":"i16"}}}]}"#;
+        let request = encode_request(json, &[0, 0, 0, 0, 1, 0, 2, 0]).unwrap();
+        let decoded = decode_request(&request).unwrap();
+        assert_eq!(decoded.tail, [0, 0, 0, 0, 1, 0, 2, 0]);
+
+        let out_of_bounds = frame(
+            REQUEST_MARKER,
+            br#"{"values":{"__rspyts_buf__":{"off":4,"len":3,"dt":"i16"}}}"#,
+            &[0; 8],
+        )
+        .unwrap();
+        assert!(
+            decode_request(&out_of_bounds)
+                .unwrap_err()
+                .to_string()
+                .contains("exceeds tail length")
+        );
+
+        let unaligned = frame(
+            REQUEST_MARKER,
+            br#"{"values":{"__rspyts_buf__":{"off":1,"len":1,"dt":"f64"}}}"#,
+            &[0; 9],
+        )
+        .unwrap();
+        assert!(
+            decode_request(&unaligned)
+                .unwrap_err()
+                .to_string()
+                .contains("not aligned")
+        );
+
+        let invalid_dtype = frame(
+            REQUEST_MARKER,
+            br#"{"values":{"__rspyts_buf__":{"off":0,"len":1,"dt":"usize"}}}"#,
+            &[0; 8],
+        )
+        .unwrap();
+        assert!(
+            decode_request(&invalid_dtype)
+                .unwrap_err()
+                .to_string()
+                .contains("unknown buffer dtype")
+        );
+    }
+
+    #[test]
+    fn strict_decoder_rejects_malformed_buffer_placeholders() {
+        for json in [
+            br#"{"__rspyts_buf__":null}"#.as_slice(),
+            br#"{"__rspyts_buf__":{"off":0,"len":1}}"#.as_slice(),
+            br#"{"__rspyts_buf__":{"off":-1,"len":1,"dt":"u8"}}"#.as_slice(),
+            br#"{"__rspyts_buf__":{"off":0,"len":1,"dt":"u8"},"extra":true}"#.as_slice(),
+        ] {
+            let bytes = frame(REQUEST_MARKER, json, &[0]).unwrap();
+            assert!(decode_request(&bytes).is_err());
+        }
+    }
+
+    #[test]
+    fn request_tail_reads_little_endian_values_with_bounds_and_alignment() {
+        let mut tail = Vec::new();
+        tail.extend_from_slice(&(-2i16).to_le_bytes());
+        tail.extend_from_slice(&7i16.to_le_bytes());
+        tail.extend_from_slice(&1.5f32.to_le_bytes());
+
+        with_request_tail(&tail, || {
+            assert_eq!(request_tail_read::<i16>(0, 2).unwrap(), [-2, 7]);
+            assert_eq!(request_tail_read::<f32>(4, 1).unwrap(), [1.5]);
+            assert!(
+                request_tail_read::<i16>(1, 1)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("not aligned")
+            );
+            assert!(
+                request_tail_read::<f32>(8, 1)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("exceeds tail length")
+            );
+            assert!(
+                request_tail_read::<f64>(0, usize::MAX)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("overflows")
+            );
+        });
+        assert!(
+            request_tail_read::<u8>(0, 0)
+                .unwrap_err()
+                .to_string()
+                .contains("outside a request-tail scope")
+        );
+    }
+
+    #[test]
+    fn request_tail_guard_restores_nested_prior_state() {
+        with_request_tail(&[10, 11], || {
+            assert_eq!(request_tail_read::<u8>(0, 2).unwrap(), [10, 11]);
+            {
+                let _inner = request_tail_scope(&[20]);
+                assert_eq!(request_tail_read::<u8>(0, 1).unwrap(), [20]);
+            }
+            assert_eq!(request_tail_read::<u8>(0, 2).unwrap(), [10, 11]);
+        });
+        assert!(request_tail_read::<u8>(0, 1).is_err());
+    }
+
+    #[test]
+    fn request_tail_guard_clears_state_after_failure_and_panic() {
+        let failed: serde_json::Result<serde_json::Value> =
+            with_request_tail(&[1, 2, 3], || serde_json::from_slice(br#"{"#));
+        assert!(failed.is_err());
+        assert!(request_tail_read::<u8>(0, 1).is_err());
+
+        let panicked = std::panic::catch_unwind(|| {
+            with_request_tail(&[4, 5, 6], || panic!("deserializer panic"));
+        });
+        assert!(panicked.is_err());
+        assert!(request_tail_read::<u8>(0, 1).is_err());
+    }
 
     #[test]
     fn envelope_round_trip() {
@@ -222,11 +791,11 @@ mod tests {
 
     #[test]
     fn tail_alignment_pads() {
-        let previous = TAIL.with(|s| s.borrow_mut().replace(Vec::new()));
+        let previous = RESPONSE_TAIL.with(|s| s.borrow_mut().replace(Vec::new()));
         assert_eq!(tail_push(&[1], 1), Some(0));
         // Next f64 push must start at offset 8, not 1.
         assert_eq!(tail_push(&[0u8; 16], 8), Some(8));
-        TAIL.with(|s| *s.borrow_mut() = previous);
+        RESPONSE_TAIL.with(|s| *s.borrow_mut() = previous);
     }
 
     #[test]

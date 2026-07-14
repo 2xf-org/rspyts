@@ -1,18 +1,45 @@
 import { describe, expect, it } from "vitest";
 
-import { callDrop, callFn, writeBytes, writeSlice } from "../src/call.js";
-import type { BufTypedArray, Dtype } from "../src/envelope.js";
-import { RspytsError, RspytsPanicError, registerError } from "../src/errors.js";
-import { createFake } from "./fake.js";
+import {
+  callDrop,
+  callFn,
+  floatFromWire,
+  i64FromWire,
+  i64ToWire,
+  jsonFromWire,
+  u64FromWire,
+  u64ToWire,
+  writeBytes,
+  writeSlice,
+} from "../src/call.js";
+import {
+  decodeRequest,
+  substituteBuffers,
+  wireBuffer,
+  type BufTypedArray,
+  type Dtype,
+} from "../src/envelope.js";
+import {
+  InstancePoisonedError,
+  RspytsError,
+  RspytsPanicError,
+  registerError,
+} from "../src/errors.js";
+import { isPoisoned } from "../src/module.js";
+import { createFake, runtimeTrap } from "./fake.js";
 
-const utf8 = new TextDecoder();
+type Scalar = number | bigint;
+
+function valuesOf(array: BufTypedArray): Scalar[] {
+  return Array.from(array as unknown as ArrayLike<Scalar>);
+}
 
 interface SliceCase {
   dt: Dtype;
   bytes: number;
-  make: (values: number[]) => BufTypedArray;
+  make: (values: Scalar[]) => BufTypedArray;
   view: (buffer: ArrayBufferLike, byteOffset: number, length: number) => BufTypedArray;
-  values: number[];
+  values: Scalar[];
 }
 
 /** One slice argument per wire dtype, with values exact in every type. */
@@ -20,52 +47,140 @@ const SLICE_CASES: SliceCase[] = [
   {
     dt: "u8",
     bytes: 1,
-    make: (v) => new Uint8Array(v),
+    make: (v) => new Uint8Array(v as number[]),
     view: (b, o, l) => new Uint8Array(b, o, l),
     values: [0, 127, 255],
   },
   {
+    dt: "i8",
+    bytes: 1,
+    make: (v) => new Int8Array(v as number[]),
+    view: (b, o, l) => new Int8Array(b, o, l),
+    values: [-128, -1, 127],
+  },
+  {
+    dt: "u16",
+    bytes: 2,
+    make: (v) => new Uint16Array(v as number[]),
+    view: (b, o, l) => new Uint16Array(b, o, l),
+    values: [0, 32768, 65535],
+  },
+  {
     dt: "i16",
     bytes: 2,
-    make: (v) => new Int16Array(v),
+    make: (v) => new Int16Array(v as number[]),
     view: (b, o, l) => new Int16Array(b, o, l),
     values: [-32768, -1, 32767],
   },
   {
+    dt: "u32",
+    bytes: 4,
+    make: (v) => new Uint32Array(v as number[]),
+    view: (b, o, l) => new Uint32Array(b, o, l),
+    values: [0, 2147483648, 4294967295],
+  },
+  {
     dt: "i32",
     bytes: 4,
-    make: (v) => new Int32Array(v),
+    make: (v) => new Int32Array(v as number[]),
     view: (b, o, l) => new Int32Array(b, o, l),
     values: [-2147483648, 0, 2147483647],
   },
   {
+    dt: "u64",
+    bytes: 8,
+    make: (v) => new BigUint64Array(v as bigint[]),
+    view: (b, o, l) => new BigUint64Array(b, o, l),
+    values: [0n, 1n << 63n, (1n << 64n) - 1n],
+  },
+  {
+    dt: "i64",
+    bytes: 8,
+    make: (v) => new BigInt64Array(v as bigint[]),
+    view: (b, o, l) => new BigInt64Array(b, o, l),
+    values: [-(1n << 63n), -1n, (1n << 63n) - 1n],
+  },
+  {
     dt: "f32",
     bytes: 4,
-    make: (v) => new Float32Array(v),
+    make: (v) => new Float32Array(v as number[]),
     view: (b, o, l) => new Float32Array(b, o, l),
     values: [-0.5, 1.25, 1024],
   },
   {
     dt: "f64",
     bytes: 8,
-    make: (v) => new Float64Array(v),
+    make: (v) => new Float64Array(v as number[]),
     view: (b, o, l) => new Float64Array(b, o, l),
     values: [Math.PI, -1e300, 0.1],
   },
 ];
 
+describe("exact 64-bit conversion", () => {
+  it("round-trips signed and unsigned boundaries as canonical strings", () => {
+    for (const value of [-(1n << 63n), -(1n << 53n) - 1n, -1n, 0n, 1n, (1n << 63n) - 1n]) {
+      expect(i64FromWire(i64ToWire(value))).toBe(value);
+    }
+    for (const value of [0n, 1n, (1n << 53n) + 1n, (1n << 64n) - 1n]) {
+      expect(u64FromWire(u64ToWire(value))).toBe(value);
+    }
+  });
+
+  it("rejects overflow and negative unsigned values before a call", () => {
+    expect(() => i64ToWire(-(1n << 63n) - 1n)).toThrow(/i64 value out of range/);
+    expect(() => i64ToWire(1n << 63n)).toThrow(/i64 value out of range/);
+    expect(() => u64ToWire(-1n)).toThrow(/u64 value out of range/);
+    expect(() => u64ToWire(1n << 64n)).toThrow(/u64 value out of range/);
+  });
+
+  it("rejects noncanonical or non-string wire values", () => {
+    for (const value of ["01", "-0", "+1", "1.0", " 1", 1n, 1]) {
+      expect(() => i64FromWire(value), String(value)).toThrow(/canonical signed/);
+    }
+    expect(() => u64FromWire("-1")).toThrow(/canonical unsigned/);
+    expect(() => u64FromWire("18446744073709551616")).toThrow(/u64 value out of range/);
+  });
+
+  it("requires bigint host values", () => {
+    expect(() => i64ToWire(1 as unknown as bigint)).toThrow(/signed 64-bit bigint/);
+    expect(() => u64ToWire("1" as unknown as bigint)).toThrow(/unsigned 64-bit bigint/);
+  });
+});
+
+describe("structured float conversion", () => {
+  it("accepts finite numbers and canonicalizes negative zero", () => {
+    expect(floatFromWire(1.25)).toBe(1.25);
+    expect(Object.is(floatFromWire(-0), -0)).toBe(false);
+  });
+
+  it("rejects non-finite and non-number wire values", () => {
+    for (const value of [Number.NaN, Number.POSITIVE_INFINITY, "1", null, true]) {
+      expect(() => floatFromWire(value), String(value)).toThrow(/finite JSON number/);
+    }
+  });
+});
+
+describe("opaque Json conversion", () => {
+  it("unwraps only the exact wire wrapper", () => {
+    const value = { __rspyts_buf__: { off: 0, len: 1, dt: "u8" } };
+    expect(jsonFromWire({ __rspyts_json__: value })).toEqual(value);
+    expect(() => jsonFromWire(value)).toThrow(/Json wrapper/);
+    expect(() => jsonFromWire({ __rspyts_json__: value, sibling: true })).toThrow(/Json wrapper/);
+  });
+});
+
 describe("callFn argument encoding", () => {
-  it("sends the two-byte '{}' payload for empty args", () => {
+  it("sends an envelope-framed empty object for empty args", () => {
     const fake = createFake();
-    let seen: string | undefined;
+    let seen: unknown;
     fake.setExport("rspyts_fn__ping", (argsPtr: number, argsLen: number) => {
-      seen = utf8.decode(fake.readBytes(argsPtr, argsLen));
+      seen = decodeRequest(fake.readBytes(argsPtr, argsLen)).payload;
       return fake.putEnvelope(0, null);
     });
 
     const result = callFn(fake.mod, "rspyts_fn__ping", {});
 
-    expect(seen).toBe("{}");
+    expect(seen).toEqual({});
     expect(result).toBeNull();
   });
 
@@ -73,15 +188,35 @@ describe("callFn argument encoding", () => {
     const fake = createFake();
     let seen: unknown;
     fake.setExport("rspyts_fn__configure", (argsPtr: number, argsLen: number) => {
-      seen = JSON.parse(utf8.decode(fake.readBytes(argsPtr, argsLen)));
+      seen = decodeRequest(fake.readBytes(argsPtr, argsLen)).payload;
       return fake.putEnvelope(0, "ok");
     });
 
-    const args = { sampleRate: 44100, params: { minDurationS: 0.5, threshold: null } };
+    const args = { batchSize: 128, options: { minimumValue: 0.5, tolerance: null } };
     const result = callFn(fake.mod, "rspyts_fn__configure", args);
 
     expect(seen).toEqual(args);
     expect(result).toBe("ok");
+  });
+
+  it("sends nested marked buffers inside the request envelope allocation", () => {
+    const fake = createFake();
+    let seen: unknown;
+    fake.setExport("rspyts_fn__buffered", (argsPtr: number, argsLen: number) => {
+      const request = decodeRequest(fake.readBytes(argsPtr, argsLen));
+      seen = substituteBuffers(request.payload, request.tail);
+      return fake.putEnvelope(0, null);
+    });
+
+    callFn(fake.mod, "rspyts_fn__buffered", {
+      nested: [{ values: wireBuffer(new Int32Array([-2, 7]), "i32") }],
+    });
+
+    const values = (seen as { nested: Array<{ values: Int32Array }> }).nested[0]!.values;
+    expect(values).toBeInstanceOf(Int32Array);
+    expect(Array.from(values)).toEqual([-2, 7]);
+    fake.assertAllFreedOnce();
+    expect(fake.freed).toHaveLength(2); // response envelope + combined request envelope
   });
 
   it("passes slices as naturally-aligned (ptr, element count) pairs", () => {
@@ -136,13 +271,13 @@ describe("callFn argument encoding", () => {
     for (const { dt, bytes, make, view, values } of SLICE_CASES) {
       const fake = createFake();
       fake.misalign(3); // knock the bump pointer off every alignment > 1
-      let observed: { ptr: number; values: number[] } | undefined;
+      let observed: { ptr: number; values: Scalar[] } | undefined;
       fake.setExport(
         "rspyts_fn__take",
         (_argsPtr: number, _argsLen: number, slicePtr: number, sliceLen: number) => {
           observed = {
             ptr: slicePtr,
-            values: Array.from(view(fake.memory.buffer, slicePtr, sliceLen)),
+            values: valuesOf(view(fake.memory.buffer, slicePtr, sliceLen)),
           };
           return fake.putEnvelope(0, null);
         },
@@ -152,7 +287,7 @@ describe("callFn argument encoding", () => {
 
       expect(observed, dt).toBeDefined();
       expect(observed!.ptr % bytes, dt).toBe(0);
-      expect(observed!.values, dt).toEqual(Array.from(make(values)));
+      expect(observed!.values, dt).toEqual(valuesOf(make(values)));
       fake.assertAllFreedOnce();
     }
   });
@@ -208,18 +343,18 @@ describe("callFn argument encoding", () => {
     expect(receivedHandle).toBe(handle);
   });
 
-  it("normalizes null and undefined args to the two-byte '{}' payload", () => {
+  it("normalizes null and undefined args to an envelope-framed empty object", () => {
     for (const args of [null, undefined]) {
       const fake = createFake();
-      let seen: string | undefined;
+      let seen: unknown;
       fake.setExport("rspyts_fn__ping", (argsPtr: number, argsLen: number) => {
-        seen = utf8.decode(fake.readBytes(argsPtr, argsLen));
+        seen = decodeRequest(fake.readBytes(argsPtr, argsLen)).payload;
         return fake.putEnvelope(0, null);
       });
 
       callFn(fake.mod, "rspyts_fn__ping", args);
 
-      expect(seen, String(args)).toBe("{}");
+      expect(seen, String(args)).toEqual({});
       fake.assertAllFreedOnce();
     }
   });
@@ -264,18 +399,18 @@ describe("callFn result handling", () => {
   });
 
   it("throws registered error classes on status 1", () => {
-    class WindowTooLargeError extends RspytsError {
+    class BatchTooLargeError extends RspytsError {
       constructor(message: string, data?: unknown) {
-        super(message, "callTestWindowTooLarge", data);
+        super(message, "callTestBatchTooLarge", data);
       }
     }
-    registerError("callTestWindowTooLarge", WindowTooLargeError);
+    registerError("callTestBatchTooLarge", BatchTooLargeError);
 
     const fake = createFake();
     fake.setExport("rspyts_fn__fails", () =>
       fake.putEnvelope(1, {
-        code: "callTestWindowTooLarge",
-        message: "window too large",
+        code: "callTestBatchTooLarge",
+        message: "batch too large",
         data: { max: 5 },
       }),
     );
@@ -286,10 +421,27 @@ describe("callFn result handling", () => {
     } catch (error) {
       caught = error;
     }
-    expect(caught).toBeInstanceOf(WindowTooLargeError);
-    expect((caught as RspytsError).message).toBe("window too large");
+    expect(caught).toBeInstanceOf(BatchTooLargeError);
+    expect((caught as RspytsError).message).toBe("batch too large");
     expect((caught as RspytsError).data).toEqual({ max: 5 });
     expect(fake.live.size).toBe(0);
+  });
+
+  it("uses a call-scoped error map before the process registry", () => {
+    class ScopedError extends RspytsError {
+      constructor(message: string, data?: unknown) {
+        super(message, "scoped", data);
+      }
+    }
+    const fake = createFake();
+    fake.setExport("rspyts_fn__fails", () =>
+      fake.putEnvelope(1, { code: "scoped", message: "only here" }),
+    );
+
+    expect(() =>
+      callFn(fake.mod, "rspyts_fn__fails", {}, [], undefined, { scoped: ScopedError }),
+    ).toThrow(ScopedError);
+    fake.assertAllFreedOnce();
   });
 
   it("throws RspytsPanicError on status 2", () => {
@@ -448,7 +600,7 @@ describe("callFn memory discipline", () => {
     fake.setExport(
       "rspyts_fn__grow",
       (argsPtr: number, argsLen: number, slicePtr: number, sliceLen: number) => {
-        seenArgs = JSON.parse(utf8.decode(fake.readBytes(argsPtr, argsLen)));
+        seenArgs = decodeRequest(fake.readBytes(argsPtr, argsLen)).payload;
         seenSlice = Array.from(new Float64Array(fake.memory.buffer, slicePtr, sliceLen));
         fake.memory.grow(1);
         return fake.putEnvelope(0, { echoed: true });
@@ -486,21 +638,21 @@ describe("callFn memory discipline", () => {
     fake.assertAllFreedOnce();
   });
 
-  it("survives growth on every allocation with all five slice dtypes at once", () => {
+  it("survives growth on every allocation with all ten slice dtypes at once", () => {
     // Worst case: every rspyts_alloc grows memory (detaching all previous
     // views), the export grows again mid-call, and once more after writing
-    // the envelope. Args and all five slices must still arrive intact.
+    // the envelope. Args and all ten slices must still arrive intact.
     const fake = createFake({ growOnAlloc: true });
-    const seen: Record<string, number[]> = {};
+    const seen: Record<string, Scalar[]> = {};
     fake.setExport("rspyts_fn__growAll", (...raw: number[]) => {
       const [argsPtr, argsLen] = raw as [number, number];
-      expect(utf8.decode(fake.readBytes(argsPtr, argsLen))).toBe('{"n":1}');
+      expect(decodeRequest(fake.readBytes(argsPtr, argsLen)).payload).toEqual({ n: 1 });
       fake.memory.grow(1);
       for (const [i, { dt, bytes, view }] of SLICE_CASES.entries()) {
         const ptr = raw[2 + i * 2]!;
         const count = raw[3 + i * 2]!;
         expect(ptr % bytes, dt).toBe(0);
-        seen[dt] = Array.from(view(fake.memory.buffer, ptr, count));
+        seen[dt] = valuesOf(view(fake.memory.buffer, ptr, count));
       }
       const envPtr = fake.putEnvelope(0, { done: true });
       fake.memory.grow(1);
@@ -516,9 +668,90 @@ describe("callFn memory discipline", () => {
 
     expect(result).toEqual({ done: true });
     for (const { dt, make, values } of SLICE_CASES) {
-      expect(seen[dt], dt).toEqual(Array.from(make(values)));
+      expect(seen[dt], dt).toEqual(valuesOf(make(values)));
     }
     fake.assertAllFreedOnce();
+  });
+});
+
+describe("WebAssembly trap poisoning", () => {
+  it("poisons on an allocation trap and rejects the next call before allocation", () => {
+    const fake = createFake();
+    let allocations = 0;
+    fake.setExport("rspyts_alloc", () => {
+      allocations += 1;
+      throw runtimeTrap("allocator trapped");
+    });
+    fake.setExport("rspyts_fn__work", () => fake.putEnvelope(0, null));
+
+    expect(() => callFn(fake.mod, "rspyts_fn__work", {})).toThrow("allocator trapped");
+    expect(isPoisoned(fake.mod)).toBe(true);
+    expect(() => callFn(fake.mod, "rspyts_fn__work", {})).toThrow(InstancePoisonedError);
+    expect(allocations).toBe(1);
+  });
+
+  it("poisons on a call trap and skips all remaining frees", () => {
+    const fake = createFake();
+    fake.setExport("rspyts_fn__work", () => {
+      throw runtimeTrap();
+    });
+
+    expect(() =>
+      callFn(fake.mod, "rspyts_fn__work", { a: 1 }, [
+        { data: new Uint8Array([1]), dt: "u8" },
+      ]),
+    ).toThrow(WebAssembly.RuntimeError);
+    expect(isPoisoned(fake.mod)).toBe(true);
+    expect(fake.freed).toHaveLength(0);
+    expect(fake.live.size).toBe(2);
+  });
+
+  it("poisons on an envelope free trap and does not attempt request cleanup", () => {
+    const fake = createFake();
+    const originalFree = fake.mod.exports["rspyts_free"]!;
+    let frees = 0;
+    fake.setExport("rspyts_free", (...args: Array<number | bigint>) => {
+      frees += 1;
+      if (frees === 1) {
+        throw runtimeTrap("free trapped");
+      }
+      return originalFree(...args);
+    });
+    fake.setExport("rspyts_fn__work", () => fake.putEnvelope(0, null));
+
+    expect(() => callFn(fake.mod, "rspyts_fn__work", {})).toThrow("free trapped");
+    expect(isPoisoned(fake.mod)).toBe(true);
+    expect(frees).toBe(1);
+  });
+
+  it("marks callDrop traps poisoned and skips every later drop", () => {
+    const fake = createFake();
+    let drops = 0;
+    fake.setExport("rspyts_cls__Session__drop", () => {
+      drops += 1;
+      throw runtimeTrap("drop trapped");
+    });
+
+    expect(() => callDrop(fake.mod, "rspyts_cls__Session__drop", 1n)).not.toThrow();
+    expect(isPoisoned(fake.mod)).toBe(true);
+    callDrop(fake.mod, "rspyts_cls__Session__drop", 2n);
+    expect(drops).toBe(1);
+  });
+
+  it("does not poison for pre-WASM validation or ordinary JavaScript errors", () => {
+    const fake = createFake();
+    fake.setExport("rspyts_fn__work", () => {
+      throw new TypeError("fixture validation failed");
+    });
+
+    expect(() =>
+      callFn(fake.mod, "rspyts_fn__work", {}, [
+        { data: new Uint8Array([1]), dt: "f64" },
+      ]),
+    ).toThrow(/requires a Float64Array/);
+    expect(isPoisoned(fake.mod)).toBe(false);
+    expect(() => callFn(fake.mod, "rspyts_fn__work", {})).toThrow("fixture validation failed");
+    expect(isPoisoned(fake.mod)).toBe(false);
   });
 });
 
@@ -545,8 +778,8 @@ describe("writeSlice", () => {
       expect(sa.aligned % bytes, dt).toBe(0);
       expect(sa.aligned, dt).toBeGreaterThanOrEqual(sa.ptr);
       expect(sa.aligned + values.length * bytes, dt).toBeLessThanOrEqual(sa.ptr + sa.len);
-      const written = Array.from(view(fake.memory.buffer, sa.aligned, values.length));
-      expect(written, dt).toEqual(Array.from(make(values)));
+      const written = valuesOf(view(fake.memory.buffer, sa.aligned, values.length));
+      expect(written, dt).toEqual(valuesOf(make(values)));
     }
   });
 

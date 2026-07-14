@@ -63,7 +63,6 @@ name = "basic-example"
 version = "0.1.0"
 dependencies = [
  "rspyts",
- "serde",
  "serde_json",
 ]
 
@@ -264,7 +263,6 @@ name = "multi-crate-app"
 version = "0.1.0"
 dependencies = [
  "rspyts",
- "serde",
  "shared-types",
 ]
 
@@ -294,7 +292,7 @@ dependencies = [
 
 [[package]]
 name = "rspyts"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "inventory",
  "rspyts-core",
@@ -305,7 +303,7 @@ dependencies = [
 
 [[package]]
 name = "rspyts-cli"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -321,7 +319,7 @@ dependencies = [
 
 [[package]]
 name = "rspyts-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "inventory",
  "serde",
@@ -330,12 +328,12 @@ dependencies = [
 
 [[package]]
 name = "rspyts-macros"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
- "heck",
  "proc-macro2",
  "quote",
  "rspyts",
+ "serde",
  "syn",
  "trybuild",
 ]
@@ -415,7 +413,6 @@ name = "shared-types"
 version = "0.1.0"
 dependencies = [
  "rspyts",
- "serde",
 ]
 
 [[package]]

@@ -4,6 +4,7 @@
 //! directory. Unknown keys are rejected so typos surface as errors
 //! instead of silently disabling an emitter.
 
+use crate::build::BuildOptions;
 use anyhow::{Context, Result, ensure};
 use serde::Deserialize;
 use std::collections::BTreeMap;
@@ -18,6 +19,39 @@ struct RawConfig {
     python: Option<RawPython>,
     typescript: Option<RawTypescript>,
     schema: Option<RawSchema>,
+    #[serde(default)]
+    build: RawBuild,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawBuild {
+    #[serde(default)]
+    features: Vec<String>,
+    #[serde(default, rename = "no-default-features")]
+    no_default_features: bool,
+    #[serde(default = "default_profile")]
+    profile: String,
+    #[serde(default)]
+    targets: Vec<String>,
+    #[serde(default)]
+    locked: bool,
+}
+
+impl Default for RawBuild {
+    fn default() -> Self {
+        Self {
+            features: Vec::new(),
+            no_default_features: false,
+            profile: default_profile(),
+            targets: Vec::new(),
+            locked: false,
+        }
+    }
+}
+
+fn default_profile() -> String {
+    "dev".to_string()
 }
 
 #[derive(Debug, Deserialize)]
@@ -86,6 +120,8 @@ pub struct Config {
     pub python: Option<PythonConfig>,
     pub typescript: Option<TypescriptConfig>,
     pub schema: Option<SchemaConfig>,
+    /// Cargo inputs shared by generate, check, and artifact staging.
+    pub build: BuildOptions,
 }
 
 #[derive(Debug)]
@@ -134,14 +170,15 @@ pub fn load(path: &Path) -> Result<Config> {
     })?;
     let raw: RawConfig =
         toml::from_str(&text).with_context(|| format!("invalid config `{}`", path.display()))?;
-    let base = absolute(path)?;
+    let base = std::path::absolute(path)
+        .with_context(|| format!("cannot make config path `{}` absolute", path.display()))?;
     let base = base
         .parent()
         .context("config path has no parent directory")?;
-    Ok(resolve(raw, base))
+    resolve(raw, base)
 }
 
-fn resolve(raw: RawConfig, base: &Path) -> Config {
+fn resolve(raw: RawConfig, base: &Path) -> Result<Config> {
     let join = |p: &str| -> PathBuf {
         let p = Path::new(p);
         if p.is_absolute() {
@@ -150,7 +187,14 @@ fn resolve(raw: RawConfig, base: &Path) -> Config {
             base.join(p)
         }
     };
-    Config {
+    let build = BuildOptions::new(
+        raw.build.features,
+        raw.build.no_default_features,
+        raw.build.profile,
+        raw.build.targets,
+        raw.build.locked,
+    )?;
+    Ok(Config {
         crate_dir: join(&raw.krate.path),
         python: raw.python.filter(|s| s.enabled).map(|s| PythonConfig {
             out: join(&s.out),
@@ -170,17 +214,8 @@ fn resolve(raw: RawConfig, base: &Path) -> Config {
             .schema
             .filter(|s| s.enabled)
             .map(|s| SchemaConfig { out: join(&s.out) }),
-    }
-}
-
-/// Make `path` absolute against the current directory without touching
-/// the filesystem (`std::path::absolute` needs Rust 1.79; we target 1.77).
-fn absolute(path: &Path) -> Result<PathBuf> {
-    if path.is_absolute() {
-        return Ok(path.to_path_buf());
-    }
-    let cwd = std::env::current_dir().context("cannot determine current directory")?;
-    Ok(cwd.join(path))
+        build,
+    })
 }
 
 /// The commented starter configuration written by `rspyts init`.
@@ -190,6 +225,14 @@ pub const INIT_TEMPLATE: &str = r#"# rspyts configuration. All relative paths re
 [crate]
 # Directory containing the bridged crate's Cargo.toml.
 path = "."
+
+[build]
+# Cargo inputs shared by generate, check, and build.
+features = []
+no-default-features = false
+profile = "dev"
+targets = ["wasm32-unknown-unknown"]
+locked = true
 
 [python]
 enabled = true
@@ -201,7 +244,7 @@ library_search = ["../../../../target/debug", "../../../../target/release"]
 
 # Items to drop from this projection (simple globs; methods and statics
 # match as "Class.method"):
-# exclude = ["render_*", "Recording.preload"]
+# exclude = ["render_*", "Session.warm_up"]
 
 # Bridged types defined in a dependency crate can be imported from that
 # crate's own generated package instead of re-emitted here:
@@ -243,7 +286,7 @@ mod tests {
 
     fn parse(text: &str) -> Config {
         let raw: RawConfig = toml::from_str(text).expect("config parses");
-        resolve(raw, Path::new("/project"))
+        resolve(raw, Path::new("/project")).expect("config resolves")
     }
 
     #[test]
@@ -252,6 +295,13 @@ mod tests {
             r#"
             [crate]
             path = "rust"
+
+            [build]
+            features = ["serde", "fast-path"]
+            no-default-features = true
+            profile = "release"
+            targets = ["wasm32-unknown-unknown"]
+            locked = true
 
             [python]
             enabled = true
@@ -266,6 +316,11 @@ mod tests {
             "#,
         );
         assert_eq!(cfg.crate_dir, Path::new("/project/rust"));
+        assert_eq!(cfg.build.features, vec!["serde", "fast-path"]);
+        assert!(cfg.build.no_default_features);
+        assert_eq!(cfg.build.profile, "release");
+        assert_eq!(cfg.build.targets, vec!["wasm32-unknown-unknown"]);
+        assert!(cfg.build.locked);
         assert_eq!(
             cfg.python.as_ref().unwrap().out,
             Path::new("/project/python/_generated")
@@ -289,20 +344,20 @@ mod tests {
             out = "py"
 
             [python.imports]
-            "neurovirtual-hardware" = "neurovirtual.hardware.generated"
+            "shared-types" = "shared_types.generated"
             "other-crate" = "other_package._generated"
 
             [typescript]
             out = "ts"
 
             [typescript.imports]
-            "neurovirtual-hardware" = "@neurovirtual/hardware/generated"
+            "shared-types" = "shared-types-example"
             "#,
         );
         let py = cfg.python.unwrap();
         assert_eq!(
-            py.imports.get("neurovirtual-hardware").map(String::as_str),
-            Some("neurovirtual.hardware.generated")
+            py.imports.get("shared-types").map(String::as_str),
+            Some("shared_types.generated")
         );
         assert_eq!(
             py.imports.get("other-crate").map(String::as_str),
@@ -310,8 +365,8 @@ mod tests {
         );
         let ts = cfg.typescript.unwrap();
         assert_eq!(
-            ts.imports.get("neurovirtual-hardware").map(String::as_str),
-            Some("@neurovirtual/hardware/generated")
+            ts.imports.get("shared-types").map(String::as_str),
+            Some("shared-types-example")
         );
     }
 
@@ -328,7 +383,7 @@ mod tests {
             r#"
             [python]
             out = "py"
-            exclude = ["render_*", "Recording.preload"]
+            exclude = ["render_*", "Session.warm_up"]
 
             [typescript]
             out = "ts"
@@ -336,7 +391,7 @@ mod tests {
         );
         assert_eq!(
             cfg.python.unwrap().exclude,
-            vec!["render_*".to_string(), "Recording.preload".to_string()]
+            vec!["render_*".to_string(), "Session.warm_up".to_string()]
         );
         assert!(cfg.typescript.unwrap().exclude.is_empty());
     }
@@ -348,6 +403,7 @@ mod tests {
         assert!(cfg.python.is_none());
         assert!(cfg.typescript.is_none());
         assert!(cfg.schema.is_none());
+        assert_eq!(cfg.build, BuildOptions::default());
     }
 
     #[test]
@@ -366,6 +422,26 @@ mod tests {
     }
 
     #[test]
+    fn unknown_build_keys_are_rejected() {
+        let err = toml::from_str::<RawConfig>("[build]\nprofil = \"release\"\n").unwrap_err();
+        assert!(err.to_string().contains("profil"), "{err}");
+    }
+
+    #[test]
+    fn invalid_build_values_are_rejected() {
+        for text in [
+            "[build]\nprofile = \"\"\n",
+            "[build]\nprofile = \"bad profile\"\n",
+            "[build]\ntargets = [\"\"]\n",
+            "[build]\ntargets = [\"bad target\"]\n",
+            "[build]\nfeatures = [\"bad feature\"]\n",
+        ] {
+            let raw: RawConfig = toml::from_str(text).unwrap();
+            assert!(resolve(raw, Path::new("/project")).is_err(), "{text}");
+        }
+    }
+
+    #[test]
     fn unknown_top_level_section_is_rejected() {
         assert!(toml::from_str::<RawConfig>("[pyhton]\nout = \"x\"\n").is_err());
     }
@@ -373,7 +449,7 @@ mod tests {
     #[test]
     fn init_template_parses() {
         let raw: RawConfig = toml::from_str(INIT_TEMPLATE).expect("template parses");
-        let cfg = resolve(raw, Path::new("/p"));
+        let cfg = resolve(raw, Path::new("/p")).expect("template resolves");
         assert!(cfg.python.is_some() && cfg.typescript.is_some() && cfg.schema.is_some());
     }
 }

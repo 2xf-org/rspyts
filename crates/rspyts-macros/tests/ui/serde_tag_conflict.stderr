@@ -1,0 +1,5 @@
+error: #[bridge(tag = …)] competes with the adopted Serde contract; put `tag` in #[serde(...)] instead
+ --> tests/ui/serde_tag_conflict.rs:4:23
+  |
+4 | #[bridge(serde, tag = "kind")]
+  |                       ^^^^^^

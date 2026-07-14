@@ -12,4 +12,3 @@ publish = false
 # `module/` crate next door adds the export for standalone codegen.
 [dependencies]
 rspyts = { workspace = true }
-serde = { workspace = true }

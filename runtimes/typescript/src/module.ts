@@ -4,21 +4,37 @@
  * rspyts modules are self-contained `wasm32-unknown-unknown` cdylibs: they
  * import nothing and export linear memory plus the `rspyts_*` symbols.
  * {@link instantiate} accepts anything the WebAssembly JS API can
- * instantiate, verifies the module speaks ABI version 1, and returns the
+ * instantiate, verifies the module speaks ABI version 2, and returns the
  * {@link BridgeModule} that `callFn`/`callDrop` operate on.
  */
 
 /** The ABI major version this runtime implements (ABI §3). */
-export const ABI_VERSION = 1;
+export const ABI_VERSION = 2;
 
 /**
  * An instantiated rspyts module: the raw export object plus its linear
  * memory. `memory` is also reachable as `exports.memory`; it is hoisted
- * here so callers never touch a possibly-absent property.
+ * here so callers never touch a possibly-absent property. A WebAssembly
+ * runtime trap poisons the instance permanently because its Rust-side
+ * invariants and allocator state can no longer be trusted.
  */
 export interface BridgeModule {
   exports: Record<string, Function> & { memory?: WebAssembly.Memory };
   memory: WebAssembly.Memory;
+}
+
+// Kept outside the public object so consumers cannot accidentally clear a
+// poison flag and resume calls into an unsafe instance.
+const poisonedModules = new WeakSet<BridgeModule>();
+
+/** @internal Whether a prior WebAssembly runtime trap poisoned this module. */
+export function isPoisoned(mod: BridgeModule): boolean {
+  return poisonedModules.has(mod);
+}
+
+/** @internal Permanently poison a module after a WebAssembly runtime trap. */
+export function markPoisoned(mod: BridgeModule): void {
+  poisonedModules.add(mod);
 }
 
 /**

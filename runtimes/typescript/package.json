@@ -1,6 +1,6 @@
 {
   "name": "rspyts",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "TypeScript/WebAssembly runtime for rspyts: define it in Rust, call it in Python and TypeScript.",
   "license": "MIT",
   "repository": {
@@ -19,10 +19,11 @@
   "module": "./dist/index.js",
   "types": "./dist/index.d.ts",
   "files": [
-    "dist"
+    "dist",
+    "src"
   ],
   "engines": {
-    "node": ">=20"
+    "node": ">=22.12"
   },
   "scripts": {
     "build": "tsc -p tsconfig.build.json",
@@ -40,7 +41,7 @@
     "ffi"
   ],
   "devDependencies": {
-    "@types/node": "^20.0.0",
+    "@types/node": "^22.0.0",
     "@vitest/coverage-v8": "^4.1.10",
     "typescript": "^7.0.2",
     "vitest": "^4.1.10"

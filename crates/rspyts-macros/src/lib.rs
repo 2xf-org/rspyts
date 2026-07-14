@@ -19,6 +19,7 @@ mod consts;
 mod docs;
 mod emit;
 mod functions;
+mod serde_reflect;
 mod sig;
 mod types;
 
@@ -36,23 +37,41 @@ use proc_macro::TokenStream;
 ///
 /// ```ignore
 /// #[bridge]
-/// /// Parameters controlling the analysis pass.
-/// pub struct AnalysisParams {
-///     /// Minimum duration, in seconds.
-///     pub min_duration_s: f64,
-///     pub threshold: Option<f64>,
+/// /// Options controlling value processing.
+/// pub struct QueryOptions {
+///     /// Minimum value to include.
+///     pub minimum_value: f64,
+///     pub tolerance: Option<f64>,
 /// }
 /// ```
 ///
 /// Adds `#[derive(Serialize, Deserialize)]` with
 /// `#[serde(rename_all = "camelCase", deny_unknown_fields)]` — wire field
-/// names are camelCase (`minDurationS`) and unknown fields are rejected on
+/// names are camelCase (`minimumValue`) and unknown fields are rejected on
 /// deserialize. Override the casing per struct with
 /// `#[bridge(rename_all = "snake_case")]`. Doc comments propagate to
 /// Python docstrings, TypeScript doc comments, and JSON Schema
 /// descriptions. `Option<T>` fields are marked optional in the generated
 /// surfaces (null default). Rejected: generics, lifetimes, tuple structs,
 /// unit structs, non-`pub` fields.
+///
+/// A type that already derives Serde can instead use adoption mode:
+///
+/// ```ignore
+/// #[bridge(serde)]
+/// #[derive(serde::Serialize, serde::Deserialize)]
+/// #[serde(rename_all = "kebab-case", deny_unknown_fields)]
+/// pub struct ExistingOptions {
+///     pub batch_size: u32,
+/// }
+/// ```
+///
+/// Adoption injects neither derives nor Serde attributes. rspyts reflects
+/// Serde's `rename`, `rename_all`, `tag`, `transparent`, and
+/// `deny_unknown_fields` subset into the manifest and rejects every
+/// unmodeled shape-changing key at its definition site. Both derives are
+/// required syntactically and by trait bound. Use `rspyts::Json` for an
+/// intentionally schemaless custom codec.
 ///
 /// # Enums
 ///
@@ -70,9 +89,9 @@ use proc_macro::TokenStream;
 ///
 /// ```ignore
 /// #[bridge(tag = "kind")]
-/// pub enum ThresholdEvent {
-///     Crossed { at_sample: u32, value: f64 },  // {"kind":"crossed","atSample":…}
-///     Cleared { at_sample: u32 },
+/// pub enum ValueEvent {
+///     Accepted { index: u32, value: f64 },  // {"kind":"accepted","index":…}
+///     Rejected { index: u32 },
 /// }
 /// ```
 ///
@@ -82,11 +101,11 @@ use proc_macro::TokenStream;
 ///
 /// ```ignore
 /// #[bridge(error)]
-/// pub enum AnalysisError {
-///     InvalidSampleRate,
-///     WindowTooLarge { max: u32 },
+/// pub enum QueryError {
+///     InvalidBatchSize,
+///     BatchTooLarge { max: u32 },
 /// }
-/// impl std::fmt::Display for AnalysisError { /* … */ }
+/// impl std::fmt::Display for QueryError { /* … */ }
 /// ```
 ///
 /// Derives [`BridgeErr`](../rspyts/trait.BridgeErr.html): the camelCase
@@ -99,11 +118,11 @@ use proc_macro::TokenStream;
 ///
 /// ```ignore
 /// #[bridge]
-/// /// Sample rate every analysis assumes.
-/// pub const SAMPLE_RATE_HZ: f64 = 256.0;
+/// /// Default number of values processed at once.
+/// pub const DEFAULT_BATCH_SIZE: u32 = 256;
 ///
 /// #[bridge]
-/// pub const CHANNEL_LABELS: &[&str] = &["chin_emg", "leg_emg"];
+/// pub const SUPPORTED_FORMATS: &[&str] = &["csv", "json"];
 /// ```
 ///
 /// The const is re-emitted unchanged; its value is captured with
@@ -129,24 +148,26 @@ use proc_macro::TokenStream;
 ///
 /// ```ignore
 /// #[bridge]
-/// /// Analyze a signal buffer.
-/// pub fn analyze_signal(
-///     samples: &[f64],                        // slice param: (ptr, len), zero-copy
-///     sample_rate: u32,                       // plain param: JSON args object
-///     params: &AnalysisParams,                // plain param, deserialized owned
-/// ) -> Result<AnalysisReport, AnalysisError> { /* … */ }
+/// /// Process a buffer of numeric values.
+/// pub fn process_values(
+///     values: &[f64],                         // borrowed slice param: (ptr, len)
+///     batch_size: u32,                        // plain param: JSON args object
+///     options: &QueryOptions,                 // plain param, deserialized owned
+/// ) -> Result<ProcessingReport, QueryError> { /* … */ }
 /// ```
 ///
-/// Emits `extern "C" fn rspyts_fn__analyze_signal(args_ptr, args_len,
-/// s0_ptr, s0_len) -> *mut u8` (ABI §3.1). Parameters written as `&[u8]`,
-/// `&[i16]`, `&[i32]`, `&[f32]`, or `&[f64]` cross as raw `(ptr, len)`
-/// pairs; everything else travels in one JSON object keyed by the
-/// camelCase parameter name. `&T` and `&str` parameters deserialize to
+/// Emits `extern "C" fn rspyts_fn__process_values(args_ptr, args_len,
+/// s0_ptr, s0_len) -> *mut u8` (ABI §3.1). Parameters written as slices of
+/// any supported numeric dtype cross as raw `(ptr, len)`
+/// pairs; everything else travels in one ABI-2 request envelope keyed by the
+/// camelCase parameter name. Owned `Buf<T>` and `Bytes` values use binary
+/// attachments in that envelope. `&T` and `&str` parameters deserialize to
 /// owned values and are re-borrowed for the call. Return `T`, `()`, or —
 /// written literally — `Result<T, E>` where `E: BridgeErr`. Every shim
 /// catches panics; nothing unwinds across the boundary. Rejected:
-/// `async fn`, generics, non-identifier parameter patterns, and
-/// `Buf<T>` parameters (`Buf` is return-only; accept `&[T]`).
+/// `async fn`, generics, non-identifier parameter patterns, and unsupported
+/// borrowed types. Use `&[T]` for a borrowed top-level numeric input and
+/// `Buf<T>` for an owned or nested numeric value.
 ///
 /// # Classes — `#[bridge]` on an impl block
 ///
@@ -158,7 +179,7 @@ use proc_macro::TokenStream;
 ///     #[bridge(constructor)]
 ///     pub fn new(window: u32) -> Self { /* … */ }
 ///     pub fn push(&mut self, chunk: &[f64]) { /* … */ }
-///     pub fn snapshot(&self) -> SignalStats { /* … */ }
+///     pub fn snapshot(&self) -> Statistics { /* … */ }
 /// }
 /// ```
 ///
@@ -178,8 +199,8 @@ use proc_macro::TokenStream;
 ///
 /// ```ignore
 /// #[bridge]
-/// impl Recording {
-///     /// Open a recording file.
+/// impl Session {
+///     /// Open a data file.
 ///     #[bridge(static)]
 ///     pub fn open(path: &str) -> Result<Self, IoError> { /* … */ }
 ///
@@ -187,7 +208,7 @@ use proc_macro::TokenStream;
 ///     #[bridge(static)]
 ///     pub fn default_window() -> u32 { 512 }
 ///
-///     pub fn duration_s(&self) -> f64 { /* … */ }
+///     pub fn progress(&self) -> f64 { /* … */ }
 /// }
 /// ```
 ///
@@ -240,6 +261,7 @@ use proc_macro::TokenStream;
 /// |---|---|---|
 /// | *(none)* | struct, enum, fn, const, impl | default bridging |
 /// | `error` | enum | derive `BridgeErr` instead of data serde |
+/// | `serde` | struct, data enum | adopt existing Serde derives and reflected naming metadata |
 /// | `tag = "…"` | data enum | discriminator key (default `"type"`) |
 /// | `rename_all = "…"` | struct | wire casing: `"camelCase"` (default) or `"snake_case"` |
 /// | `constructor` | method in a bridged impl | marks the constructor |

@@ -7,7 +7,7 @@
  * not just resembles — the type the app client accepts and returns.
  *
  * Requires the WASM build:
- *   cargo build -p multi-crate-app --target wasm32-unknown-unknown
+ *   rspyts build --config examples/multi-crate/app/rspyts.toml
  */
 
 import { readFile } from "node:fs/promises";
@@ -20,7 +20,7 @@ import { createClient, type MultiCrateAppClient } from "../src";
 
 const WASM_PATH = fileURLToPath(
   new URL(
-    "../../../../../target/wasm32-unknown-unknown/debug/multi_crate_app.wasm",
+    "../../../../../target/rspyts/wasm32-unknown-unknown/debug/multi_crate_app.wasm",
     import.meta.url,
   ),
 );

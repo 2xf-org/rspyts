@@ -48,13 +48,27 @@ def test_stale_handle_is_preregistered():
 
 
 def test_registered_class_takes_precedence():
-    class WindowTooLargeError(BridgeError):
+    class BatchTooLargeError(BridgeError):
         pass
 
-    register_error("windowTooLarge", WindowTooLargeError)
-    with pytest.raises(WindowTooLargeError) as exc_info:
-        errors.raise_bridge_error(1, {"code": "windowTooLarge", "message": "m", "data": {"max": 5}})
+    register_error("batchTooLarge", BatchTooLargeError)
+    with pytest.raises(BatchTooLargeError) as exc_info:
+        errors.raise_bridge_error(1, {"code": "batchTooLarge", "message": "m", "data": {"max": 5}})
     assert exc_info.value.data == {"max": 5}
+
+
+def test_call_scoped_registry_prevents_cross_package_collisions():
+    class FirstPackageError(BridgeError):
+        pass
+
+    class SecondPackageError(BridgeError):
+        pass
+
+    payload = {"code": "sharedCode", "message": "scoped"}
+    with pytest.raises(FirstPackageError):
+        errors.raise_bridge_error(1, payload, {"sharedCode": FirstPackageError})
+    with pytest.raises(SecondPackageError):
+        errors.raise_bridge_error(1, payload, {"sharedCode": SecondPackageError})
 
 
 def test_later_registration_wins():

@@ -27,7 +27,9 @@ pub fn expand_const(args: BridgeArgs, item: syn::ItemConst) -> syn::Result<Token
     args.deny_tag("constants")?;
     args.deny_rename_all("constants")?;
     args.deny_target("constants; constants are projected into every target")?;
+    args.deny_serde("constants; it adopts Serde derives on data types")?;
     sig::ensure_no_generics(&item.generics, "constants")?;
+    sig::reject_attachment_type(&item.ty, "a bridged constant")?;
 
     let ty_expr = const_ir_ty(&item.ty)?;
     let ident = &item.ident;

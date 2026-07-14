@@ -4,12 +4,13 @@
 //! A Rust type can cross the bridge if and only if it implements
 //! [`Bridged`]. Deliberately **not** implemented (see
 //! `docs/design/type-system.md` §1): `u64`, `i64`, `u128`, `i128`,
-//! `usize`, `isize`, `char`, tuples. If you hit a "trait bound not
-//! satisfied" error on one of these, that is the type system saying no —
-//! use `u32`/`i32` or `String`.
+//! `usize`, `isize`, `char`, and tuples outside arities 2 through 12. If
+//! you hit a "trait bound not satisfied" error on one of these, that is
+//! the type system saying no — use [`I64`]/[`U64`] for exact 64-bit
+//! integers, or a supported portable shape.
 
 use crate::ir::{Dtype, Ty};
-use serde::de::{SeqAccess, Visitor};
+use serde::de::{MapAccess, SeqAccess, Visitor};
 use serde::ser::SerializeSeq;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::collections::{BTreeMap, HashMap};
@@ -77,15 +78,186 @@ impl<T: Bridged> Bridged for BTreeMap<String, T> {
     }
 }
 
+macro_rules! impl_bridged_tuple {
+    ($(($($ty:ident),+)),+ $(,)?) => {
+        $(
+            impl<$($ty: Bridged),+> Bridged for ($($ty,)+) {
+                fn ty() -> Ty {
+                    Ty::Tuple {
+                        items: vec![$($ty::ty()),+],
+                    }
+                }
+            }
+        )+
+    };
+}
+
+impl_bridged_tuple! {
+    (A, B),
+    (A, B, C),
+    (A, B, C, D),
+    (A, B, C, D, E),
+    (A, B, C, D, E, F),
+    (A, B, C, D, E, F, G),
+    (A, B, C, D, E, F, G, H),
+    (A, B, C, D, E, F, G, H, I),
+    (A, B, C, D, E, F, G, H, I, J),
+    (A, B, C, D, E, F, G, H, I, J, K),
+    (A, B, C, D, E, F, G, H, I, J, K, L),
+}
+
+/// Exact signed 64-bit integer transported as a canonical decimal string.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct I64(pub i64);
+
+impl I64 {
+    pub const fn new(value: i64) -> Self {
+        Self(value)
+    }
+
+    pub const fn get(self) -> i64 {
+        self.0
+    }
+
+    pub const fn into_inner(self) -> i64 {
+        self.0
+    }
+}
+
+impl From<i64> for I64 {
+    fn from(value: i64) -> Self {
+        Self(value)
+    }
+}
+
+impl From<I64> for i64 {
+    fn from(value: I64) -> Self {
+        value.0
+    }
+}
+
+impl std::fmt::Display for I64 {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+impl std::str::FromStr for I64 {
+    type Err = std::num::ParseIntError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        value.parse::<i64>().map(Self)
+    }
+}
+
+impl Bridged for I64 {
+    fn ty() -> Ty {
+        Ty::I64
+    }
+}
+
+impl Serialize for I64 {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_str(&self.0)
+    }
+}
+
+impl<'de> Deserialize<'de> for I64 {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = String::deserialize(deserializer)?;
+        let parsed = value.parse::<i64>().map_err(|_| {
+            serde::de::Error::custom("expected a canonical signed 64-bit decimal string")
+        })?;
+        if parsed.to_string() != value {
+            return Err(serde::de::Error::custom(
+                "expected a canonical signed 64-bit decimal string",
+            ));
+        }
+        Ok(Self(parsed))
+    }
+}
+
+/// Exact unsigned 64-bit integer transported as a canonical decimal string.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct U64(pub u64);
+
+impl U64 {
+    pub const fn new(value: u64) -> Self {
+        Self(value)
+    }
+
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+
+    pub const fn into_inner(self) -> u64 {
+        self.0
+    }
+}
+
+impl From<u64> for U64 {
+    fn from(value: u64) -> Self {
+        Self(value)
+    }
+}
+
+impl From<U64> for u64 {
+    fn from(value: U64) -> Self {
+        value.0
+    }
+}
+
+impl std::fmt::Display for U64 {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+impl std::str::FromStr for U64 {
+    type Err = std::num::ParseIntError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        value.parse::<u64>().map(Self)
+    }
+}
+
+impl Bridged for U64 {
+    fn ty() -> Ty {
+        Ty::U64
+    }
+}
+
+impl Serialize for U64 {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_str(&self.0)
+    }
+}
+
+impl<'de> Deserialize<'de> for U64 {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = String::deserialize(deserializer)?;
+        let parsed = value.parse::<u64>().map_err(|_| {
+            serde::de::Error::custom("expected a canonical unsigned 64-bit decimal string")
+        })?;
+        if parsed.to_string() != value {
+            return Err(serde::de::Error::custom(
+                "expected a canonical unsigned 64-bit decimal string",
+            ));
+        }
+        Ok(Self(parsed))
+    }
+}
+
 /// Element types allowed in `&[T]` slice parameters (ABI §6).
 pub trait SliceElem: Copy + 'static {
     const DTYPE: Dtype;
 }
 
-/// Element types allowed in [`Buf<T>`] returns (ABI §6).
+/// Element types allowed in [`Buf<T>`] attachments (ABI §6).
 pub trait BufElem: Copy + Serialize + for<'de> Deserialize<'de> + 'static {
     const DTYPE: Dtype;
     fn to_le_bytes_vec(items: &[Self]) -> Vec<u8>;
+    fn from_le_bytes_vec(bytes: &[u8]) -> Option<Vec<Self>>;
 }
 
 macro_rules! impl_elem {
@@ -103,6 +275,18 @@ macro_rules! impl_elem {
                     }
                     out
                 }
+                fn from_le_bytes_vec(bytes: &[u8]) -> Option<Vec<Self>> {
+                    let width = std::mem::size_of::<Self>();
+                    if bytes.len() % width != 0 {
+                        return None;
+                    }
+                    Some(
+                        bytes
+                            .chunks_exact(width)
+                            .map(|chunk| Self::from_le_bytes(chunk.try_into().unwrap()))
+                            .collect(),
+                    )
+                }
             }
         )*
     };
@@ -110,19 +294,24 @@ macro_rules! impl_elem {
 
 impl_elem! {
     u8 => U8,
+    i8 => I8,
+    u16 => U16,
     i16 => I16,
+    u32 => U32,
     i32 => I32,
+    u64 => U64,
+    i64 => I64,
     f32 => F32,
     f64 => F64,
 }
 
-/// An owned numeric vector that returns to the caller through the
+/// An owned numeric vector that crosses through the
 /// envelope's raw tail instead of JSON — O(1) JSON size regardless of
 /// element count.
 ///
-/// Valid in return position only (including nested inside returned
-/// structs); the type system rejects it in parameters — accept `&[T]`
-/// there instead.
+/// Valid in parameters and returns, including nested positions. Use a
+/// top-level `&[T]` parameter when borrowing without a Rust-side copy is
+/// more important than ownership or nesting.
 ///
 /// Outside an envelope serialization scope (e.g. if you `serde_json` a
 /// value containing a `Buf` yourself), it degrades gracefully to a plain
@@ -151,13 +340,65 @@ impl<T: BufElem> Bridged for Buf<T> {
     }
 }
 
+/// Owned binary data, distinct from the numeric `Buf<u8>` contract.
+///
+/// In an envelope it uses a `dt: "bytes"` attachment. Outside an envelope
+/// Serde scope it degrades to a JSON array of byte values.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Bytes(pub Vec<u8>);
+
+impl Bytes {
+    pub fn new(bytes: Vec<u8>) -> Self {
+        Self(bytes)
+    }
+
+    pub fn as_slice(&self) -> &[u8] {
+        &self.0
+    }
+
+    pub fn into_inner(self) -> Vec<u8> {
+        self.0
+    }
+
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
+impl From<Vec<u8>> for Bytes {
+    fn from(bytes: Vec<u8>) -> Self {
+        Self(bytes)
+    }
+}
+
+impl From<&[u8]> for Bytes {
+    fn from(bytes: &[u8]) -> Self {
+        Self(bytes.to_vec())
+    }
+}
+
+impl AsRef<[u8]> for Bytes {
+    fn as_ref(&self) -> &[u8] {
+        self.as_slice()
+    }
+}
+
+impl Bridged for Bytes {
+    fn ty() -> Ty {
+        Ty::Bytes
+    }
+}
+
 /// Schemaless JSON passthrough — the deliberate escape hatch for payloads
 /// whose shape is decided at runtime (plugin parameters, free-form
 /// attributes). Projects as `Any` in Python, `unknown` in TypeScript, and
 /// `{}` in JSON Schema. Prefer real bridged types wherever the shape is
 /// actually known.
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
-#[serde(transparent)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct Json(pub serde_json::Value);
 
 impl Json {
@@ -178,6 +419,36 @@ impl From<serde_json::Value> for Json {
 impl Bridged for Json {
     fn ty() -> Ty {
         Ty::Json
+    }
+}
+
+/// The exact single-key wrapper used to keep schemaless JSON opaque to the
+/// attachment scanner. The wrapper is removed by host runtimes, so `Json`
+/// remains an ordinary JSON value in generated APIs.
+pub const JSON_WRAPPER_KEY: &str = "__rspyts_json__";
+
+impl Serialize for Json {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+        let mut map = serializer.serialize_map(Some(1))?;
+        map.serialize_entry(JSON_WRAPPER_KEY, &self.0)?;
+        map.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for Json {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let mut map = BTreeMap::<String, serde_json::Value>::deserialize(deserializer)?;
+        if map.len() != 1 {
+            return Err(serde::de::Error::custom(
+                "schemaless JSON wrapper must contain exactly one field",
+            ));
+        }
+        map.remove(JSON_WRAPPER_KEY).map(Self).ok_or_else(|| {
+            serde::de::Error::custom(format!(
+                "schemaless JSON wrapper must use {JSON_WRAPPER_KEY:?}"
+            ))
+        })
     }
 }
 
@@ -221,23 +492,119 @@ impl<T: BufElem> Serialize for Buf<T> {
     }
 }
 
-impl<'de, T: BufElem> Deserialize<'de> for Buf<T> {
-    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        struct SeqVisitor<T>(std::marker::PhantomData<T>);
-        impl<'de, T: BufElem> Visitor<'de> for SeqVisitor<T> {
-            type Value = Buf<T>;
-            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-                f.write_str("a numeric array")
+impl Serialize for Bytes {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match crate::envelope::tail_push(&self.0, 1) {
+            Some(off) => {
+                use serde::ser::SerializeMap;
+                let mut map = serializer.serialize_map(Some(1))?;
+                map.serialize_entry(
+                    BUF_PLACEHOLDER_KEY,
+                    &BufPlaceholderBody {
+                        off,
+                        len: self.0.len(),
+                        dt: "bytes",
+                    },
+                )?;
+                map.end()
             }
-            fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
-                let mut items = Vec::with_capacity(seq.size_hint().unwrap_or(0));
-                while let Some(item) = seq.next_element::<T>()? {
-                    items.push(item);
+            None => {
+                let mut seq = serializer.serialize_seq(Some(self.0.len()))?;
+                for byte in &self.0 {
+                    seq.serialize_element(byte)?;
                 }
-                Ok(Buf(items))
+                seq.end()
             }
         }
-        deserializer.deserialize_seq(SeqVisitor(std::marker::PhantomData))
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OwnedPlaceholderBody {
+    off: usize,
+    len: usize,
+    dt: String,
+}
+
+struct AttachmentVisitor<T: BufElem> {
+    dtype: &'static str,
+    description: &'static str,
+    marker: std::marker::PhantomData<T>,
+}
+
+impl<'de, T: BufElem> Visitor<'de> for AttachmentVisitor<T> {
+    type Value = Vec<T>;
+
+    fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        f.write_str(self.description)
+    }
+
+    fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+        let mut items = Vec::with_capacity(seq.size_hint().unwrap_or(0));
+        while let Some(item) = seq.next_element::<T>()? {
+            items.push(item);
+        }
+        Ok(items)
+    }
+
+    fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+        let key = map
+            .next_key::<String>()?
+            .ok_or_else(|| serde::de::Error::custom("empty buffer placeholder object"))?;
+        if key != BUF_PLACEHOLDER_KEY {
+            return Err(serde::de::Error::custom(format!(
+                "expected {BUF_PLACEHOLDER_KEY:?}, found {key:?}"
+            )));
+        }
+        let body = map.next_value::<OwnedPlaceholderBody>()?;
+        if map.next_key::<serde::de::IgnoredAny>()?.is_some() {
+            return Err(serde::de::Error::custom(
+                "buffer placeholder object must contain no sibling fields",
+            ));
+        }
+        if body.dt != self.dtype {
+            return Err(serde::de::Error::custom(format!(
+                "buffer dtype mismatch: expected {:?}, found {:?}",
+                self.dtype, body.dt
+            )));
+        }
+        crate::envelope::request_tail_read::<T>(body.off, body.len)
+            .map_err(serde::de::Error::custom)
+    }
+}
+
+fn deserialize_attachment<'de, D, T>(
+    deserializer: D,
+    dtype: &'static str,
+    description: &'static str,
+) -> Result<Vec<T>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: BufElem,
+{
+    deserializer.deserialize_any(AttachmentVisitor {
+        dtype,
+        description,
+        marker: std::marker::PhantomData,
+    })
+}
+
+impl<'de, T: BufElem> Deserialize<'de> for Buf<T> {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        deserialize_attachment(
+            deserializer,
+            T::DTYPE.wire_name(),
+            "a numeric array or buffer placeholder",
+        )
+        .map(Buf)
+    }
+}
+
+impl<'de> Deserialize<'de> for Bytes {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        deserialize_attachment(deserializer, "bytes", "a byte array or bytes placeholder")
+            .map(Bytes)
     }
 }
 
@@ -250,6 +617,30 @@ mod tests {
     fn buf_outside_envelope_is_plain_array() {
         let json = serde_json::to_string(&Buf::new(vec![1.0f64, 2.0])).unwrap();
         assert_eq!(json, "[1.0,2.0]");
+    }
+
+    #[test]
+    fn json_uses_an_exact_wrapper_and_preserves_attachment_shaped_content() {
+        let inner = serde_json::json!({
+            BUF_PLACEHOLDER_KEY: {"off": 0, "len": 1, "dt": "u8"}
+        });
+        let wrapped = Json::new(inner.clone());
+        let encoded = serde_json::to_value(&wrapped).unwrap();
+        assert_eq!(encoded, serde_json::json!({JSON_WRAPPER_KEY: inner}));
+        assert_eq!(
+            serde_json::from_value::<Json>(encoded)
+                .unwrap()
+                .into_inner(),
+            inner
+        );
+        assert!(serde_json::from_value::<Json>(serde_json::json!({})).is_err());
+        assert!(
+            serde_json::from_value::<Json>(serde_json::json!({
+                JSON_WRAPPER_KEY: null,
+                "sibling": true
+            }))
+            .is_err()
+        );
     }
 
     #[test]
@@ -277,6 +668,41 @@ mod tests {
     }
 
     #[test]
+    fn buf_deserializes_owned_little_endian_request_attachments() {
+        let tail = [0x34, 0x12, 0xfe, 0xff];
+        let json = format!(r#"{{"{BUF_PLACEHOLDER_KEY}":{{"off":0,"len":2,"dt":"i16"}}}}"#);
+        let buf =
+            envelope::with_request_tail(&tail, || serde_json::from_str::<Buf<i16>>(&json).unwrap());
+        assert_eq!(buf.into_inner(), vec![0x1234, -2]);
+
+        let mismatch = envelope::with_request_tail(&tail, || {
+            serde_json::from_str::<Buf<u16>>(&json).unwrap_err()
+        });
+        assert!(mismatch.to_string().contains("dtype mismatch"));
+    }
+
+    #[test]
+    fn bytes_are_distinct_attachments_and_fall_back_to_json_arrays() {
+        let bytes = Bytes::from(&[0x00, 0x7f, 0xff][..]);
+        assert_eq!(bytes.as_slice(), &[0x00, 0x7f, 0xff]);
+        assert_eq!(bytes.len(), 3);
+        assert!(!bytes.is_empty());
+        assert_eq!(serde_json::to_string(&bytes).unwrap(), "[0,127,255]");
+        assert_eq!(Bytes::ty(), Ty::Bytes);
+
+        let ptr = envelope::encode_ok(&bytes);
+        let (status, json, tail) = envelope::decode_owned(ptr);
+        assert_eq!(status, envelope::STATUS_OK);
+        assert_eq!(tail, [0x00, 0x7f, 0xff]);
+        let value: serde_json::Value = serde_json::from_slice(&json).unwrap();
+        assert_eq!(value[BUF_PLACEHOLDER_KEY]["dt"], "bytes");
+
+        let decoded =
+            envelope::with_request_tail(&tail, || serde_json::from_slice::<Bytes>(&json).unwrap());
+        assert_eq!(decoded.into_inner(), vec![0x00, 0x7f, 0xff]);
+    }
+
+    #[test]
     fn scalar_ty_shapes() {
         assert_eq!(bool::ty(), Ty::Bool);
         assert_eq!(u8::ty(), Ty::U8);
@@ -285,6 +711,8 @@ mod tests {
         assert_eq!(i8::ty(), Ty::I8);
         assert_eq!(i16::ty(), Ty::I16);
         assert_eq!(i32::ty(), Ty::I32);
+        assert_eq!(I64::ty(), Ty::I64);
+        assert_eq!(U64::ty(), Ty::U64);
         assert_eq!(f32::ty(), Ty::F32);
         assert_eq!(f64::ty(), Ty::F64);
         assert_eq!(String::ty(), Ty::String);
@@ -318,8 +746,13 @@ mod tests {
             },
         );
         assert_eq!(Buf::<u8>::ty(), Ty::Buf { dt: Dtype::U8 });
+        assert_eq!(Buf::<i8>::ty(), Ty::Buf { dt: Dtype::I8 });
+        assert_eq!(Buf::<u16>::ty(), Ty::Buf { dt: Dtype::U16 });
         assert_eq!(Buf::<i16>::ty(), Ty::Buf { dt: Dtype::I16 });
+        assert_eq!(Buf::<u32>::ty(), Ty::Buf { dt: Dtype::U32 });
         assert_eq!(Buf::<i32>::ty(), Ty::Buf { dt: Dtype::I32 });
+        assert_eq!(Buf::<u64>::ty(), Ty::Buf { dt: Dtype::U64 });
+        assert_eq!(Buf::<i64>::ty(), Ty::Buf { dt: Dtype::I64 });
         assert_eq!(Buf::<f32>::ty(), Ty::Buf { dt: Dtype::F32 });
         assert_eq!(Buf::<f64>::ty(), Ty::Buf { dt: Dtype::F64 });
     }
@@ -336,58 +769,126 @@ mod tests {
                 }),
             },
         );
+        assert_eq!(
+            <(u8, String, Option<I64>)>::ty(),
+            Ty::Tuple {
+                items: vec![
+                    Ty::U8,
+                    Ty::String,
+                    Ty::Option {
+                        inner: Box::new(Ty::I64),
+                    },
+                ],
+            }
+        );
+    }
+
+    #[test]
+    fn exact_integer_wrappers_use_canonical_decimal_strings() {
+        for value in [i64::MIN, -9_007_199_254_740_993, -1, 0, 1, i64::MAX] {
+            let wrapped = I64::new(value);
+            let json = serde_json::to_string(&wrapped).unwrap();
+            assert_eq!(json, format!("\"{value}\""));
+            assert_eq!(serde_json::from_str::<I64>(&json).unwrap().get(), value);
+            assert_eq!(i64::from(wrapped), value);
+        }
+        for value in [0, 1, 9_007_199_254_740_993, u64::MAX] {
+            let wrapped = U64::new(value);
+            let json = serde_json::to_string(&wrapped).unwrap();
+            assert_eq!(json, format!("\"{value}\""));
+            assert_eq!(serde_json::from_str::<U64>(&json).unwrap().get(), value);
+            assert_eq!(u64::from(wrapped), value);
+        }
+
+        for invalid in ["\"01\"", "\"-0\"", "\"+1\"", "\"9223372036854775808\"", "1"] {
+            assert!(serde_json::from_str::<I64>(invalid).is_err(), "{invalid}");
+        }
+        for invalid in [
+            "\"01\"",
+            "\"-1\"",
+            "\"+1\"",
+            "\"18446744073709551616\"",
+            "1",
+        ] {
+            assert!(serde_json::from_str::<U64>(invalid).is_err(), "{invalid}");
+        }
+    }
+
+    #[test]
+    fn tuple_arity_twelve_has_a_fixed_ir_shape() {
+        type Twelve = (u8, u8, u8, u8, u8, u8, u8, u8, u8, u8, u8, u8);
+        assert_eq!(
+            Twelve::ty(),
+            Ty::Tuple {
+                items: vec![Ty::U8; 12]
+            }
+        );
     }
 
     #[test]
     fn every_dtype_serializes_byte_exact_in_envelope() {
         #[derive(Serialize)]
         struct Out {
-            bytes: Buf<u8>,
-            shorts: Buf<i16>,
-            ints: Buf<i32>,
-            floats: Buf<f32>,
-            doubles: Buf<f64>,
+            u8s: Buf<u8>,
+            i8s: Buf<i8>,
+            u16s: Buf<u16>,
+            i16s: Buf<i16>,
+            u32s: Buf<u32>,
+            i32s: Buf<i32>,
+            u64s: Buf<u64>,
+            i64s: Buf<i64>,
+            f32s: Buf<f32>,
+            f64s: Buf<f64>,
         }
         let ptr = envelope::encode_ok(&Out {
-            bytes: Buf::new(vec![0u8, 255]),
-            shorts: Buf::new(vec![i16::MIN, -1, i16::MAX]),
-            ints: Buf::new(vec![i32::MIN, i32::MAX]),
-            floats: Buf::new(vec![f32::MIN, -0.0f32, f32::NAN]),
-            doubles: Buf::new(vec![f64::NEG_INFINITY, f64::MIN_POSITIVE]),
+            u8s: Buf::new(vec![0, u8::MAX]),
+            i8s: Buf::new(vec![i8::MIN, i8::MAX]),
+            u16s: Buf::new(vec![0, u16::MAX]),
+            i16s: Buf::new(vec![i16::MIN, i16::MAX]),
+            u32s: Buf::new(vec![0, u32::MAX]),
+            i32s: Buf::new(vec![i32::MIN, i32::MAX]),
+            u64s: Buf::new(vec![0, u64::MAX]),
+            i64s: Buf::new(vec![i64::MIN, i64::MAX]),
+            f32s: Buf::new(vec![f32::MIN, -0.0f32, f32::NAN]),
+            f64s: Buf::new(vec![f64::NEG_INFINITY, f64::MIN_POSITIVE]),
         });
         let (status, json, tail) = envelope::decode_owned(ptr);
         assert_eq!(status, envelope::STATUS_OK);
 
-        // Offsets: u8 x2 at 0, i16 x3 at 2, i32 x2 at 8, f32 x3 at 16,
-        // then pad 4 so the f64 x2 land 8-aligned at 32.
-        let mut expected = vec![0u8, 255];
-        for v in [i16::MIN, -1, i16::MAX] {
-            expected.extend_from_slice(&v.to_le_bytes());
+        fn le<T: BufElem>(values: &[T]) -> Vec<u8> {
+            T::to_le_bytes_vec(values)
         }
-        for v in [i32::MIN, i32::MAX] {
-            expected.extend_from_slice(&v.to_le_bytes());
-        }
-        for v in [f32::MIN, -0.0f32, f32::NAN] {
-            expected.extend_from_slice(&v.to_le_bytes());
-        }
-        expected.extend_from_slice(&[0u8; 4]);
-        for v in [f64::NEG_INFINITY, f64::MIN_POSITIVE] {
-            expected.extend_from_slice(&v.to_le_bytes());
-        }
-        assert_eq!(tail, expected);
 
         let v: serde_json::Value = serde_json::from_slice(&json).unwrap();
-        for (field, dt, off, len) in [
-            ("bytes", "u8", 0, 2),
-            ("shorts", "i16", 2, 3),
-            ("ints", "i32", 8, 2),
-            ("floats", "f32", 16, 3),
-            ("doubles", "f64", 32, 2),
+        let mut cursor = 0usize;
+        for (field, dt, align, expected_bytes) in [
+            ("u8s", "u8", 1, le(&[0u8, u8::MAX])),
+            ("i8s", "i8", 1, le(&[i8::MIN, i8::MAX])),
+            ("u16s", "u16", 2, le(&[0u16, u16::MAX])),
+            ("i16s", "i16", 2, le(&[i16::MIN, i16::MAX])),
+            ("u32s", "u32", 4, le(&[0u32, u32::MAX])),
+            ("i32s", "i32", 4, le(&[i32::MIN, i32::MAX])),
+            ("u64s", "u64", 8, le(&[0u64, u64::MAX])),
+            ("i64s", "i64", 8, le(&[i64::MIN, i64::MAX])),
+            ("f32s", "f32", 4, le(&[f32::MIN, -0.0, f32::NAN])),
+            (
+                "f64s",
+                "f64",
+                8,
+                le(&[f64::NEG_INFINITY, f64::MIN_POSITIVE]),
+            ),
         ] {
+            cursor += (align - (cursor % align)) % align;
             assert_eq!(v[field][BUF_PLACEHOLDER_KEY]["dt"], dt);
-            assert_eq!(v[field][BUF_PLACEHOLDER_KEY]["off"], off);
-            assert_eq!(v[field][BUF_PLACEHOLDER_KEY]["len"], len);
+            assert_eq!(v[field][BUF_PLACEHOLDER_KEY]["off"], cursor);
+            assert_eq!(
+                v[field][BUF_PLACEHOLDER_KEY]["len"],
+                expected_bytes.len() / align
+            );
+            assert_eq!(&tail[cursor..cursor + expected_bytes.len()], expected_bytes);
+            cursor += expected_bytes.len();
         }
+        assert_eq!(cursor, tail.len());
     }
 
     #[test]
@@ -433,7 +934,7 @@ mod tests {
     fn buf_deserialize_rejects_json_objects() {
         let object = format!(r#"{{"{BUF_PLACEHOLDER_KEY}":{{"off":0,"len":1,"dt":"f32"}}}}"#);
         let err = serde_json::from_str::<Buf<f32>>(&object).unwrap_err();
-        assert!(err.to_string().contains("a numeric array"));
+        assert!(err.to_string().contains("outside a request-tail scope"));
         assert!(serde_json::from_str::<Buf<i32>>("{}").is_err());
         assert!(serde_json::from_str::<Buf<u8>>(r#""text""#).is_err());
     }
