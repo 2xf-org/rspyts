@@ -10,6 +10,9 @@ CLI emitters, the Python runtime package, and the TypeScript runtime package.
 Lives next to (or near) the bridged crate; all relative paths resolve
 against the file's own directory.
 
+Configuration is parsed as a TOML 1.1 document. TOML 1.0 files remain
+valid; the newer parser also accepts the additive TOML 1.1 syntax.
+
 ```toml
 [crate]
 path = "."                        # directory containing Cargo.toml
