@@ -107,7 +107,7 @@ export function createFake(options: FakeOptions = {}): Fake {
 
   const exportsObj: Record<string, unknown> = {
     memory,
-    rspyts_abi_version: () => 1,
+    rspyts_abi_version: () => 2,
     rspyts_alloc: alloc,
     rspyts_free: free,
   };
@@ -155,4 +155,9 @@ export function createFake(options: FakeOptions = {}): Fake {
       }
     },
   };
+}
+
+/** A real WebAssembly trap-shaped error for poison lifecycle tests. */
+export function runtimeTrap(message = "unreachable executed"): WebAssembly.RuntimeError {
+  return new WebAssembly.RuntimeError(message);
 }

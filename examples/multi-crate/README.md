@@ -14,8 +14,8 @@ shared/module/      leaf cdylib: pub use shared_types::*; rspyts::export!()
 shared/rspyts.toml  codegen config -> shared/python, shared/typescript
 app/rust/           bridged functions over the shared types (+ export!())
 app/rspyts.toml     codegen config with [python.imports]/[typescript.imports]
-app/python/tests/   identity smoke tests (Python)
-app/typescript/     identity smoke tests (TypeScript, WASM)
+app/python/tests/   shared-import smoke tests (Python)
+app/typescript/     shared-import smoke tests (TypeScript, WASM)
 ```
 
 ## Running
@@ -23,15 +23,15 @@ app/typescript/     identity smoke tests (TypeScript, WASM)
 From the repository root:
 
 ```sh
-# 1. Native libraries + codegen for both crates.
-cargo build -p shared-types-module -p multi-crate-app
+# 1. Stage native + WASM artifacts and run codegen for both crates.
+cargo run -p rspyts-cli -- build --config examples/multi-crate/shared/rspyts.toml
+cargo run -p rspyts-cli -- build --config examples/multi-crate/app/rspyts.toml
 cargo run -p rspyts-cli -- generate --config examples/multi-crate/shared/rspyts.toml
 cargo run -p rspyts-cli -- generate --config examples/multi-crate/app/rspyts.toml
 
-# 2. Python identity smoke tests.
+# 2. Python shared-import smoke tests.
 cd examples/multi-crate/app/python && uv sync && uv run pytest
 
-# 3. TypeScript identity smoke tests (WASM).
-cargo build -p multi-crate-app --target wasm32-unknown-unknown
+# 3. TypeScript shared-import smoke tests (the staged app WASM artifact).
 cd ../typescript && npm install && npm test
 ```

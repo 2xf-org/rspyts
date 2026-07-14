@@ -1,0 +1,5 @@
+error: unsupported Serde attribute `with` on this field; rspyts can reflect only `rename`. Use `rspyts::Json` for a deliberately schemaless custom wire contract
+  --> tests/ui/serde_with.rs:25:13
+   |
+25 |     #[serde(with = "codec")]
+   |             ^^^^

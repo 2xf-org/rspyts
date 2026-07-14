@@ -1,4 +1,4 @@
-//! Panic-safe entry points for macro-generated `extern "C"` shims
+//! Panic-contained entry points for macro-generated `extern "C"` shims
 //! (ABI §9).
 //!
 //! Every exported function body is exactly:
@@ -6,8 +6,8 @@
 //! ```ignore
 //! rspyts_core::shim::run(|| {
 //!     let args: Args = unsafe { shim::decode_args(args_ptr, args_len) }?;
-//!     let samples = unsafe { shim::slice_arg(s0_ptr, s0_len) };
-//!     shim::map_result(analyze_signal(samples, args.sample_rate, &args.params))
+//!     let values = unsafe { shim::slice_arg(s0_ptr, s0_len) };
+//!     shim::map_result(process_values(values, args.batch_size, &args.options))
 //! })
 //! ```
 //!
@@ -22,6 +22,7 @@ use crate::envelope;
 use crate::error::{BridgeErr, BridgeError};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
+use std::mem::ManuallyDrop;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
 /// Run a shim body, converting the three possible outcomes into an
@@ -33,9 +34,38 @@ where
     F: FnOnce() -> Result<T, BridgeError>,
 {
     match catch_unwind(AssertUnwindSafe(body)) {
-        Ok(Ok(value)) => envelope::encode_ok(&value),
+        Ok(Ok(value)) => encode_success(value),
         Ok(Err(err)) => envelope::encode_err(&err),
         Err(payload) => envelope::encode_panic(&panic_message(payload)),
+    }
+}
+
+/// Serialize and destroy a successful value behind separate unwind barriers.
+///
+/// `ManuallyDrop` prevents a serialization panic from beginning a second
+/// unwind if the value's destructor also panics. If destruction fails after
+/// an envelope was allocated, discard that envelope before returning the
+/// status-2 replacement.
+fn encode_success<T: Serialize>(value: T) -> *mut u8 {
+    let mut value = ManuallyDrop::new(value);
+    let encoded = catch_unwind(AssertUnwindSafe(|| envelope::encode_ok(&*value)));
+    let dropped = catch_unwind(AssertUnwindSafe(|| unsafe {
+        ManuallyDrop::drop(&mut value);
+    }));
+
+    match (encoded, dropped) {
+        (Ok(ptr), Ok(())) => ptr,
+        (Ok(ptr), Err(payload)) => {
+            let len = unsafe { envelope::total_len(ptr) };
+            unsafe { envelope::dealloc(ptr, len) };
+            envelope::encode_panic(&panic_message(payload))
+        }
+        (Err(payload), Ok(())) => envelope::encode_panic(&panic_message(payload)),
+        (Err(encode_payload), Err(drop_payload)) => envelope::encode_panic(&format!(
+            "{}; value destruction also panicked: {}",
+            panic_message(encode_payload),
+            panic_message(drop_payload)
+        )),
     }
 }
 
@@ -55,22 +85,24 @@ fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
     }
 }
 
-/// Deserialize the args JSON payload.
+/// Deserialize an ABI-2 request envelope.
 ///
 /// # Safety
 /// `(ptr, len)` must describe `len` readable bytes (the caller-owned
-/// request buffer, ABI §2). `len == 0` is treated as an empty object.
+/// request buffer, ABI §2). `len == 0` remains a compatibility shorthand for
+/// an empty JSON object; every non-empty request must use envelope framing.
 pub unsafe fn decode_args<T: DeserializeOwned>(
     ptr: *const u8,
     len: usize,
 ) -> Result<T, BridgeError> {
     unsafe {
-        let bytes: &[u8] = if len == 0 {
-            b"{}"
-        } else {
-            std::slice::from_raw_parts(ptr, len)
-        };
-        serde_json::from_slice(bytes).map_err(BridgeError::invalid_args)
+        if len == 0 {
+            return serde_json::from_slice(b"{}").map_err(BridgeError::invalid_args);
+        }
+        let bytes = std::slice::from_raw_parts(ptr, len);
+        let decoded = envelope::decode_request(bytes).map_err(BridgeError::invalid_args)?;
+        envelope::with_request_tail(decoded.tail, || serde_json::from_slice(decoded.json))
+            .map_err(BridgeError::invalid_args)
     }
 }
 
@@ -131,6 +163,57 @@ mod tests {
         unsafe { envelope::dealloc(ptr, envelope::total_len(ptr)) };
     }
 
+    struct PanicSerialize;
+
+    impl Serialize for PanicSerialize {
+        fn serialize<S>(&self, _serializer: S) -> Result<S::Ok, S::Error>
+        where
+            S: serde::Serializer,
+        {
+            panic!("serialization exploded")
+        }
+    }
+
+    #[test]
+    fn run_catches_panics_during_success_serialization() {
+        let ptr = run(|| Ok::<_, BridgeError>(PanicSerialize));
+        let (status, json, tail) = envelope::decode_owned(ptr);
+        assert_eq!(status, envelope::STATUS_PANIC);
+        assert!(tail.is_empty());
+        let value: serde_json::Value = serde_json::from_slice(&json).unwrap();
+        assert_eq!(value["message"], "serialization exploded");
+
+        // The response-tail scope was restored while unwinding.
+        assert!(envelope::tail_push(&[1], 1).is_none());
+    }
+
+    struct PanicDrop;
+
+    impl Serialize for PanicDrop {
+        fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+        where
+            S: serde::Serializer,
+        {
+            serializer.serialize_str("encoded before drop")
+        }
+    }
+
+    impl Drop for PanicDrop {
+        fn drop(&mut self) {
+            panic!("destructor exploded")
+        }
+    }
+
+    #[test]
+    fn run_catches_panics_during_success_value_destruction() {
+        let ptr = run(|| Ok::<_, BridgeError>(PanicDrop));
+        let (status, json, tail) = envelope::decode_owned(ptr);
+        assert_eq!(status, envelope::STATUS_PANIC);
+        assert!(tail.is_empty());
+        let value: serde_json::Value = serde_json::from_slice(&json).unwrap();
+        assert_eq!(value["message"], "destructor exploded");
+    }
+
     #[test]
     fn decode_args_empty_is_empty_object() {
         #[derive(serde::Deserialize)]
@@ -146,12 +229,24 @@ mod tests {
     }
 
     fn decode_count(bytes: &[u8]) -> Result<CountArgs, BridgeError> {
-        unsafe { decode_args(bytes.as_ptr(), bytes.len()) }
+        let request = envelope::encode_request(bytes, &[]).unwrap();
+        unsafe { decode_args(request.as_ptr(), request.len()) }
+    }
+
+    fn unchecked_request(json: &[u8], tail: &[u8]) -> Vec<u8> {
+        let mut request = vec![0u8; envelope::HEADER_LEN];
+        request[4..8].copy_from_slice(&(json.len() as u32).to_le_bytes());
+        request[8..12].copy_from_slice(&(tail.len() as u32).to_le_bytes());
+        request.extend_from_slice(json);
+        request.extend_from_slice(tail);
+        request
     }
 
     #[test]
     fn decode_args_invalid_utf8_is_invalid_args() {
-        let err = decode_count(&[0xFF, 0xFE, 0x01]).unwrap_err();
+        let request = unchecked_request(&[0xFF, 0xFE, 0x01], &[]);
+        let err: BridgeError =
+            unsafe { decode_args::<CountArgs>(request.as_ptr(), request.len()) }.unwrap_err();
         assert_eq!(err.code, crate::error::codes::INVALID_ARGS);
         assert!(err.message.starts_with("invalid arguments:"));
     }
@@ -166,9 +261,22 @@ mod tests {
             br#"{"count":1}extra"#, // trailing garbage
         ];
         for bytes in malformed {
-            let err = decode_count(bytes).unwrap_err();
+            let request = unchecked_request(bytes, &[]);
+            let err: BridgeError =
+                unsafe { decode_args::<CountArgs>(request.as_ptr(), request.len()) }.unwrap_err();
             assert_eq!(err.code, crate::error::codes::INVALID_ARGS);
         }
+    }
+
+    #[test]
+    fn decode_args_rejects_unframed_json() {
+        let parsed = decode_count(br#"{"count":1}"#).unwrap();
+        assert_eq!(parsed.count, 1);
+
+        let raw = br#"{"count":1}"#;
+        let err = unsafe { decode_args::<CountArgs>(raw.as_ptr(), raw.len()) }.unwrap_err();
+        assert_eq!(err.code, crate::error::codes::INVALID_ARGS);
+        assert!(err.message.contains("truncated envelope header"));
     }
 
     #[test]

@@ -33,6 +33,8 @@ pub struct BridgeArgs {
     pub rename_all: Option<(RenameRule, Span)>,
     /// `target = "…"` — restrict a function, method, or static to one projection.
     pub target: Option<(TargetArg, Span)>,
+    /// `serde` — adopt derives and supported Serde metadata already on a data type.
+    pub serde: Option<Span>,
 }
 
 impl BridgeArgs {
@@ -66,6 +68,10 @@ impl BridgeArgs {
             require_bare(&meta, "error")?;
             require_unset(self.error.is_none(), meta.span())?;
             self.error = Some(meta.span());
+        } else if meta.path().is_ident("serde") {
+            require_bare(&meta, "serde")?;
+            require_unset(self.serde.is_none(), meta.span())?;
+            self.serde = Some(meta.span());
         } else if meta.path().is_ident("constructor") {
             require_bare(&meta, "constructor")?;
             require_unset(self.constructor.is_none(), meta.span())?;
@@ -103,7 +109,7 @@ impl BridgeArgs {
         } else {
             return Err(syn::Error::new_spanned(
                 meta.path(),
-                "unknown #[bridge] argument; expected `error`, `constructor`, `static`, \
+                "unknown #[bridge] argument; expected `error`, `serde`, `constructor`, `static`, \
                  `tag = \"…\"`, `rename_all = \"…\"`, or `target = \"…\"`",
             ));
         }
@@ -144,6 +150,10 @@ impl BridgeArgs {
             "target",
             context,
         )
+    }
+
+    pub fn deny_serde(&self, context: &str) -> syn::Result<()> {
+        deny(self.serde, "serde", context)
     }
 }
 
@@ -238,6 +248,7 @@ mod tests {
         assert!(args.tag.is_none());
         assert!(args.rename_all.is_none());
         assert!(args.target.is_none());
+        assert!(args.serde.is_none());
     }
 
     #[test]
@@ -261,6 +272,9 @@ mod tests {
         assert_eq!(args.target.unwrap().0, TargetArg::Python);
         let args = BridgeArgs::parse(quote!(target = "typescript")).unwrap();
         assert_eq!(args.target.unwrap().0, TargetArg::Typescript);
+
+        let args = BridgeArgs::parse(quote!(serde)).unwrap();
+        assert!(args.serde.is_some());
     }
 
     #[test]
@@ -276,7 +290,14 @@ mod tests {
         assert!(BridgeArgs::parse(quote!(error = "yes")).is_err());
         assert!(BridgeArgs::parse(quote!(tag)).is_err());
         assert!(BridgeArgs::parse(quote!(tag = 3)).is_err());
-        assert!(BridgeArgs::parse(quote!(rename_all = "PascalCase")).is_err());
+        assert_eq!(
+            BridgeArgs::parse(quote!(rename_all = "PascalCase"))
+                .unwrap()
+                .rename_all
+                .unwrap()
+                .0,
+            RenameRule::Pascal
+        );
         assert!(BridgeArgs::parse(quote!(error, error)).is_err());
         assert!(BridgeArgs::parse(quote!(static, static)).is_err());
         // `rename` ceased to exist: it is an ordinary unknown key now.

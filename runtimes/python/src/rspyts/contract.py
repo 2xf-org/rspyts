@@ -1,16 +1,10 @@
 """
-The pydantic base model shared by all generated rspyts contracts.
-
-Notes:
-    Wire field names are camelCase (see ``docs/design/type-system.md``
-    §3); the Python surface is snake_case. :class:`Contract` bridges the
-    two with a deterministic ``snake_case -> camelCase`` alias generator
-    so generated models never spell out aliases by hand.
+Pydantic contracts shared by generated rspyts models.
 """
 
 from __future__ import annotations
 
-from pydantic import BaseModel, ConfigDict
+import pydantic
 
 __all__ = ["Contract", "to_camel"]
 
@@ -21,8 +15,8 @@ def to_camel(name: str) -> str:
 
     Notes:
         The first ``_``-separated part is kept as-is; every following part
-        has only its first letter uppercased (``min_duration_s`` ->
-        ``minDurationS``). Written here rather than borrowed from pydantic
+        has only its first letter uppercased (``minimum_value`` ->
+        ``minimumValue``). Written here rather than borrowed from pydantic
         so the mapping is under rspyts' control and pinned by its own
         tests.
 
@@ -36,7 +30,7 @@ def to_camel(name: str) -> str:
     return head + "".join(part[:1].upper() + part[1:] for part in rest)
 
 
-class Contract(BaseModel):
+class Contract(pydantic.BaseModel):
     """
     Base class for every generated rspyts model.
 
@@ -51,7 +45,7 @@ class Contract(BaseModel):
           ``numpy.ndarray`` fields for ``Buf<T>`` returns.
     """
 
-    model_config = ConfigDict(
+    model_config = pydantic.ConfigDict(
         alias_generator=to_camel,
         populate_by_name=True,
         extra="forbid",

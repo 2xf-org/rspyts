@@ -4,6 +4,13 @@
 [crate]
 path = "rust"
 
+[build]
+features = []
+no-default-features = false
+profile = "dev"
+targets = ["wasm32-unknown-unknown"]
+locked = true
+
 [python]
 enabled = true
 out = "python/src/basic_example/generated"

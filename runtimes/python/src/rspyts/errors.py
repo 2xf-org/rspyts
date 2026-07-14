@@ -1,23 +1,15 @@
 """
-The bridge error model on the Python side (ABI §5).
-
-Notes:
-    A bridged function that fails returns an envelope whose JSON payload is
-    ``{"code": …, "message": …, "data": …}``. This module turns those
-    payloads into exceptions:
-
-    - status 1 -> the class registered for ``code`` (generated
-      ``errors.py`` modules register one subclass per error code at import
-      time), falling back to plain :class:`BridgeError`;
-    - status 2 -> :class:`RspytsPanicError`, always.
+Errors that cross the Rust boundary.
 """
 
 from __future__ import annotations
 
-from typing import Any, NoReturn
+import collections.abc
+import typing
 
 __all__ = [
     "BridgeError",
+    "BridgeErrorRegistry",
     "RspytsPanicError",
     "StaleHandleError",
     "raise_bridge_error",
@@ -39,9 +31,9 @@ class BridgeError(Exception):
 
     code: str
     message: str
-    data: Any | None
+    data: typing.Any | None
 
-    def __init__(self, message: str, *, code: str, data: Any | None = None) -> None:
+    def __init__(self, message: str, *, code: str, data: typing.Any | None = None) -> None:
         self.code = code
         self.message = message
         self.data = data
@@ -57,7 +49,7 @@ class RspytsPanicError(BridgeError):
         callers should generally not catch it.
     """
 
-    def __init__(self, message: str, *, code: str = "panic", data: Any | None = None) -> None:
+    def __init__(self, message: str, *, code: str = "panic", data: typing.Any | None = None) -> None:
         super().__init__(message, code=code, data=data)
 
 
@@ -66,8 +58,12 @@ class StaleHandleError(BridgeError):
     A method was called on a dropped or unknown handle (ABI §8).
     """
 
-    def __init__(self, message: str, *, code: str = "staleHandle", data: Any | None = None) -> None:
+    def __init__(self, message: str, *, code: str = "staleHandle", data: typing.Any | None = None) -> None:
         super().__init__(message, code=code, data=data)
+
+
+# Call-scoped map from wire error codes to generated exception classes.
+BridgeErrorRegistry: typing.TypeAlias = collections.abc.Mapping[str, type[BridgeError]]
 
 
 def register_error(code: str, cls: type[BridgeError]) -> None:
@@ -75,9 +71,10 @@ def register_error(code: str, cls: type[BridgeError]) -> None:
     Map an error ``code`` to the exception class raised for it.
 
     Notes:
-        Generated ``errors.py`` modules call this at import time for every
-        error variant, so callers can catch exact per-code subclasses.
-        Later registrations for the same code win.
+        This process-wide compatibility hook is useful for handwritten
+        integrations. Generated clients use call-scoped maps so unrelated
+        packages may safely reuse the same error code. Later global
+        registrations for the same code win.
 
     Args:
         code: The wire error code.
@@ -94,7 +91,11 @@ def register_error(code: str, cls: type[BridgeError]) -> None:
 register_error("staleHandle", StaleHandleError)
 
 
-def raise_bridge_error(status: int, payload: dict[str, Any]) -> NoReturn:
+def raise_bridge_error(
+    status: int,
+    payload: dict[str, typing.Any],
+    error_types: BridgeErrorRegistry | None = None,
+) -> typing.NoReturn:
     """
     Raise the exception for a non-ok envelope (status 1 or 2).
 
@@ -108,5 +109,5 @@ def raise_bridge_error(status: int, payload: dict[str, Any]) -> NoReturn:
     """
     if status == 2:
         raise RspytsPanicError(payload["message"], code=payload["code"], data=payload.get("data"))
-    cls = REGISTRY.get(payload["code"], BridgeError)
+    cls = (error_types or {}).get(payload["code"]) or REGISTRY.get(payload["code"], BridgeError)
     raise cls(payload["message"], code=payload["code"], data=payload.get("data"))

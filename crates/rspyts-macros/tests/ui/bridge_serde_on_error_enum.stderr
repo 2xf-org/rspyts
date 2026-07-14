@@ -1,0 +1,5 @@
+error: `serde` does not apply to error enums; error envelopes are not Serde data contracts
+ --> tests/ui/bridge_serde_on_error_enum.rs:4:17
+  |
+4 | #[bridge(error, serde)]
+  |                 ^^^^^

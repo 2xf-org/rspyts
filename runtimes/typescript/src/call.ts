@@ -20,12 +20,92 @@ import {
   DTYPE,
   HEADER_LEN,
   STATUS_OK,
+  buildRequest,
   decodeEnvelope,
   type BufTypedArray,
   type Dtype,
 } from "./envelope.js";
-import { throwBridgeError } from "./errors.js";
-import type { BridgeModule } from "./module.js";
+import {
+  type BridgeErrorRegistry,
+  InstancePoisonedError,
+  throwBridgeError,
+} from "./errors.js";
+import { isPoisoned, markPoisoned, type BridgeModule } from "./module.js";
+
+const I64_MIN = -(1n << 63n);
+const I64_MAX = (1n << 63n) - 1n;
+const U64_MAX = (1n << 64n) - 1n;
+
+function exactWireInteger(value: unknown, signed: boolean): bigint {
+  const label = signed ? "signed" : "unsigned";
+  if (typeof value !== "string") {
+    throw new TypeError(`rspyts: expected a canonical ${label} 64-bit decimal string`);
+  }
+  const canonical = signed ? /^(?:0|-?[1-9][0-9]*)$/ : /^(?:0|[1-9][0-9]*)$/;
+  if (!canonical.test(value)) {
+    throw new TypeError(`rspyts: expected a canonical ${label} 64-bit decimal string`);
+  }
+  const parsed = BigInt(value);
+  const minimum = signed ? I64_MIN : 0n;
+  const maximum = signed ? I64_MAX : U64_MAX;
+  if (parsed < minimum || parsed > maximum) {
+    throw new RangeError(`rspyts: ${signed ? "i64" : "u64"} value out of range: ${value}`);
+  }
+  return parsed;
+}
+
+function exactHostInteger(value: bigint, signed: boolean): string {
+  if (typeof value !== "bigint") {
+    throw new TypeError(`rspyts: expected a ${signed ? "signed" : "unsigned"} 64-bit bigint`);
+  }
+  const minimum = signed ? I64_MIN : 0n;
+  const maximum = signed ? I64_MAX : U64_MAX;
+  if (value < minimum || value > maximum) {
+    throw new RangeError(`rspyts: ${signed ? "i64" : "u64"} value out of range: ${value}`);
+  }
+  return value.toString(10);
+}
+
+/** Convert a host bigint to the canonical signed 64-bit wire string. */
+export function i64ToWire(value: bigint): string {
+  return exactHostInteger(value, true);
+}
+
+/** Convert a host bigint to the canonical unsigned 64-bit wire string. */
+export function u64ToWire(value: bigint): string {
+  return exactHostInteger(value, false);
+}
+
+/** Validate a canonical signed 64-bit wire string and return a bigint. */
+export function i64FromWire(value: unknown): bigint {
+  return exactWireInteger(value, true);
+}
+
+/** Validate a canonical unsigned 64-bit wire string and return a bigint. */
+export function u64FromWire(value: unknown): bigint {
+  return exactWireInteger(value, false);
+}
+
+/** Validate a finite structured float and canonicalize signed zero. */
+export function floatFromWire(value: unknown): number {
+  if (typeof value !== "number" || !Number.isFinite(value)) {
+    throw new TypeError("rspyts: expected a finite JSON number");
+  }
+  return Object.is(value, -0) ? 0 : value;
+}
+
+/** Unwrap a schemaless JSON field from an opaque application-error payload. */
+export function jsonFromWire(value: unknown): unknown {
+  if (
+    value === null ||
+    typeof value !== "object" ||
+    Object.keys(value).length !== 1 ||
+    !Object.prototype.hasOwnProperty.call(value, "__rspyts_json__")
+  ) {
+    throw new TypeError("rspyts: expected an rspyts Json wrapper");
+  }
+  return (value as Record<string, unknown>)["__rspyts_json__"];
+}
 
 /**
  * One `&[T]` slice argument: the data to pass and its wire dtype. The
@@ -36,8 +116,6 @@ export interface SliceArg {
   data: BufTypedArray;
   dt: Dtype;
 }
-
-const utf8Encoder = new TextEncoder();
 
 /** A live `rspyts_alloc` allocation: free with exactly this (ptr, len). */
 interface Allocation {
@@ -61,16 +139,54 @@ function exportFn(mod: BridgeModule, name: string): Function {
   return fn;
 }
 
+function ensureHealthy(mod: BridgeModule): void {
+  if (isPoisoned(mod)) {
+    throw new InstancePoisonedError();
+  }
+}
+
+function invokeWasm(mod: BridgeModule, fn: Function, args: Array<number | bigint>): unknown {
+  try {
+    return fn(...args);
+  } catch (error) {
+    if (error instanceof WebAssembly.RuntimeError) {
+      markPoisoned(mod);
+    }
+    throw error;
+  }
+}
+
 function allocRaw(mod: BridgeModule, len: number): number {
-  const ptr: unknown = exportFn(mod, "rspyts_alloc")(len);
-  if (typeof ptr !== "number") {
+  const raw = invokeWasm(mod, exportFn(mod, "rspyts_alloc"), [len]);
+  if (typeof raw !== "number") {
     throw new Error("rspyts: rspyts_alloc returned a non-numeric pointer");
+  }
+  return wasm32Pointer(raw, "rspyts_alloc");
+}
+
+function freeRaw(mod: BridgeModule, ptr: number, len: number): void {
+  invokeWasm(mod, exportFn(mod, "rspyts_free"), [ptr, len]);
+}
+
+function wasm32Pointer(value: number, source: string): number {
+  if (!Number.isInteger(value)) {
+    throw new Error(`rspyts: ${source} returned a non-integer pointer`);
+  }
+  const ptr = value >>> 0;
+  if (ptr === 0) {
+    throw new Error(`rspyts: ${source} returned a null pointer`);
   }
   return ptr;
 }
 
-function freeRaw(mod: BridgeModule, ptr: number, len: number): void {
-  exportFn(mod, "rspyts_free")(ptr, len);
+function ensureMemoryRange(mod: BridgeModule, ptr: number, len: number, label: string): void {
+  const end = ptr + len;
+  if (!Number.isSafeInteger(len) || len < 0 || end > mod.memory.buffer.byteLength) {
+    throw new RangeError(
+      `rspyts: ${label} range ${ptr}..${end} exceeds WebAssembly memory ` +
+        `${mod.memory.buffer.byteLength}`,
+    );
+  }
 }
 
 /**
@@ -79,10 +195,12 @@ function freeRaw(mod: BridgeModule, ptr: number, len: number): void {
  * detaches every earlier view.
  */
 export function writeBytes(mod: BridgeModule, bytes: Uint8Array): Allocation {
-  const len = bytes.byteLength;
+  const owned = new Uint8Array(bytes);
+  const len = owned.byteLength;
   const ptr = allocRaw(mod, len);
   if (len > 0) {
-    new Uint8Array(mod.memory.buffer, ptr, len).set(bytes);
+    ensureMemoryRange(mod, ptr, len, "request allocation");
+    new Uint8Array(mod.memory.buffer, ptr, len).set(owned);
   }
   return { ptr, len };
 }
@@ -107,15 +225,25 @@ export function writeSlice(mod: BridgeModule, slice: SliceArg): SliceAllocation 
     );
   }
   const byteLen = slice.data.byteLength;
-  // Build the source view BEFORE allocating: constructing a view over a
-  // detached buffer (e.g. transferred via postMessage) throws, and doing
-  // so after rspyts_alloc would leak the allocation.
-  const src = new Uint8Array(slice.data.buffer, slice.data.byteOffset, byteLen);
+  // Encode before allocating so a detached input or a memory-growing alloc
+  // cannot strand an allocation. Typed-array backing bytes are host-endian;
+  // DataView writes make the ABI's little-endian requirement explicit on
+  // every host.
+  const wire = new Uint8Array(byteLen);
+  const wireView = new DataView(wire.buffer);
+  for (let index = 0; index < slice.data.length; index++) {
+    const element = slice.data[index];
+    if (element === undefined) {
+      throw new Error("rspyts: typed array changed length while encoding");
+    }
+    info.write(wireView, index * info.bytes, element);
+  }
   const align = info.bytes;
   const len = byteLen + align;
   const ptr = allocRaw(mod, len);
   const aligned = ptr + ((align - (ptr % align)) % align);
-  new Uint8Array(mod.memory.buffer, aligned, byteLen).set(src);
+  ensureMemoryRange(mod, aligned, byteLen, "slice allocation");
+  new Uint8Array(mod.memory.buffer, aligned, byteLen).set(wire);
   return { ptr, len, aligned, count: slice.data.length };
 }
 
@@ -123,7 +251,7 @@ export function writeSlice(mod: BridgeModule, slice: SliceArg): SliceAllocation 
  * Call a bridged export and return its decoded result.
  *
  * @param mod    The instantiated module.
- * @param symbol Export name, e.g. `"rspyts_fn__analyze_signal"`.
+ * @param symbol Export name, e.g. `"rspyts_fn__process_values"`.
  * @param args   Plain parameters as a wire-cased JSON object (`{}` when
  *               there are none — the pair is always passed, ABI §3.1).
  * @param slices `&[T]` parameters, in declaration order.
@@ -141,12 +269,15 @@ export function callFn(
   args: unknown,
   slices: SliceArg[] = [],
   handle?: bigint,
+  errorTypes?: BridgeErrorRegistry,
 ): unknown {
+  ensureHealthy(mod);
   const fn = exportFn(mod, symbol);
   const allocations: Allocation[] = [];
+  let response: Allocation | undefined;
   let envelope: Uint8Array;
   try {
-    const argsAlloc = writeBytes(mod, utf8Encoder.encode(JSON.stringify(args ?? {})));
+    const argsAlloc = writeBytes(mod, buildRequest(args ?? {}));
     allocations.push(argsAlloc);
 
     const callArgs: Array<number | bigint> = handle === undefined ? [] : [handle];
@@ -157,26 +288,45 @@ export function callFn(
       callArgs.push(sliceAlloc.aligned, sliceAlloc.count);
     }
 
-    const retPtr: unknown = fn(...callArgs);
-    if (typeof retPtr !== "number") {
+    const rawRetPtr = invokeWasm(mod, fn, callArgs);
+    if (typeof rawRetPtr !== "number") {
       throw new Error(`rspyts: export "${symbol}" returned a non-pointer`);
     }
+    const retPtr = wasm32Pointer(rawRetPtr, `export "${symbol}"`);
 
     // Fresh view: the call itself may have grown linear memory while
     // allocating the envelope.
+    try {
+      ensureMemoryRange(mod, retPtr, HEADER_LEN, "response header");
+    } catch (error) {
+      markPoisoned(mod);
+      throw error;
+    }
     const view = new DataView(mod.memory.buffer);
     const jsonLen = view.getUint32(retPtr + 4, true);
     const tailLen = view.getUint32(retPtr + 8, true);
     const total = HEADER_LEN + jsonLen + tailLen;
+    response = { ptr: retPtr, len: total };
+    try {
+      ensureMemoryRange(mod, retPtr, total, "response envelope");
+    } catch (error) {
+      markPoisoned(mod);
+      throw error;
+    }
     // Copy the whole envelope out before freeing; nothing may reference
     // linear memory after this point.
     envelope = new Uint8Array(mod.memory.buffer, retPtr, total).slice();
-    freeRaw(mod, retPtr, total);
   } finally {
+    if (response !== undefined && !isPoisoned(mod)) {
+      freeRaw(mod, response.ptr, response.len);
+    }
     // Request buffers stay alive for the duration of the call (the callee
     // borrows, never frees — ABI §2) and are released even when the call
     // traps.
     for (const allocation of allocations) {
+      if (isPoisoned(mod)) {
+        break;
+      }
       freeRaw(mod, allocation.ptr, allocation.len);
     }
   }
@@ -185,7 +335,7 @@ export function callFn(
   if (status === STATUS_OK) {
     return payload;
   }
-  throwBridgeError(status, payload);
+  throwBridgeError(status, payload, errorTypes);
 }
 
 /**
@@ -196,9 +346,12 @@ export function callFn(
  * swallowed. A missing export (a codegen bug) still throws.
  */
 export function callDrop(mod: BridgeModule, symbol: string, handle: bigint): void {
+  if (isPoisoned(mod)) {
+    return;
+  }
   const fn = exportFn(mod, symbol);
   try {
-    fn(handle);
+    invokeWasm(mod, fn, [handle]);
   } catch {
     // Deliberately ignored; see doc comment.
   }

@@ -1,470 +1,202 @@
-# Code generation: CLI, emitters, and generated-code contracts
+# Code generation
 
-This document specifies the `rspyts` CLI, the layout and style of everything
-it generates, and the exact runtime APIs the generated code is allowed to
-call. It is the contract between three independently-built components: the
-CLI emitters, the Python runtime package, and the TypeScript runtime package.
+The generator reads the API that Rust actually compiled. It does not parse
+source files or guess which `cfg` branches are active.
 
-## 1. Configuration — `rspyts.toml`
+## Requirements
 
-Lives next to (or near) the bridged crate; all relative paths resolve
-against the file's own directory.
+- Rust 1.85 or newer
+- Python 3.11 or newer for generated Python packages
+- Node.js 22.12 or newer for the TypeScript runtime
+- `wasm32-unknown-unknown` when generating a WebAssembly artifact
 
-Configuration is parsed as a TOML 1.1 document. TOML 1.0 files remain
-valid; the newer parser also accepts the additive TOML 1.1 syntax.
+The bridged crate must include `crate-type = ["cdylib", "rlib"]`, depend on
+`rspyts`, and depend directly on Serde with `features = ["derive"]`.
+
+## Configuration
+
+Run `rspyts init` to create a commented `rspyts.toml`. Relative filesystem
+paths resolve from that file, not from the current shell directory.
 
 ```toml
 [crate]
-path = "."                        # directory containing Cargo.toml
+path = "rust"
+
+[build]
+features = []
+no-default-features = false
+profile = "dev"
+targets = ["wasm32-unknown-unknown"]
+locked = true
 
 [python]
 enabled = true
-out = "../python/src/basic_example/generated"
-# Candidate directories searched for the compiled cdylib at import time,
-# relative to the generated package directory. The RSPYTS_LIBRARY env var
-# and rspyts Library.set_path() always take precedence.
-library_search = ["../../../rust/target/debug", "../../../rust/target/release"]
-
-# Items to drop from this projection (optional; see below):
-# exclude = ["render_*", "Recording.preload"]
-
-# Bridged types defined in a dependency crate can be imported from that
-# crate's own generated package instead of re-emitted here (§9):
-# [python.imports]
-# "other-crate" = "other_package._generated"
+out = "python/src/example/generated"
+library_search = ["../../../../../target/debug"]
 
 [typescript]
 enabled = true
-out = "../typescript/src/generated"
-# exclude = ["load_values"]
-
-# Same idea for TypeScript, mapping to a module specifier (§9):
-# [typescript.imports]
-# "other-crate" = "@scope/other/generated"
+out = "typescript/src/generated"
 
 [schema]
 enabled = true
-out = "../schema"
+out = "schema"
 ```
 
-Any of the three output sections may be disabled or omitted. Unknown keys
-are rejected, so typos surface as errors instead of silently disabling an
-emitter.
+Unknown keys are errors. An omitted output section is disabled. Setting
+`enabled = false` also disables it.
 
-The `[python]` and `[typescript]` sections take an optional
-`exclude = ["glob", …]` list: matching items are dropped from that
-language's projection exactly like target filtering (§3) — no wrapper, no
-re-export, no `__all__`/client entry; an excluded error enum also loses
-its registration calls. Patterns are simple globs (`*` matches any run of
-characters within a dot-separated segment) and match item names: free
-functions, classes, named types, and constants by name; methods and
-statics as `"Class.method"`. Excluding a type that other emitted items
-still reference is a config error naming both sides. The `[schema]`
-bundle is always complete — `exclude` is a per-language knob.
+Build flags are shared by `generate`, `check`, `build`, and `manifest`:
 
-## 2. CLI commands
+- `features` selects Cargo features;
+- `no-default-features` controls Cargo defaults;
+- `profile` accepts `dev`, `release`, or a custom profile;
+- `targets` lists artifacts staged by `build`;
+- `locked` passes `--locked` to Cargo.
 
-Binary name: `rspyts` (crate `rspyts-cli`).
+Command-line build flags override the file for one invocation.
 
-- `rspyts generate [--config <path>] [--release]` — build the crate
-  (`cargo build --message-format=json` to locate the cdylib artifact
-  robustly), `dlopen` it, check `rspyts_abi_version() == 1`, call
-  `rspyts_manifest()`, decode the envelope, deserialize the IR, run all
-  enabled emitters, and write outputs. Files are only rewritten when content
-  changed (stable mtimes). Prints a one-line-per-file summary.
-- `rspyts check [--config <path>] [--release]` — identical rendering, but
-  compares against what's on disk and exits non-zero with a unified diff
-  (crate `similar`) when anything is stale, missing, or unexpected. This is
-  the CI drift gate.
-- `rspyts init [--dir <path>]` — write a commented starter `rspyts.toml`.
+## Commands
 
-Exit codes: 0 ok · 1 drift (check) · 2 usage/config error · 3 build or
-load failure.
-
-## 3. Determinism rules (all emitters)
-
-- Emitters iterate deterministic functions of manifest order (already
-  sorted; see ABI §7) — never HashMap iteration order. Python `models.py`
-  is emitted in dependency order with name-order tie-breaks.
-- No timestamps anywhere. LF line endings, trailing final newline.
-- Every generated `.py`/`.ts` file starts with a header comment:
-  - Python: `# Code generated by rspyts v{VERSION}. DO NOT EDIT.`
-  - TS: `// Code generated by rspyts v{VERSION}. DO NOT EDIT.`
-  followed by a second line `# rspyts:manifest-hash sha256:{hex}` (same idea
-  in TS with `//`). The hash is SHA-256 of the manifest JSON bytes, so
-  `check` can fast-path compare and humans can trace provenance.
-  `schema.json` carries the same provenance in its `x-rspyts` key instead
-  (JSON has no comments).
-- Generated Python targets Python ≥ 3.13, 4-space indent, double quotes,
-  passes `ruff check --select E,F,I,N,UP,RUF` with line-length 120. Generated TS
-  targets ES2022, 2-space indent, semicolons, double quotes, `strict` tsc.
-- Identifier casing: wire names are camelCase (from the manifest). Python
-  surface uses snake_case (pydantic aliases map to wire). TypeScript surface
-  uses camelCase throughout.
-- Target filtering: functions, methods, and statics whose manifest
-  `targets` (ABI §7) exclude a language are skipped by that language's
-  emitter — no wrapper, no re-export, no `__all__`/client entry. The
-  compiled shim exists regardless.
-- `Ty::Json` projects as `Any` (Python, from `typing`), `unknown`
-  (TypeScript), and an unconstrained schema (JSON Schema). Values pass
-  through both directions with no conversion.
-
-## 4. Generated Python package
-
-Written into `[python].out` (a directory named `generated`, wholly owned —
-regeneration deletes files it no longer emits):
-
-```
-generated/
-  __init__.py     re-exports the public surface; defines __all__
-  library.py      module-level Library singleton: name + search list baked in
-  models.py       Contract subclasses, StrEnums, discriminated unions
-  constants.py    Final-annotated module constants, values baked in
-  errors.py       exception hierarchy + code→class registry
-  functions.py    typed wrappers for free functions
-  classes.py      handle classes
+```text
+rspyts init
+rspyts generate [--config rspyts.toml]
+rspyts check [--config rspyts.toml]
+rspyts build [--config rspyts.toml]
+rspyts manifest [--config rspyts.toml]
+rspyts diff old.json new.json [--fail-on breaking|any]
 ```
 
-### 4.1 Python runtime API (package `rspyts`, PyPI)
+`generate` builds the host cdylib, loads its manifest, validates the complete
+surface, and rewrites enabled outputs.
 
-Generated code may import **only** these names from the runtime:
+`check` runs the same pipeline without writing. It prints a unified diff and
+exits `1` if committed output is stale. Configuration errors exit `2`; build
+or load failures exit `3`.
 
-```python
-from rspyts import (
-    Contract,          # pydantic BaseModel base: alias_generator=to_camel,
-                       # populate_by_name=True, extra="forbid",
-                       # arbitrary_types_allowed=True (for numpy fields)
-    BridgeError,       # Exception; .code: str, .message: str, .data: Any|None
-    RspytsPanicError,  # BridgeError subclass for status==2
-    StaleHandleError,  # BridgeError subclass for code=="staleHandle"
-    Library,           # the loader/caller (below)
-)
+`build` stages the host artifact and configured targets under:
+
+```text
+target/rspyts/<target-triple>/<profile>/
 ```
 
-`Library` behavior (implemented with `ctypes` + `numpy`, both hard deps):
+`--target` replaces configured targets. `--no-targets` builds only the host.
 
-```python
-lib = Library(name="basic_example", search=[...], anchor=Path(__file__).parent)
-# Resolution order: RSPYTS_LIBRARY env var (full path) → Library.set_path()
-# override → each search dir joined with the platform filename
-# (libNAME.dylib / libNAME.so / NAME.dll; hyphens in NAME normalized to
-# underscores). Loading is lazy (first call) and cached; checks
-# rspyts_abi_version()==1 on load.
+`manifest` prints the canonical manifest JSON. Save snapshots when a library
+needs an explicit compatibility gate. `diff` treats a new top-level
+declaration as additive, documentation-only changes as informational, and any
+other declaration change as breaking. It is intentionally conservative.
 
-lib.call(symbol, args_obj, slices=(), handle=None)
-# args_obj: JSON-serializable dict (already wire-cased) or {}.
-# slices: sequence of (numpy_array, dtype_str); Library makes each
-#   C-contiguous + correctly typed (np.ascontiguousarray) and passes
-#   (data_ptr, element_count).
-# handle: int → passed as leading u64 (for methods).
-# Returns the decoded JSON payload where every {"__rspyts_buf__": …}
-# placeholder (at any depth) has been replaced by a numpy array copied out
-# of the envelope tail. Raises BridgeError subclasses on status 1 (looked up
-# via the code→class registry populated by generated errors.py) and
-# RspytsPanicError on status 2. Always frees the envelope.
+## Generated Python
 
-lib.call_drop(symbol, handle)   # fire-and-forget __drop
+The Python output directory is wholly owned by the generator:
+
+```text
+__init__.py
+classes.py
+constants.py
+errors.py
+functions.py
+library.py
+models.py
 ```
 
-Registry hook for generated errors:
-`rspyts.register_error(code: str, cls: type[BridgeError])`.
+Models use pydantic, reject unknown input fields, and preserve exact wire
+aliases. Functions validate returned structured values. Each generated call
+passes only its declared error map to the runtime.
 
-### 4.2 Style of generated wrappers
+The generated `library.py` creates one lazy `rspyts.Library`. Resolution order
+is:
 
-```python
-def summarize(values: np.ndarray, label: str | None) -> Summary:
-    """
-    Docs from Rust.
-    """
-    raw = library.LIB.call(
-        "rspyts_fn__summarize",
-        {"label": label},
-        slices=((values, "f64"),),
-    )
-    return Summary.model_validate(raw)
+1. the `RSPYTS_LIBRARY` environment variable;
+2. `Library.set_path()`;
+3. configured `library_search` directories;
+4. platform loader lookup.
+
+Python slices are copied into private, aligned numpy arrays for the duration
+of a native call. Returned buffers are host-owned copies.
+
+## Generated TypeScript
+
+The TypeScript output is:
+
+```text
+client.ts
+constants.ts
+errors.ts
+index.ts
+types.ts
 ```
 
-Handle classes get `close()`, `__enter__`/`__exit__`, and a `__del__` that
-swallows all exceptions. Constructor stores `self.handle: int`; methods
-raise `StaleHandleError` naturally via the code registry after close.
+`createClient(module)` binds the typed surface to an instantiated
+`BridgeModule`. Structs become interfaces, string enums become literal unions,
+data enums become discriminated unions, and classes wrap opaque handles.
 
-**Statics and factories.** A factory static (manifest `returnsSelf`)
-becomes a `@classmethod` returning `Self`: it calls the handle-less symbol,
-allocates the wrapper with `cls.__new__(cls)`, and assigns the fresh
-handle. Every other static is a `@staticmethod`. A factory-only class
-(`constructor: null`) declares `handle: int` at class level and its
-`__init__` raises `TypeError` pointing at the factories:
+Generated classes expose `free()` and `[Symbol.dispose]()`. A
+`FinalizationRegistry` is a best-effort fallback, not the primary ownership
+mechanism.
 
-```python
-class Recording:
-    handle: int
+## JSON Schema
 
-    def __init__(self) -> None:
-        raise TypeError("Recording cannot be constructed directly; use Recording.open(...)")
+The schema emitter writes `schema.json`. It covers declared data types and the
+same closed wire shapes used by both runtimes. It does not describe executable
+symbols or host-specific class behavior.
 
-    @classmethod
-    def open(cls, path: str) -> Self:
-        raw = library.LIB.call(
-            "rspyts_cls__Recording__open",
-            {"path": path},
-        )
-        obj = cls.__new__(cls)
-        obj.handle = raw
-        return obj
-```
+## Shared types across crates
 
-**Constants.** `constants.py` bakes the manifest values in as
-`Final`-annotated module attributes, with doc comments as `#` comments.
-Ref-typed constants construct real typed values at import time — models
-through `model_validate`, string enums through the enum constructor, data
-enums through the tagged variant class:
-
-```python
-# Baseline analysis parameters.
-DEFAULT_PARAMS: Final[AnalysisParams] = AnalysisParams.model_validate(
-    {"minDurationS": 0.5, "threshold": None}
-)
-
-DEFAULT_THRESHOLD: Final[float] = 0.75
-```
-
-**Json.** `Ty::Json` positions annotate as `Any` and pass through the
-wrappers with no conversion in either direction.
-
-## 5. Generated TypeScript
-
-Written into `[typescript].out` (directory `generated/`, wholly owned):
-
-```
-generated/
-  types.ts      interfaces, string-literal enums, discriminated unions
-  constants.ts  export const … as const, values baked in
-  errors.ts     error classes + code→class registry
-  client.ts     createClient(module) → typed API object + handle classes
-  index.ts      re-exports
-```
-
-`constants.ts` renders each manifest constant as a literal with a const
-assertion (`export const DEFAULT_THRESHOLD = 0.75 as const;` — plain
-`null` for null-valued constants, where `as const` is illegal). `Ty::Json`
-positions type as `unknown` everywhere.
-
-### 5.1 TypeScript runtime API (package `rspyts`, npm)
-
-Generated code may import **only**:
-
-```ts
-import {
-  type BridgeModule,       // { exports, memory } — returned by instantiate
-  instantiate,             // (source: WebAssembly.Module | BufferSource | Response | Promise<Response>) => Promise<BridgeModule>; checks rspyts_abi_version
-  callFn,                  // (mod, symbol, args: unknown, slices?: SliceArg[], handle?: bigint) => unknown
-  callDrop,                // (mod, symbol, handle: bigint) => void
-  type SliceArg,           // { data: TypedArray, dt: "u8"|"i16"|"i32"|"f32"|"f64" }
-  RspytsError,             // base: .code, .message (Error.message), .data
-  RspytsPanicError,
-  StaleHandleError,
-  registerError,           // (code: string, ctor) => void
-} from "rspyts";
-```
-
-`callFn` semantics mirror Python's `Library.call`: encode args to JSON bytes
-(TextEncoder), copy into WASM memory via `rspyts_alloc`, copy each slice into
-an aligned allocation, invoke the export, decode the envelope with a
-`DataView`, replace `__rspyts_buf__` placeholders with typed arrays **copied**
-out of linear memory, free everything, throw registered error classes on
-status 1 and `RspytsPanicError` on status 2. Handles cross as `bigint`
-(wasm i64); generated classes store `#handle: bigint` and expose `free()` +
-`[Symbol.dispose]`, with a `FinalizationRegistry` as best-effort backstop.
-
-The generated `client.ts` shape:
-
-```ts
-export function createClient(mod: BridgeModule): BasicExampleClient;
-export interface BasicExampleClient {
-  summarize(values: Float64Array, label: string | null): Summary;
-  Counter: { new (start: number, label: string): Counter };  // class bound to mod
-  Recording: {
-    open(path: string): Recording;      // factory static — no `new` signature
-    defaultExtension(): string;         // plain static
-  };
-}
-```
-
-(Exact mechanism: `createClient` returns an object literal of arrow
-functions plus class expressions closing over `mod`.)
-
-**Statics and factories.** Statics are `static` members of the bound
-class expression; the client interface types the class property as an
-object literal carrying the `new` signature (when a constructor exists)
-plus one entry per static. Factory statics call the handle-less symbol and
-route the fresh handle through an internal, symbol-gated constructor path;
-constructing a factory-only class directly (`new client.Recording(...)`)
-throws. Factory-made instances register with the same
-`FinalizationRegistry` backstop and expose the same `free()` /
-`[Symbol.dispose]` as constructor-made ones.
-
-## 6. Generated JSON Schema
-
-`[schema].out/schema.json`: a single JSON Schema (draft 2020-12) bundle —
-`$defs` entry per named data type (error enums project to exceptions and
-are excluded), wire-cased property names,
-`additionalProperties: false`, integer bounds, doc comments as
-`description`. Buf placeholders schema-ize as the placeholder object shape;
-`Json` positions schema-ize as an unconstrained schema (a bare
-`description`, accepting anything). A `x-rspyts` top-level key records
-`{ "version", "crate", "manifestHash" }`. The schema bundle is always
-self-contained: it ignores the import tables (§9) and includes every data
-type regardless of origin.
-
-## 7. Pydantic model style (normative examples)
-
-String enum:
-
-```python
-class Rounding(StrEnum):
-    UP = "up"
-    DOWN = "down"
-    NEAREST = "nearest"
-```
-
-Struct:
-
-```python
-class Summary(Contract):
-    """
-    Summary statistics for a list of numbers.
-    """
-
-    item_count: int = Field(ge=0, le=4294967295)
-    label: str | None = None
-```
-
-Data enum (tag `type`):
-
-```python
-class ParsedNumberInteger(Contract):
-    type: Literal["integer"] = "integer"
-    value: int = Field(ge=-2147483648, le=2147483647)
-
-ParsedNumber = Annotated[
-    ParsedNumberInteger | ParsedNumberDecimal,
-    Field(discriminator="type"),
-]
-```
-
-Error enum → exceptions:
-
-```python
-import rspyts
-
-
-class BasicError(rspyts.BridgeError):
-    """
-    Failure modes of the basic functions.
-    """
-
-
-class BasicErrorEmptyInput(BasicError):  # noqa: N818
-    """
-    The input contained no values.
-    """
-
-
-class BasicErrorNotANumber(BasicError):  # noqa: N818
-    """
-    The text could not be parsed as a number.
-    """
-
-    # .data: {"text": str}
-
-
-rspyts.register_error("emptyInput", BasicErrorEmptyInput)
-rspyts.register_error("notANumber", BasicErrorNotANumber)
-```
-
-`errors.py` registers each concrete class with `register_error(code, cls)` at
-import time, carrying the wire codes. `functions.py` imports `errors` for its
-side effects before any call.
-
-## 8. TypeScript type style (normative examples)
-
-```ts
-export type Rounding = "up" | "down" | "nearest";
-
-/** Summary statistics for a list of numbers. */
-export interface Summary {
-  /** How many values were summarized. */
-  itemCount: number;
-  label?: string | null;
-}
-
-export type ParsedNumber =
-  | { type: "integer"; value: number }
-  | { type: "decimal"; value: number };
-```
-
-`Buf<T>` in returns → the corresponding typed array in the TS type
-(`Float64Array` etc.). Input slices type as the typed array; plain `number[]`
-is not accepted (explicitness over convenience).
-
-## 9. Cross-crate imports
-
-A `#[bridge]` type defined in a dependency crate registers into the
-dependent module's manifest carrying its `origin` — the defining crate's
-name (ABI §7). The `[python.imports]` and `[typescript.imports]` tables
-map an origin crate name to the import location of *that crate's own*
-generated package:
+Types carry their defining crate in the manifest. A consuming crate can map
+that origin to an existing generated package:
 
 ```toml
 [python.imports]
-"example-catalog" = "example.catalog.generated"
+"shared-types" = "shared_types.generated"
 
 [typescript.imports]
-"example-catalog" = "@example/catalog/generated"
+"shared-types" = "@example/shared-types"
 ```
 
-Semantics, per emitter:
+Mapped types are imported instead of emitted again. A missing mapping for a
+foreign origin is an error; silently duplicating a type would break identity.
 
-- A type declaration is **imported instead of re-emitted** exactly when
-  its `origin` differs from the manifest's `crateName` *and* the origin
-  has an entry in the language's table. This preserves type identity: the
-  foreign struct is the same pydantic class / the same TS type in both
-  packages.
-- **Python**: `models.py` replaces the class body with
-  `from example.catalog.generated import CatalogInfo` (marked
-  `# noqa: F401` when only re-exported for `__init__`); `__init__.py`
-  re-exports it like any local model. Foreign **error enums** are
-  re-imported in `errors.py` with no local `register_error` calls — the
-  foreign package's own `errors.py` registers its codes at import time.
-- **TypeScript**: `types.ts` uses `import type { … } from "…"` plus an
-  `export type { … };` re-export so `index.ts`'s `export * from "./types"`
-  still surfaces the name. Foreign error enums are value-imported and
-  re-exported in `errors.ts`; loading the foreign module runs its
-  `registerError` calls.
-- **Fallback**: a foreign origin with **no mapping is emitted locally** —
-  the generated package stays self-contained, at the cost of nominally
-  distinct (if structurally identical) types across packages.
-- The tables apply to named types only. Constants carry an `origin` in the
-  manifest but their values are always baked in locally; functions and
-  classes always emit locally. The JSON Schema emitter ignores the tables
-  entirely (§6).
+Symbols do not compose across modules. Each generated client calls only the
+module whose manifest it loaded.
 
-The mapped package must itself be generated by rspyts (it is the same
-`generated/` layout being pointed at), and regenerating either side is
-gated by the same `rspyts check` drift rules. A complete, tested setup —
-two crates, one set of types, identity asserted in both languages — lives
-at [examples/multi-crate](../../examples/multi-crate).
+## Projection exclusions
 
-## 10. Keeping `generated/` out of imports
+Python and TypeScript may exclude items independently:
 
-Consumers should never spell `generated` in an import — the directory is
-an implementation detail of the wrapping package, owned and rewritten by
-`rspyts generate`. The convention: the parent package re-exports the
-generated surface, and everything (tests included) imports from the
-parent. In Python that is the package `__init__.py`
-(`from .generated import …`, plus `__all__`); in TypeScript a
-hand-written `src/index.ts` containing `export * from "./generated";`
-(and, for packages consumed by others, a package.json `exports` entry
-pointing at it). Hand-written helpers live in the parent alongside the
-re-export, importing from the generated modules — never the reverse. The
-examples follow this layout in all four language packages.
+```toml
+[python]
+out = "python/src/example/generated"
+exclude = ["browser_*", "Session.browser_only"]
+```
+
+Patterns are simple globs. Functions, classes, types, and constants match by
+name. Methods and statics match as `Class.member`. Excluding a declaration
+still required by another emitted declaration is a validation error.
+
+Prefer `#[bridge(target = "python")]` or `#[bridge(target = "typescript")]`
+when the distinction belongs to the Rust API itself. Use projection exclusions
+for packaging choices.
+
+## Determinism
+
+Every generated file contains the rspyts version and a hash of the canonical
+manifest. Declarations and imports are stably sorted. There are no timestamps,
+machine paths, or random identifiers. Files are written only when their bytes
+change.
+
+Generated directories should be committed. CI should run `rspyts check` for
+every configuration, build both runtimes, and exercise the real native and
+WebAssembly artifacts.
+
+## Validation boundary
+
+The macro rejects local mistakes such as unsupported signatures, invalid
+attributes, and unbridgeable field types. The CLI rejects conflicts that need
+the full manifest: duplicate projected names, missing foreign imports,
+reserved generated names, reference cycles, invalid exclusions, or an
+unsupported ABI.
+
+Validation finishes before any emitter writes. A failed generation therefore
+does not leave a half-updated package.

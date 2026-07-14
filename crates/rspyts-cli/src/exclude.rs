@@ -129,6 +129,10 @@ fn dangling_references(
 
     for t in &manifest.types {
         let fields: Vec<&rspyts_core::ir::FieldDecl> = match t {
+            TypeDecl::Newtype { inner, .. } => {
+                d.check_ty(inner, &format!("newtype `{}` inner type", t.name()));
+                Vec::new()
+            }
             TypeDecl::Struct { fields, .. } => fields.iter().collect(),
             TypeDecl::Enum { variants, .. } => {
                 variants.iter().flat_map(|v| v.fields.iter()).collect()
@@ -186,6 +190,11 @@ fn collect_refs(ty: &Ty, refs: &mut BTreeSet<String>) {
         }
         Ty::Option { inner } | Ty::List { inner } => collect_refs(inner, refs),
         Ty::Map { value } => collect_refs(value, refs),
+        Ty::Tuple { items } => {
+            for item in items {
+                collect_refs(item, refs);
+            }
+        }
         _ => {}
     }
 }
@@ -202,19 +211,19 @@ mod tests {
 
     #[test]
     fn glob_matching_is_segmented_with_star_within_segments() {
-        assert!(glob_match("render_report", "render_report"));
-        assert!(glob_match("render_*", "render_report"));
-        assert!(glob_match("*", "render_report"));
-        assert!(glob_match("Recording.preload", "Recording.preload"));
-        assert!(glob_match("Recording.*", "Recording.preload"));
-        assert!(glob_match("*.preload", "Recording.preload"));
-        assert!(glob_match("R*g.pre*", "Recording.preload"));
+        assert!(glob_match("render_summary", "render_summary"));
+        assert!(glob_match("render_*", "render_summary"));
+        assert!(glob_match("*", "render_summary"));
+        assert!(glob_match("Session.warm_up", "Session.warm_up"));
+        assert!(glob_match("Session.*", "Session.warm_up"));
+        assert!(glob_match("*.warm_up", "Session.warm_up"));
+        assert!(glob_match("S*n.wa*", "Session.warm_up"));
 
         // `*` never crosses a `.` boundary, and segment counts must match.
-        assert!(!glob_match("*", "Recording.preload"));
-        assert!(!glob_match("Recording.preload", "Recording"));
-        assert!(!glob_match("Recording", "Recording.preload"));
-        assert!(!glob_match("render_*", "analyze_signal"));
+        assert!(!glob_match("*", "Session.warm_up"));
+        assert!(!glob_match("Session.warm_up", "Session"));
+        assert!(!glob_match("Session", "Session.warm_up"));
+        assert!(!glob_match("render_*", "process_values"));
         assert!(!glob_match("", "x"));
     }
 
@@ -226,29 +235,34 @@ mod tests {
 
     #[test]
     fn functions_classes_methods_and_constants_are_excluded_by_name() {
-        let filtered = apply_py(&["render_report"]).unwrap();
-        assert!(!filtered.functions.iter().any(|f| f.name == "render_report"));
+        let filtered = apply_py(&["render_summary"]).unwrap();
+        assert!(
+            !filtered
+                .functions
+                .iter()
+                .any(|f| f.name == "render_summary")
+        );
         assert_eq!(filtered.functions.len(), manifest().functions.len() - 1);
 
-        let filtered = apply_py(&["Recording"]).unwrap();
-        assert!(!filtered.classes.iter().any(|c| c.name == "Recording"));
+        let filtered = apply_py(&["Session"]).unwrap();
+        assert!(!filtered.classes.iter().any(|c| c.name == "Session"));
         assert!(filtered.classes.iter().any(|c| c.name == "RunningStats"));
 
-        let filtered = apply_py(&["Recording.preload", "Recording.default_extension"]).unwrap();
-        let recording = filtered
+        let filtered = apply_py(&["Session.warm_up", "Session.default_extension"]).unwrap();
+        let session = filtered
             .classes
             .iter()
-            .find(|c| c.name == "Recording")
+            .find(|c| c.name == "Session")
             .unwrap();
-        assert!(!recording.methods.iter().any(|m| m.name == "preload"));
-        assert!(recording.methods.iter().any(|m| m.name == "duration_s"));
+        assert!(!session.methods.iter().any(|m| m.name == "warm_up"));
+        assert!(session.methods.iter().any(|m| m.name == "progress"));
         assert!(
-            !recording
+            !session
                 .statics
                 .iter()
                 .any(|s| s.name == "default_extension")
         );
-        assert!(recording.statics.iter().any(|s| s.name == "open"));
+        assert!(session.statics.iter().any(|s| s.name == "open"));
 
         let filtered = apply_py(&["DEFAULT_*"]).unwrap();
         assert!(
@@ -257,40 +271,43 @@ mod tests {
                 .iter()
                 .any(|c| c.name.starts_with("DEFAULT_"))
         );
-        assert!(filtered.constants.iter().any(|c| c.name == "ENGINE_NAME"));
+        assert!(
+            filtered
+                .constants
+                .iter()
+                .any(|c| c.name == "PROCESSOR_NAME")
+        );
     }
 
     #[test]
     fn excluding_a_type_still_referenced_is_an_error() {
-        // `AnalysisParams` is referenced by `analyze_signal`, by the
-        // `DEFAULT_PARAMS` constant, and by `RunningStats` members.
-        let msg = apply_py(&["AnalysisParams"]).unwrap_err().to_string();
+        // `QueryOptions` is referenced by `process_values`, by the
+        // `DEFAULT_OPTIONS` constant, and by `RunningStats` members.
+        let msg = apply_py(&["QueryOptions"]).unwrap_err().to_string();
         assert!(msg.contains("[python] exclude"), "{msg}");
         assert!(
-            msg.contains(
-                "`AnalysisParams` is excluded but function `analyze_signal` references it"
-            ),
+            msg.contains("`QueryOptions` is excluded but function `process_values` references it"),
             "{msg}"
         );
-        assert!(msg.contains("constant `DEFAULT_PARAMS`"), "{msg}");
+        assert!(msg.contains("constant `DEFAULT_OPTIONS`"), "{msg}");
 
         // Excluding an error enum that a kept fallible item uses dangles too.
-        let msg = apply_py(&["AnalysisError"]).unwrap_err().to_string();
-        assert!(msg.contains("function `analyze_signal`"), "{msg}");
-        assert!(msg.contains("class `Recording` static `open`"), "{msg}");
+        let msg = apply_py(&["QueryError"]).unwrap_err().to_string();
+        assert!(msg.contains("function `process_values`"), "{msg}");
+        assert!(msg.contains("class `Session` static `open`"), "{msg}");
     }
 
     #[test]
     fn excluding_the_referencing_items_alongside_the_type_is_fine() {
-        // Dropping every user of `CatalogInfo` lets the type go with it —
+        // Dropping every user of `SourceInfo` lets the type go with it —
         // an excluded class's references no longer count.
-        let filtered = apply_py(&["CatalogInfo", "Recording.info"]).unwrap();
-        assert!(!filtered.types.iter().any(|t| t.name() == "CatalogInfo"));
-        let recording = filtered
+        let filtered = apply_py(&["SourceInfo", "Session.info"]).unwrap();
+        assert!(!filtered.types.iter().any(|t| t.name() == "SourceInfo"));
+        let session = filtered
             .classes
             .iter()
-            .find(|c| c.name == "Recording")
+            .find(|c| c.name == "Session")
             .unwrap();
-        assert!(!recording.methods.iter().any(|m| m.name == "info"));
+        assert!(!session.methods.iter().any(|m| m.name == "info"));
     }
 }

@@ -32,49 +32,49 @@ fn param(name: &str, wire: &str, ty: Ty) -> ParamDecl {
 
 /// The dependency crate one fixture type originates from; the imports
 /// tests map it, the default goldens leave it unmapped.
-pub const FOREIGN_ORIGIN: &str = "example-catalog";
+pub const FOREIGN_ORIGIN: &str = "shared-types";
 
 /// Build the fixture. Sections are name-sorted, mirroring ABI §7.
 pub fn manifest() -> Manifest {
     Manifest {
-        abi: "0.1".to_string(),
+        abi: "2.0".to_string(),
         crate_name: "demo-crate".to_string(),
         crate_version: "0.1.0".to_string(),
         types: vec![
             TypeDecl::ErrorEnum {
-                name: "AnalysisError".to_string(),
+                name: "QueryError".to_string(),
                 docs: String::new(),
                 origin: "demo-crate".to_string(),
                 variants: vec![
                     ErrorVariantDecl {
-                        name: "InvalidSampleRate".to_string(),
-                        wire_code: "invalidSampleRate".to_string(),
-                        docs: "The sample rate must be positive.".to_string(),
+                        name: "InvalidBatchSize".to_string(),
+                        wire_code: "invalidBatchSize".to_string(),
+                        docs: "The batch size must be positive.".to_string(),
                         fields: vec![],
                     },
                     ErrorVariantDecl {
-                        name: "WindowTooLarge".to_string(),
-                        wire_code: "windowTooLarge".to_string(),
+                        name: "BatchTooLarge".to_string(),
+                        wire_code: "batchTooLarge".to_string(),
                         docs: String::new(),
                         fields: vec![field("max", "max", "", Ty::U32, false)],
                     },
                 ],
             },
             TypeDecl::Struct {
-                name: "AnalysisParams".to_string(),
-                docs: "Parameters controlling the analysis pass.".to_string(),
+                name: "QueryOptions".to_string(),
+                docs: "Options controlling value processing.".to_string(),
                 origin: "demo-crate".to_string(),
                 fields: vec![
                     field(
-                        "min_duration_s",
-                        "minDurationS",
-                        "Minimum duration, in seconds.",
+                        "minimum_value",
+                        "minimumValue",
+                        "Minimum value to include.",
                         Ty::F64,
                         false,
                     ),
                     field(
-                        "threshold",
-                        "threshold",
+                        "tolerance",
+                        "tolerance",
                         "",
                         Ty::Option {
                             inner: Box::new(Ty::F64),
@@ -85,12 +85,12 @@ pub fn manifest() -> Manifest {
                 ],
             },
             TypeDecl::Struct {
-                name: "CatalogInfo".to_string(),
-                docs: "Catalog description reported by the device.".to_string(),
+                name: "SourceInfo".to_string(),
+                docs: "Description of an input source.".to_string(),
                 origin: FOREIGN_ORIGIN.to_string(),
                 fields: vec![
-                    field("vendor", "vendor", "", Ty::String, false),
-                    field("channel_count", "channelCount", "", Ty::U16, false),
+                    field("name", "name", "", Ty::String, false),
+                    field("field_count", "fieldCount", "", Ty::U16, false),
                 ],
             },
             TypeDecl::StringEnum {
@@ -107,89 +107,89 @@ pub fn manifest() -> Manifest {
                     .collect(),
             },
             TypeDecl::Enum {
-                name: "ThresholdEvent".to_string(),
-                docs: "Signal threshold transitions.".to_string(),
+                name: "ValueEvent".to_string(),
+                docs: "Value-processing transitions.".to_string(),
                 origin: "demo-crate".to_string(),
                 tag: "kind".to_string(),
                 variants: vec![
                     VariantDecl {
-                        name: "Crossed".to_string(),
-                        wire_name: "crossed".to_string(),
+                        name: "Accepted".to_string(),
+                        wire_name: "accepted".to_string(),
                         docs: String::new(),
                         fields: vec![
-                            field("at_sample", "atSample", "", Ty::U32, false),
+                            field("index", "index", "", Ty::U32, false),
                             field("value", "value", "", Ty::F64, false),
                         ],
                     },
                     VariantDecl {
-                        name: "Cleared".to_string(),
-                        wire_name: "cleared".to_string(),
+                        name: "Rejected".to_string(),
+                        wire_name: "rejected".to_string(),
                         docs: String::new(),
-                        fields: vec![field("at_sample", "atSample", "", Ty::U32, false)],
+                        fields: vec![field("index", "index", "", Ty::U32, false)],
                     },
                 ],
             },
         ],
         constants: vec![
             ConstDecl {
-                name: "DEFAULT_PARAMS".to_string(),
-                docs: "Baseline analysis parameters.".to_string(),
+                name: "DEFAULT_OPTIONS".to_string(),
+                docs: "Baseline processing options.".to_string(),
                 origin: "demo-crate".to_string(),
                 ty: Ty::Ref {
-                    name: "AnalysisParams".to_string(),
+                    name: "QueryOptions".to_string(),
                 },
                 value: json!({
-                    "minDurationS": 0.5,
-                    "threshold": null,
+                    "minimumValue": 0.5,
+                    "tolerance": null,
                     "metadata": {"rev": 2}
                 }),
             },
             ConstDecl {
-                name: "DEFAULT_THRESHOLD".to_string(),
+                name: "DEFAULT_LIMIT".to_string(),
                 docs: String::new(),
                 origin: "demo-crate".to_string(),
                 ty: Ty::F64,
                 value: json!(0.75),
             },
             ConstDecl {
-                name: "ENGINE_NAME".to_string(),
-                docs: "Name reported by the analysis engine.".to_string(),
+                name: "PROCESSOR_NAME".to_string(),
+                docs: "Name reported by the value processor.".to_string(),
                 origin: "demo-crate".to_string(),
                 ty: Ty::String,
-                value: json!("neuro-engine"),
+                value: json!("vector-processor"),
             },
             ConstDecl {
-                name: "SUPPORTED_UNITS".to_string(),
+                name: "SUPPORTED_FORMATS".to_string(),
                 docs: String::new(),
                 origin: "demo-crate".to_string(),
                 ty: Ty::List {
                     inner: Box::new(Ty::String),
                 },
-                value: json!(["uV", "mV"]),
+                value: json!(["csv", "json"]),
             },
         ],
         functions: vec![
             FnDecl {
-                name: "analyze_signal".to_string(),
-                docs: "Analyze a signal buffer.".to_string(),
+                name: "process_values".to_string(),
+                docs: "Process a buffer of numeric values.".to_string(),
                 params: vec![
-                    param("samples", "samples", Ty::Slice { dt: Dtype::F64 }),
-                    param("sample_rate", "sampleRate", Ty::U32),
+                    param("values", "values", Ty::Slice { dt: Dtype::F64 }),
+                    param("batch_size", "batchSize", Ty::U32),
                     param(
-                        "params",
-                        "params",
+                        "options",
+                        "options",
                         Ty::Ref {
-                            name: "AnalysisParams".to_string(),
+                            name: "QueryOptions".to_string(),
                         },
                     ),
                 ],
                 ret: Ty::Buf { dt: Dtype::F64 },
-                err: Some("AnalysisError".to_string()),
+                err: Some("QueryError".to_string()),
                 targets: Target::all(),
             },
             FnDecl {
-                name: "render_report".to_string(),
-                docs: "Render an HTML report.".to_string(),
+                name: "render_summary".to_string(),
+                docs: "Render an HTML summary.".to_string(),
                 params: vec![],
                 ret: Ty::String,
                 err: None,
@@ -199,13 +199,13 @@ pub fn manifest() -> Manifest {
         classes: vec![
             // Factory-only: no constructor, built through `open`.
             ClassDecl {
-                name: "Recording".to_string(),
-                docs: "A recorded session backed by a native handle.".to_string(),
+                name: "Session".to_string(),
+                docs: "A processing session backed by a native handle.".to_string(),
                 constructor: None,
                 methods: vec![
                     MethodDecl {
-                        name: "duration_s".to_string(),
-                        docs: "Total duration in seconds.".to_string(),
+                        name: "progress".to_string(),
+                        docs: "Current completion ratio.".to_string(),
                         mutable: false,
                         params: vec![],
                         ret: Ty::F64,
@@ -218,14 +218,14 @@ pub fn manifest() -> Manifest {
                         mutable: false,
                         params: vec![],
                         ret: Ty::Ref {
-                            name: "CatalogInfo".to_string(),
+                            name: "SourceInfo".to_string(),
                         },
                         err: None,
                         targets: Target::all(),
                     },
                     MethodDecl {
-                        name: "preload".to_string(),
-                        docs: "Eagerly load samples into memory.".to_string(),
+                        name: "warm_up".to_string(),
+                        docs: "Prepare the session for processing.".to_string(),
                         mutable: true,
                         params: vec![],
                         ret: Ty::Unit,
@@ -236,10 +236,10 @@ pub fn manifest() -> Manifest {
                 statics: vec![
                     StaticDecl {
                         name: "open".to_string(),
-                        docs: "Open a recording from disk.".to_string(),
+                        docs: "Open a processing session from disk.".to_string(),
                         params: vec![param("path", "path", Ty::String)],
                         ret: Ty::Unit,
-                        err: Some("AnalysisError".to_string()),
+                        err: Some("QueryError".to_string()),
                         returns_self: true,
                         targets: Target::all(),
                     },
@@ -278,7 +278,7 @@ pub fn manifest() -> Manifest {
                         mutable: false,
                         params: vec![],
                         ret: Ty::Ref {
-                            name: "AnalysisParams".to_string(),
+                            name: "QueryOptions".to_string(),
                         },
                         err: None,
                         targets: Target::all(),
@@ -291,7 +291,7 @@ pub fn manifest() -> Manifest {
                         "state",
                         "state",
                         Ty::Ref {
-                            name: "AnalysisParams".to_string(),
+                            name: "QueryOptions".to_string(),
                         },
                     )],
                     ret: Ty::Unit,
@@ -302,6 +302,232 @@ pub fn manifest() -> Manifest {
             },
         ],
     }
+}
+
+/// Build a focused attachment/newtype fixture without expanding the broad
+/// emitter goldens above. This keeps binary projection tests readable while
+/// still making every emitter consume the same manifest shape.
+pub fn binary_manifest() -> Manifest {
+    let mut m = manifest();
+    m.types.push(TypeDecl::Newtype {
+        name: "PacketId".to_string(),
+        docs: "Stable packet identifier.".to_string(),
+        origin: "demo-crate".to_string(),
+        inner: Ty::U32,
+    });
+    m.types.push(TypeDecl::Struct {
+        name: "BinaryPacket".to_string(),
+        docs: "Nested binary attachment fixture.".to_string(),
+        origin: "demo-crate".to_string(),
+        fields: vec![
+            field(
+                "id",
+                "id",
+                "",
+                Ty::Ref {
+                    name: "PacketId".to_string(),
+                },
+                false,
+            ),
+            field("payload", "payload", "", Ty::Bytes, false),
+            field("samples", "samples", "", Ty::Buf { dt: Dtype::F64 }, false),
+            field(
+                "chunks",
+                "chunks",
+                "",
+                Ty::List {
+                    inner: Box::new(Ty::Buf { dt: Dtype::I16 }),
+                },
+                false,
+            ),
+            field(
+                "channels",
+                "channels",
+                "",
+                Ty::Map {
+                    value: Box::new(Ty::Buf { dt: Dtype::U8 }),
+                },
+                false,
+            ),
+        ],
+    });
+    m.functions.push(FnDecl {
+        name: "echo_binary_packet".to_string(),
+        docs: String::new(),
+        params: vec![param(
+            "value",
+            "value",
+            Ty::Ref {
+                name: "BinaryPacket".to_string(),
+            },
+        )],
+        ret: Ty::Ref {
+            name: "BinaryPacket".to_string(),
+        },
+        err: None,
+        targets: Target::all(),
+    });
+    m.functions.push(FnDecl {
+        name: "echo_bytes".to_string(),
+        docs: String::new(),
+        params: vec![param("value", "value", Ty::Bytes)],
+        ret: Ty::Bytes,
+        err: None,
+        targets: Target::all(),
+    });
+    m.functions.push(FnDecl {
+        name: "echo_u8".to_string(),
+        docs: String::new(),
+        params: vec![param("value", "value", Ty::Buf { dt: Dtype::U8 })],
+        ret: Ty::Buf { dt: Dtype::U8 },
+        err: None,
+        targets: Target::all(),
+    });
+    m
+}
+
+/// Build the exact-integer, tuple, and mixed-enum fixture shared by all
+/// emitters. It deliberately nests exact values through every structural
+/// container so converters cannot accidentally handle only top-level cases.
+pub fn exact_manifest() -> Manifest {
+    let mut m = manifest();
+    m.types.push(TypeDecl::Newtype {
+        name: "SequenceId".to_string(),
+        docs: String::new(),
+        origin: "demo-crate".to_string(),
+        inner: Ty::U64,
+    });
+    m.types.push(TypeDecl::Struct {
+        name: "ExactRecord".to_string(),
+        docs: String::new(),
+        origin: "demo-crate".to_string(),
+        fields: vec![
+            field(
+                "sequence",
+                "sequence",
+                "",
+                Ty::Ref {
+                    name: "SequenceId".into(),
+                },
+                false,
+            ),
+            field("delta", "delta", "", Ty::I64, false),
+            field(
+                "pair",
+                "pair",
+                "",
+                Ty::Tuple {
+                    items: vec![Ty::I64, Ty::U64],
+                },
+                false,
+            ),
+            field(
+                "nested",
+                "nested",
+                "",
+                Ty::List {
+                    inner: Box::new(Ty::Map {
+                        value: Box::new(Ty::Option {
+                            inner: Box::new(Ty::U64),
+                        }),
+                    }),
+                },
+                false,
+            ),
+        ],
+    });
+    m.types.push(TypeDecl::Enum {
+        name: "MixedResult".to_string(),
+        docs: String::new(),
+        origin: "demo-crate".to_string(),
+        tag: "type".to_string(),
+        variants: vec![
+            VariantDecl {
+                name: "Pending".to_string(),
+                wire_name: "pending".to_string(),
+                docs: String::new(),
+                fields: vec![],
+            },
+            VariantDecl {
+                name: "Ready".to_string(),
+                wire_name: "ready".to_string(),
+                docs: String::new(),
+                fields: vec![field("total", "total", "", Ty::U64, false)],
+            },
+        ],
+    });
+    if let TypeDecl::ErrorEnum { variants, .. } = &mut m.types[0] {
+        variants[1]
+            .fields
+            .push(field("exact_limit", "exactLimit", "", Ty::U64, false));
+    }
+    m.constants.push(ConstDecl {
+        name: "MAX_SEQUENCE".to_string(),
+        docs: String::new(),
+        origin: "demo-crate".to_string(),
+        ty: Ty::Ref {
+            name: "SequenceId".to_string(),
+        },
+        value: json!(u64::MAX.to_string()),
+    });
+    m.constants.push(ConstDecl {
+        name: "EXACT_PAIR".to_string(),
+        docs: String::new(),
+        origin: "demo-crate".to_string(),
+        ty: Ty::Tuple {
+            items: vec![Ty::I64, Ty::U64],
+        },
+        value: json!([i64::MIN.to_string(), u64::MAX.to_string()]),
+    });
+    m.functions.push(FnDecl {
+        name: "round_trip_exact".to_string(),
+        docs: String::new(),
+        params: vec![param(
+            "value",
+            "value",
+            Ty::Ref {
+                name: "ExactRecord".to_string(),
+            },
+        )],
+        ret: Ty::Ref {
+            name: "ExactRecord".to_string(),
+        },
+        err: None,
+        targets: Target::all(),
+    });
+    m.functions.push(FnDecl {
+        name: "round_trip_mixed".to_string(),
+        docs: String::new(),
+        params: vec![param(
+            "value",
+            "value",
+            Ty::Ref {
+                name: "MixedResult".to_string(),
+            },
+        )],
+        ret: Ty::Ref {
+            name: "MixedResult".to_string(),
+        },
+        err: None,
+        targets: Target::all(),
+    });
+    m.functions.push(FnDecl {
+        name: "round_trip_tuple".to_string(),
+        docs: String::new(),
+        params: vec![param(
+            "value",
+            "value",
+            Ty::Tuple {
+                items: vec![Ty::I64, Ty::U64],
+            },
+        )],
+        ret: Ty::Tuple {
+            items: vec![Ty::I64, Ty::U64],
+        },
+        err: None,
+        targets: Target::all(),
+    });
+    m
 }
 
 /// The manifest-hash the emitters would receive for this fixture: the

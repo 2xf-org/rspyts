@@ -1,13 +1,14 @@
 //! Syntactic analysis of bridged signatures.
 //!
 //! Everything here is deliberately *syntactic* (ABI §3.1): a parameter is
-//! a slice parameter iff it is written as `&[u8]`/`&[i16]`/`&[i32]`/
-//! `&[f32]`/`&[f64]`; a return type is fallible iff it is written
+//! a slice parameter iff its element is one of the ten ABI numeric dtypes;
+//! a return type is fallible iff it is written
 //! literally as `Result<T, E>`. Semantic membership in the portable type
 //! system is enforced later by the `Bridged` trait bounds the emitted code
 //! places on every plain type — a non-bridgeable type produces a
 //! "trait bound not satisfied" error at the definition site.
 
+use std::collections::BTreeSet;
 use syn::parse_quote;
 
 /// How a plain parameter is passed to the original function from the
@@ -38,6 +39,33 @@ pub enum ParamKind {
 pub struct BridgedParam {
     pub ident: syn::Ident,
     pub kind: ParamKind,
+}
+
+/// Check the JSON keys produced from a function's plain parameters.
+pub fn validate_param_wire_names(params: &[BridgedParam]) -> syn::Result<()> {
+    let mut seen = BTreeSet::new();
+    for param in params {
+        if matches!(param.kind, ParamKind::Slice { .. }) {
+            continue;
+        }
+        let wire = crate::casing::field_wire_name(
+            &param.ident.to_string(),
+            crate::casing::RenameRule::Camel,
+        );
+        if ["__rspyts_buf__", "__rspyts_json__"].contains(&wire.as_str()) {
+            return Err(syn::Error::new_spanned(
+                &param.ident,
+                format!("parameter wire name `{wire}` is reserved by the ABI envelope"),
+            ));
+        }
+        if !seen.insert(wire.clone()) {
+            return Err(syn::Error::new_spanned(
+                &param.ident,
+                format!("duplicate parameter wire name `{wire}` after camelCase projection"),
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Classification of a bridged return type.
@@ -111,8 +139,9 @@ pub fn classify_type(ty: &syn::Type) -> syn::Result<ParamKind> {
                     }),
                     None => Err(syn::Error::new_spanned(
                         ty,
-                        "only `&[u8]`, `&[i16]`, `&[i32]`, `&[f32]`, and `&[f64]` are \
-                         supported as slice parameters; use `Vec<T>` for other element \
+                        "only slices of ABI numeric dtypes (`u8`, `i8`, `u16`, `i16`, \
+                         `u32`, `i32`, `u64`, `i64`, `f32`, `f64`) are supported as \
+                         slice parameters; use `Vec<T>` for other element \
                          types (docs/design/type-system.md §5)",
                     )),
                 },
@@ -122,26 +151,20 @@ pub fn classify_type(ty: &syn::Type) -> syn::Result<ParamKind> {
                         borrow: Borrow::Str,
                     })
                 }
-                inner => {
-                    reject_buf(inner)?;
-                    Ok(ParamKind::Plain {
-                        owned: inner.clone(),
-                        borrow: Borrow::Ref,
-                    })
-                }
+                inner => Ok(ParamKind::Plain {
+                    owned: inner.clone(),
+                    borrow: Borrow::Ref,
+                }),
             }
         }
         syn::Type::Slice(_) => Err(syn::Error::new_spanned(
             ty,
             "bare slice types are not valid parameters; write `&[T]`",
         )),
-        other => {
-            reject_buf(other)?;
-            Ok(ParamKind::Plain {
-                owned: other.clone(),
-                borrow: Borrow::Owned,
-            })
-        }
+        other => Ok(ParamKind::Plain {
+            owned: other.clone(),
+            borrow: Borrow::Owned,
+        }),
     }
 }
 
@@ -221,6 +244,69 @@ pub fn is_option(ty: &syn::Type) -> bool {
     }
 }
 
+/// Reject bare 64-bit integers in JSON-carried positions with actionable
+/// guidance. Raw `&[i64]`/`&[u64]` slices are a separate binary ABI path and
+/// never call this helper.
+pub fn reject_bare_exact_integer(ty: &syn::Type) -> syn::Result<()> {
+    let syn::Type::Path(path) = ty else {
+        return Ok(());
+    };
+    if path.qself.is_some() || path.path.segments.len() != 1 {
+        return Ok(());
+    }
+    let ident = &path.path.segments[0].ident;
+    let wrapper = match ident.to_string().as_str() {
+        "i64" => "I64",
+        "u64" => "U64",
+        _ => return Ok(()),
+    };
+    Err(syn::Error::new_spanned(
+        ty,
+        format!(
+            "bare `{ident}` is not bridgeable because JSON numbers cannot preserve every 64-bit value; use `rspyts::{wrapper}` for canonical decimal-string transport"
+        ),
+    ))
+}
+
+/// Reject values that require an envelope attachment in positions whose
+/// wire format has no raw tail (constants and application-error data).
+pub fn reject_attachment_type(ty: &syn::Type, position: &str) -> syn::Result<()> {
+    fn attachment(ty: &syn::Type) -> Option<&syn::Type> {
+        match ty {
+            syn::Type::Path(path) => {
+                let last = path.path.segments.last()?;
+                if last.ident == "Buf" || last.ident == "Bytes" {
+                    return Some(ty);
+                }
+                let syn::PathArguments::AngleBracketed(args) = &last.arguments else {
+                    return None;
+                };
+                args.args.iter().find_map(|arg| match arg {
+                    syn::GenericArgument::Type(inner) => attachment(inner),
+                    _ => None,
+                })
+            }
+            syn::Type::Tuple(tuple) => tuple.elems.iter().find_map(attachment),
+            syn::Type::Array(array) => attachment(&array.elem),
+            syn::Type::Reference(reference) => attachment(&reference.elem),
+            syn::Type::Paren(paren) => attachment(&paren.elem),
+            syn::Type::Group(group) => attachment(&group.elem),
+            _ => None,
+        }
+    }
+
+    if let Some(found) = attachment(ty) {
+        Err(syn::Error::new_spanned(
+            found,
+            format!(
+                "`Buf` and `Bytes` cannot appear in {position} because that wire format has no attachment tail"
+            ),
+        ))
+    } else {
+        Ok(())
+    }
+}
+
 /// True iff `ty` is `Self` or the bare class name — the literal forms a
 /// constructor may return (type-system §7).
 pub fn is_self_ty(ty: &syn::Type, self_ident: &syn::Ident) -> bool {
@@ -260,7 +346,7 @@ pub fn ensure_plain_signature(sig: &syn::Signature, what: &str) -> syn::Result<(
     if let Some(token) = &sig.asyncness {
         return Err(syn::Error::new_spanned(
             token,
-            "`async fn` cannot be bridged — ABI 0.1 has no async support \
+            "`async fn` cannot be bridged — ABI 2 has no async support \
              (docs/design/abi.md §11)",
         ));
     }
@@ -289,30 +375,18 @@ fn slice_dtype(elem: &syn::Type) -> Option<syn::Ident> {
     let ident = path.path.get_ident()?;
     let variant = match ident.to_string().as_str() {
         "u8" => "U8",
+        "i8" => "I8",
+        "u16" => "U16",
         "i16" => "I16",
+        "u32" => "U32",
         "i32" => "I32",
+        "u64" => "U64",
+        "i64" => "I64",
         "f32" => "F32",
         "f64" => "F64",
         _ => return None,
     };
     Some(syn::Ident::new(variant, proc_macro2::Span::call_site()))
-}
-
-/// Reject `Buf<…>` in parameter position (ABI §6: return-only).
-fn reject_buf(ty: &syn::Type) -> syn::Result<()> {
-    if let syn::Type::Path(path) = ty {
-        if let Some(segment) = path.path.segments.last() {
-            if segment.ident == "Buf"
-                && matches!(segment.arguments, syn::PathArguments::AngleBracketed(_))
-            {
-                return Err(syn::Error::new_spanned(
-                    ty,
-                    "`Buf` is return-only; accept `&[T]` (docs/design/abi.md §6)",
-                ));
-            }
-        }
-    }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -328,8 +402,13 @@ mod tests {
     fn dtype_slices_classify_as_slice_params() {
         for (ty, variant) in [
             (parse_quote!(&[u8]), "U8"),
+            (parse_quote!(&[i8]), "I8"),
+            (parse_quote!(&[u16]), "U16"),
             (parse_quote!(&[i16]), "I16"),
+            (parse_quote!(&[u32]), "U32"),
             (parse_quote!(&[i32]), "I32"),
+            (parse_quote!(&[u64]), "U64"),
+            (parse_quote!(&[i64]), "I64"),
             (parse_quote!(&[f32]), "F32"),
             (parse_quote!(&[f64]), "F64"),
         ] {
@@ -343,7 +422,7 @@ mod tests {
     #[test]
     fn non_dtype_slices_are_rejected() {
         assert!(classify(parse_quote!(&[String])).is_err());
-        assert!(classify(parse_quote!(&[u64])).is_err());
+        assert!(classify(parse_quote!(&[bool])).is_err());
     }
 
     #[test]
@@ -362,10 +441,10 @@ mod tests {
 
     #[test]
     fn shared_refs_strip_one_level_and_owned_stay_owned() {
-        match classify(parse_quote!(&AnalysisParams)).unwrap() {
+        match classify(parse_quote!(&QueryOptions)).unwrap() {
             ParamKind::Plain { owned, borrow } => {
                 assert_eq!(borrow, Borrow::Ref);
-                assert_eq!(owned.to_token_stream().to_string(), "AnalysisParams");
+                assert_eq!(owned.to_token_stream().to_string(), "QueryOptions");
             }
             ParamKind::Slice { .. } => panic!("expected plain"),
         }
@@ -376,11 +455,23 @@ mod tests {
     }
 
     #[test]
-    fn mut_refs_and_buf_params_are_rejected() {
+    fn mut_refs_are_rejected_and_buf_params_are_plain_owned_values() {
         assert!(classify(parse_quote!(&mut Foo)).is_err());
-        assert!(classify(parse_quote!(Buf<f64>)).is_err());
-        assert!(classify(parse_quote!(&Buf<f64>)).is_err());
-        assert!(classify(parse_quote!(rspyts::Buf<f64>)).is_err());
+        assert!(matches!(
+            classify(parse_quote!(Buf<f64>)).unwrap(),
+            ParamKind::Plain {
+                borrow: Borrow::Owned,
+                ..
+            }
+        ));
+        assert!(matches!(
+            classify(parse_quote!(&Buf<f64>)).unwrap(),
+            ParamKind::Plain {
+                borrow: Borrow::Ref,
+                ..
+            }
+        ));
+        assert!(classify(parse_quote!(rspyts::Buf<f64>)).is_ok());
     }
 
     #[test]
@@ -391,13 +482,13 @@ mod tests {
         ));
         assert!(matches!(classify_ret(&parse_quote!(-> ())), RetKind::Unit));
         assert!(matches!(
-            classify_ret(&parse_quote!(-> AnalysisReport)),
+            classify_ret(&parse_quote!(-> ProcessingReport)),
             RetKind::Plain(_)
         ));
 
-        match classify_ret(&parse_quote!(-> Result<AnalysisReport, AnalysisError>)) {
+        match classify_ret(&parse_quote!(-> Result<ProcessingReport, QueryError>)) {
             RetKind::Result { err_name, .. } => {
-                assert_eq!(err_name.as_deref(), Some("AnalysisError"));
+                assert_eq!(err_name.as_deref(), Some("QueryError"));
             }
             _ => panic!("expected result"),
         }

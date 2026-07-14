@@ -3,9 +3,230 @@
   "x-rspyts": {
     "version": "0.1.0",
     "crate": "basic-example",
-    "manifestHash": "sha256:f17eeb3983e7ef2c303839410d5751eb190846d99bdd20c73e69854a89fead86"
+    "manifestHash": "sha256:bcb4295a5648b6010d7a1b2f4328fa31fcdd4b96af7993bce8a914cb74a4d3d2"
   },
   "$defs": {
+    "BinaryPacket": {
+      "description": "Binary values and owned numeric buffers nested in ordinary data.",
+      "type": "object",
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/PacketId"
+        },
+        "payload": {
+          "description": "Opaque bytes, distinct from a numeric `u8` buffer on the wire.",
+          "type": "object",
+          "properties": {
+            "__rspyts_buf__": {
+              "type": "object",
+              "properties": {
+                "off": {
+                  "type": "integer",
+                  "minimum": 0
+                },
+                "len": {
+                  "type": "integer",
+                  "minimum": 0
+                },
+                "dt": {
+                  "const": "bytes"
+                }
+              },
+              "required": [
+                "off",
+                "len",
+                "dt"
+              ],
+              "additionalProperties": false
+            }
+          },
+          "required": [
+            "__rspyts_buf__"
+          ],
+          "additionalProperties": false
+        },
+        "samples": {
+          "description": "An aligned floating-point buffer.",
+          "type": "object",
+          "properties": {
+            "__rspyts_buf__": {
+              "type": "object",
+              "properties": {
+                "off": {
+                  "type": "integer",
+                  "minimum": 0
+                },
+                "len": {
+                  "type": "integer",
+                  "minimum": 0
+                },
+                "dt": {
+                  "const": "f64"
+                }
+              },
+              "required": [
+                "off",
+                "len",
+                "dt"
+              ],
+              "additionalProperties": false
+            }
+          },
+          "required": [
+            "__rspyts_buf__"
+          ],
+          "additionalProperties": false
+        },
+        "chunks": {
+          "description": "Buffers can appear inside lists.",
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "__rspyts_buf__": {
+                "type": "object",
+                "properties": {
+                  "off": {
+                    "type": "integer",
+                    "minimum": 0
+                  },
+                  "len": {
+                    "type": "integer",
+                    "minimum": 0
+                  },
+                  "dt": {
+                    "const": "i16"
+                  }
+                },
+                "required": [
+                  "off",
+                  "len",
+                  "dt"
+                ],
+                "additionalProperties": false
+              }
+            },
+            "required": [
+              "__rspyts_buf__"
+            ],
+            "additionalProperties": false
+          }
+        },
+        "channels": {
+          "description": "Buffers can also appear inside string-keyed maps.",
+          "type": "object",
+          "additionalProperties": {
+            "type": "object",
+            "properties": {
+              "__rspyts_buf__": {
+                "type": "object",
+                "properties": {
+                  "off": {
+                    "type": "integer",
+                    "minimum": 0
+                  },
+                  "len": {
+                    "type": "integer",
+                    "minimum": 0
+                  },
+                  "dt": {
+                    "const": "u8"
+                  }
+                },
+                "required": [
+                  "off",
+                  "len",
+                  "dt"
+                ],
+                "additionalProperties": false
+              }
+            },
+            "required": [
+              "__rspyts_buf__"
+            ],
+            "additionalProperties": false
+          }
+        }
+      },
+      "required": [
+        "id",
+        "payload",
+        "samples",
+        "chunks",
+        "channels"
+      ],
+      "additionalProperties": false
+    },
+    "ExactNumbers": {
+      "description": "Exact integers in plain, tuple, optional, and list positions.",
+      "type": "object",
+      "properties": {
+        "signed": {
+          "type": "string",
+          "format": "int64",
+          "pattern": "^(?:0|-?[1-9][0-9]*)$",
+          "x-rspyts-minimum": "-9223372036854775808",
+          "x-rspyts-maximum": "9223372036854775807"
+        },
+        "unsigned": {
+          "type": "string",
+          "format": "uint64",
+          "pattern": "^(?:0|[1-9][0-9]*)$",
+          "x-rspyts-minimum": "0",
+          "x-rspyts-maximum": "18446744073709551615"
+        },
+        "pair": {
+          "type": "array",
+          "prefixItems": [
+            {
+              "type": "string",
+              "format": "int64",
+              "pattern": "^(?:0|-?[1-9][0-9]*)$",
+              "x-rspyts-minimum": "-9223372036854775808",
+              "x-rspyts-maximum": "9223372036854775807"
+            },
+            {
+              "type": "string",
+              "format": "uint64",
+              "pattern": "^(?:0|[1-9][0-9]*)$",
+              "x-rspyts-minimum": "0",
+              "x-rspyts-maximum": "18446744073709551615"
+            }
+          ],
+          "minItems": 2,
+          "maxItems": 2
+        },
+        "history": {
+          "anyOf": [
+            {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "format": "uint64",
+                "pattern": "^(?:0|[1-9][0-9]*)$",
+                "x-rspyts-minimum": "0",
+                "x-rspyts-maximum": "18446744073709551615"
+              }
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "signed",
+        "unsigned",
+        "pair"
+      ],
+      "additionalProperties": false
+    },
+    "PacketId": {
+      "description": "Stable identifier for a binary packet.\n\nTransparent newtypes remain named in generated APIs and schemas while\nusing the inner integer directly at runtime.",
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 4294967295
+    },
     "ParsedNumber": {
       "description": "A number parsed from text.",
       "oneOf": [
@@ -89,6 +310,43 @@
         "average"
       ],
       "additionalProperties": false
+    },
+    "TransferState": {
+      "description": "A state that can be either tag-only or carry exact data.",
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "const": "pending"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "const": "complete"
+            },
+            "sequence": {
+              "type": "string",
+              "format": "uint64",
+              "pattern": "^(?:0|[1-9][0-9]*)$",
+              "x-rspyts-minimum": "0",
+              "x-rspyts-maximum": "18446744073709551615"
+            }
+          },
+          "required": [
+            "type",
+            "sequence"
+          ],
+          "additionalProperties": false
+        }
+      ]
     }
   }
 }

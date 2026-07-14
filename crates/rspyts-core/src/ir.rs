@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Manifest {
-    /// ABI version string, e.g. `"0.1"`.
+    /// ABI version string, e.g. `"2.0"`.
     pub abi: String,
     pub crate_name: String,
     pub crate_version: String,
@@ -31,6 +31,15 @@ pub struct Manifest {
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 #[serde(tag = "kind", rename_all = "camelCase", deny_unknown_fields)]
 pub enum TypeDecl {
+    /// A transparent single-field Rust newtype. Foreign projections keep
+    /// the name but reuse the inner wire representation.
+    #[serde(rename_all = "camelCase")]
+    Newtype {
+        name: String,
+        docs: String,
+        origin: String,
+        inner: Ty,
+    },
     /// A struct with named fields → object on the wire.
     #[serde(rename_all = "camelCase")]
     Struct {
@@ -83,7 +92,8 @@ pub enum TypeDecl {
 impl TypeDecl {
     pub fn name(&self) -> &str {
         match self {
-            TypeDecl::Struct { name, .. }
+            TypeDecl::Newtype { name, .. }
+            | TypeDecl::Struct { name, .. }
             | TypeDecl::Enum { name, .. }
             | TypeDecl::StringEnum { name, .. }
             | TypeDecl::ErrorEnum { name, .. } => name,
@@ -92,7 +102,8 @@ impl TypeDecl {
 
     pub fn origin(&self) -> &str {
         match self {
-            TypeDecl::Struct { origin, .. }
+            TypeDecl::Newtype { origin, .. }
+            | TypeDecl::Struct { origin, .. }
             | TypeDecl::Enum { origin, .. }
             | TypeDecl::StringEnum { origin, .. }
             | TypeDecl::ErrorEnum { origin, .. } => origin,
@@ -154,9 +165,15 @@ pub enum Ty {
     I8,
     I16,
     I32,
+    /// Exact signed 64-bit integer, encoded as a canonical decimal string.
+    I64,
+    /// Exact unsigned 64-bit integer, encoded as a canonical decimal string.
+    U64,
     F32,
     F64,
     String,
+    /// Opaque binary bytes transported through an envelope attachment.
+    Bytes,
     /// `()` — valid in return position only.
     Unit,
     Option {
@@ -169,14 +186,18 @@ pub enum Ty {
     Map {
         value: Box<Ty>,
     },
+    /// Fixed-length heterogeneous tuple (supported arities: 2 through 12).
+    Tuple {
+        items: Vec<Ty>,
+    },
     /// A named type declared in `Manifest::types`.
     Ref {
         name: String,
     },
-    /// Schemaless JSON passthrough (`rspyts::Json`): `Any` in Python,
+    /// Schemaless JSON passthrough (`rspyts::Json`): `JsonValue` in Python,
     /// `unknown` in TypeScript, `{}` in JSON Schema.
     Json,
-    /// Owned numeric buffer returned via the envelope tail (return only).
+    /// Owned numeric buffer transported via an envelope attachment.
     Buf {
         dt: Dtype,
     },
@@ -191,10 +212,20 @@ pub enum Ty {
 pub enum Dtype {
     #[serde(rename = "u8")]
     U8,
+    #[serde(rename = "i8")]
+    I8,
+    #[serde(rename = "u16")]
+    U16,
     #[serde(rename = "i16")]
     I16,
+    #[serde(rename = "u32")]
+    U32,
     #[serde(rename = "i32")]
     I32,
+    #[serde(rename = "u64")]
+    U64,
+    #[serde(rename = "i64")]
+    I64,
     #[serde(rename = "f32")]
     F32,
     #[serde(rename = "f64")]
@@ -205,11 +236,45 @@ impl Dtype {
     pub fn wire_name(self) -> &'static str {
         match self {
             Dtype::U8 => "u8",
+            Dtype::I8 => "i8",
+            Dtype::U16 => "u16",
             Dtype::I16 => "i16",
+            Dtype::U32 => "u32",
             Dtype::I32 => "i32",
+            Dtype::U64 => "u64",
+            Dtype::I64 => "i64",
             Dtype::F32 => "f32",
             Dtype::F64 => "f64",
         }
+    }
+
+    pub fn from_wire_name(name: &str) -> Option<Self> {
+        match name {
+            "u8" => Some(Dtype::U8),
+            "i8" => Some(Dtype::I8),
+            "u16" => Some(Dtype::U16),
+            "i16" => Some(Dtype::I16),
+            "u32" => Some(Dtype::U32),
+            "i32" => Some(Dtype::I32),
+            "u64" => Some(Dtype::U64),
+            "i64" => Some(Dtype::I64),
+            "f32" => Some(Dtype::F32),
+            "f64" => Some(Dtype::F64),
+            _ => None,
+        }
+    }
+
+    pub fn byte_width(self) -> usize {
+        match self {
+            Dtype::U8 | Dtype::I8 => 1,
+            Dtype::U16 | Dtype::I16 => 2,
+            Dtype::U32 | Dtype::I32 | Dtype::F32 => 4,
+            Dtype::U64 | Dtype::I64 | Dtype::F64 => 8,
+        }
+    }
+
+    pub fn alignment(self) -> usize {
+        self.byte_width()
     }
 }
 
@@ -320,4 +385,39 @@ pub struct MethodDecl {
     pub err: Option<String>,
     /// Projections this method appears in (see [`FnDecl::targets`]).
     pub targets: Vec<Target>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Dtype;
+
+    #[test]
+    fn every_dtype_has_stable_wire_name_width_and_alignment() {
+        for (dtype, name, width) in [
+            (Dtype::U8, "u8", 1),
+            (Dtype::I8, "i8", 1),
+            (Dtype::U16, "u16", 2),
+            (Dtype::I16, "i16", 2),
+            (Dtype::U32, "u32", 4),
+            (Dtype::I32, "i32", 4),
+            (Dtype::U64, "u64", 8),
+            (Dtype::I64, "i64", 8),
+            (Dtype::F32, "f32", 4),
+            (Dtype::F64, "f64", 8),
+        ] {
+            assert_eq!(dtype.wire_name(), name);
+            assert_eq!(Dtype::from_wire_name(name), Some(dtype));
+            assert_eq!(dtype.byte_width(), width);
+            assert_eq!(dtype.alignment(), width);
+            assert_eq!(
+                serde_json::to_string(&dtype).unwrap(),
+                format!(r#""{name}""#)
+            );
+            assert_eq!(
+                serde_json::from_str::<Dtype>(&format!(r#""{name}""#)).unwrap(),
+                dtype
+            );
+        }
+        assert_eq!(Dtype::from_wire_name("usize"), None);
+    }
 }

@@ -7,5 +7,23 @@
  */
 
 export { instantiate, type BridgeModule } from "./module.js";
-export { callFn, callDrop, type SliceArg } from "./call.js";
-export { RspytsError, RspytsPanicError, StaleHandleError, registerError } from "./errors.js";
+export {
+  callFn,
+  callDrop,
+  floatFromWire,
+  i64FromWire,
+  i64ToWire,
+  jsonFromWire,
+  u64FromWire,
+  u64ToWire,
+  type SliceArg,
+} from "./call.js";
+export { wireBuffer } from "./envelope.js";
+export {
+  InstancePoisonedError,
+  RspytsError,
+  RspytsPanicError,
+  StaleHandleError,
+  type BridgeErrorRegistry,
+  registerError,
+} from "./errors.js";

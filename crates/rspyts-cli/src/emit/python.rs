@@ -1,7 +1,7 @@
 //! The Python emitter (codegen.md §4, §7).
 //!
 //! Produces the seven files of the wholly-owned `generated` package.
-//! Output targets Python ≥ 3.13, 4-space indent, double quotes, and
+//! Output targets Python ≥ 3.11, 4-space indent, double quotes, and
 //! passes `ruff check --select E,F,I,N,UP,RUF` at line-length 120.
 //! Models are emitted in dependency order (recursion is impossible in
 //! the type system), so forward references only appear in the cycle
@@ -49,7 +49,9 @@ fn is_imported(m: &Manifest, decl: &TypeDecl, imports: &BTreeMap<String, String>
 /// plus one variant class per data-enum variant.
 fn projected_names(decl: &TypeDecl) -> Vec<String> {
     match decl {
-        TypeDecl::Struct { name, .. } | TypeDecl::StringEnum { name, .. } => vec![name.clone()],
+        TypeDecl::Newtype { name, .. }
+        | TypeDecl::Struct { name, .. }
+        | TypeDecl::StringEnum { name, .. } => vec![name.clone()],
         TypeDecl::Enum { name, variants, .. } => std::iter::once(name.clone())
             .chain(variants.iter().map(|v| format!("{name}{}", v.name)))
             .collect(),
@@ -57,6 +59,12 @@ fn projected_names(decl: &TypeDecl) -> Vec<String> {
             .chain(variants.iter().map(|v| format!("{name}{}", v.name)))
             .collect(),
     }
+}
+
+fn error_registry_name(name: &str) -> String {
+    let shouty = heck::ToShoutySnakeCase::to_shouty_snake_case(name);
+    let base = shouty.strip_suffix("_ERROR").unwrap_or(&shouty);
+    format!("{base}_ERROR_TYPES")
 }
 
 // ---------------------------------------------------------------- models.py
@@ -81,11 +89,29 @@ fn models_py(m: &Manifest, hash: &str, imports: &BTreeMap<String, String>) -> St
         };
         body.push_str("\n\n");
         match decl {
+            TypeDecl::Newtype {
+                name, docs, inner, ..
+            } => {
+                uses_any |= uses_json(inner);
+                if !doc_lines(docs).is_empty() {
+                    for line in doc_lines(docs) {
+                        if line.trim().is_empty() {
+                            body.push_str("#\n");
+                        } else {
+                            body.push_str(&format!("# {line}\n"));
+                        }
+                    }
+                }
+                body.push_str(&format!(
+                    "{name}: typing.TypeAlias = {}\n",
+                    py_type(inner, true, &quote)
+                ));
+            }
             TypeDecl::Struct {
                 name, docs, fields, ..
             } => {
                 uses_any |= fields.iter().any(|f| uses_json(&f.ty));
-                body.push_str(&format!("class {name}(Contract):\n"));
+                body.push_str(&format!("class {name}(rspyts.Contract):\n"));
                 body.push_str(&py_docstring(docs, "    "));
                 if fields.is_empty() && doc_lines(docs).is_empty() {
                     body.push_str("    pass\n");
@@ -105,16 +131,16 @@ fn models_py(m: &Manifest, hash: &str, imports: &BTreeMap<String, String>) -> St
                 variants,
                 ..
             } => {
-                body.push_str(&format!("class {name}(StrEnum):\n"));
+                body.push_str(&format!("class {name}(enum.StrEnum):\n"));
                 body.push_str(&py_docstring(docs, "    "));
                 if !doc_lines(docs).is_empty() && !variants.is_empty() {
                     body.push('\n');
                 }
                 for v in variants {
                     body.push_str(&format!(
-                        "    {} = \"{}\"\n",
+                        "    {} = {}\n",
                         heck::ToShoutySnakeCase::to_shouty_snake_case(v.name.as_str()),
-                        v.wire_name
+                        py_string(&v.wire_name)
                     ));
                 }
             }
@@ -180,6 +206,9 @@ fn foreign_import_lines(m: &Manifest, imports: &BTreeMap<String, String>) -> Vec
         if is_imported(m, decl, imports) {
             continue;
         }
+        if let TypeDecl::Newtype { inner, .. } = decl {
+            collect_refs(inner, &mut refs);
+        }
         let fields: Vec<&FieldDecl> = match decl {
             TypeDecl::Struct { fields, .. } => fields.iter().collect(),
             TypeDecl::Enum { variants, .. } => {
@@ -222,6 +251,9 @@ fn data_types_in_dependency_order<'m>(
     let names: BTreeSet<&str> = data.iter().map(|t| t.name()).collect();
     let deps = |t: &TypeDecl| -> BTreeSet<String> {
         let mut refs = BTreeSet::new();
+        if let TypeDecl::Newtype { inner, .. } = t {
+            collect_refs(inner, &mut refs);
+        }
         let fields: Vec<&FieldDecl> = match t {
             TypeDecl::Struct { fields, .. } => fields.iter().collect(),
             TypeDecl::Enum { variants, .. } => {
@@ -255,7 +287,7 @@ fn data_types_in_dependency_order<'m>(
 
 /// One pydantic model field line (4-space indent).
 fn field_line(field: &FieldDecl, quote: &dyn Fn(&str) -> bool) -> String {
-    let name = py_name(&field.wire_name);
+    let name = py_name(&field.name);
     let is_opt = field.optional || matches!(field.ty, Ty::Option { .. });
     // Bounded integers at the top level of a field move their bounds
     // into the `Field(...)` default instead of `Annotated[...]`.
@@ -274,7 +306,7 @@ fn field_line(field: &FieldDecl, quote: &dyn Fn(&str) -> bool) -> String {
         args.push("default=None".to_string());
     }
     if !py_alias_roundtrips(&name, &field.wire_name) {
-        args.push(format!("alias=\"{}\"", field.wire_name));
+        args.push(format!("alias={}", py_string(&field.wire_name)));
     }
     if let Some((lo, hi)) = top_bounds {
         args.push(format!("ge={lo}"));
@@ -283,19 +315,19 @@ fn field_line(field: &FieldDecl, quote: &dyn Fn(&str) -> bool) -> String {
     let default = match args.as_slice() {
         [] => String::new(),
         [only] if only == "default=None" => " = None".to_string(),
-        _ => format!(" = Field({})", args.join(", ")),
+        _ => format!(" = pydantic.Field({})", args.join(", ")),
     };
     format!("    {name}: {annotation}{default}\n")
 }
 
-/// One data-enum variant model, e.g. `class ThresholdEventCrossed(Contract)`.
+/// One data-enum variant model, e.g. `class ValueEventAccepted(rspyts.Contract)`.
 fn variant_class(
     enum_name: &str,
     tag: &str,
     v: &VariantDecl,
     quote: &dyn Fn(&str) -> bool,
 ) -> String {
-    let mut out = format!("class {enum_name}{}(Contract):\n", v.name);
+    let mut out = format!("class {enum_name}{}(rspyts.Contract):\n", v.name);
     out.push_str(&py_docstring(&v.docs, "    "));
     // ruff format separates a class docstring from the first member with
     // one blank line.
@@ -303,15 +335,15 @@ fn variant_class(
         out.push('\n');
     }
     let tag_attr = py_name(tag);
+    let wire = py_string(&v.wire_name);
     if py_alias_roundtrips(&tag_attr, tag) {
         out.push_str(&format!(
-            "    {tag_attr}: Literal[\"{w}\"] = \"{w}\"\n",
-            w = v.wire_name
+            "    {tag_attr}: typing.Literal[{wire}] = {wire}\n"
         ));
     } else {
         out.push_str(&format!(
-            "    {tag_attr}: Literal[\"{w}\"] = Field(default=\"{w}\", alias=\"{tag}\")\n",
-            w = v.wire_name
+            "    {tag_attr}: typing.Literal[{wire}] = pydantic.Field(default={wire}, alias={})\n",
+            py_string(tag)
         ));
     }
     for field in &v.fields {
@@ -334,7 +366,7 @@ fn union_alias(name: &str, tag: &str, variants: &[VariantDecl]) -> String {
         return format!("{name} = {}\n", members[0]);
     }
     let joined = members.join(" | ");
-    let mut out = format!("{name} = Annotated[\n");
+    let mut out = format!("{name} = typing.Annotated[\n");
     // 4-space indent plus the trailing comma must stay on one line.
     if 4 + joined.len() < LINE_LIMIT {
         out.push_str(&format!("    {joined},\n"));
@@ -348,49 +380,40 @@ fn union_alias(name: &str, tag: &str, variants: &[VariantDecl]) -> String {
         out.push_str(",\n");
     }
     out.push_str(&format!(
-        "    Field(discriminator=\"{}\"),\n]\n",
-        py_name(tag)
+        "    pydantic.Field(discriminator={}),\n]\n",
+        py_string(&py_name(tag))
     ));
     out
 }
 
 /// Imports for models.py, derived from what the body actually uses plus
 /// the foreign `(module, line)` imports, section-sorted for isort.
-fn models_imports(body: &str, uses_any: bool, foreign: &[(String, String)]) -> String {
+fn models_imports(body: &str, _uses_any: bool, foreign: &[(String, String)]) -> String {
     let mut stdlib: Vec<String> = Vec::new();
-    if body.contains("StrEnum") {
-        stdlib.push("from enum import StrEnum".to_string());
+    if body.contains("enum.StrEnum") {
+        stdlib.push("import enum".to_string());
     }
-    let mut typing: Vec<&str> = Vec::new();
-    if body.contains("Annotated[") {
-        typing.push("Annotated");
-    }
-    if uses_any {
-        typing.push("Any");
-    }
-    if body.contains("Literal[") {
-        typing.push("Literal");
-    }
-    if !typing.is_empty() {
-        stdlib.push(format!("from typing import {}", typing.join(", ")));
+    if body.contains("typing.") {
+        stdlib.push("import typing".to_string());
     }
     let mut third: Vec<(String, String)> = foreign.to_vec();
     if body.contains("np.ndarray") {
         third.push(("numpy".to_string(), "import numpy as np".to_string()));
     }
-    if body.contains("Field(") {
-        third.push((
-            "pydantic".to_string(),
-            "from pydantic import Field".to_string(),
-        ));
+    if body.contains("pydantic.Field(") {
+        third.push(("pydantic".to_string(), "import pydantic".to_string()));
     }
-    if body.contains("(Contract)") {
-        third.push((
-            "rspyts".to_string(),
-            "from rspyts import Contract".to_string(),
-        ));
+    if body.contains("rspyts.") {
+        third.push(("rspyts".to_string(), "import rspyts".to_string()));
     }
-    third.sort();
+    third.sort_by(|(left_module, left_line), (right_module, right_line)| {
+        let left_rank = usize::from(!left_line.starts_with("import "));
+        let right_rank = usize::from(!right_line.starts_with("import "));
+        left_rank
+            .cmp(&right_rank)
+            .then(left_module.cmp(right_module))
+            .then(left_line.cmp(right_line))
+    });
     let mut out = String::new();
     if !stdlib.is_empty() {
         out.push('\n');
@@ -428,14 +451,11 @@ fn errors_py(m: &Manifest, hash: &str, imports: &BTreeMap<String, String>) -> St
             continue;
         };
         if is_imported(m, t, imports) {
-            // The foreign package's own errors module registers these
-            // classes with the runtime on import; re-import for export.
+            // Import the classes and the call-scoped map used by wrappers.
             let module = imports[t.origin()].as_str();
-            let names = projected_names(t);
-            foreign.push((
-                module.to_string(),
-                format!("from {module} import {}  # noqa: F401", names.join(", ")),
-            ));
+            let mut names = projected_names(t);
+            names.push(error_registry_name(name));
+            foreign.push((module.to_string(), wrap_reexport_import(module, &names)));
         } else {
             local.push((name, docs, variants));
         }
@@ -444,22 +464,35 @@ fn errors_py(m: &Manifest, hash: &str, imports: &BTreeMap<String, String>) -> St
         return out;
     }
 
+    let converts_exact = local.iter().any(|(_, _, variants)| {
+        variants.iter().any(|variant| {
+            variant
+                .fields
+                .iter()
+                .any(|field| py_exact_from_wire("value", &field.ty, m, 0).is_some())
+        })
+    });
+    if converts_exact {
+        out.push_str("\nimport typing\n");
+    }
+
     let mut third: Vec<(String, String)> = foreign;
     if !local.is_empty() {
         third.push(("rspyts".to_string(), "import rspyts".to_string()));
     }
     third.sort();
     out.push('\n');
-    let lines: Vec<&str> = third.iter().map(|(_, l)| l.as_str()).collect();
+    let lines: Vec<&str> = third.iter().map(|(_, l)| l.trim_end()).collect();
     out.push_str(&lines.join("\n"));
     out.push('\n');
 
     for (name, docs, variants) in &local {
         out.push_str("\n\n");
-        out.push_str(&error_class(name, "rspyts.BridgeError", docs, &[]));
+        out.push_str(&error_class(m, name, "rspyts.BridgeError", docs, &[]));
         for v in *variants {
             out.push_str("\n\n");
             out.push_str(&error_class(
+                m,
                 &format!("{name}{}", v.name),
                 name,
                 &v.docs,
@@ -467,27 +500,43 @@ fn errors_py(m: &Manifest, hash: &str, imports: &BTreeMap<String, String>) -> St
             ));
         }
     }
-    if !local.is_empty() {
-        out.push_str("\n\n");
-    }
     for (name, _, variants) in &local {
+        out.push_str("\n\n");
+        out.push_str(&format!(
+            "{}: rspyts.BridgeErrorRegistry = {{\n",
+            error_registry_name(name)
+        ));
         for v in *variants {
             out.push_str(&format!(
-                "rspyts.register_error(\"{}\", {name}{})\n",
-                v.wire_code, v.name
+                "    {}: {name}{},\n",
+                py_string(&v.wire_code),
+                v.name
             ));
         }
+        out.push_str("}\n");
     }
     out
 }
 
-fn error_class(name: &str, base: &str, docs: &str, data_fields: &[FieldDecl]) -> String {
+fn error_class(
+    m: &Manifest,
+    name: &str,
+    base: &str,
+    docs: &str,
+    data_fields: &[FieldDecl],
+) -> String {
     let data_note = if data_fields.is_empty() {
         String::new()
     } else {
         let entries: Vec<String> = data_fields
             .iter()
-            .map(|f| format!("\"{}\": {}", f.wire_name, py_type(&f.ty, false, &|_| false)))
+            .map(|f| {
+                format!(
+                    "{}: {}",
+                    py_string(&f.wire_name),
+                    py_type(&f.ty, false, &|_| false)
+                )
+            })
             .collect();
         format!("# .data: {{{}}}", entries.join(", "))
     };
@@ -499,6 +548,44 @@ fn error_class(name: &str, base: &str, docs: &str, data_fields: &[FieldDecl]) ->
         "  # noqa: N818"
     };
     let docstring = py_docstring(docs, "    ");
+    let conversions: Vec<String> = data_fields
+        .iter()
+        .filter_map(|field| {
+            let key = py_string(&field.wire_name);
+            let access = format!("data[{key}]");
+            py_exact_from_wire(&access, &field.ty, m, 0)
+                .map(|converted| format!("{key}: {converted}"))
+        })
+        .collect();
+    if !conversions.is_empty() {
+        let mut out = format!("class {name}({base}):{noqa}\n");
+        out.push_str(&docstring);
+        if !docstring.is_empty() {
+            out.push('\n');
+        }
+        if !data_note.is_empty() {
+            out.push_str(&format!("    {data_note}\n\n"));
+        }
+        out.push_str(
+            "    def __init__(self, message: str, *, code: str, data: typing.Any | None = None) -> None:\n",
+        );
+        out.push_str("        if data is not None:\n");
+        let one_line = format!(
+            "            data = {{**data, {}}}\n",
+            conversions.join(", ")
+        );
+        if one_line.trim_end().len() <= LINE_LIMIT {
+            out.push_str(&one_line);
+        } else {
+            out.push_str("            data = {\n                **data,\n");
+            for conversion in &conversions {
+                out.push_str(&format!("                {conversion},\n"));
+            }
+            out.push_str("            }\n");
+        }
+        out.push_str("        super().__init__(message, code=code, data=data)\n");
+        return out;
+    }
     if docstring.is_empty() {
         if data_note.is_empty() {
             format!("class {name}({base}): ...{noqa}\n")
@@ -521,24 +608,24 @@ fn library_py(m: &Manifest, hash: &str, library_search: &[String]) -> String {
         "\"\"\"\nLoader for the compiled `{}` bridge library.\n\"\"\"\n",
         m.crate_name
     ));
-    out.push_str("\nfrom pathlib import Path\n\nfrom rspyts import Library\n\n");
-    out.push_str("LIB = Library(\n");
+    out.push_str("\nimport pathlib\n\nimport rspyts\n\n");
+    out.push_str("LIB = rspyts.Library(\n");
     out.push_str(&format!(
-        "    name=\"{}\",\n",
-        m.crate_name.replace('-', "_")
+        "    name={},\n",
+        py_string(&m.crate_name.replace('-', "_"))
     ));
     if library_search.is_empty() {
         out.push_str("    search=[],\n");
     } else {
         out.push_str("    search=[\n");
         for dir in library_search {
-            out.push_str(&format!("        \"{dir}\",\n"));
+            out.push_str(&format!("        {},\n", py_string(dir)));
         }
         out.push_str("    ],\n");
     }
     // Relative search entries must resolve against the generated package
     // directory, not the process cwd (codegen.md §4.1).
-    out.push_str("    anchor=Path(__file__).parent,\n");
+    out.push_str("    anchor=pathlib.Path(__file__).parent,\n");
     out.push_str(")\n");
     out
 }
@@ -548,7 +635,6 @@ fn library_py(m: &Manifest, hash: &str, library_search: &[String]) -> String {
 fn constants_py(m: &Manifest, hash: &str) -> String {
     let mut body = String::new();
     let mut model_imports: BTreeSet<String> = BTreeSet::new();
-    let mut uses_any = false;
     for c in &m.constants {
         body.push('\n');
         for line in doc_lines(&c.docs) {
@@ -558,13 +644,12 @@ fn constants_py(m: &Manifest, hash: &str) -> String {
                 body.push_str(&format!("# {line}\n"));
             }
         }
-        uses_any |= uses_json(&c.ty);
         let mut refs = BTreeSet::new();
         collect_refs(&c.ty, &mut refs);
         model_imports.extend(refs);
         let annotation = py_type(&c.ty, false, &|_| false);
         let expr = py_const_expr(m, &c.ty, &c.value, &mut model_imports);
-        let head = format!("{}: Final[{annotation}] = ", c.name);
+        let head = format!("{}: typing.Final[{annotation}] = ", c.name);
         let one = format!("{head}{expr}");
         if one.len() <= LINE_LIMIT {
             body.push_str(&one);
@@ -582,8 +667,10 @@ fn constants_py(m: &Manifest, hash: &str) -> String {
         m.crate_name
     ));
     if !m.constants.is_empty() {
-        let typing = if uses_any { "Any, Final" } else { "Final" };
-        out.push_str(&format!("\nfrom typing import {typing}\n"));
+        out.push_str("\nimport typing\n");
+        if body.contains("rspyts.") {
+            out.push_str("\nimport rspyts\n");
+        }
         if !model_imports.is_empty() {
             let names: Vec<String> = model_imports.into_iter().collect();
             out.push('\n');
@@ -604,7 +691,12 @@ fn py_const_expr(
     model_imports: &mut BTreeSet<String>,
 ) -> String {
     match ty {
+        Ty::Json => value
+            .get("__rspyts_json__")
+            .map(py_json)
+            .unwrap_or_else(|| py_json(value)),
         Ty::Ref { name } => match find_type(m, name) {
+            Some(TypeDecl::Newtype { inner, .. }) => py_const_expr(m, inner, value, model_imports),
             Some(TypeDecl::Struct { .. }) => {
                 format!("{name}.model_validate({})", py_json(value))
             }
@@ -652,6 +744,21 @@ fn py_const_expr(
                     .collect();
                 format!("{{{}}}", rendered.join(", "))
             }
+            None => py_json(value),
+        },
+        Ty::Tuple { items: item_types } => match value.as_array() {
+            Some(items) if items.len() == item_types.len() => {
+                let rendered: Vec<String> = item_types
+                    .iter()
+                    .zip(items)
+                    .map(|(ty, value)| py_const_expr(m, ty, value, model_imports))
+                    .collect();
+                format!("({})", rendered.join(", "))
+            }
+            _ => py_json(value),
+        },
+        Ty::I64 | Ty::U64 => match value.as_str() {
+            Some(value) => format!("int({})", py_json(&serde_json::Value::String(value.into()))),
             None => py_json(value),
         },
         _ => py_json(value),
@@ -715,9 +822,6 @@ fn functions_py(m: &Manifest, hash: &str) -> String {
     let mut body = String::new();
     let mut model_imports: BTreeSet<String> = BTreeSet::new();
     let mut uses_np = false;
-    let uses_any = fns
-        .iter()
-        .any(|f| uses_json(&f.ret) || f.params.iter().any(|p| uses_json(&p.ty)));
     for f in &fns {
         body.push_str("\n\n");
         body.push_str(&function_def(m, f, &mut model_imports, &mut uses_np));
@@ -726,15 +830,21 @@ fn functions_py(m: &Manifest, hash: &str) -> String {
     let mut out = py_header(hash);
     out.push_str("\"\"\"\nTyped wrappers for bridged free functions.\n\"\"\"\n");
     if !fns.is_empty() {
-        if uses_any {
-            out.push_str("\nfrom typing import Any\n");
-        }
-        if uses_np {
-            out.push_str("\nimport numpy as np\n");
+        if uses_np || body.contains("rspyts.") {
+            out.push('\n');
+            if uses_np {
+                out.push_str("import numpy as np\n");
+            }
+            if body.contains("rspyts.") {
+                out.push_str("import rspyts\n");
+            }
         }
         out.push('\n');
-        // `errors` is imported for its import-time register_error calls.
-        out.push_str("from . import errors, library  # noqa: F401\n");
+        if body.contains("errors.") {
+            out.push_str("from . import errors, library\n");
+        } else {
+            out.push_str("from . import library\n");
+        }
         if !model_imports.is_empty() {
             let names: Vec<String> = model_imports.into_iter().collect();
             out.push_str(&wrap_from_import(".models", &names));
@@ -761,6 +871,7 @@ fn function_def(
         &args_entries(m, &f.params),
         &slice_params(&f.params),
         false,
+        f.err.as_deref(),
     ));
     out.push_str(&return_stmts(m, &f.ret, "    ", model_imports));
     out
@@ -780,17 +891,22 @@ fn classes_py(m: &Manifest, hash: &str) -> String {
     let mut out = py_header(hash);
     out.push_str("\"\"\"\nHandle classes for bridged Rust objects.\n\"\"\"\n");
     if !m.classes.is_empty() {
-        if m.classes.iter().any(class_uses_json) {
-            out.push_str("\nfrom typing import Any, Self\n");
-        } else {
-            out.push_str("\nfrom typing import Self\n");
-        }
-        if uses_np {
-            out.push_str("\nimport numpy as np\n");
+        out.push_str("\nimport typing\n");
+        if uses_np || body.contains("rspyts.") {
+            out.push('\n');
+            if uses_np {
+                out.push_str("import numpy as np\n");
+            }
+            if body.contains("rspyts.") {
+                out.push_str("import rspyts\n");
+            }
         }
         out.push('\n');
-        // `errors` is imported for its import-time register_error calls.
-        out.push_str("from . import errors, library  # noqa: F401\n");
+        if body.contains("errors.") {
+            out.push_str("from . import errors, library\n");
+        } else {
+            out.push_str("from . import library\n");
+        }
         if !model_imports.is_empty() {
             let names: Vec<String> = model_imports.into_iter().collect();
             out.push_str(&wrap_from_import(".models", &names));
@@ -841,6 +957,7 @@ fn class_def(
                 &args_entries(m, &ctor.params),
                 &slice_params(&ctor.params),
                 false,
+                ctor.err.as_deref(),
             ));
             if class_level_handle {
                 out.push_str("        self.handle = raw\n");
@@ -880,7 +997,7 @@ fn class_def(
             out.push_str("    @classmethod\n");
             let mut params = vec![("cls".to_string(), String::new())];
             params.extend(py_params(m, &s.params, model_imports, uses_np));
-            out.push_str(&def_line("        ", &s.name, &params, "Self", 4));
+            out.push_str(&def_line("        ", &s.name, &params, "typing.Self", 4));
             out.push_str(&py_docstring(&s.docs, "        "));
             out.push_str(&call_block(
                 "        ",
@@ -889,6 +1006,7 @@ fn class_def(
                 &args_entries(m, &s.params),
                 &slice_params(&s.params),
                 false,
+                s.err.as_deref(),
             ));
             out.push_str("        obj = cls.__new__(cls)\n");
             out.push_str("        obj.handle = raw\n");
@@ -906,6 +1024,7 @@ fn class_def(
                 &args_entries(m, &s.params),
                 &slice_params(&s.params),
                 false,
+                s.err.as_deref(),
             ));
             out.push_str(&return_stmts(m, &s.ret, "        ", model_imports));
         }
@@ -929,6 +1048,7 @@ fn class_def(
             &args_entries(m, &method.params),
             &slice_params(&method.params),
             true,
+            method.err.as_deref(),
         ));
         out.push_str(&return_stmts(m, &method.ret, "        ", model_imports));
     }
@@ -942,7 +1062,7 @@ fn class_def(
         \"\"\"
         library.LIB.call_drop(\"rspyts_cls__{name}__drop\", self.handle)
 
-    def __enter__(self) -> Self:
+    def __enter__(self) -> typing.Self:
         return self
 
     def __exit__(self, *exc: object) -> None:
@@ -965,7 +1085,10 @@ fn init_py(m: &Manifest, hash: &str) -> String {
     let mut error_names: Vec<String> = Vec::new();
     for t in &m.types {
         match t {
-            TypeDecl::ErrorEnum { .. } => error_names.extend(projected_names(t)),
+            TypeDecl::ErrorEnum { name, .. } => {
+                error_names.extend(projected_names(t));
+                error_names.push(error_registry_name(name));
+            }
             _ => model_names.extend(projected_names(t)),
         }
     }
@@ -1024,6 +1147,10 @@ fn init_py(m: &Manifest, hash: &str) -> String {
 }
 
 // ------------------------------------------------------------------ shared
+
+fn py_string(value: &str) -> String {
+    serde_json::to_string(value).expect("serializing a string cannot fail")
+}
 
 /// Names the wrapper bodies reference at module scope: the sibling
 /// modules imported at the top of `functions.py`/`classes.py` and the
@@ -1088,6 +1215,7 @@ fn uses_ndarray(ty: &Ty) -> bool {
         Ty::Buf { .. } | Ty::Slice { .. } => true,
         Ty::Option { inner } | Ty::List { inner } => uses_ndarray(inner),
         Ty::Map { value } => uses_ndarray(value),
+        Ty::Tuple { items } => items.iter().any(uses_ndarray),
         _ => false,
     }
 }
@@ -1097,27 +1225,9 @@ fn uses_json(ty: &Ty) -> bool {
         Ty::Json => true,
         Ty::Option { inner } | Ty::List { inner } => uses_json(inner),
         Ty::Map { value } => uses_json(value),
+        Ty::Tuple { items } => items.iter().any(uses_json),
         _ => false,
     }
-}
-
-/// True when any Python-projected part of `class` needs `typing.Any`.
-fn class_uses_json(class: &ClassDecl) -> bool {
-    let in_params = |params: &[ParamDecl]| params.iter().any(|p| uses_json(&p.ty));
-    class
-        .constructor
-        .as_ref()
-        .is_some_and(|c| in_params(&c.params))
-        || class
-            .statics
-            .iter()
-            .filter(|s| s.targets.contains(&Target::Python))
-            .any(|s| in_params(&s.params) || (!s.returns_self && uses_json(&s.ret)))
-        || class
-            .methods
-            .iter()
-            .filter(|method| method.targets.contains(&Target::Python))
-            .any(|method| in_params(&method.params) || uses_json(&method.ret))
 }
 
 /// `def name(params) -> ret:` wrapped when past the line limit.
@@ -1162,7 +1272,7 @@ fn args_entries(m: &Manifest, params: &[ParamDecl]) -> Vec<String> {
         .map(|p| {
             let expr = py_param_name(&p.name);
             let converted = py_conv(&expr, &p.ty, m, Dir::Dump, 0).unwrap_or(expr);
-            format!("\"{}\": {converted}", p.wire_name)
+            format!("{}: {converted}", py_string(&p.wire_name))
         })
         .collect()
 }
@@ -1186,6 +1296,7 @@ fn call_block(
     args: &[String],
     slices: &[(String, Dtype)],
     handle: bool,
+    err: Option<&str>,
 ) -> String {
     let assign = if matches!(ret, Ty::Unit) {
         ""
@@ -1208,6 +1319,12 @@ fn call_block(
     }
     if handle {
         out.push_str(&format!("{indent}    handle=self.handle,\n"));
+    }
+    if let Some(err) = err {
+        out.push_str(&format!(
+            "{indent}    error_types=errors.{},\n",
+            error_registry_name(err)
+        ));
     }
     out.push_str(&format!("{indent})\n"));
     out
@@ -1248,14 +1365,15 @@ fn return_stmts(
             for v in variants {
                 model_imports.insert(format!("{name}{}", v.name));
                 out.push_str(&format!(
-                    "{indent}    \"{}\": {name}{},\n",
-                    v.wire_name, v.name
+                    "{indent}    {}: {name}{},\n",
+                    py_string(&v.wire_name),
+                    v.name
                 ));
             }
             out.push_str(&format!("{indent}}}\n"));
             out.push_str(&format!(
-                "{indent}return variants[raw[\"{}\"]].model_validate(raw)\n",
-                tag
+                "{indent}return variants[raw[{}]].model_validate(raw)\n",
+                py_string(tag)
             ));
             return out;
         }
@@ -1292,16 +1410,37 @@ enum Dir {
 }
 
 /// The conversion expression for `expr: ty`, or `None` when the value
-/// passes through unchanged (scalars, strings, buffers, `Json`, string
-/// enums on dump).
+/// passes through unchanged (scalars, strings, buffers, string enums on
+/// dump, and nested `Json` values handled by their pydantic alias).
 fn py_conv(expr: &str, ty: &Ty, m: &Manifest, dir: Dir, depth: usize) -> Option<String> {
     match ty {
-        Ty::Ref { name } => match (find_type(m, name), dir) {
-            (Some(TypeDecl::Struct { .. }), Dir::Dump) => {
-                Some(format!("{expr}.model_dump(by_alias=True, mode=\"json\")"))
+        Ty::F32 | Ty::F64 if matches!(dir, Dir::Validate) => {
+            Some(format!("rspyts.float_from_wire({expr})"))
+        }
+        Ty::Json => match dir {
+            Dir::Dump => Some(format!("rspyts.json_to_wire({expr})")),
+            Dir::Validate => None,
+        },
+        Ty::I64 => Some(format!(
+            "rspyts.{}({expr})",
+            match dir {
+                Dir::Dump => "i64_to_wire",
+                Dir::Validate => "i64_from_wire",
             }
-            (Some(TypeDecl::Enum { .. }), Dir::Dump) => {
-                Some(format!("{expr}.model_dump(by_alias=True, mode=\"json\")"))
+        )),
+        Ty::U64 => Some(format!(
+            "rspyts.{}({expr})",
+            match dir {
+                Dir::Dump => "u64_to_wire",
+                Dir::Validate => "u64_from_wire",
+            }
+        )),
+        Ty::Ref { name } => match (find_type(m, name), dir) {
+            (Some(TypeDecl::Newtype { inner, .. }), _) => py_conv(expr, inner, m, dir, depth),
+            (Some(decl @ TypeDecl::Struct { .. }), Dir::Dump)
+            | (Some(decl @ TypeDecl::Enum { .. }), Dir::Dump) => {
+                let _ = decl;
+                Some(format!("{expr}.model_dump(by_alias=True, mode=\"python\")"))
             }
             (Some(TypeDecl::StringEnum { .. }), Dir::Dump) => None,
             (Some(TypeDecl::Struct { .. }), Dir::Validate) => {
@@ -1310,11 +1449,12 @@ fn py_conv(expr: &str, ty: &Ty, m: &Manifest, dir: Dir, depth: usize) -> Option<
             (Some(TypeDecl::Enum { tag, variants, .. }), Dir::Validate) => {
                 let pairs: Vec<String> = variants
                     .iter()
-                    .map(|v| format!("\"{}\": {name}{}", v.wire_name, v.name))
+                    .map(|v| format!("{}: {name}{}", py_string(&v.wire_name), v.name))
                     .collect();
                 Some(format!(
-                    "{{{}}}[{expr}[\"{tag}\"]].model_validate({expr})",
-                    pairs.join(", ")
+                    "{{{}}}[{expr}[{}]].model_validate({expr})",
+                    pairs.join(", "),
+                    py_string(tag)
                 ))
             }
             (Some(TypeDecl::StringEnum { .. }), Dir::Validate) => Some(format!("{name}({expr})")),
@@ -1340,8 +1480,107 @@ fn py_conv(expr: &str, ty: &Ty, m: &Manifest, dir: Dir, depth: usize) -> Option<
             py_conv(&v, value, m, dir, depth + 1)
                 .map(|conv| format!("{{{k}: {conv} for {k}, {v} in {expr}.items()}}"))
         }
+        Ty::Tuple { items } => {
+            let mut changed = false;
+            let converted: Vec<String> = items
+                .iter()
+                .enumerate()
+                .map(|(index, item)| {
+                    let access = format!("{expr}[{index}]");
+                    match py_conv(&access, item, m, dir, depth + 1) {
+                        Some(converted) => {
+                            changed = true;
+                            converted
+                        }
+                        None => access,
+                    }
+                })
+                .collect();
+            changed.then(|| format!("({})", converted.join(", ")))
+        }
         _ => None,
     }
+}
+
+/// Validate structured floats and convert exact integers inside raw
+/// error-data dictionaries. Error payloads stay dictionaries while scalar
+/// wire invariants are restored at every nested position.
+fn py_exact_from_wire(expr: &str, ty: &Ty, m: &Manifest, depth: usize) -> Option<String> {
+    match ty {
+        Ty::Json => Some(format!("rspyts.json_from_wire({expr})")),
+        Ty::F32 | Ty::F64 => Some(format!("rspyts.float_from_wire({expr})")),
+        Ty::I64 => Some(format!("rspyts.i64_from_wire({expr})")),
+        Ty::U64 => Some(format!("rspyts.u64_from_wire({expr})")),
+        Ty::Option { inner } => py_exact_from_wire(expr, inner, m, depth)
+            .map(|converted| format!("None if {expr} is None else {converted}")),
+        Ty::List { inner } => {
+            let item = format!("item{depth}");
+            py_exact_from_wire(&item, inner, m, depth + 1)
+                .map(|converted| format!("[{converted} for {item} in {expr}]"))
+        }
+        Ty::Map { value } => {
+            let key = format!("key{depth}");
+            let item = format!("value{depth}");
+            py_exact_from_wire(&item, value, m, depth + 1).map(|converted| {
+                format!("{{{key}: {converted} for {key}, {item} in {expr}.items()}}")
+            })
+        }
+        Ty::Tuple { items } => {
+            let mut changed = false;
+            let converted = items
+                .iter()
+                .enumerate()
+                .map(|(index, item)| {
+                    let access = format!("{expr}[{index}]");
+                    match py_exact_from_wire(&access, item, m, depth + 1) {
+                        Some(converted) => {
+                            changed = true;
+                            converted
+                        }
+                        None => access,
+                    }
+                })
+                .collect::<Vec<_>>();
+            changed.then(|| format!("({})", converted.join(", ")))
+        }
+        Ty::Ref { name } => match find_type(m, name) {
+            Some(TypeDecl::Newtype { inner, .. }) => py_exact_from_wire(expr, inner, m, depth),
+            Some(TypeDecl::Struct { fields, .. }) => py_exact_object(expr, fields, m, depth),
+            Some(TypeDecl::Enum { tag, variants, .. }) => {
+                let mut arms = Vec::new();
+                for variant in variants {
+                    if let Some(converted) = py_exact_object(expr, &variant.fields, m, depth) {
+                        arms.push(format!(
+                            "{converted} if {expr}[{}] == {}",
+                            py_string(tag),
+                            py_string(&variant.wire_name)
+                        ));
+                    }
+                }
+                (!arms.is_empty()).then(|| format!("{} else {expr}", arms.join(" else ")))
+            }
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn py_exact_object(expr: &str, fields: &[FieldDecl], m: &Manifest, depth: usize) -> Option<String> {
+    let converted = fields
+        .iter()
+        .filter_map(|field| {
+            let key = py_string(&field.wire_name);
+            let access = format!("{expr}[{key}]");
+            let value = py_exact_from_wire(&access, &field.ty, m, depth + 1)?;
+            let value = if field.optional {
+                format!("{value} if {key} in {expr} else None")
+            } else {
+                value
+            };
+            Some(format!("{key}: {value}"))
+        })
+        .collect::<Vec<_>>();
+    (!converted.is_empty()).then(|| format!("{{**{expr}, {}}}", converted.join(", ")))
 }
 
 /// `from {module} import a, b, c`, parenthesized past the line limit.
@@ -1358,9 +1597,24 @@ fn wrap_from_import(module: &str, names: &[String]) -> String {
     out
 }
 
+fn wrap_reexport_import(module: &str, names: &[String]) -> String {
+    let one = format!("from {module} import {}  # noqa: F401", names.join(", "));
+    if one.len() <= LINE_LIMIT {
+        return one;
+    }
+    let mut out = format!("from {module} import (  # noqa: F401\n");
+    for name in names {
+        out.push_str(&format!("    {name},\n"));
+    }
+    out.push(')');
+    out
+}
+
 #[cfg(test)]
 mod tests {
-    use super::super::test_manifest::{FOREIGN_ORIGIN, manifest, manifest_hash};
+    use super::super::test_manifest::{
+        FOREIGN_ORIGIN, binary_manifest, exact_manifest, manifest, manifest_hash,
+    };
     use super::super::util::VERSION;
     use super::*;
 
@@ -1371,7 +1625,7 @@ mod tests {
     fn mapped_imports() -> BTreeMap<String, String> {
         [(
             FOREIGN_ORIGIN.to_string(),
-            "example.catalog.generated".to_string(),
+            "shared_types.generated".to_string(),
         )]
         .into_iter()
         .collect()
@@ -1425,55 +1679,55 @@ mod tests {
 Data models bridged from `demo-crate`.
 """
 
-from enum import StrEnum
-from typing import Annotated, Any, Literal
+import enum
+import typing
 
-from pydantic import Field
-from rspyts import Contract
+import pydantic
+import rspyts
 
 
-class AnalysisParams(Contract):
+class QueryOptions(rspyts.Contract):
     """
-    Parameters controlling the analysis pass.
-    """
-
-    min_duration_s: float
-    threshold: float | None = None
-    metadata: Any
-
-
-class CatalogInfo(Contract):
-    """
-    Catalog description reported by the device.
+    Options controlling value processing.
     """
 
-    vendor: str
-    channel_count: int = Field(ge=0, le=65535)
+    minimum_value: float
+    tolerance: float | None = None
+    metadata: rspyts.JsonValue
 
 
-class Severity(StrEnum):
+class SourceInfo(rspyts.Contract):
+    """
+    Description of an input source.
+    """
+
+    name: str
+    field_count: int = pydantic.Field(ge=0, le=65535)
+
+
+class Severity(enum.StrEnum):
     LOW = "low"
     MEDIUM = "medium"
     HIGH = "high"
 
 
-class ThresholdEventCrossed(Contract):
-    kind: Literal["crossed"] = "crossed"
-    at_sample: int = Field(ge=0, le=4294967295)
+class ValueEventAccepted(rspyts.Contract):
+    kind: typing.Literal["accepted"] = "accepted"
+    index: int = pydantic.Field(ge=0, le=4294967295)
     value: float
 
 
-class ThresholdEventCleared(Contract):
-    kind: Literal["cleared"] = "cleared"
-    at_sample: int = Field(ge=0, le=4294967295)
+class ValueEventRejected(rspyts.Contract):
+    kind: typing.Literal["rejected"] = "rejected"
+    index: int = pydantic.Field(ge=0, le=4294967295)
 
 
-ThresholdEvent = Annotated[
-    ThresholdEventCrossed | ThresholdEventCleared,
-    Field(discriminator="kind"),
+ValueEvent = typing.Annotated[
+    ValueEventAccepted | ValueEventRejected,
+    pydantic.Field(discriminator="kind"),
 ]
 """
-Signal threshold transitions.
+Value-processing transitions.
 """
 "#,
         );
@@ -1489,21 +1743,21 @@ Signal threshold transitions.
 Constants bridged from `demo-crate`.
 """
 
-from typing import Final
+import typing
 
-from .models import AnalysisParams
+from .models import QueryOptions
 
-# Baseline analysis parameters.
-DEFAULT_PARAMS: Final[AnalysisParams] = AnalysisParams.model_validate(
-    {"minDurationS": 0.5, "threshold": None, "metadata": {"rev": 2}}
+# Baseline processing options.
+DEFAULT_OPTIONS: typing.Final[QueryOptions] = QueryOptions.model_validate(
+    {"minimumValue": 0.5, "tolerance": None, "metadata": {"rev": 2}}
 )
 
-DEFAULT_THRESHOLD: Final[float] = 0.75
+DEFAULT_LIMIT: typing.Final[float] = 0.75
 
-# Name reported by the analysis engine.
-ENGINE_NAME: Final[str] = "neuro-engine"
+# Name reported by the value processor.
+PROCESSOR_NAME: typing.Final[str] = "vector-processor"
 
-SUPPORTED_UNITS: Final[list[str]] = ["uV", "mV"]
+SUPPORTED_FORMATS: typing.Final[list[str]] = ["csv", "json"]
 "#,
         );
         assert_text_eq(&emitted("constants.py"), &expected, "constants.py");
@@ -1521,20 +1775,22 @@ Exception classes bridged from `demo-crate`.
 import rspyts
 
 
-class AnalysisError(rspyts.BridgeError): ...
+class QueryError(rspyts.BridgeError): ...
 
 
-class AnalysisErrorInvalidSampleRate(AnalysisError):  # noqa: N818
+class QueryErrorInvalidBatchSize(QueryError):  # noqa: N818
     """
-    The sample rate must be positive.
+    The batch size must be positive.
     """
 
 
-class AnalysisErrorWindowTooLarge(AnalysisError): ...  # noqa: N818  # .data: {"max": int}
+class QueryErrorBatchTooLarge(QueryError): ...  # noqa: N818  # .data: {"max": int}
 
 
-rspyts.register_error("invalidSampleRate", AnalysisErrorInvalidSampleRate)
-rspyts.register_error("windowTooLarge", AnalysisErrorWindowTooLarge)
+QUERY_ERROR_TYPES: rspyts.BridgeErrorRegistry = {
+    "invalidBatchSize": QueryErrorInvalidBatchSize,
+    "batchTooLarge": QueryErrorBatchTooLarge,
+}
 "#,
         );
         assert_text_eq(&emitted("errors.py"), &expected, "errors.py");
@@ -1549,17 +1805,17 @@ rspyts.register_error("windowTooLarge", AnalysisErrorWindowTooLarge)
 Loader for the compiled `demo-crate` bridge library.
 """
 
-from pathlib import Path
+import pathlib
 
-from rspyts import Library
+import rspyts
 
-LIB = Library(
+LIB = rspyts.Library(
     name="demo_crate",
     search=[
         "../../../rust/target/debug",
         "../../../rust/target/release",
     ],
-    anchor=Path(__file__).parent,
+    anchor=pathlib.Path(__file__).parent,
 )
 "#,
         );
@@ -1568,7 +1824,7 @@ LIB = Library(
 
     #[test]
     fn functions_py_matches_golden() {
-        // `render_report` is TypeScript-only: it must not appear here.
+        // `render_summary` is TypeScript-only: it must not appear here.
         let expected = golden(
             r#"# Code generated by rspyts v@VERSION@. DO NOT EDIT.
 # rspyts:manifest-hash sha256:@HASH@
@@ -1578,18 +1834,19 @@ Typed wrappers for bridged free functions.
 
 import numpy as np
 
-from . import errors, library  # noqa: F401
-from .models import AnalysisParams
+from . import errors, library
+from .models import QueryOptions
 
 
-def analyze_signal(samples: np.ndarray, sample_rate: int, params: AnalysisParams) -> np.ndarray:
+def process_values(values: np.ndarray, batch_size: int, options: QueryOptions) -> np.ndarray:
     """
-    Analyze a signal buffer.
+    Process a buffer of numeric values.
     """
     raw = library.LIB.call(
-        "rspyts_fn__analyze_signal",
-        {"sampleRate": sample_rate, "params": params.model_dump(by_alias=True, mode="json")},
-        slices=((samples, "f64"),),
+        "rspyts_fn__process_values",
+        {"batchSize": batch_size, "options": options.model_dump(by_alias=True, mode="python")},
+        slices=((values, "f64"),),
+        error_types=errors.QUERY_ERROR_TYPES,
     )
     return raw
 "#,
@@ -1606,32 +1863,34 @@ def analyze_signal(samples: np.ndarray, sample_rate: int, params: AnalysisParams
 Handle classes for bridged Rust objects.
 """
 
-from typing import Self
+import typing
 
 import numpy as np
+import rspyts
 
-from . import errors, library  # noqa: F401
-from .models import AnalysisParams, CatalogInfo
+from . import errors, library
+from .models import QueryOptions, SourceInfo
 
 
-class Recording:
+class Session:
     """
-    A recorded session backed by a native handle.
+    A processing session backed by a native handle.
     """
 
     handle: int
 
     def __init__(self) -> None:
-        raise TypeError("Recording cannot be constructed directly; use Recording.open(...)")
+        raise TypeError("Session cannot be constructed directly; use Session.open(...)")
 
     @classmethod
-    def open(cls, path: str) -> Self:
+    def open(cls, path: str) -> typing.Self:
         """
-        Open a recording from disk.
+        Open a processing session from disk.
         """
         raw = library.LIB.call(
-            "rspyts_cls__Recording__open",
+            "rspyts_cls__Session__open",
             {"path": path},
+            error_types=errors.QUERY_ERROR_TYPES,
         )
         obj = cls.__new__(cls)
         obj.handle = raw
@@ -1640,36 +1899,36 @@ class Recording:
     @staticmethod
     def default_extension() -> str:
         raw = library.LIB.call(
-            "rspyts_cls__Recording__default_extension",
+            "rspyts_cls__Session__default_extension",
             {},
         )
         return raw
 
-    def duration_s(self) -> float:
+    def progress(self) -> float:
         """
-        Total duration in seconds.
+        Current completion ratio.
         """
         raw = library.LIB.call(
-            "rspyts_cls__Recording__duration_s",
+            "rspyts_cls__Session__progress",
             {},
             handle=self.handle,
         )
-        return raw
+        return rspyts.float_from_wire(raw)
 
-    def info(self) -> CatalogInfo:
+    def info(self) -> SourceInfo:
         raw = library.LIB.call(
-            "rspyts_cls__Recording__info",
+            "rspyts_cls__Session__info",
             {},
             handle=self.handle,
         )
-        return CatalogInfo.model_validate(raw)
+        return SourceInfo.model_validate(raw)
 
-    def preload(self) -> None:
+    def warm_up(self) -> None:
         """
-        Eagerly load samples into memory.
+        Prepare the session for processing.
         """
         library.LIB.call(
-            "rspyts_cls__Recording__preload",
+            "rspyts_cls__Session__warm_up",
             {},
             handle=self.handle,
         )
@@ -1678,9 +1937,9 @@ class Recording:
         """
         Release the underlying Rust object. Safe to call more than once.
         """
-        library.LIB.call_drop("rspyts_cls__Recording__drop", self.handle)
+        library.LIB.call_drop("rspyts_cls__Session__drop", self.handle)
 
-    def __enter__(self) -> Self:
+    def __enter__(self) -> typing.Self:
         return self
 
     def __exit__(self, *exc: object) -> None:
@@ -1708,13 +1967,13 @@ class RunningStats:
         self.handle = raw
 
     @classmethod
-    def resumed(cls, state: AnalysisParams) -> Self:
+    def resumed(cls, state: QueryOptions) -> typing.Self:
         """
         Rebuild from a snapshot.
         """
         raw = library.LIB.call(
             "rspyts_cls__RunningStats__resumed",
-            {"state": state.model_dump(by_alias=True, mode="json")},
+            {"state": state.model_dump(by_alias=True, mode="python")},
         )
         obj = cls.__new__(cls)
         obj.handle = raw
@@ -1728,7 +1987,7 @@ class RunningStats:
             handle=self.handle,
         )
 
-    def snapshot(self) -> AnalysisParams:
+    def snapshot(self) -> QueryOptions:
         """
         Snapshot current state.
         """
@@ -1737,7 +1996,7 @@ class RunningStats:
             {},
             handle=self.handle,
         )
-        return AnalysisParams.model_validate(raw)
+        return QueryOptions.model_validate(raw)
 
     def close(self) -> None:
         """
@@ -1745,7 +2004,7 @@ class RunningStats:
         """
         library.LIB.call_drop("rspyts_cls__RunningStats__drop", self.handle)
 
-    def __enter__(self) -> Self:
+    def __enter__(self) -> typing.Self:
         return self
 
     def __exit__(self, *exc: object) -> None:
@@ -1770,36 +2029,42 @@ class RunningStats:
 Generated bridge surface for `demo-crate`.
 """
 
-from .classes import Recording, RunningStats
-from .constants import DEFAULT_PARAMS, DEFAULT_THRESHOLD, ENGINE_NAME, SUPPORTED_UNITS
-from .errors import AnalysisError, AnalysisErrorInvalidSampleRate, AnalysisErrorWindowTooLarge
-from .functions import analyze_signal
+from .classes import RunningStats, Session
+from .constants import DEFAULT_LIMIT, DEFAULT_OPTIONS, PROCESSOR_NAME, SUPPORTED_FORMATS
+from .errors import (
+    QUERY_ERROR_TYPES,
+    QueryError,
+    QueryErrorBatchTooLarge,
+    QueryErrorInvalidBatchSize,
+)
+from .functions import process_values
 from .models import (
-    AnalysisParams,
-    CatalogInfo,
+    QueryOptions,
     Severity,
-    ThresholdEvent,
-    ThresholdEventCleared,
-    ThresholdEventCrossed,
+    SourceInfo,
+    ValueEvent,
+    ValueEventAccepted,
+    ValueEventRejected,
 )
 
 __all__ = [
-    "DEFAULT_PARAMS",
-    "DEFAULT_THRESHOLD",
-    "ENGINE_NAME",
-    "SUPPORTED_UNITS",
-    "AnalysisError",
-    "AnalysisErrorInvalidSampleRate",
-    "AnalysisErrorWindowTooLarge",
-    "AnalysisParams",
-    "CatalogInfo",
-    "Recording",
+    "DEFAULT_LIMIT",
+    "DEFAULT_OPTIONS",
+    "PROCESSOR_NAME",
+    "QUERY_ERROR_TYPES",
+    "SUPPORTED_FORMATS",
+    "QueryError",
+    "QueryErrorBatchTooLarge",
+    "QueryErrorInvalidBatchSize",
+    "QueryOptions",
     "RunningStats",
+    "Session",
     "Severity",
-    "ThresholdEvent",
-    "ThresholdEventCleared",
-    "ThresholdEventCrossed",
-    "analyze_signal",
+    "SourceInfo",
+    "ValueEvent",
+    "ValueEventAccepted",
+    "ValueEventRejected",
+    "process_values",
 ]
 "#,
         );
@@ -1813,21 +2078,19 @@ __all__ = [
         // The class body is gone; the mapped import (kept for __init__
         // re-export, hence the noqa) replaces it.
         assert!(
-            models.contains(
-                "from example.catalog.generated import CatalogInfo  # noqa: F401\n"
-            ),
+            models.contains("from shared_types.generated import SourceInfo  # noqa: F401\n"),
             "{models}"
         );
-        assert!(!models.contains("class CatalogInfo"), "{models}");
+        assert!(!models.contains("class SourceInfo"), "{models}");
 
         // __init__ re-exports it exactly like a local model.
         let init = &files.iter().find(|(n, _)| *n == "__init__.py").unwrap().1;
-        assert!(init.contains("CatalogInfo"), "{init}");
+        assert!(init.contains("SourceInfo"), "{init}");
 
         // classes.py keeps importing it via .models, which re-exports.
         let classes = &files.iter().find(|(n, _)| *n == "classes.py").unwrap().1;
         assert!(
-            classes.contains("from .models import AnalysisParams, CatalogInfo"),
+            classes.contains("from .models import QueryOptions, SourceInfo"),
             "{classes}"
         );
     }
@@ -1837,8 +2100,11 @@ __all__ = [
         // No [python.imports] entry: origin is ignored, output stays
         // self-contained.
         let models = emitted("models.py");
-        assert!(models.contains("class CatalogInfo(Contract):"), "{models}");
-        assert!(!models.contains("example"), "{models}");
+        assert!(
+            models.contains("class SourceInfo(rspyts.Contract):"),
+            "{models}"
+        );
+        assert!(!models.contains("shared_types.generated"), "{models}");
     }
 
     #[test]
@@ -1853,16 +2119,21 @@ __all__ = [
         let files = emit(&m, &hash, &[], &mapped_imports());
         let errors = &files.iter().find(|(n, _)| *n == "errors.py").unwrap().1;
         assert!(
-            errors.contains(
-                "from example.catalog.generated import AnalysisError, \
-                 AnalysisErrorInvalidSampleRate, AnalysisErrorWindowTooLarge  # noqa: F401\n"
-            ),
+            errors.contains("from shared_types.generated import (  # noqa: F401"),
             "{errors}"
         );
-        // The foreign package registers its own error codes on import.
-        assert!(!errors.contains("class AnalysisError"), "{errors}");
+        for name in [
+            "QueryError,",
+            "QueryErrorInvalidBatchSize,",
+            "QueryErrorBatchTooLarge,",
+            "QUERY_ERROR_TYPES,",
+        ] {
+            assert!(errors.contains(name), "{errors}");
+        }
+        // The foreign package exports the registry used by local wrappers.
+        assert!(!errors.contains("class QueryError"), "{errors}");
         assert!(!errors.contains("register_error"), "{errors}");
-        assert!(!errors.contains("import rspyts"), "{errors}");
+        assert!(errors.contains("QUERY_ERROR_TYPES"), "{errors}");
     }
 
     #[test]
@@ -1870,11 +2141,11 @@ __all__ = [
         let mut m = manifest();
         if let TypeDecl::Struct { fields, .. } = &mut m.types[1] {
             fields.push(FieldDecl {
-                name: "catalog".to_string(),
-                wire_name: "catalog".to_string(),
+                name: "source".to_string(),
+                wire_name: "source".to_string(),
                 docs: String::new(),
                 ty: Ty::Ref {
-                    name: "CatalogInfo".to_string(),
+                    name: "SourceInfo".to_string(),
                 },
                 optional: false,
             });
@@ -1885,10 +2156,10 @@ __all__ = [
         let files = emit(&m, &hash, &[], &mapped_imports());
         let models = &files.iter().find(|(n, _)| *n == "models.py").unwrap().1;
         assert!(
-            models.contains("from example.catalog.generated import CatalogInfo\n"),
+            models.contains("from shared_types.generated import SourceInfo\n"),
             "{models}"
         );
-        assert!(!models.contains("CatalogInfo  # noqa"), "{models}");
+        assert!(!models.contains("SourceInfo  # noqa"), "{models}");
     }
 
     #[test]
@@ -1899,7 +2170,7 @@ __all__ = [
         assert_eq!(py_json(&json!(false)), "False");
         assert_eq!(py_json(&json!(-3)), "-3");
         assert_eq!(py_json(&json!(0.75)), "0.75");
-        assert_eq!(py_json(&json!("uV \"quoted\"")), r#""uV \"quoted\"""#);
+        assert_eq!(py_json(&json!("csv \"quoted\"")), r#""csv \"quoted\"""#);
         assert_eq!(
             py_json(&json!({"a": [1, null], "b": {"c": false}})),
             r#"{"a": [1, None], "b": {"c": False}}"#
@@ -1928,14 +2199,14 @@ __all__ = [
             py_const_expr(
                 &m,
                 &Ty::Ref {
-                    name: "ThresholdEvent".into()
+                    name: "ValueEvent".into()
                 },
-                &json!({"kind": "cleared", "atSample": 7}),
+                &json!({"kind": "rejected", "index": 7}),
                 &mut imports
             ),
-            "ThresholdEventCleared.model_validate({\"kind\": \"cleared\", \"atSample\": 7})"
+            "ValueEventRejected.model_validate({\"kind\": \"rejected\", \"index\": 7})"
         );
-        assert!(imports.contains("ThresholdEventCleared"));
+        assert!(imports.contains("ValueEventRejected"));
         // Lists of refs construct element-wise.
         assert_eq!(
             py_const_expr(
@@ -1967,8 +2238,8 @@ __all__ = [
     #[test]
     fn split_call_finds_the_wrap_point() {
         assert_eq!(
-            split_call("AnalysisParams.model_validate({\"a\": 1})"),
-            Some(("AnalysisParams.model_validate", "{\"a\": 1}"))
+            split_call("QueryOptions.model_validate({\"a\": 1})"),
+            Some(("QueryOptions.model_validate", "{\"a\": 1}"))
         );
         assert_eq!(
             split_call("Severity(\"low\")"),
@@ -1983,16 +2254,16 @@ __all__ = [
         let m = manifest();
         let ty = Ty::Option {
             inner: Box::new(Ty::Ref {
-                name: "AnalysisParams".into(),
+                name: "QueryOptions".into(),
             }),
         };
         assert_eq!(
             py_conv("params", &ty, &m, Dir::Dump, 0).unwrap(),
-            "None if params is None else params.model_dump(by_alias=True, mode=\"json\")"
+            "None if params is None else params.model_dump(by_alias=True, mode=\"python\")"
         );
         assert_eq!(
             py_conv("raw", &ty, &m, Dir::Validate, 0).unwrap(),
-            "None if raw is None else AnalysisParams.model_validate(raw)"
+            "None if raw is None else QueryOptions.model_validate(raw)"
         );
     }
 
@@ -2001,17 +2272,87 @@ __all__ = [
         let m = manifest();
         let ty = Ty::List {
             inner: Box::new(Ty::Ref {
-                name: "AnalysisParams".into(),
+                name: "QueryOptions".into(),
             }),
         };
         assert_eq!(
             py_conv("items", &ty, &m, Dir::Dump, 0).unwrap(),
-            "[item.model_dump(by_alias=True, mode=\"json\") for item in items]"
+            "[item.model_dump(by_alias=True, mode=\"python\") for item in items]"
         );
         assert_eq!(
             py_conv("raw", &ty, &m, Dir::Validate, 0).unwrap(),
-            "[AnalysisParams.model_validate(item) for item in raw]"
+            "[QueryOptions.model_validate(item) for item in raw]"
         );
+    }
+
+    #[test]
+    fn binary_newtype_fixture_projects_without_adapters() {
+        let mut m = binary_manifest();
+        if let Some(TypeDecl::Newtype { docs, .. }) = m
+            .types
+            .iter_mut()
+            .find(|decl| matches!(decl, TypeDecl::Newtype { name, .. } if name == "PacketId"))
+        {
+            *docs = "Stable packet identifier.\n\nUsed on the wire.".to_string();
+        }
+        let hash = manifest_hash(&m);
+        let files = emit(&m, &hash, &[], &no_imports());
+        let models = &files.iter().find(|(n, _)| *n == "models.py").unwrap().1;
+        let functions = &files.iter().find(|(n, _)| *n == "functions.py").unwrap().1;
+
+        assert!(
+            models.contains(
+                "PacketId: typing.TypeAlias = typing.Annotated[int, pydantic.Field(ge=0, le=4294967295)]"
+            )
+        );
+        assert!(models.contains("    payload: bytes\n"));
+        assert!(models.contains("    samples: np.ndarray\n"));
+        assert!(models.contains("    chunks: list[np.ndarray]\n"));
+        assert!(models.contains("    channels: dict[str, np.ndarray]\n"));
+        assert!(models.contains("# Stable packet identifier.\n#\n# Used on the wire.\n"));
+        assert!(!models.contains("# \n"));
+        assert!(functions.contains("value.model_dump(by_alias=True, mode=\"python\")"));
+        assert!(functions.contains("def echo_bytes(value: bytes) -> bytes:"));
+        assert!(functions.contains("def echo_u8(value: np.ndarray) -> np.ndarray:"));
+    }
+
+    #[test]
+    fn exact_tuple_and_mixed_fixture_projects_recursive_conversions() {
+        let m = exact_manifest();
+        crate::validate::validate(&m).expect("fixture validates");
+        let hash = manifest_hash(&m);
+        let files = emit(&m, &hash, &[], &no_imports());
+        let file = |name| files.iter().find(|(n, _)| *n == name).unwrap().1.as_str();
+        let models = file("models.py");
+        let functions = file("functions.py");
+        let constants = file("constants.py");
+        let errors = file("errors.py");
+
+        assert!(models.contains("    sequence: SequenceId\n"));
+        assert!(models.contains("    delta: rspyts.I64\n"));
+        assert!(models.contains("    pair: tuple[rspyts.I64, rspyts.U64]\n"));
+        assert!(models.contains(
+            "class MixedResultPending(rspyts.Contract):\n    type: typing.Literal[\"pending\"]"
+        ));
+        assert!(models.contains("class MixedResultReady(rspyts.Contract):"));
+        assert!(
+            functions.contains(
+                "{\"value\": (rspyts.i64_to_wire(value[0]), rspyts.u64_to_wire(value[1]))}"
+            )
+        );
+        assert!(
+            functions
+                .contains("return (rspyts.i64_from_wire(raw[0]), rspyts.u64_from_wire(raw[1]))")
+        );
+        assert!(constants.contains("EXACT_PAIR: typing.Final[tuple[rspyts.I64, rspyts.U64]] = ("));
+        assert!(
+            constants.contains("(int(\"-9223372036854775808\"), int(\"18446744073709551615\"))")
+        );
+        assert!(
+            constants
+                .contains("MAX_SEQUENCE: typing.Final[SequenceId] = int(\"18446744073709551615\")")
+        );
+        assert!(errors.contains("rspyts.u64_from_wire(data[\"exactLimit\"])"));
     }
 
     #[test]
@@ -2052,11 +2393,29 @@ __all__ = [
     }
 
     #[test]
-    fn scalars_buffers_and_json_pass_through() {
+    fn hostile_serde_name_is_escaped_without_changing_the_wire_key() {
+        let field = FieldDecl {
+            name: "r#class".to_string(),
+            wire_name: "line\n\"quote-dash".to_string(),
+            docs: String::new(),
+            ty: Ty::String,
+            optional: false,
+        };
+        assert_eq!(
+            field_line(&field, &|_| false),
+            "    class_: str = pydantic.Field(alias=\"line\\n\\\"quote-dash\")\n"
+        );
+    }
+
+    #[test]
+    fn scalars_and_buffers_pass_through_while_json_is_wrapped() {
         let m = manifest();
         assert!(py_conv("x", &Ty::U32, &m, Dir::Dump, 0).is_none());
         assert!(py_conv("x", &Ty::Buf { dt: Dtype::F64 }, &m, Dir::Validate, 0).is_none());
-        assert!(py_conv("x", &Ty::Json, &m, Dir::Dump, 0).is_none());
+        assert_eq!(
+            py_conv("x", &Ty::Json, &m, Dir::Dump, 0).as_deref(),
+            Some("rspyts.json_to_wire(x)")
+        );
         assert!(py_conv("x", &Ty::Json, &m, Dir::Validate, 0).is_none());
         assert!(
             py_conv(

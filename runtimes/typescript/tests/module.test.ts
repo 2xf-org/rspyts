@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { instantiate } from "../src/module.js";
+import { instantiate, isPoisoned } from "../src/module.js";
 
 /**
  * Hand-assembled minimal wasm module: one exported memory (1 page) and a
@@ -19,7 +19,7 @@ function buildTinyModule(options: {
    * the real memory — a "memory" export that is not a WebAssembly.Memory. */
   memoryAsFunction?: boolean;
 } = {}) {
-  const { abiVersion = 1, exportMemory = true, exportAbi = true, memoryAsFunction = false } = options;
+  const { abiVersion = 2, exportMemory = true, exportAbi = true, memoryAsFunction = false } = options;
 
   const uleb = (value: number): number[] => {
     const out: number[] = [];
@@ -79,6 +79,7 @@ describe("instantiate", () => {
     expect(mod.memory).toBeInstanceOf(WebAssembly.Memory);
     expect(mod.exports["rspyts_abi_version"]).toBeTypeOf("function");
     expect(mod.memory.buffer.byteLength).toBe(65536);
+    expect(isPoisoned(mod)).toBe(false);
   });
 
   it("accepts a precompiled WebAssembly.Module", async () => {
@@ -105,14 +106,14 @@ describe("instantiate", () => {
   });
 
   it("rejects a module reporting a different ABI version", async () => {
-    await expect(instantiate(buildTinyModule({ abiVersion: 2 }))).rejects.toThrow(
-      /ABI version mismatch: module reports 2/,
+    await expect(instantiate(buildTinyModule({ abiVersion: 1 }))).rejects.toThrow(
+      /ABI version mismatch: module reports 1/,
     );
   });
 
   it("names both versions and a remedy in the ABI mismatch error", async () => {
     await expect(instantiate(buildTinyModule({ abiVersion: 0 }))).rejects.toThrow(
-      /module reports 0, this runtime requires 1 — regenerate/,
+      /module reports 0, this runtime requires 2 — regenerate/,
     );
   });
 

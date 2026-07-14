@@ -5,7 +5,7 @@ use serde::ser::SerializeStruct;
 
 /// Well-known error codes used by the bridge itself.
 pub mod codes {
-    /// A panic crossed the shim boundary (envelope status 2).
+    /// A panic was caught at the shim boundary (envelope status 2).
     pub const PANIC: &str = "panic";
     /// The args payload failed to deserialize.
     pub const INVALID_ARGS: &str = "invalidArgs";

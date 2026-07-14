@@ -1,300 +1,269 @@
-# The rspyts portable type system
+# Type system
 
-rspyts does not try to bridge every Rust type. It defines a deliberate,
-closed subset that maps losslessly onto JSON, Python 3.13+ (pydantic v2), and
-TypeScript. A type is bridgeable if and only if it appears in this document.
-The single source of truth for a shape is the Rust definition; the pydantic
-model, the TypeScript type, the JSON Schema, and the bytes on the wire are
-all mechanical projections of it.
+rspyts supports a closed set of Rust shapes that map predictably to JSON,
+Python 3.11+, TypeScript, and JSON Schema.
 
-## 1. Scalars
+If a shape is not listed here, it is not part of the bridge.
 
-| Rust | wire (JSON) | Python | TypeScript | JSON Schema |
-|---|---|---|---|---|
-| `bool` | true/false | `bool` | `boolean` | `boolean` |
-| `u8` `u16` `u32` | number | `int` (ge/le bounds) | `number` | `integer` + min/max |
-| `i8` `i16` `i32` | number | `int` (ge/le bounds) | `number` | `integer` + min/max |
-| `f32` `f64` | number | `float` | `number` | `number` |
-| `String` | string | `str` | `string` | `string` |
-| `()` (return only) | null | `None` | `void` | `null` |
+## Scalars
 
-**Rejected scalars** — `u64`, `i64`, `u128`, `i128`, `usize`, `isize`,
-`char`. JavaScript numbers lose integer precision above 2^53; rather than
-silently corrupt, rspyts refuses to compile them (the `Bridged` trait is
-simply not implemented) with a diagnostic suggesting `u32`/`i32` or `String`.
-This is a spec decision, not a limitation to be "fixed".
-
-Integer bounds are enforced at the boundary: pydantic validates
-`ge`/`le`; Rust's serde rejects out-of-range on deserialize.
-
-## 2. Composites
-
-| Rust | wire | Python | TypeScript |
+| Rust | Wire | Python | TypeScript |
 |---|---|---|---|
-| `Option<T>` | `T` or null | `T \| None` | `T \| null` |
-| `Vec<T>` | array | `list[T]` | `T[]` |
-| `HashMap<String, T>`, `BTreeMap<String, T>` | object | `dict[str, T]` | `Record<string, T>` |
-| bridged struct | object | pydantic model | interface |
-| bridged enum | §4 | tagged union | discriminated union |
-| `rspyts::Json` (§11) | any JSON value | `Any` | `unknown` |
+| `bool` | boolean | `bool` | `boolean` |
+| `u8`, `u16`, `u32` | bounded integer | `int` | `number` |
+| `i8`, `i16`, `i32` | bounded integer | `int` | `number` |
+| `rspyts::I64` | canonical signed decimal string | `int` | `bigint` |
+| `rspyts::U64` | canonical unsigned decimal string | `int` | `bigint` |
+| `f32`, `f64` | finite number | `float` | `number` |
+| `String`, `&str` parameter | string | `str` | `string` |
+| `()` return | null | `None` | `void` |
 
-Nesting is unrestricted (`Vec<Option<Foo>>`, `HashMap<String, Vec<Bar>>`, …).
-Map keys must be `String` in v0.1. Tuples are not bridgeable (name the
-fields — define a struct).
+Bare `i64`, `u64`, `i128`, `u128`, `isize`, `usize`, and `char` are not
+bridgeable. JavaScript cannot represent every 64-bit integer as `number`, so
+full-range values must use the explicit wrappers.
 
-`Option<T>` fields serialize as `null` when `None` (not omitted); pydantic
-models mark them with a `None` default so they may be omitted on input.
+Exact integer strings contain no leading zeroes, no plus sign, and no negative
+zero. Range and canonical form are checked in both runtimes.
 
-## 3. Structs
+Structured floats must be finite. Generated runtimes reject NaN and infinities
+in JSON positions and normalize returned negative zero. Numeric attachments
+preserve raw IEEE values.
+
+## Composites
+
+| Rust | Python | TypeScript |
+|---|---|---|
+| `Option<T>` | `T | None` | `T | null` |
+| `Vec<T>` | `list[T]` | `T[]` |
+| `HashMap<String, T>` | `dict[str, T]` | `Record<string, T>` |
+| `BTreeMap<String, T>` | `dict[str, T]` | `Record<string, T>` |
+| tuple of 2–12 items | fixed tuple | fixed tuple |
+| bridged newtype | named alias | named alias |
+| bridged struct | pydantic model | interface |
+| bridged enum | enum or discriminated union | literal or discriminated union |
+| `rspyts::Bytes` | `bytes` | `Uint8Array` |
+| `rspyts::Buf<T>` | `numpy.ndarray` | typed array |
+| `rspyts::Json` | `rspyts.JsonValue` | `unknown` |
+
+Composites may nest. Map keys are strings. A one-item tuple should be a
+transparent newtype; tuples longer than 12 should become named structs.
+
+## Structs
 
 ```rust
 #[bridge]
-/// Summary statistics for a list of numbers.
 pub struct Summary {
-    /// How many values were summarized.
     pub item_count: u32,
+    pub average: f64,
     pub label: Option<String>,
 }
 ```
 
-- Wire field names are **camelCase** (`itemCount`). Overridable per
-  struct: `#[bridge(rename_all = "snake_case")]`.
-- Unknown fields are **rejected** on deserialize (Rust `deny_unknown_fields`,
-  pydantic `extra="forbid"`). Wire compatibility is explicit, never
-  accidental.
-- All fields must themselves be bridgeable. Doc comments propagate to
-  Python docstrings, TS doc comments, and JSON Schema `description`.
-- Generics, lifetimes, and non-`pub` fields are rejected by the macro.
+Default `#[bridge]` owns serialization. It adds Serde derives, camelCase wire
+names, unknown-field rejection, and the internal Serde crate path.
 
-## 4. Enums
+Every field must be public and bridgeable. Generic, lifetime-parameterized,
+unit, and multi-field tuple structs are rejected.
 
-**String enums** (all variants fieldless) map to string literals:
+`Option<T>` fields may be omitted by generated host models, but the wire value
+is explicit null when absent.
 
-```rust
-#[bridge]
-pub enum Rounding { Up, Down, Nearest }
-```
+### Serde adoption
 
-wire: `"up" | "down" | "nearest"` · Python: `enum.StrEnum` subclass ·
-TypeScript: `"up" | "down" | "nearest"` · Schema: `enum`.
-
-**Data enums** (any variant with fields) are internally tagged; every variant
-must use named fields (struct variants). Tag key defaults to `"type"`,
-overridable with `#[bridge(tag = "kind")]`:
+Use adoption when a type already owns a derived Serde contract:
 
 ```rust
-#[bridge(tag = "type")]
-pub enum ParsedNumber {
-    Integer { value: i32 },
-    Decimal { value: f64 },
+#[bridge(serde)]
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+pub struct ExistingRecord {
+    pub record_id: u32,
+    #[serde(rename = "display")]
+    pub display_name: String,
 }
 ```
 
-wire: `{"type": "integer", "value": 42}` ·
-Python: one model per variant + `Annotated[Union[…], Field(discriminator="type")]` ·
-TypeScript: `{ type: "integer"; value: number } | …`.
+Adoption adds no Serde attributes or derives. Both derives are required.
+Object structs and data enums must already use `deny_unknown_fields`, keeping
+Rust and Python rejection behavior aligned.
 
-Tuple variants and mixed fieldless-plus-data enums are rejected in v0.1
-(fieldless variants inside a data enum would serialize asymmetrically).
+rspyts reflects this closed Serde vocabulary:
 
-Variant wire values (string enums) and discriminator values (data enums)
-are always the camelCase variant name — `ChinEmg` is `"chinEmg"` on the
-wire, no exceptions.
+- container `rename`, `rename_all`, `tag`, `transparent`, and
+  `deny_unknown_fields`;
+- field `rename`;
+- variant `rename` and `rename_all`.
 
-## 5. Bulk numeric data
+Directional names, aliases, `flatten`, `skip`, `default`, `untagged`,
+`with`, and custom serializers are rejected. They can change a shape in ways
+the manifest cannot model. Use `rspyts::Json` for an intentionally schemaless
+value.
 
-| Rust | direction | Python | TypeScript |
-|---|---|---|---|
-| `&[u8] &[i16] &[i32] &[f32] &[f64]` | param only | `numpy.ndarray` (or any buffer-protocol object of matching dtype; lists accepted and converted) | `Uint8Array` `Int16Array` `Int32Array` `Float32Array` `Float64Array` |
-| `rspyts::Buf<T>` (same `T` set) | return only (incl. nested in structs) | `numpy.ndarray` | typed array |
+Adopted names remain exact. Generated Python uses safe binding names plus
+pydantic aliases. TypeScript quotes names that are not legal identifiers.
 
-These bypass JSON entirely (see ABI §6). Use them for samples, signals,
-images — anything where element count is large. `Vec<f64>` remains available
-and serializes as a JSON array; prefer it only for small collections.
+## Transparent newtypes
 
-## 6. Functions
+A public one-field tuple struct is transparent:
 
 ```rust
 #[bridge]
-/// Summarize a list of numbers.
+pub struct PacketId(pub u32);
+```
+
+A one-field named struct may use `#[serde(transparent)]`. The wire contains the
+inner value, not an object. Newtypes may not form reference cycles.
+
+## Enums
+
+An enum with only fieldless variants is a string enum:
+
+```rust
+#[bridge]
+pub enum Severity {
+    Low,
+    Medium,
+    High,
+}
+```
+
+Its default wire values are `"low"`, `"medium"`, and `"high"`.
+
+An enum with any data variant is internally tagged. Data variants use named
+fields; unit variants become tag-only objects:
+
+```rust
+#[bridge(tag = "kind")]
+pub enum Event {
+    Pending,
+    Accepted { index: u32, value: f64 },
+    Rejected { index: u32 },
+}
+```
+
+The wire uses `{"kind":"pending"}` or an object containing the tag and
+named fields. Tuple variants are rejected.
+
+## Functions
+
+```rust
+#[bridge]
 pub fn summarize(
     values: &[f64],
     label: Option<String>,
-) -> Result<Summary, BasicError> { … }
-```
-
-- Parameters: any bridgeable type, plus `&T`/`&[T]` borrows of bridgeable
-  types (borrowed params deserialize to owned values on the shim side;
-  `&str` is accepted as `String`).
-- Return: bridgeable type, `()`, or `Result<bridgeable, E>` where
-  `E: BridgeErr`.
-- Generated Python: `def summarize(values: np.ndarray, label: str | None) -> Summary` — errors raise.
-- Generated TS: `summarize(values: Float64Array, label: string | null): Summary` — errors throw.
-
-## 7. Classes (opaque handles)
-
-```rust
-pub struct Counter { /* private state, NOT bridgeable as data */ }
-
-#[bridge]
-impl Counter {
-    #[bridge(constructor)]
-    pub fn new(start: i32, label: String) -> Self { … }
-    pub fn increment(&mut self, by: i32) -> i32 { … }
-    pub fn current_value(&self) -> i32 { … }
+) -> Result<Summary, BasicError> {
+    // ...
 }
 ```
 
-- A `#[bridge] impl` block makes the type an **opaque class**: state lives in
-  Rust; foreign code holds a handle. The struct itself must NOT also be
-  `#[bridge]`-annotated as a data type — a type is data or a class, never both.
-  (Mark the impl block; leave the struct bare.)
-- At most one `#[bridge(constructor)]`; it takes no `self` and returns
-  `Self` or `Result<Self, E>`. A class may instead be built entirely
-  through factories (below); a class with neither a constructor nor a
-  factory is rejected.
-- Methods take `&self` or `&mut self` plus bridgeable params; `self`-by-value
-  is rejected.
-- Python projection: a class with `__enter__`/`__exit__`, `close()`, and
-  `__del__`; methods are typed. TS projection: a class with
-  `free()` and `[Symbol.dispose]`.
+Plain parameters must be bridgeable. Shared `&T` and `&str` parameters are
+decoded into owned values inside the shim and borrowed for the Rust call.
+Top-level numeric `&[T]` parameters use the borrowed slice ABI.
 
-### Statics and factories — `#[bridge(static)]`
+Returns may be a bridgeable value, `()`, or `Result<T, E>` where `E`
+implements `BridgeErr`. Async functions, generics, mutable references,
+callbacks, and arbitrary parameter patterns are rejected.
 
-```rust
-#[bridge]
-impl Recording {
-    /// Open a recording file.
-    #[bridge(static)]
-    pub fn open(path: &str) -> Result<Self, IoError> { … }
-
-    /// The library's default window length.
-    #[bridge(static)]
-    pub fn default_window() -> u32 { 512 }
-
-    pub fn duration_s(&self) -> f64 { … }
-}
-```
-
-- A `#[bridge(static)]` method takes no `self`; parameters and returns
-  follow the free-function rules (§6).
-- Returning `Self` or `Result<Self, E>` (written literally) makes it a
-  **factory**: the instance is stored in the Rust-side slab and the caller
-  receives a fresh handle, exactly as with the constructor. A class may be
-  **factory-only** — no `#[bridge(constructor)]` at all, like `Recording`
-  above.
-- Projections: Python factories are `@classmethod`s returning `Self`,
-  other statics are `@staticmethod`s; TypeScript statics live on the class
-  bound by the client (`client.Recording.open(…)`). Constructing a
-  factory-only class directly raises `TypeError` (Python) / throws (TS).
-- Statics share one name space with methods; `new` and `drop` stay
-  reserved.
-
-## 8. Errors
+## Errors
 
 ```rust
 #[bridge(error)]
 pub enum BasicError {
-    /// The input contained no values.
     EmptyInput,
-    NotANumber { text: String },
+    TooLarge { max: u32 },
 }
-impl std::fmt::Display for BasicError { … }
+
+impl std::fmt::Display for BasicError {
+    // ...
+}
 ```
 
-`#[bridge(error)]` derives `BridgeErr`:
-variant → camelCase `code`, `Display` → `message`, named fields → `data`.
-Python raises a generated exception subclass of `rspyts.BridgeError` with
-`.code`, `.message`, `.data`; TypeScript throws a generated subclass of
-`RspytsError`. Exhaustive per-code subclasses are generated so callers can
-`except BasicErrorNotANumber:` / `catch (e instanceof BasicErrorNotANumber)`.
+The variant name becomes a camelCase code. `Display` supplies the message.
+Named fields become structured data. Error fields may use ordinary structured
+types, exact integers, finite floats, and `Json`, but not `Buf` or `Bytes`:
+error envelopes have no attachment tail.
 
-An error enum is an error, full stop — it cannot also appear as a data type
-in fields or return positions (`rspyts check` rejects it). Its variants may
-be fieldless or carry named fields, and unlike data enums the two may mix.
-The wire `code` is always the camelCase variant name.
+Generated runtimes dispatch through a map scoped to the function's declared
+error enum.
 
-## 9. Deliberately unsupported (v0.1)
+## Constants
 
-Datetimes (use ISO-8601 `String`; `chrono` feature on the roadmap), UUIDs
-(use `String`), `u64`/`i64` and the other rejected scalars (§1), async
-functions and callbacks (every bridged call is synchronous, ABI §11),
-`HashSet`, tuples, unit structs, newtypes, generics, trait objects,
-duck typing (every shape is a nominal, declared type — there is no
-structural typing), references in return position, recursive types
-(compile-time cycle = macro error), and per-item wire renames (deliberate:
-the camelCase convention IS the contract; no legacy-compat surface).
+`#[bridge]` supports scalar constants, `&'static str`, arrays and static
+slices of supported values, tuples, and const-constructible owned bridged
+types.
 
-Every rejection is a compile-time error at the Rust definition site — never
-a runtime surprise in Python or TypeScript.
+The generator captures the serialized value from the compiled manifest and
+emits a host constant. `Buf` and `Bytes` are rejected because constants have
+no attachment tail. Structured float constants must be finite.
 
-## 10. Constants
+## Binary data
+
+The attachment dtypes are:
+
+```text
+u8 i8 u16 i16 u32 i32 u64 i64 f32 f64
+```
+
+Every numeric element is little-endian and naturally aligned in the envelope
+tail.
+
+- `Bytes` carries opaque bytes and may be nested in owned data.
+- `Buf<T>` carries owned numeric data and may be nested in owned data.
+- `&[T]` is a top-level parameter only and is borrowed by Rust for one call.
+
+Host runtimes copy top-level slice input into private storage before the call.
+Owned inputs are decoded into Rust-owned storage. Returned values are copied
+into host-owned storage. No attachment creates a cross-language lifetime.
+
+`Bytes` and `Buf<u8>` both appear as `Uint8Array` in TypeScript. Generated
+code marks declared `Buf<u8>` values so the runtime keeps the distinction.
+
+## Stateful classes
+
+Mark an impl block, not its backing struct:
 
 ```rust
-#[bridge]
-/// Sample rate every analysis assumes.
-pub const SAMPLE_RATE_HZ: f64 = 256.0;
+pub struct Counter {
+    value: i32,
+}
 
 #[bridge]
-pub const CHANNEL_LABELS: &[&str] = &["chin_emg", "leg_emg"];
+impl Counter {
+    #[bridge(constructor)]
+    pub fn new(value: i32) -> Self {
+        Self { value }
+    }
+
+    pub fn increment(&mut self, by: i32) -> i32 {
+        self.value += by;
+        self.value
+    }
+}
 ```
 
-The const is re-emitted unchanged; its value is captured with
-`serde_json::to_value` when the manifest is built inside the compiled
-module, and projected as a **real importable constant** in both languages
-(Python: a `Final`-annotated module attribute in `constants.py`;
-TypeScript: an `export const … as const` in `constants.ts`). The
-SCREAMING_SNAKE_CASE name is kept verbatim.
+The foreign class contains only a handle. A class may have one constructor.
+`#[bridge(static)]` exposes statics; a static returning `Self` is a factory.
+A factory-only class is allowed. A class with neither a constructor nor a
+factory is rejected.
 
-Accepted const types — exactly these:
+Methods take `&self` or `&mut self`. Consuming `self` is unsupported.
 
-- **scalars**: `bool`, `u8`/`u16`/`u32`, `i8`/`i16`/`i32`, `f32`/`f64`;
-- **`&'static str`** (a `String` on the wire — `const String` is
-  impossible in Rust, so the borrowed form is special-cased);
-- **arrays and slices of supported types**: `[T; N]`, `&'static [T]`,
-  including `&'static [&'static str]`, nested arbitrarily — each maps to
-  a list;
-- **any owned `Bridged` + `Serialize` type constructible in const
-  context** (e.g. a `#[bridge]` struct with a `const`-buildable shape —
-  such constants project as constructed models/enum members, not plain
-  dicts).
+## Schemaless JSON
 
-Everything else — references other than the forms above, raw pointers,
-function pointers, trait objects — is rejected at expansion time.
-Constants share the generated module's one namespace with types,
-functions, and classes; name collisions are rejected at generate time.
+`rspyts::Json` wraps `serde_json::Value`. Generated APIs expose an ordinary
+host value, but the wire uses the exact wrapper
+`{"__rspyts_json__": value}`. That wrapper prevents user data resembling a
+buffer placeholder from being interpreted as protocol metadata.
 
-## 11. `rspyts::Json` — the schemaless escape hatch
+The shape is not checked. The value must still be valid JSON with finite
+numbers. Prefer a real bridged type whenever the shape is known.
 
-`rspyts::Json` is a serde-transparent newtype over `serde_json::Value`.
-On the wire it is the value itself, verbatim. It projects as `Any` in
-Python, `unknown` in TypeScript, and an unconstrained schema in JSON
-Schema, and it is legal anywhere data is: fields, parameters, returns,
-nested inside `Option`/`Vec`/maps.
+## Target scoping
 
-It exists for payloads whose shape is genuinely decided at runtime —
-plugin parameters, free-form attributes. **Prefer real bridged types
-wherever the shape is actually known**: `Json` contents cross the
-boundary unvalidated, and every consumer inherits the type-checking hole.
+Functions, methods, and statics may use `target = "python"` or
+`target = "typescript"`. The Rust shim still exists; the other emitter omits
+the wrapper. An impl-level target is the default for its methods and statics,
+and a member may override it.
 
-## 12. Target scoping
-
-```rust
-#[bridge(target = "python")]
-pub fn as_numpy_layout(samples: &[f64]) -> Buf<f64> { … }
-```
-
-Free functions, methods, and statics (not types, constants, or
-constructors) can be limited to a single projection with
-`#[bridge(target = "python")]` or `#[bridge(target = "typescript")]`,
-combinable as `#[bridge(static, target = "python")]`. The compiled shim
-always exists; the emitters simply skip the item when generating the
-other language.
-
-On an impl block, `#[bridge(target = "…")]` sets the default for every
-method and static in it — a member's own `target` overrides it, and the
-class itself (its existence and constructor) stays in both projections.
-Larger-scale scoping without touching the Rust source lives in the CLI
-config: the `[python]`/`[typescript]` sections take an
-`exclude = ["glob", …]` list dropping whole items from one projection
-(codegen.md §1).
+Per-language `exclude` patterns in `rspyts.toml` can remove whole items from
+one generated projection. Excluding a still-referenced type is an error.

@@ -53,6 +53,7 @@ pub fn expand_impl(args: BridgeArgs, mut item: syn::ItemImpl) -> syn::Result<Tok
     args.deny_static("the impl block itself; mark the individual method")?;
     args.deny_tag("impl blocks")?;
     args.deny_rename_all("impl blocks")?;
+    args.deny_serde("impl blocks; it adopts Serde derives on data types")?;
     // `target = "…"` on the impl block sets the default for every method
     // and static; a member's own `target` overrides it. The constructor
     // (and the class itself) is never scoped — `CtorDecl` carries no
@@ -224,6 +225,7 @@ fn take_method_marker(method: &mut syn::ImplItemFn) -> syn::Result<Marker> {
         margs.deny_error("methods")?;
         margs.deny_tag("methods")?;
         margs.deny_rename_all("methods")?;
+        margs.deny_serde("methods; it adopts Serde derives on data types")?;
         marker = match (margs.constructor, margs.statik, margs.target) {
             (Some(_), Some(span), _) => {
                 return Err(syn::Error::new(
@@ -274,10 +276,12 @@ fn analyze_ctor(method: &syn::ImplItemFn, ty_ident: &syn::Ident) -> syn::Result<
              (docs/design/type-system.md §7)",
         ));
     }
+    let params = sig::bridged_params(method.sig.inputs.iter())?;
+    sig::validate_param_wire_names(&params)?;
     Ok(MethodInfo {
         ident: method.sig.ident.clone(),
         docs: extract_docs(&method.attrs),
-        params: sig::bridged_params(method.sig.inputs.iter())?,
+        params,
         ret,
         mutable: false,
         returns_self: true,
@@ -304,10 +308,12 @@ fn analyze_static(
         sig::RetKind::Result { ok, .. } => sig::is_self_ty(ok, ty_ident),
         sig::RetKind::Unit => false,
     };
+    let params = sig::bridged_params(method.sig.inputs.iter())?;
+    sig::validate_param_wire_names(&params)?;
     Ok(MethodInfo {
         ident: method.sig.ident.clone(),
         docs: extract_docs(&method.attrs),
-        params: sig::bridged_params(method.sig.inputs.iter())?,
+        params,
         ret,
         mutable: false,
         returns_self,
@@ -331,10 +337,12 @@ fn analyze_method(method: &syn::ImplItemFn, target: Option<TargetArg>) -> syn::R
         ));
     }
     ensure_not_reserved(&method.sig.ident)?;
+    let params = sig::bridged_params(method.sig.inputs.iter().skip(1))?;
+    sig::validate_param_wire_names(&params)?;
     Ok(MethodInfo {
         ident: method.sig.ident.clone(),
         docs: extract_docs(&method.attrs),
-        params: sig::bridged_params(method.sig.inputs.iter().skip(1))?,
+        params,
         ret: sig::classify_ret(&method.sig.output),
         mutable: receiver.mutability.is_some(),
         returns_self: false,
