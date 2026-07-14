@@ -17,7 +17,20 @@
  *    buffers and the header-derived total length of envelopes.
  */
 import { type BufTypedArray, type Dtype } from "./envelope.js";
-import type { BridgeModule } from "./module.js";
+import { type BridgeErrorRegistry } from "./errors.js";
+import { type BridgeModule } from "./module.js";
+/** Convert a host bigint to the canonical signed 64-bit wire string. */
+export declare function i64ToWire(value: bigint): string;
+/** Convert a host bigint to the canonical unsigned 64-bit wire string. */
+export declare function u64ToWire(value: bigint): string;
+/** Validate a canonical signed 64-bit wire string and return a bigint. */
+export declare function i64FromWire(value: unknown): bigint;
+/** Validate a canonical unsigned 64-bit wire string and return a bigint. */
+export declare function u64FromWire(value: unknown): bigint;
+/** Validate a finite structured float and canonicalize signed zero. */
+export declare function floatFromWire(value: unknown): number;
+/** Unwrap a schemaless JSON field from an opaque application-error payload. */
+export declare function jsonFromWire(value: unknown): unknown;
 /**
  * One `&[T]` slice argument: the data to pass and its wire dtype. The
  * typed array's constructor must match `dt` (`Float64Array` for `"f64"`,
@@ -61,7 +74,7 @@ export declare function writeSlice(mod: BridgeModule, slice: SliceArg): SliceAll
  * Call a bridged export and return its decoded result.
  *
  * @param mod    The instantiated module.
- * @param symbol Export name, e.g. `"rspyts_fn__analyze_signal"`.
+ * @param symbol Export name, e.g. `"rspyts_fn__process_values"`.
  * @param args   Plain parameters as a wire-cased JSON object (`{}` when
  *               there are none — the pair is always passed, ABI §3.1).
  * @param slices `&[T]` parameters, in declaration order.
@@ -73,7 +86,7 @@ export declare function writeSlice(mod: BridgeModule, slice: SliceArg): SliceAll
  * @throws A registered {@link RspytsError} subclass on status 1,
  *         {@link RspytsPanicError} on status 2.
  */
-export declare function callFn(mod: BridgeModule, symbol: string, args: unknown, slices?: SliceArg[], handle?: bigint): unknown;
+export declare function callFn(mod: BridgeModule, symbol: string, args: unknown, slices?: SliceArg[], handle?: bigint, errorTypes?: BridgeErrorRegistry): unknown;
 /**
  * Invoke a `__drop` export (ABI §8). Fire-and-forget: `__drop` is
  * idempotent and infallible by contract, and this is called from
@@ -86,11 +99,11 @@ export {};
 
 // --- envelope.d.ts ---
 /**
- * Decoding of the rspyts response envelope (ABI §4) and substitution of
+ * Strict request/response envelope codecs (ABI §4) and substitution of
  * `__rspyts_buf__` tail placeholders with typed arrays (ABI §6).
  *
- * Every bridged function returns a pointer to a single allocation with a
- * 12-byte little-endian header:
+ * Both directions use one 12-byte little-endian header. Byte zero is a
+ * zero request marker on calls and a closed 0/1/2 status on responses:
  *
  * ```text
  * offset  size       field
@@ -102,8 +115,8 @@ export {};
  * 12+j    tail_len   raw numeric tail (Buf<T> data)
  * ```
  *
- * This module operates on envelope bytes already copied out of WASM linear
- * memory; reading from (and freeing inside) the module is `call.ts`'s job.
+ * This module operates on owned host bytes; copying to/from WASM linear
+ * memory and freeing module allocations is `call.ts`'s job.
  */
 /** Byte length of the envelope header (ABI §4). */
 export declare const HEADER_LEN = 12;
@@ -114,13 +127,16 @@ export declare const STATUS_ERROR = 1;
 /** Envelope status: a panic was caught behind the shim. */
 export declare const STATUS_PANIC = 2;
 /** Wire names of the supported raw-buffer element types (ABI §6). */
-export type Dtype = "u8" | "i16" | "i32" | "f32" | "f64";
+export type Dtype = "u8" | "i8" | "u16" | "i16" | "u32" | "i32" | "u64" | "i64" | "f32" | "f64";
 /** The typed arrays that raw buffers and slices materialize as. */
-export type BufTypedArray = Uint8Array | Int16Array | Int32Array | Float32Array | Float64Array;
+export type BufTypedArray = Uint8Array | Int8Array | Uint16Array | Int16Array | Uint32Array | Int32Array | BigUint64Array | BigInt64Array | Float32Array | Float64Array;
 interface DtypeInfo {
     readonly ctor: new (buffer: ArrayBuffer) => BufTypedArray;
     /** Element size in bytes; also the natural alignment of the element. */
     readonly bytes: number;
+    readonly create: (length: number) => BufTypedArray;
+    readonly read: (view: DataView, offset: number) => number | bigint;
+    readonly write: (view: DataView, offset: number, value: number | bigint) => void;
 }
 /** Per-dtype typed-array constructor and element size. */
 export declare const DTYPE: Record<Dtype, DtypeInfo>;
@@ -130,12 +146,30 @@ export declare const DTYPE: Record<Dtype, DtypeInfo>;
  * major version.
  */
 export declare const BUF_PLACEHOLDER_KEY = "__rspyts_buf__";
+export declare const JSON_WRAPPER_KEY = "__rspyts_json__";
+/** Explicit marker for a numeric typed array nested in request JSON. */
+export interface WireBuffer {
+    readonly __rspytsWireBuffer: true;
+    readonly data: BufTypedArray;
+    readonly dt: Dtype;
+}
+/** Mark a typed array as a numeric `Buf<T>` request attachment. */
+export declare function wireBuffer(data: BufTypedArray, dt: Dtype): WireBuffer;
+/** Encode JSON plus aligned numeric attachments as a strict ABI-2 request. */
+export declare function buildRequest(args: unknown): Uint8Array;
 /** A decoded envelope: `payload` is the parsed JSON, with every buffer
  * placeholder already replaced by a typed array when `status` is ok. */
 export interface DecodedEnvelope {
     status: number;
     payload: unknown;
 }
+/** A validated request, retained in wire form for conformance diagnostics. */
+export interface DecodedRequest {
+    payload: unknown;
+    tail: Uint8Array;
+}
+/** Strictly decode an ABI-2 request envelope. */
+export declare function decodeRequest(bytes: Uint8Array): DecodedRequest;
 /**
  * Decode a complete envelope. Placeholders are substituted only for
  * status-ok payloads — error payloads never carry them (their tail is
@@ -145,8 +179,8 @@ export declare function decodeEnvelope(bytes: Uint8Array): DecodedEnvelope;
 /**
  * Recursively replace every `{"__rspyts_buf__": {off, len, dt}}`
  * placeholder in `value` with a typed array holding the corresponding
- * elements of `tail`. Only objects whose SOLE key is the placeholder key
- * are substituted; anything else is walked structurally.
+ * elements of `tail`. The placeholder key is reserved: an object that
+ * contains it must contain no sibling keys.
  *
  * The result is always a copy: `tail` is a view whose `byteOffset` need
  * not be a multiple of the element size (the tail merely follows the JSON
@@ -168,9 +202,9 @@ export {};
  * JavaScript error class:
  *
  * - status 2 always becomes a {@link RspytsPanicError}, regardless of code;
- * - status 1 consults the code registry populated at import time by
- *   generated `errors.ts` modules (via {@link registerError}), falling back
- *   to the {@link RspytsError} base class for unregistered codes.
+ * - status 1 consults the generated call-scoped map, then the optional
+ *   process registry populated through {@link registerError}, then the
+ *   {@link RspytsError} base class.
  */
 /**
  * Base class for every error crossing the rspyts bridge.
@@ -193,14 +227,22 @@ export declare class StaleHandleError extends RspytsError {
     constructor(message: string, data?: unknown);
 }
 /**
+ * A prior WebAssembly runtime trap left this module instance unsafe to
+ * call. Instantiate a fresh module before retrying.
+ */
+export declare class InstancePoisonedError extends Error {
+    constructor();
+}
+/**
  * Constructor shape a registered error class must have: `code` is baked
  * into the subclass, so only `message` and `data` arrive at throw time.
  */
 export type BridgeErrorConstructor = new (message: string, data?: unknown) => RspytsError;
+export type BridgeErrorRegistry = Readonly<Record<string, BridgeErrorConstructor>>;
 /**
- * Register an error class for a bridge error `code`. Generated `errors.ts`
- * modules call this at import time; a later registration for the same code
- * replaces the earlier one.
+ * Register a process-wide fallback for a bridge error `code`. Generated
+ * clients use call-scoped maps so packages may safely reuse codes; this
+ * compatibility hook remains useful for handwritten integrations.
  */
 export declare function registerError(code: string, ctor: BridgeErrorConstructor): void;
 /**
@@ -208,7 +250,7 @@ export declare function registerError(code: string, ctor: BridgeErrorConstructor
  * beats the registry; otherwise the registry maps `code` to a generated
  * class, with {@link RspytsError} as the fallback.
  */
-export declare function throwBridgeError(status: number, payload: unknown): never;
+export declare function throwBridgeError(status: number, payload: unknown, errorTypes?: BridgeErrorRegistry): never;
 
 // --- index.d.ts ---
 /**
@@ -219,8 +261,9 @@ export declare function throwBridgeError(status: number, payload: unknown): neve
  * these names and nothing else.
  */
 export { instantiate, type BridgeModule } from "./module.js";
-export { callFn, callDrop, type SliceArg } from "./call.js";
-export { RspytsError, RspytsPanicError, StaleHandleError, registerError } from "./errors.js";
+export { callFn, callDrop, floatFromWire, i64FromWire, i64ToWire, jsonFromWire, u64FromWire, u64ToWire, type SliceArg, } from "./call.js";
+export { wireBuffer } from "./envelope.js";
+export { InstancePoisonedError, RspytsError, RspytsPanicError, StaleHandleError, type BridgeErrorRegistry, registerError, } from "./errors.js";
 
 // --- module.d.ts ---
 /**
@@ -229,15 +272,17 @@ export { RspytsError, RspytsPanicError, StaleHandleError, registerError } from "
  * rspyts modules are self-contained `wasm32-unknown-unknown` cdylibs: they
  * import nothing and export linear memory plus the `rspyts_*` symbols.
  * {@link instantiate} accepts anything the WebAssembly JS API can
- * instantiate, verifies the module speaks ABI version 1, and returns the
+ * instantiate, verifies the module speaks ABI version 2, and returns the
  * {@link BridgeModule} that `callFn`/`callDrop` operate on.
  */
 /** The ABI major version this runtime implements (ABI §3). */
-export declare const ABI_VERSION = 1;
+export declare const ABI_VERSION = 2;
 /**
  * An instantiated rspyts module: the raw export object plus its linear
  * memory. `memory` is also reachable as `exports.memory`; it is hoisted
- * here so callers never touch a possibly-absent property.
+ * here so callers never touch a possibly-absent property. A WebAssembly
+ * runtime trap poisons the instance permanently because its Rust-side
+ * invariants and allocator state can no longer be trusted.
  */
 export interface BridgeModule {
     exports: Record<string, Function> & {
@@ -245,6 +290,10 @@ export interface BridgeModule {
     };
     memory: WebAssembly.Memory;
 }
+/** @internal Whether a prior WebAssembly runtime trap poisoned this module. */
+export declare function isPoisoned(mod: BridgeModule): boolean;
+/** @internal Permanently poison a module after a WebAssembly runtime trap. */
+export declare function markPoisoned(mod: BridgeModule): void;
 /**
  * Instantiate a bridged module from compiled bytes, a precompiled
  * `WebAssembly.Module`, or a (promised) HTTP `Response` — the latter two

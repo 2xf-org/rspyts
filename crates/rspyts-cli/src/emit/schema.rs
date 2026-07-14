@@ -26,6 +26,14 @@ pub fn emit(m: &Manifest, hash: &str) -> Vec<(&'static str, String)> {
     let mut defs = Map::new();
     for decl in &m.types {
         match decl {
+            TypeDecl::Newtype {
+                name, docs, inner, ..
+            } => {
+                let mut def = Map::new();
+                add_description(&mut def, docs);
+                extend_with(&mut def, ty_schema(inner));
+                defs.insert(name.clone(), Value::Object(def));
+            }
             TypeDecl::Struct {
                 name, docs, fields, ..
             } => {
@@ -138,8 +146,23 @@ fn ty_schema(ty: &Ty) -> Value {
     }
     match ty {
         Ty::Bool => json!({"type": "boolean"}),
+        Ty::I64 => json!({
+            "type": "string",
+            "format": "int64",
+            "pattern": "^(?:0|-?[1-9][0-9]*)$",
+            "x-rspyts-minimum": i64::MIN.to_string(),
+            "x-rspyts-maximum": i64::MAX.to_string()
+        }),
+        Ty::U64 => json!({
+            "type": "string",
+            "format": "uint64",
+            "pattern": "^(?:0|[1-9][0-9]*)$",
+            "x-rspyts-minimum": "0",
+            "x-rspyts-maximum": u64::MAX.to_string()
+        }),
         Ty::F32 | Ty::F64 => json!({"type": "number"}),
         Ty::String => json!({"type": "string"}),
+        Ty::Bytes => attachment_schema("bytes"),
         Ty::Unit => json!({"type": "null"}),
         Ty::Option { inner } => json!({"anyOf": [ty_schema(inner), {"type": "null"}]}),
         Ty::List { inner } => {
@@ -154,36 +177,46 @@ fn ty_schema(ty: &Ty) -> Value {
             map.insert("additionalProperties".to_string(), ty_schema(value));
             Value::Object(map)
         }
+        Ty::Tuple { items } => json!({
+            "type": "array",
+            "prefixItems": items.iter().map(ty_schema).collect::<Vec<_>>(),
+            "minItems": items.len(),
+            "maxItems": items.len()
+        }),
         Ty::Ref { name } => json!({"$ref": format!("#/$defs/{name}")}),
         // Schemaless passthrough: the empty schema accepts anything.
         Ty::Json => json!({"description": "schemaless"}),
         // Buf crosses as the tail placeholder object (ABI §6).
-        Ty::Buf { dt } => json!({
-            "type": "object",
-            "properties": {
-                "__rspyts_buf__": {
-                    "type": "object",
-                    "properties": {
-                        "off": {"type": "integer", "minimum": 0},
-                        "len": {"type": "integer", "minimum": 0},
-                        "dt": {"const": dt.wire_name()}
-                    },
-                    "required": ["off", "len", "dt"],
-                    "additionalProperties": false
-                }
-            },
-            "required": ["__rspyts_buf__"],
-            "additionalProperties": false
-        }),
+        Ty::Buf { dt } => attachment_schema(dt.wire_name()),
         Ty::Slice { .. } => unreachable!("slices are param-only; validation rejects them here"),
         // Bounded integers are handled above.
         Ty::U8 | Ty::U16 | Ty::U32 | Ty::I8 | Ty::I16 | Ty::I32 => unreachable!(),
     }
 }
 
+fn attachment_schema(dt: &str) -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "__rspyts_buf__": {
+                "type": "object",
+                "properties": {
+                    "off": {"type": "integer", "minimum": 0},
+                    "len": {"type": "integer", "minimum": 0},
+                    "dt": {"const": dt}
+                },
+                "required": ["off", "len", "dt"],
+                "additionalProperties": false
+            }
+        },
+        "required": ["__rspyts_buf__"],
+        "additionalProperties": false
+    })
+}
+
 #[cfg(test)]
 mod tests {
-    use super::super::test_manifest::{manifest, manifest_hash};
+    use super::super::test_manifest::{binary_manifest, exact_manifest, manifest, manifest_hash};
     use super::*;
 
     #[test]
@@ -200,15 +233,15 @@ mod tests {
     "manifestHash": "sha256:@HASH@"
   },
   "$defs": {
-    "AnalysisParams": {
-      "description": "Parameters controlling the analysis pass.",
+    "QueryOptions": {
+      "description": "Options controlling value processing.",
       "type": "object",
       "properties": {
-        "minDurationS": {
-          "description": "Minimum duration, in seconds.",
+        "minimumValue": {
+          "description": "Minimum value to include.",
           "type": "number"
         },
-        "threshold": {
+        "tolerance": {
           "anyOf": [
             {
               "type": "number"
@@ -223,27 +256,27 @@ mod tests {
         }
       },
       "required": [
-        "minDurationS",
+        "minimumValue",
         "metadata"
       ],
       "additionalProperties": false
     },
-    "HardwareInfo": {
-      "description": "Hardware description reported by the device.",
+    "SourceInfo": {
+      "description": "Description of an input source.",
       "type": "object",
       "properties": {
-        "vendor": {
+        "name": {
           "type": "string"
         },
-        "channelCount": {
+        "fieldCount": {
           "type": "integer",
           "minimum": 0,
           "maximum": 65535
         }
       },
       "required": [
-        "vendor",
-        "channelCount"
+        "name",
+        "fieldCount"
       ],
       "additionalProperties": false
     },
@@ -255,16 +288,16 @@ mod tests {
         "high"
       ]
     },
-    "ThresholdEvent": {
-      "description": "Signal threshold transitions.",
+    "ValueEvent": {
+      "description": "Value-processing transitions.",
       "oneOf": [
         {
           "type": "object",
           "properties": {
             "kind": {
-              "const": "crossed"
+              "const": "accepted"
             },
-            "atSample": {
+            "index": {
               "type": "integer",
               "minimum": 0,
               "maximum": 4294967295
@@ -275,7 +308,7 @@ mod tests {
           },
           "required": [
             "kind",
-            "atSample",
+            "index",
             "value"
           ],
           "additionalProperties": false
@@ -284,9 +317,9 @@ mod tests {
           "type": "object",
           "properties": {
             "kind": {
-              "const": "cleared"
+              "const": "rejected"
             },
-            "atSample": {
+            "index": {
               "type": "integer",
               "minimum": 0,
               "maximum": 4294967295
@@ -294,7 +327,7 @@ mod tests {
           },
           "required": [
             "kind",
-            "atSample"
+            "index"
           ],
           "additionalProperties": false
         }
@@ -328,6 +361,52 @@ mod tests {
     }
 
     #[test]
+    fn binary_newtype_fixture_preserves_named_inner_shapes() {
+        let m = binary_manifest();
+        let hash = manifest_hash(&m);
+        let (_, text) = emit(&m, &hash).remove(0);
+        let schema: Value = serde_json::from_str(&text).unwrap();
+        let defs = &schema["$defs"];
+
+        assert_eq!(defs["PacketId"]["type"], "integer");
+        assert_eq!(defs["PacketId"]["minimum"], 0);
+        assert_eq!(defs["PacketId"]["maximum"], 4_294_967_295_u64);
+        assert_eq!(
+            defs["BinaryPacket"]["properties"]["payload"]["properties"]["__rspyts_buf__"]["properties"]
+                ["dt"]["const"],
+            "bytes"
+        );
+        assert_eq!(
+            defs["BinaryPacket"]["properties"]["channels"]["additionalProperties"]["properties"]["__rspyts_buf__"]
+                ["properties"]["dt"]["const"],
+            "u8"
+        );
+    }
+
+    #[test]
+    fn exact_tuple_and_mixed_fixture_has_closed_wire_schemas() {
+        let m = exact_manifest();
+        let hash = manifest_hash(&m);
+        let (_, text) = emit(&m, &hash).remove(0);
+        let schema: Value = serde_json::from_str(&text).unwrap();
+        let defs = &schema["$defs"];
+
+        assert_eq!(defs["SequenceId"]["type"], "string");
+        assert_eq!(defs["SequenceId"]["format"], "uint64");
+        assert_eq!(
+            defs["ExactRecord"]["properties"]["pair"]["prefixItems"][0]["format"],
+            "int64"
+        );
+        assert_eq!(defs["ExactRecord"]["properties"]["pair"]["minItems"], 2);
+        assert_eq!(defs["ExactRecord"]["properties"]["pair"]["maxItems"], 2);
+        assert_eq!(defs["MixedResult"]["oneOf"][0]["required"], json!(["type"]));
+        assert_eq!(
+            defs["MixedResult"]["oneOf"][1]["properties"]["total"]["format"],
+            "uint64"
+        );
+    }
+
+    #[test]
     fn integer_bounds_are_emitted() {
         let v = ty_schema(&Ty::I16);
         assert_eq!(v["minimum"], -32768);
@@ -355,6 +434,6 @@ mod tests {
         let m = manifest();
         let hash = manifest_hash(&m);
         let (_, text) = emit(&m, &hash).remove(0);
-        assert!(text.contains("\"HardwareInfo\""), "{text}");
+        assert!(text.contains("\"SourceInfo\""), "{text}");
     }
 }

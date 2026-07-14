@@ -1,6 +1,6 @@
-//! `u64` is deliberately outside the portable type system
-//! (docs/design/type-system.md §1); the rejection surfaces as a missing
-//! `Bridged` bound on the field type.
+//! Bare `u64` is deliberately outside the portable type system
+//! (docs/design/type-system.md §1); the diagnostic points at the explicit
+//! exact `rspyts::U64` wrapper.
 use rspyts::bridge;
 
 /// A struct with a non-bridgeable scalar.

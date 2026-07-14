@@ -43,10 +43,28 @@ pub fn pascal(name: &str) -> String {
     name.to_upper_camel_case()
 }
 
-/// Wire (camelCase) name → Python (snake_case) attribute name, with a
-/// trailing underscore when the result would shadow a Python keyword.
-pub fn py_name(wire: &str) -> String {
-    let snake = wire.to_snake_case();
+/// Arbitrary contract name → a stable Python identifier, with a trailing
+/// underscore for keywords. Invalid/empty starts are prefixed because
+/// pydantic does not treat leading-underscore names as model fields.
+pub fn py_name(name: &str) -> String {
+    let source = name.strip_prefix("r#").unwrap_or(name);
+    let mut snake: String = source
+        .to_snake_case()
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '_' {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    if snake.is_empty() {
+        snake.push_str("field");
+    }
+    if snake.starts_with('_') || snake.starts_with(|ch: char| ch.is_ascii_digit()) {
+        snake = format!("field_{snake}");
+    }
     if PY_KEYWORDS.contains(&snake.as_str()) {
         format!("{snake}_")
     } else {
@@ -61,7 +79,7 @@ pub fn py_alias_roundtrips(py_name: &str, wire: &str) -> bool {
 }
 
 const PY_KEYWORDS: &[&str] = &[
-    "False", "None", "True", "and", "as", "assert", "async", "await", "break", "class", "continue",
+    "false", "none", "true", "and", "as", "assert", "async", "await", "break", "class", "continue",
     "def", "del", "elif", "else", "except", "finally", "for", "from", "global", "if", "import",
     "in", "is", "lambda", "nonlocal", "not", "or", "pass", "raise", "return", "try", "while",
     "with", "yield",
@@ -84,8 +102,13 @@ pub fn int_bounds(ty: &Ty) -> Option<(i64, u64)> {
 pub fn ts_typed_array(dt: Dtype) -> &'static str {
     match dt {
         Dtype::U8 => "Uint8Array",
+        Dtype::I8 => "Int8Array",
+        Dtype::U16 => "Uint16Array",
         Dtype::I16 => "Int16Array",
+        Dtype::U32 => "Uint32Array",
         Dtype::I32 => "Int32Array",
+        Dtype::U64 => "BigUint64Array",
+        Dtype::I64 => "BigInt64Array",
         Dtype::F32 => "Float32Array",
         Dtype::F64 => "Float64Array",
     }
@@ -98,7 +121,7 @@ pub fn find_type<'m>(m: &'m Manifest, name: &str) -> Option<&'m TypeDecl> {
 
 /// Python annotation for `ty`.
 ///
-/// `bounds`: emit `Annotated[int, Field(ge=…, le=…)]` for bounded
+/// `bounds`: emit `typing.Annotated[int, pydantic.Field(ge=…, le=…)]` for bounded
 /// integers (model fields) instead of plain `int` (signatures).
 /// `quote`: names that must be forward-referenced as `"Name"` because
 /// they are not yet defined at this point in `models.py`.
@@ -108,17 +131,28 @@ pub fn py_type(ty: &Ty, bounds: bool, quote: &dyn Fn(&str) -> bool) -> String {
         Ty::U8 | Ty::U16 | Ty::U32 | Ty::I8 | Ty::I16 | Ty::I32 => {
             if bounds {
                 let (lo, hi) = int_bounds(ty).expect("bounded integer kind");
-                format!("Annotated[int, Field(ge={lo}, le={hi})]")
+                format!("typing.Annotated[int, pydantic.Field(ge={lo}, le={hi})]")
             } else {
                 "int".into()
             }
         }
+        Ty::I64 => "rspyts.I64".into(),
+        Ty::U64 => "rspyts.U64".into(),
         Ty::F32 | Ty::F64 => "float".into(),
         Ty::String => "str".into(),
+        Ty::Bytes => "bytes".into(),
         Ty::Unit => "None".into(),
         Ty::Option { inner } => format!("{} | None", py_type(inner, bounds, quote)),
         Ty::List { inner } => format!("list[{}]", py_type(inner, bounds, quote)),
         Ty::Map { value } => format!("dict[str, {}]", py_type(value, bounds, quote)),
+        Ty::Tuple { items } => format!(
+            "tuple[{}]",
+            items
+                .iter()
+                .map(|item| py_type(item, bounds, quote))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
         Ty::Ref { name } => {
             if quote(name) {
                 format!("\"{name}\"")
@@ -126,7 +160,7 @@ pub fn py_type(ty: &Ty, bounds: bool, quote: &dyn Fn(&str) -> bool) -> String {
                 name.clone()
             }
         }
-        Ty::Json => "Any".into(),
+        Ty::Json => "rspyts.JsonValue".into(),
         Ty::Buf { .. } | Ty::Slice { .. } => "np.ndarray".into(),
     }
 }
@@ -138,7 +172,9 @@ pub fn ts_type(ty: &Ty) -> String {
         Ty::U8 | Ty::U16 | Ty::U32 | Ty::I8 | Ty::I16 | Ty::I32 | Ty::F32 | Ty::F64 => {
             "number".into()
         }
+        Ty::I64 | Ty::U64 => "bigint".into(),
         Ty::String => "string".into(),
+        Ty::Bytes => "Uint8Array".into(),
         Ty::Unit => "void".into(),
         Ty::Option { inner } => format!("{} | null", ts_type(inner)),
         Ty::List { inner } => {
@@ -150,6 +186,10 @@ pub fn ts_type(ty: &Ty) -> String {
             }
         }
         Ty::Map { value } => format!("Record<string, {}>", ts_type(value)),
+        Ty::Tuple { items } => format!(
+            "[{}]",
+            items.iter().map(ts_type).collect::<Vec<_>>().join(", ")
+        ),
         Ty::Ref { name } => name.clone(),
         Ty::Json => "unknown".into(),
         Ty::Buf { dt } | Ty::Slice { dt } => ts_typed_array(*dt).into(),
@@ -164,6 +204,11 @@ pub fn collect_refs(ty: &Ty, out: &mut std::collections::BTreeSet<String>) {
         }
         Ty::Option { inner } | Ty::List { inner } => collect_refs(inner, out),
         Ty::Map { value } => collect_refs(value, out),
+        Ty::Tuple { items } => {
+            for item in items {
+                collect_refs(item, out);
+            }
+        }
         _ => {}
     }
 }
@@ -253,9 +298,9 @@ mod tests {
 
     #[test]
     fn py_name_snake_cases_and_avoids_keywords() {
-        assert_eq!(py_name("minDurationS"), "min_duration_s");
+        assert_eq!(py_name("minimumValue"), "minimum_value");
         assert_eq!(py_name("class"), "class_");
-        assert!(py_alias_roundtrips("min_duration_s", "minDurationS"));
+        assert!(py_alias_roundtrips("minimum_value", "minimumValue"));
         // pydantic's to_camel drops the trailing underscore, just like
         // heck: keyword-renamed attributes need no explicit alias.
         assert!(py_alias_roundtrips("class_", "class"));
@@ -279,7 +324,7 @@ mod tests {
         };
         assert_eq!(
             py_type(&ty, true, &|_| false),
-            "list[Annotated[int, Field(ge=0, le=255)]]"
+            "list[typing.Annotated[int, pydantic.Field(ge=0, le=255)]]"
         );
         assert_eq!(py_type(&ty, false, &|_| false), "list[int]");
     }

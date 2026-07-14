@@ -7,6 +7,13 @@
 # see module/src/lib.rs for why the types crate cannot export itself.
 path = "module"
 
+[build]
+features = []
+no-default-features = false
+profile = "dev"
+targets = ["wasm32-unknown-unknown"]
+locked = true
+
 [python]
 enabled = true
 out = "python/src/shared_types/generated"

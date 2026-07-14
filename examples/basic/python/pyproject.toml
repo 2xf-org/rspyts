@@ -2,7 +2,7 @@
 name = "basic-example"
 version = "0.1.0"
 description = "Python surface of the rspyts basic example."
-requires-python = ">=3.13"
+requires-python = ">=3.11"
 dependencies = ["rspyts", "numpy>=1.24", "pydantic>=2.7"]
 
 [dependency-groups]

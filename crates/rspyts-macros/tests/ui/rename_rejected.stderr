@@ -1,4 +1,4 @@
-error: unknown #[bridge] argument; expected `error`, `constructor`, `static`, `tag = "…"`, `rename_all = "…"`, or `target = "…"`
+error: unknown #[bridge] argument; expected `error`, `serde`, `constructor`, `static`, `tag = "…"`, `rename_all = "…"`, or `target = "…"`
  --> tests/ui/rename_rejected.rs:7:14
   |
 7 |     #[bridge(rename = "access.login.succeeded")]

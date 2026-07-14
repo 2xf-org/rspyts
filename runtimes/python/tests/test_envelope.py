@@ -55,6 +55,22 @@ def test_error_statuses_pass_through(status):
     assert payload == {"code": "x", "message": "y"}
 
 
+@pytest.mark.parametrize("status", [1, 2])
+def test_error_statuses_reject_attachment_tails(status):
+    with pytest.raises(ValueError, match="must not contain attachment bytes"):
+        envelope.parse_envelope(make_envelope(status, {"code": "x", "message": "y"}, b"x"))
+
+
+def test_json_wrapper_keeps_marker_shaped_content_opaque_and_unwraps_it():
+    marker = placeholder(0, 1, "u8")
+    wrapped = {"__rspyts_json__": {"marker": marker, "nested": [{"marker": marker}]}}
+    assert envelope.parse_envelope(make_envelope(0, wrapped)) == (0, wrapped["__rspyts_json__"])
+
+    payload, tail = envelope.decode_request(envelope.build_request({"value": wrapped}))
+    assert payload == {"value": wrapped}
+    assert tail == b""
+
+
 def test_buffer_substitution_with_offset_and_alignment():
     # Tail layout mirrors Rust tail_push: a u8 at offset 0, then zero
     # padding so the f64 data starts at its natural alignment (offset 8).
@@ -72,18 +88,23 @@ def test_buffer_substitution_with_offset_and_alignment():
 
 
 @pytest.mark.parametrize(
-    ("dt", "np_dtype"),
+    ("dt", "np_dtype", "items"),
     [
-        ("u8", np.uint8),
-        ("i16", np.int16),
-        ("i32", np.int32),
-        ("f32", np.float32),
-        ("f64", np.float64),
+        ("u8", np.uint8, [0, 255]),
+        ("i8", np.int8, [-128, 127]),
+        ("u16", np.uint16, [0, 65535]),
+        ("i16", np.int16, [-32768, 32767]),
+        ("u32", np.uint32, [0, 2**32 - 1]),
+        ("i32", np.int32, [-(2**31), 2**31 - 1]),
+        ("u64", np.uint64, [0, 2**64 - 1]),
+        ("i64", np.int64, [-(2**63), 2**63 - 1]),
+        ("f32", np.float32, [-0.5, 1024.25]),
+        ("f64", np.float64, [-1e300, 0.1]),
     ],
 )
-def test_every_wire_dtype_decodes(dt, np_dtype):
-    values = np.array([1, 2, 3], dtype=np_dtype)
-    status, decoded = envelope.parse_envelope(make_envelope(0, placeholder(0, 3, dt), values.tobytes()))
+def test_every_wire_dtype_decodes(dt, np_dtype, items):
+    values = np.array(items, dtype=np_dtype)
+    status, decoded = envelope.parse_envelope(make_envelope(0, placeholder(0, len(items), dt), values.tobytes()))
     assert status == 0
     assert decoded.dtype == np_dtype
     np.testing.assert_array_equal(decoded, values)
@@ -119,11 +140,10 @@ def test_decoded_arrays_are_owned_copies():
     assert decoded.flags.owndata
 
 
-def test_only_exact_single_key_dicts_are_substituted():
+def test_placeholder_key_with_siblings_is_rejected():
     obj = {"__rspyts_buf__": {"off": 0, "len": 1, "dt": "u8"}, "other": 1}
-    decoded = envelope.substitute_buffers(obj, b"\x01")
-    # Two keys: not a placeholder, walked as a plain dict.
-    assert decoded == obj
+    with pytest.raises(ValueError, match="sibling fields"):
+        envelope.substitute_buffers(obj, b"\x01")
 
 
 def test_non_ascii_json_payload():
@@ -178,37 +198,144 @@ def test_zero_len_buffer_at_tail_end():
     assert decoded.size == 0
 
 
-def test_bytes_beyond_declared_tail_len_are_ignored():
+def test_bytes_beyond_declared_tail_len_are_rejected():
     values = np.array([9], dtype=np.uint8)
     raw = make_envelope(0, placeholder(0, 1, "u8"), values.tobytes()) + b"trailing junk"
-    status, decoded = envelope.parse_envelope(raw)
-    assert status == 0
-    np.testing.assert_array_equal(decoded, values)
+    with pytest.raises(ValueError, match="trailing bytes"):
+        envelope.parse_envelope(raw)
 
 
-@pytest.mark.parametrize("length", [1, 4, 8, 11])
-def test_short_header_raises_clear_struct_error(length):
-    with pytest.raises(struct.error, match="at least"):
+@pytest.mark.parametrize("length", [0, 1, 4, 8, 11])
+def test_short_header_raises_clear_protocol_error(length):
+    with pytest.raises(ValueError, match="truncated envelope header"):
         envelope.parse_envelope(bytes(length))
-
-
-def test_empty_envelope_raises():
-    with pytest.raises(IndexError):
-        envelope.parse_envelope(b"")
 
 
 def test_status_json_tail_extraction_over_size_grid():
     # Property-style sweep with hand-rolled cases: every combination of
     # status byte, JSON payload size, and tail size must round-trip.
     sizes = [0, 1, 7, 12, 64, 255, 256, 1024]
-    for status in (0, 1, 2):
-        for pad in sizes:
-            for tail_len in sizes:
-                tail = bytes((i * 31 + 7) % 256 for i in range(tail_len))
-                payload = {"pad": "x" * pad, "buf": placeholder(0, tail_len, "u8")}
+    for pad in sizes:
+        for tail_len in sizes:
+            tail = bytes((i * 31 + 7) % 256 for i in range(tail_len))
+            payload = {"pad": "x" * pad, "buf": placeholder(0, tail_len, "u8")}
 
-                got_status, decoded = envelope.parse_envelope(make_envelope(status, payload, tail))
+            got_status, decoded = envelope.parse_envelope(make_envelope(0, payload, tail))
 
-                assert got_status == status
-                assert decoded["pad"] == "x" * pad
-                assert decoded["buf"].tobytes() == tail
+            assert got_status == 0
+            assert decoded["pad"] == "x" * pad
+            assert decoded["buf"].tobytes() == tail
+
+
+def test_build_request_encodes_nested_aligned_little_endian_attachments():
+    arrays = {
+        "u8": np.array([0, 255], dtype=np.uint8),
+        "i8": np.array([-128, 127], dtype=np.int8),
+        "u16": np.array([0, 65535], dtype=np.uint16),
+        "i16": np.array([-32768, 32767], dtype=np.int16),
+        "u32": np.array([0, 2**32 - 1], dtype=np.uint32),
+        "i32": np.array([-(2**31), 2**31 - 1], dtype=np.int32),
+        "u64": np.array([0, 2**64 - 1], dtype=np.uint64),
+        "i64": np.array([-(2**63), 2**63 - 1], dtype=np.int64),
+        "f32": np.array([-0.5, 1.25], dtype=np.float32),
+        "f64": np.array([-1e300, 0.1], dtype=np.float64),
+    }
+    request = envelope.build_request({"nested": [{name: value} for name, value in arrays.items()]})
+    payload, tail = envelope.decode_request(request)
+
+    for index, (name, array) in enumerate(arrays.items()):
+        spec = payload["nested"][index][name]["__rspyts_buf__"]
+        assert spec["dt"] == name
+        assert spec["len"] == array.size
+        assert spec["off"] % array.dtype.itemsize == 0
+        expected = array.astype(array.dtype.newbyteorder("<"), copy=False).tobytes()
+        assert tail[spec["off"] : spec["off"] + len(expected)] == expected
+
+
+def test_build_request_plain_values_have_empty_tail_and_exact_header():
+    request = envelope.build_request({"a": 1, "items": [True, None, "x"]})
+    payload, tail = envelope.decode_request(request)
+    assert payload == {"a": 1, "items": [True, None, "x"]}
+    assert tail == b""
+    assert request[:4] == b"\x00\x00\x00\x00"
+    assert len(request) == envelope.HEADER_LEN + struct.unpack_from("<I", request, 4)[0]
+
+
+def test_bytes_and_numeric_u8_use_distinct_attachment_dtypes():
+    request = envelope.build_request(
+        {
+            "bytes": bytes([0x00, 0xFF]),
+            "mutable": bytearray([1, 2]),
+            "numeric": np.array([3, 4], dtype=np.uint8),
+        }
+    )
+    payload, tail = envelope.decode_request(request)
+    assert payload["bytes"]["__rspyts_buf__"]["dt"] == "bytes"
+    assert payload["mutable"]["__rspyts_buf__"]["dt"] == "bytes"
+    assert payload["numeric"]["__rspyts_buf__"]["dt"] == "u8"
+
+    decoded = envelope.substitute_buffers(payload, tail)
+    assert decoded["bytes"] == b"\x00\xff"
+    assert decoded["mutable"] == b"\x01\x02"
+    assert isinstance(decoded["numeric"], np.ndarray)
+    assert decoded["numeric"].dtype == np.uint8
+
+
+def test_bytes_response_is_an_owned_bytes_value():
+    status, value = envelope.parse_envelope(make_envelope(0, placeholder(0, 3, "bytes"), b"\x00\x7f\xff"))
+    assert status == 0
+    assert value == b"\x00\x7f\xff"
+
+
+def test_build_request_rejects_unsupported_arrays_and_non_finite_json():
+    with pytest.raises(TypeError, match="unsupported numpy buffer dtype"):
+        envelope.build_request({"values": np.array([1 + 2j], dtype=np.complex128)})
+    with pytest.raises(ValueError, match="non-finite floats"):
+        envelope.build_request({"value": float("nan")})
+
+
+def test_direction_specific_status_and_reserved_bytes_are_strict():
+    request = bytearray(envelope.build_request({}))
+    request[0] = 1
+    with pytest.raises(ValueError, match="invalid request marker"):
+        envelope.decode_request(bytes(request))
+
+    response = bytearray(make_envelope(0, None))
+    response[0] = 3
+    with pytest.raises(ValueError, match="invalid response status"):
+        envelope.parse_envelope(bytes(response))
+
+    response = bytearray(make_envelope(0, None))
+    response[2] = 1
+    with pytest.raises(ValueError, match="reserved envelope"):
+        envelope.parse_envelope(bytes(response))
+
+
+def test_declared_length_truncation_and_malformed_json_are_rejected():
+    response = make_envelope(0, {"a": 1})
+    with pytest.raises(ValueError, match="truncated envelope"):
+        envelope.parse_envelope(response[:-1])
+
+    malformed = bytes([0, 0, 0, 0]) + struct.pack("<II", 1, 0) + b"{"
+    with pytest.raises(ValueError, match="malformed envelope JSON"):
+        envelope.parse_envelope(malformed)
+
+    nonstandard = bytes([0, 0, 0, 0]) + struct.pack("<II", 3, 0) + b"NaN"
+    with pytest.raises(ValueError, match="non-standard JSON number"):
+        envelope.parse_envelope(nonstandard)
+
+
+@pytest.mark.parametrize(
+    ("body", "match"),
+    [
+        (None, "malformed buffer placeholder body"),
+        ({"off": 0, "len": 1}, "malformed buffer placeholder body"),
+        ({"off": -1, "len": 1, "dt": "u8"}, "malformed buffer placeholder"),
+        ({"off": 1, "len": 1, "dt": "i16"}, "not aligned"),
+        ({"off": 0, "len": 2, "dt": "u8"}, "exceeds tail length"),
+    ],
+)
+def test_malformed_buffer_placeholders_are_rejected(body, match):
+    raw = make_envelope(0, {"__rspyts_buf__": body}, b"\x00")
+    with pytest.raises(ValueError, match=match):
+        envelope.parse_envelope(raw)

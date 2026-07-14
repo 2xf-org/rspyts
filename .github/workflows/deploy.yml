@@ -1,6 +1,6 @@
 # Release pipeline, triggered by pushing a stable version tag (v0.1.0, v1.2.3, ...).
 #
-#   verify --> { publish-crates, publish-pypi, publish-npm } --> github-release
+#   validation -> verify -> crates.io -> PyPI -> npm -> GitHub release
 #
 # One-time setup required before the first release (details in docs/releasing.md):
 #   - crates.io: Trusted Publishers registered for all four crates for this
@@ -16,6 +16,9 @@ name: Deploy
 on:
   push:
     tags: ["v*"]
+  # Safe preflight: manual runs execute validation and `verify`; every
+  # publishing job below is additionally gated to a tag-push event.
+  workflow_dispatch:
 
 # Serialize releases: two tags pushed in quick succession must not
 # interleave the sequential crates.io publish chain. Never cancel an
@@ -32,23 +35,62 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  # Gate: nothing publishes unless the full Rust test suite passes at the tag.
-  # (Runtime and example suites run on every push to main via validation.yml; the tag
-  # commit has already been through them.)
+  validation:
+    name: Full validation
+    uses: ./.github/workflows/validation.yml
+    permissions:
+      contents: read
+
+  # Release-specific metadata/package gate. The reusable validation job above
+  # proves this exact tag SHA across Rust, both runtimes, and both examples.
   verify:
     name: Verify
+    needs: validation
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
       - name: Verify release versions
-        run: python3 .github/scripts/verify-release.py
-      - name: Test
-        run: cargo test --workspace
+        run: |
+          version=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "rspyts") | .version')
+          test "$(jq -r .version runtimes/typescript/package.json)" = "$version"
+          test "$(sed -n 's/^version = "\([^"]*\)"/\1/p' runtimes/python/pyproject.toml | head -1)" = "$version"
+          if [[ "$GITHUB_EVENT_NAME" == push ]]; then
+            test "$GITHUB_REF_NAME" = "v$version"
+          fi
+
+  build-runtime-artifacts:
+    name: Build runtime artifacts
+    if: github.event_name == 'push'
+    needs: verify
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+      - uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: "24"
+      - name: Build PyPI distributions
+        working-directory: runtimes/python
+        run: uv build --out-dir ../../release-artifacts/python
+      - name: Build npm tarball
+        working-directory: runtimes/typescript
+        run: |
+          mkdir -p ../../release-artifacts/npm
+          npm ci
+          npm run build
+          npm pack --pack-destination ../../release-artifacts/npm
+      - name: Preserve exact runtime artifacts
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: release-packages-${{ github.sha }}
+          path: release-artifacts
+          if-no-files-found: error
+          retention-days: 7
 
   publish-crates:
     name: Publish to crates.io
+    if: github.event_name == 'push'
     needs: verify
     runs-on: ubuntu-latest
     environment: crates-io
@@ -56,46 +98,49 @@ jobs:
       contents: read
       id-token: write
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: rust-lang/crates-io-auth-action@v1
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+      - uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18 # v1
         id: auth
 
-      # Publish in dependency order: core -> macros -> facade -> CLI. Each
-      # crate must be resolvable on crates.io before its dependents build
-      # there, so the workflow polls the registry API between publishes.
-      - name: Publish rspyts-core
-        run: cargo publish --locked -p rspyts-core
-        env:
-          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+      # Publish in dependency order. After each upload, wait until crates.io
+      # serves that exact version so the next crate can verify its dependency.
+      - name: Publish crates
+        run: |
+          set -euo pipefail
 
-      - name: Wait for rspyts-core
-        run: .github/scripts/wait-for-crate.sh rspyts-core "${GITHUB_REF_NAME#v}"
+          version=${GITHUB_REF_NAME#v}
 
-      - name: Publish rspyts-macros
-        run: cargo publish --locked -p rspyts-macros
-        env:
-          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+          publish() {
+            crate=$1
+            url="https://crates.io/api/v1/crates/$crate/$version"
 
-      - name: Wait for rspyts-macros
-        run: .github/scripts/wait-for-crate.sh rspyts-macros "${GITHUB_REF_NAME#v}"
+            if ! curl --fail --silent --show-error "$url" >/dev/null 2>&1; then
+              cargo publish --locked -p "$crate"
+            fi
 
-      - name: Publish rspyts
-        run: cargo publish --locked -p rspyts
-        env:
-          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+            for attempt in $(seq 1 30); do
+              if curl --fail --silent --show-error "$url" >/dev/null 2>&1; then
+                return 0
+              fi
+              sleep 10
+            done
 
-      - name: Wait for rspyts
-        run: .github/scripts/wait-for-crate.sh rspyts "${GITHUB_REF_NAME#v}"
+            echo "$crate $version did not become available on crates.io" >&2
+            return 1
+          }
 
-      - name: Publish rspyts-cli
-        run: cargo publish --locked -p rspyts-cli
+          publish rspyts-core
+          publish rspyts-macros
+          publish rspyts
+          publish rspyts-cli
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
 
   publish-pypi:
     name: Publish to PyPI
-    needs: verify
+    if: github.event_name == 'push'
+    needs: [build-runtime-artifacts, publish-crates]
     runs-on: ubuntu-latest
     # The environment name is half of the Trusted Publishing handshake; it
     # must match the environment configured for this publisher on pypi.org.
@@ -104,59 +149,61 @@ jobs:
       contents: read
       id-token: write
     steps:
-      - uses: actions/checkout@v7
-      - uses: astral-sh/setup-uv@v7
-
-      - name: Build sdist and wheel
-        working-directory: runtimes/python
-        run: uv build
+      - uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
+        with:
+          name: release-packages-${{ github.sha }}
+          path: release-artifacts
 
       # Trusted Publishing: the action exchanges this job's OIDC token
       # (id-token: write above) for a short-lived PyPI upload token — no
       # long-lived secret exists anywhere. Requires the one-time publisher
-      # registration on pypi.org described in RELEASING.md.
+      # registration on pypi.org described in docs/releasing.md.
       - name: Publish
-        uses: pypa/gh-action-pypi-publish@release/v1
+        uses: pypa/gh-action-pypi-publish@cef221092ed1bacb1cc03d23a2d87d1d172e277b # release/v1
         with:
-          packages-dir: runtimes/python/dist
+          packages-dir: release-artifacts/python
+          skip-existing: true
 
   publish-npm:
     name: Publish to npm
-    needs: verify
+    if: github.event_name == 'push'
+    needs: publish-pypi
     runs-on: ubuntu-latest
     environment: npm
     permissions:
       contents: read
       id-token: write # npm OIDC authentication and provenance attestation
     steps:
-      - uses: actions/checkout@v7
-
-      - uses: actions/setup-node@v6
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
         with:
           node-version: "24"
-
-      - name: Build
-        working-directory: runtimes/typescript
-        run: |
-          npm ci
-          npm run build
+      - uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
+        with:
+          name: release-packages-${{ github.sha }}
+          path: release-artifacts
 
       # npm exchanges this job's OIDC token for short-lived publish access;
       # --provenance also binds the tarball to this exact workflow run.
       - name: Publish
-        working-directory: runtimes/typescript
-        run: npm publish --provenance --access public
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          if npm view "rspyts@${version}" version >/dev/null 2>&1; then
+            echo "rspyts ${version} is already published on npm"
+          else
+            npm publish release-artifacts/npm/rspyts-*.tgz --provenance --access public
+          fi
 
   # Only after every registry has the artifacts: a GitHub release with notes
   # auto-generated from the merged PRs since the previous tag.
   github-release:
     name: GitHub release
+    if: github.event_name == 'push'
     needs: [publish-crates, publish-pypi, publish-npm]
     runs-on: ubuntu-latest
     permissions:
       contents: write # create the release and its notes
     steps:
       - name: Create release
-        uses: softprops/action-gh-release@v3
+        uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3
         with:
           generate_release_notes: true

@@ -209,7 +209,7 @@ class FakeCdll:
         frees the request before returning.
     """
 
-    def __init__(self, abi_version: int = 1) -> None:
+    def __init__(self, abi_version: int = 2) -> None:
         self.live: dict[int, Any] = {}
         self.freed: list[tuple[int, int]] = []
         self.rspyts_abi_version = FakeExport(lambda: abi_version)
@@ -289,13 +289,18 @@ def bridged(fake: FakeCdll) -> Library:
     return lib
 
 
+def request_payload(call: Call) -> Any:
+    payload, _tail = envelope.decode_request(call.request)
+    return payload
+
+
 # ---------------------------------------------------------------------------
 # Loading (ABI version handshake)
 # ---------------------------------------------------------------------------
 
 
 def test_load_checks_abi_version_and_caches(monkeypatch, tmp_path):
-    fake = FakeCdll(abi_version=1)
+    fake = FakeCdll(abi_version=2)
     opened: list[str] = []
 
     def fake_cdll(path):
@@ -321,7 +326,7 @@ def test_load_rejects_abi_version_mismatch(monkeypatch, tmp_path):
     lib = Library("demo")
     with pytest.raises(RuntimeError, match="ABI version 7") as exc_info:
         lib.load()
-    assert "version 1" in str(exc_info.value)
+    assert "version 2" in str(exc_info.value)
     assert lib.cdll is None  # a failed handshake caches nothing
 
 
@@ -334,11 +339,26 @@ def test_call_sends_compact_json_and_decodes_payload():
     fake = FakeCdll()
     calls = fake.install("demo__add", payload={"sum": 3})
 
-    result = bridged(fake).call("demo__add", {"a": 1, "minDurationS": 1.5})
+    result = bridged(fake).call("demo__add", {"a": 1, "minimumValue": 1.5})
 
     assert result == {"sum": 3}
-    assert calls[0].request == b'{"a":1,"minDurationS":1.5}'
+    assert request_payload(calls[0]) == {"a": 1, "minimumValue": 1.5}
     assert calls[0].handle is None
+
+
+def test_call_sends_nested_numpy_buffers_in_the_request_envelope():
+    fake = FakeCdll()
+    calls = fake.install("demo__buffered", payload=None)
+    values = np.array([-2, 7], dtype=np.int32)
+
+    bridged(fake).call("demo__buffered", {"nested": [{"values": values}]})
+
+    payload, tail = envelope.decode_request(calls[0].request)
+    decoded = envelope.substitute_buffers(payload, tail)
+    assert decoded["nested"][0]["values"].dtype == np.int32
+    np.testing.assert_array_equal(decoded["nested"][0]["values"], values)
+    assert fake.live == {}
+    assert fake.freed[0][1] == len(calls[0].request)
 
 
 def test_call_with_no_args_sends_empty_object():
@@ -346,7 +366,7 @@ def test_call_with_no_args_sends_empty_object():
     calls = fake.install("demo__ping", payload=None)
 
     assert bridged(fake).call("demo__ping", None) is None
-    assert calls[0].request == b"{}"
+    assert request_payload(calls[0]) == {}
 
 
 def test_call_passes_handle_as_leading_u64():
@@ -356,7 +376,7 @@ def test_call_passes_handle_as_leading_u64():
     bridged(fake).call("demo__method", {}, handle=42)
 
     assert calls[0].handle == 42
-    assert calls[0].request == b"{}"
+    assert request_payload(calls[0]) == {}
 
 
 def test_call_passes_slices_as_contiguous_pointer_count_pairs():
@@ -371,6 +391,25 @@ def test_call_passes_slices_as_contiguous_pointer_count_pairs():
     np.testing.assert_array_equal(first, [1.5, 2.5])
     assert second.dtype == np.int32
     np.testing.assert_array_equal(second, [0, 2, 4, 6])
+
+
+def test_call_borrows_only_runtime_owned_slice_copies():
+    fake = FakeCdll()
+    source = np.array([1.0, 2.0], dtype=np.float64)
+    seen_pointer: list[int] = []
+
+    def inspect(*args: Any) -> int:
+        seen_pointer.append(int(cvalue(args[2])))
+        body = b"null"
+        raw = bytes([0, 0, 0, 0]) + struct.pack("<II", len(body), 0) + body
+        addr = fake.alloc(len(raw))
+        ctypes.memmove(addr, raw, len(raw))
+        return addr
+
+    fake.demo__inspect = FakeExport(inspect)
+    bridged(fake).call("demo__inspect", {}, slices=[(source, "f64")])
+
+    assert seen_pointer[0] != source.ctypes.data
 
 
 def test_call_substitutes_buffers_from_the_tail():
@@ -392,6 +431,16 @@ def test_call_status_1_raises_registered_error():
     fake.install("demo__get", status=1, payload={"code": "staleHandle", "message": "dropped"})
     with pytest.raises(StaleHandleError, match="dropped"):
         bridged(fake).call("demo__get", {})
+
+
+def test_call_uses_scoped_error_types():
+    class ScopedError(BridgeError):
+        pass
+
+    fake = FakeCdll()
+    fake.install("demo__get", status=1, payload={"code": "scoped", "message": "only here"})
+    with pytest.raises(ScopedError, match="only here"):
+        bridged(fake).call("demo__get", {}, error_types={"scoped": ScopedError})
 
 
 def test_call_status_2_raises_panic_error():
@@ -424,7 +473,7 @@ def test_call_frees_request_and_envelope():
 
     assert fake.live == {}  # nothing leaked
     request_free, envelope_free = fake.freed
-    assert request_free[1] == len(b'{"a":1}')
+    assert request_free[1] == len(envelope.build_request({"a": 1}))
     assert envelope_free[1] == envelope.HEADER_LEN + len(b"7") + 2
 
 
@@ -437,6 +486,25 @@ def test_call_frees_request_even_when_the_export_raises():
     fake.demo__bad = FakeExport(explode)
     with pytest.raises(OSError, match="politely"):
         bridged(fake).call("demo__bad", {})
+    assert fake.live == {}
+
+
+def test_call_frees_response_when_copying_it_raises(monkeypatch):
+    fake = FakeCdll()
+    fake.install("demo__large", payload={"ok": True})
+    real_string_at = ctypes.string_at
+    calls = 0
+
+    def fail_second_copy(ptr, size):
+        nonlocal calls
+        calls += 1
+        if calls == 2:  # request snapshot, then the full response
+            raise MemoryError("copy failed")
+        return real_string_at(ptr, size)
+
+    monkeypatch.setattr(ctypes, "string_at", fail_second_copy)
+    with pytest.raises(MemoryError, match="copy failed"):
+        bridged(fake).call("demo__large", {})
     assert fake.live == {}
 
 

@@ -13,8 +13,8 @@ use std::sync::{Arc, Mutex};
 /// Handles must survive JSON and JS `number` transport, so they may never
 /// reach 2^53 (ABI §8). Enforced in [`Slab::insert`]; at one allocation
 /// per nanosecond the bound is ~104 days short of 300 years away, so the
-/// panic (surfacing as a status-2 envelope) is a correctness statement,
-/// not an expected event.
+/// panic (a status-2 envelope natively, a trap on aborting WASM) is a
+/// correctness statement, not an expected event.
 pub const MAX_HANDLE: u64 = 1 << 53;
 
 pub struct Slab<T> {

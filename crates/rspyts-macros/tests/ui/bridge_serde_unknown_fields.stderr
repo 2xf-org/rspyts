@@ -1,0 +1,5 @@
+error: #[bridge(serde)] object structs must use #[serde(deny_unknown_fields)] so Rust, Python, and TypeScript reject the same unknown keys
+ --> tests/ui/bridge_serde_unknown_fields.rs:6:12
+  |
+6 | pub struct OpenRecord {
+  |            ^^^^^^^^^^

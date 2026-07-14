@@ -12,5 +12,4 @@ crate-type = ["rlib", "cdylib"]
 
 [dependencies]
 rspyts = { workspace = true }
-serde = { workspace = true }
 shared-types = { path = "../../shared/rust" }

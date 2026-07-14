@@ -7,9 +7,9 @@
  * JavaScript error class:
  *
  * - status 2 always becomes a {@link RspytsPanicError}, regardless of code;
- * - status 1 consults the code registry populated at import time by
- *   generated `errors.ts` modules (via {@link registerError}), falling back
- *   to the {@link RspytsError} base class for unregistered codes.
+ * - status 1 consults the generated call-scoped map, then the optional
+ *   process registry populated through {@link registerError}, then the
+ *   {@link RspytsError} base class.
  */
 
 import { STATUS_PANIC } from "./envelope.js";
@@ -50,17 +50,31 @@ export class StaleHandleError extends RspytsError {
 }
 
 /**
+ * A prior WebAssembly runtime trap left this module instance unsafe to
+ * call. Instantiate a fresh module before retrying.
+ */
+export class InstancePoisonedError extends Error {
+  constructor() {
+    super(
+      "rspyts: WebAssembly instance is poisoned after a runtime trap; instantiate a fresh module",
+    );
+    this.name = "InstancePoisonedError";
+  }
+}
+
+/**
  * Constructor shape a registered error class must have: `code` is baked
  * into the subclass, so only `message` and `data` arrive at throw time.
  */
 export type BridgeErrorConstructor = new (message: string, data?: unknown) => RspytsError;
+export type BridgeErrorRegistry = Readonly<Record<string, BridgeErrorConstructor>>;
 
 const registry = new Map<string, BridgeErrorConstructor>();
 
 /**
- * Register an error class for a bridge error `code`. Generated `errors.ts`
- * modules call this at import time; a later registration for the same code
- * replaces the earlier one.
+ * Register a process-wide fallback for a bridge error `code`. Generated
+ * clients use call-scoped maps so packages may safely reuse codes; this
+ * compatibility hook remains useful for handwritten integrations.
  */
 export function registerError(code: string, ctor: BridgeErrorConstructor): void {
   registry.set(code, ctor);
@@ -71,7 +85,11 @@ export function registerError(code: string, ctor: BridgeErrorConstructor): void 
  * beats the registry; otherwise the registry maps `code` to a generated
  * class, with {@link RspytsError} as the fallback.
  */
-export function throwBridgeError(status: number, payload: unknown): never {
+export function throwBridgeError(
+  status: number,
+  payload: unknown,
+  errorTypes?: BridgeErrorRegistry,
+): never {
   const body =
     payload !== null && typeof payload === "object"
       ? (payload as { code?: unknown; message?: unknown; data?: unknown })
@@ -81,7 +99,7 @@ export function throwBridgeError(status: number, payload: unknown): never {
   if (status === STATUS_PANIC) {
     throw new RspytsPanicError(message, body.data);
   }
-  const ctor = registry.get(code);
+  const ctor = errorTypes?.[code] ?? registry.get(code);
   if (ctor !== undefined) {
     throw new ctor(message, body.data);
   }

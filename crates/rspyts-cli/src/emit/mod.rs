@@ -197,6 +197,7 @@ mod tests {
     fn config_for(root: &Path) -> Config {
         Config {
             crate_dir: root.join("crate"),
+            build: Default::default(),
             python: Some(PythonConfig {
                 out: root.join("py"),
                 library_search: vec![],

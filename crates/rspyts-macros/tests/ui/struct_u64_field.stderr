@@ -1,15 +1,5 @@
-error[E0277]: the trait bound `u64: Bridged` is not satisfied
+error: bare `u64` is not bridgeable because JSON numbers cannot preserve every 64-bit value; use `rspyts::U64` for canonical decimal-string transport
  --> tests/ui/struct_u64_field.rs:9:14
   |
 9 |     pub big: u64,
-  |              ^^^ the trait `Bridged` is not implemented for `u64`
-  |
-  = help: the following other types implement trait `Bridged`:
-            f32
-            f64
-            i16
-            i32
-            i8
-            u16
-            u32
-            u8
+  |              ^^^

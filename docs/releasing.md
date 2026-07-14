@@ -1,70 +1,134 @@
 # Releasing
 
-Every release ships the four crates (crates.io), the Python runtime (PyPI), and the TypeScript runtime (npm) in lockstep, with the same version number. A runtime speaks exactly one ABI major version, and aligned package versions are what let users reason about compatibility — everything at 0.3.x works together. Do not release one surface without the others.
+Releases are tag-driven and intentionally boring. A tag is published only
+after the same commit passes the full validation workflow.
 
-## 1. Bump versions
+The repository publishes four Rust crates, one Python runtime, and one npm
+runtime. All six packages use the same version.
 
-All in one commit:
+## One-time registry setup
 
-1. `Cargo.toml` (workspace root): `[workspace.package] version` **and** the three path-dependency pins in `[workspace.dependencies]` (`rspyts-core`, `rspyts-macros`, `rspyts`) — cargo publishes these as real version requirements.
-2. `runtimes/python/pyproject.toml`: `version`.
-3. `runtimes/typescript/package.json`: `version`.
-4. `runtimes/python/src/rspyts/__init__.py`: `__version__`.
-5. Run `cargo build` to refresh `Cargo.lock`, `uv lock --directory runtimes/python`, and `npm install --package-lock-only --prefix runtimes/typescript`. Then regenerate the example (`cargo run -p rspyts-cli -- generate --config examples/basic/rspyts.toml`) so the generated-file headers carry the new version. Commit everything.
+Configure trusted publishing before the first release:
 
-The deploy workflow rejects tags that do not exactly match every package and lockfile version. Releases currently use stable `vX.Y.Z` tags; add explicit cross-ecosystem prerelease normalization before introducing prerelease tags.
+- crates.io: register `.github/workflows/deploy.yml` and the `crates-io`
+  environment for `rspyts-core`, `rspyts-macros`, `rspyts`, and `rspyts-cli`;
+- PyPI: register the same workflow and the `pypi` environment for `rspyts`;
+- npm: register the same workflow and the `npm` environment for `rspyts`.
 
-Note that the ABI version (`ABI_VERSION` in `crates/rspyts-core/src/lib.rs`) is **not** bumped on release — only when the boundary itself changes. Any change to [abi.md](design/abi.md)'s contract must bump it and update the shims, the Python runtime, and the TypeScript runtime in the same PR; runtimes reject modules with an unknown ABI major version, so a partial update fails loudly at load time.
+The workflow uses short-lived OIDC credentials. Do not add long-lived registry
+tokens to repository secrets.
 
-## 2. Tag
+## Prepare the version
 
+Update these sources together:
+
+- `[workspace.package].version` in the root `Cargo.toml`;
+- internal Rust dependency versions in the workspace;
+- `runtimes/python/pyproject.toml`;
+- `runtimes/python/src/rspyts/__init__.py`;
+- `runtimes/typescript/package.json`.
+
+Then refresh lockfiles and generated clients:
+
+```sh
+cargo update --workspace
+cd runtimes/python && uv lock
+cd ../typescript && npm install --package-lock-only
+cd ../..
+
+cargo run -p rspyts-cli -- generate --config examples/basic/rspyts.toml
+cargo run -p rspyts-cli -- generate --config examples/multi-crate/shared/rspyts.toml
+cargo run -p rspyts-cli -- generate --config examples/multi-crate/app/rspyts.toml
 ```
-git tag vX.Y.Z
-git push origin vX.Y.Z
+
+Review generated changes. A new version header is expected; unexplained API
+changes are not.
+
+## Run the release gate
+
+At minimum, the candidate must pass:
+
+```sh
+cargo fmt --all --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace
+RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
+cargo check --workspace --all-targets --locked
+
+cd runtimes/python
+uv sync --dev --locked --python 3.11
+uv run ruff check .
+uv run ty check src
+uv run vulture
+uv run pytest
+cd ../typescript
+npm ci
+npm run build
+npm run typecheck
+npm run test:cov
+npm run check:surface
+cd ../..
+
+cargo run -p rspyts-cli -- check --config examples/basic/rspyts.toml
+cargo run -p rspyts-cli -- check --config examples/multi-crate/shared/rspyts.toml
+cargo run -p rspyts-cli -- check --config examples/multi-crate/app/rspyts.toml
 ```
 
-Pushing a `v{X.Y.Z}` tag triggers `.github/workflows/deploy.yml`. Its `verify` job runs the Rust workspace tests, then the publish jobs push to all three registries; the runtime and example suites already ran on `main` via `validation.yml`.
+Also build each registry artifact without publishing:
 
-## 3. Publish order (crates.io)
+```sh
+for crate in rspyts-core rspyts-macros rspyts rspyts-cli; do
+  cargo package --list --locked --allow-dirty -p "$crate"
+done
 
-Dependency order, each crate only after its dependencies are visible on the registry:
+cd runtimes/python && uv build
+cd ../typescript && npm pack --dry-run
+```
 
-1. `rspyts-core`
-2. `rspyts-macros`
-3. `rspyts`
-4. `rspyts-cli`
+The GitHub validation workflow repeats these checks across supported Python,
+Node, Rust, macOS, Windows, native, and WebAssembly lanes.
 
-The workflow does this sequentially with a registry availability check between publishes (crates.io indexing is eventually consistent). PyPI and npm have no ordering constraint and publish in parallel with the crates.io chain.
+## Tag and publish
 
-## Trusted publishing and one-time setup
+Create a signed stable tag only after the candidate commit is on `main`:
 
-All registries publish with GitHub Actions OIDC. The repository stores no long-lived registry credentials. Each publishing job uses a matching GitHub environment and receives a short-lived token for that run.
+```sh
+git tag -s v0.2.0 -m "rspyts v0.2.0"
+git push origin v0.2.0
+```
 
-### crates.io Trusted Publishing (no token)
+`.github/workflows/deploy.yml` then:
 
-For each of `rspyts-core`, `rspyts-macros`, `rspyts`, and `rspyts-cli`, configure a GitHub Trusted Publisher on crates.io with owner `2xf-org`, repository `rspyts`, workflow `deploy.yml`, and environment `crates-io`. Create the matching `crates-io` environment in the GitHub repository. The workflow's `rust-lang/crates-io-auth-action` step exchanges its GitHub OIDC identity for a short-lived Cargo registry token.
+1. runs the complete reusable validation workflow;
+2. verifies that the tag, Cargo workspace, Python package, and npm package
+   versions match;
+3. builds the Python distributions and npm tarball once;
+4. publishes Rust crates in dependency order: core, macros, facade, CLI;
+5. publishes the preserved Python artifact to PyPI;
+6. publishes the preserved npm artifact with provenance;
+7. creates a GitHub release with generated release notes.
 
-### PyPI Trusted Publishing (no token)
+The registry stages are sequential. A later registry is never published if an
+earlier one failed. Existing versions are detected so a failed workflow can be
+rerun safely.
 
-PyPI publishes via OIDC — there is no `PYPI_TOKEN`. One-time setup:
+Manual workflow dispatch runs validation and version checks but cannot publish.
 
-1. On pypi.org, go to the `rspyts` project → **Manage** → **Publishing** → **Add a new publisher** → GitHub.
-2. Enter: owner `2xf-org`, repository `rspyts`, workflow name `deploy.yml`, environment `pypi`.
-3. On GitHub, create the matching environment: repo Settings → **Environments** → New environment → `pypi`. Optionally require a reviewer for this environment — that makes PyPI publishes a manual approval step.
+## Verify the release
 
-For the **first** release, the project does not exist on PyPI yet: use a *pending* publisher instead (pypi.org → your account → **Publishing** → "Add a new pending publisher") with the same four values plus the project name `rspyts`. The first successful workflow run creates and claims the project.
+After the workflow completes, inspect the installed artifacts rather than the
+working tree:
 
-### npm Trusted Publishing (no token)
+```sh
+cargo install rspyts-cli --version 0.2.0 --locked
+python -m venv /tmp/rspyts-release
+/tmp/rspyts-release/bin/pip install rspyts==0.2.0
+npm view rspyts@0.2.0 version
+```
 
-On npm, open the `rspyts` package settings and configure a GitHub Actions Trusted Publisher with owner `2xf-org`, repository `rspyts`, workflow `deploy.yml`, environment `npm`, and the `npm publish` action allowed. Create the matching `npm` environment in the GitHub repository. The workflow uses Node 24/npm 11 and `id-token: write`, so npm authenticates the publish through OIDC and emits provenance without an `NPM_TOKEN`.
+Confirm that every registry page renders its package README, the GitHub release
+points to the tagged commit, and the published package contents contain no
+repository-only material.
 
-## First-release checklist
-
-- crates.io and npm require a one-time bootstrap publish before Trusted Publishing can be attached to a new package. Use narrowly scoped, short-lived tokens for that bootstrap only, configure the Trusted Publishers immediately afterward, then revoke and delete the tokens.
-- crates.io has no name reservation — bootstrap-publish `rspyts-core` → `rspyts-macros` → `rspyts` → `rspyts-cli` in order, same as always. Add co-owners afterward with `cargo owner --add` if needed.
-- npm: the bootstrap publish of `rspyts` claims the package name for the publishing account; grant the org team access afterward if needed.
-- PyPI: the pending publisher (above) claims the project name on first publish.
-
-## After the release
-
-- Verify the three registries show the new version and that `cargo install rspyts-cli`, `pip install rspyts`, and `npm install rspyts` resolve to it.
+If publication fails, fix the cause and rerun the same workflow. Never move or
+replace a published tag, and never reuse a registry version.
