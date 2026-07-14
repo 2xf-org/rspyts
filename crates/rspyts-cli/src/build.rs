@@ -214,9 +214,8 @@ mod tests {
     #[test]
     fn read_toml_parses_a_complete_document() {
         let path = std::env::temp_dir().join(format!(
-            "rspyts-cli-toml-document-{}-{}.toml",
-            std::process::id(),
-            std::thread::current().name().unwrap_or("unnamed")
+            "rspyts-cli-toml-document-{}.toml",
+            std::process::id()
         ));
         std::fs::write(
             &path,
