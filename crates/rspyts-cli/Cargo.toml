@@ -14,6 +14,9 @@ categories.workspace = true
 [[bin]]
 name = "rspyts"
 path = "src/main.rs"
+# The binary shares its name with the `rspyts` library crate; without this,
+# `cargo doc --workspace` hits an output filename collision.
+doc = false
 
 [dependencies]
 rspyts-core = { workspace = true }
