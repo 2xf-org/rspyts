@@ -82,6 +82,50 @@ class TestScale:
             bx.scale(np.array([1.0]), float("inf"))
 
 
+class TestBinaryAttachments:
+    def test_bytes_preserve_empty_and_edge_values(self):
+        assert bx.echo_bytes(b"") == b""
+        assert bx.echo_bytes(bytes([0x00, 0x7F, 0x80, 0xFF])) == bytes([0x00, 0x7F, 0x80, 0xFF])
+
+    def test_nested_buffers_and_transparent_newtype_round_trip(self):
+        packet = bx.BinaryPacket(
+            id=7,
+            payload=bytes([0x00, 0xFF]),
+            samples=np.array([1.5, -2.25], dtype=np.float64),
+            chunks=[
+                np.array([-32768, 0, 32767], dtype=np.int16),
+                np.array([], dtype=np.int16),
+            ],
+            channels={
+                "red": np.array([0, 127, 255], dtype=np.uint8),
+                "empty": np.array([], dtype=np.uint8),
+            },
+        )
+
+        out = bx.echo_binary_packet(packet)
+
+        assert out.id == 7
+        assert out.payload == bytes([0x00, 0xFF])
+        assert out.samples.dtype == np.float64
+        np.testing.assert_array_equal(out.samples, [1.5, -2.25])
+        assert [chunk.dtype for chunk in out.chunks] == [np.int16, np.int16]
+        np.testing.assert_array_equal(out.chunks[0], [-32768, 0, 32767])
+        assert out.chunks[1].size == 0
+        assert out.channels["red"].dtype == np.uint8
+        np.testing.assert_array_equal(out.channels["red"], [0, 127, 255])
+        assert out.channels["empty"].size == 0
+
+        assert out.samples is not packet.samples
+        assert out.chunks[0] is not packet.chunks[0]
+        assert out.channels["red"] is not packet.channels["red"]
+        packet.samples[0] = 99.0
+        packet.chunks[0][0] = 99
+        packet.channels["red"][0] = 99
+        assert out.samples[0] == 1.5
+        assert out.chunks[0][0] == -32768
+        assert out.channels["red"][0] == 0
+
+
 class TestRoundValue:
     def test_string_enum_parameter(self):
         assert bx.round_value(2.4, bx.Rounding.UP) == 3.0
@@ -104,10 +148,61 @@ class TestConstants:
         assert bx.ROUNDING_MODES == ["up", "down", "nearest", "halfEven"]
         assert bx.ROUNDING_MODES == [mode.value for mode in bx.Rounding]
 
+    def test_exact_constants_are_python_ints_without_precision_loss(self):
+        assert bx.MAX_EXACT_U64 == 2**64 - 1
+        assert bx.EXACT_BOUNDS == (-(2**63), 2**64 - 1)
+        assert all(isinstance(value, int) for value in bx.EXACT_BOUNDS)
+
+
+class TestExactIntegers:
+    def test_boundaries_nesting_and_tuple_round_trip(self):
+        value = bx.ExactNumbers(
+            signed=-(2**63),
+            unsigned=2**64 - 1,
+            pair=(2**53 + 1, 2**64 - 1),
+            history=[0, 2**53 + 1, 2**64 - 1],
+        )
+        out = bx.echo_exact_numbers(value)
+        assert out == value
+        assert out.pair == (2**53 + 1, 2**64 - 1)
+        assert bx.echo_exact_pair((2**63 - 1, 2**64 - 1)) == (2**63 - 1, 2**64 - 1)
+
+    def test_out_of_range_values_fail_before_the_native_call(self):
+        for value in [-1, 2**64]:
+            with pytest.raises(ValueError, match="u64 value out of range"):
+                bx.validate_sequence(value, 1)
+        with pytest.raises(ValueError, match="i64 value out of range"):
+            bx.echo_exact_pair((2**63, 1))
+        with pytest.raises(TypeError, match="got bool"):
+            bx.validate_sequence(True, 1)
+
+    def test_exact_error_data_is_converted_back_to_ints(self):
+        with pytest.raises(bx.BasicErrorSequenceTooLarge) as exc_info:
+            bx.validate_sequence(2**64 - 1, 2**53 + 1)
+        assert exc_info.value.data == {"value": 2**64 - 1, "maximum": 2**53 + 1}
+        assert all(isinstance(value, int) for value in exc_info.value.data.values())
+
+    def test_model_rejects_invalid_tuple_and_noncanonical_wire_values(self):
+        with pytest.raises(pydantic.ValidationError):
+            bx.ExactNumbers.model_validate({"signed": "01", "unsigned": "1", "pair": ["1", "2"], "history": None})
+        with pytest.raises(pydantic.ValidationError):
+            bx.ExactNumbers(signed=0, unsigned=0, pair=(0,), history=None)
+
+
+class TestMixedEnums:
+    def test_unit_and_data_variants_round_trip(self):
+        pending = bx.echo_transfer_state(bx.TransferStatePending())
+        assert isinstance(pending, bx.TransferStatePending)
+        assert pending.model_dump(by_alias=True) == {"type": "pending"}
+
+        complete = bx.echo_transfer_state(bx.TransferStateComplete(sequence=2**64 - 1))
+        assert isinstance(complete, bx.TransferStateComplete)
+        assert complete.sequence == 2**64 - 1
+
 
 class TestAnnotate:
     def test_json_dict_round_trips_untouched(self):
-        metadata = {"source": "sensor", "nested": {"tags": ["a", "b"], "rev": 2}, "empty": None}
+        metadata = {"source": "fixture", "nested": {"tags": ["a", "b"], "rev": 2}, "empty": None}
         out = bx.annotate(2.5, metadata)
         assert out == {**metadata, "value": 2.5}
 

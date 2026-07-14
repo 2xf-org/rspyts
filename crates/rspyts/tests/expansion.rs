@@ -10,7 +10,9 @@
 //! symbols are covered too. Keep this the only integration-test binary in
 //! this crate that invokes it.
 
-use rspyts::{Buf, Json, bridge};
+#![recursion_limit = "512"]
+
+use rspyts::{Buf, I64, Json, U64, bridge};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, HashMap};
 
@@ -87,6 +89,91 @@ pub enum Event {
     Stopped { at_ms: u32, reason: Option<String> },
 }
 
+/// Exact integers and fixed-length tuple shapes.
+#[bridge]
+pub struct ExactRecord {
+    pub signed: I64,
+    pub unsigned: U64,
+    pub pair: (I64, U64),
+    pub dozen: (u8, u8, u8, u8, u8, u8, u8, u8, u8, u8, u8, u8),
+}
+
+/// A mixed unit-and-data state.
+#[bridge]
+pub enum MixedState {
+    Pending,
+    Ready { sequence: U64 },
+}
+
+/// An owning contract whose Serde attributes are reflected by rspyts.
+#[bridge]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub struct OwnedSerdeNames {
+    pub http2_id: u32,
+    #[serde(rename = "display-code")]
+    pub display_code: String,
+}
+
+/// An existing Serde struct adopted without duplicate derives.
+#[bridge(serde)]
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+pub struct AdoptedRecord {
+    pub http2_id: u32,
+    #[serde(rename = "display")]
+    pub display_name: String,
+}
+
+/// Adoption without rename metadata follows Serde's ordinary field names.
+#[bridge(serde)]
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AdoptedDefaults {
+    pub item_count: u32,
+}
+
+/// A tuple newtype whose existing Serde contract is adopted.
+#[bridge(serde)]
+#[derive(serde::Serialize, serde::Deserialize)]
+pub struct AdoptedId(pub u32);
+
+/// An owning tuple newtype.
+#[bridge]
+pub struct RecordId(pub u32);
+
+/// A named transparent newtype.
+#[bridge]
+#[serde(transparent)]
+pub struct NamedCode {
+    pub value: String,
+}
+
+/// An adopted string enum with an explicit Serde casing contract.
+#[bridge(serde)]
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum AdoptedMode {
+    FastPath,
+    #[serde(rename = "manual")]
+    ManualOverride,
+}
+
+/// An adopted internally tagged data enum.
+#[bridge(serde)]
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(tag = "eventKind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum AdoptedMessage {
+    #[serde(rename_all = "kebab-case")]
+    HTTP2Ready {
+        request_id: u32,
+        #[serde(rename = "URL")]
+        url_value: String,
+    },
+    Closed {
+        reason_code: u32,
+    },
+}
+
 /// Failure modes of the fixture class.
 #[bridge(error)]
 #[derive(Debug)]
@@ -95,6 +182,8 @@ pub enum FixtureError {
     Empty,
     /// The counter would exceed its limit.
     OverLimit { max_allowed: i32, attempted: i32 },
+    /// An exact unsigned limit was rejected.
+    ExactLimit { limit: U64 },
 }
 
 impl std::fmt::Display for FixtureError {
@@ -107,6 +196,7 @@ impl std::fmt::Display for FixtureError {
             } => {
                 write!(f, "adding {attempted} exceeds the limit {max_allowed}")
             }
+            FixtureError::ExactLimit { limit } => write!(f, "exact limit {limit} was rejected"),
         }
     }
 }
@@ -184,6 +274,24 @@ pub fn echo_snake(wire: SnakeWire) -> SnakeWire {
     wire
 }
 
+/// Round-trip exact integers and fixed-length tuples.
+#[bridge]
+pub fn echo_exact(value: ExactRecord) -> ExactRecord {
+    value
+}
+
+/// Round-trip a mixed unit-and-data enum.
+#[bridge]
+pub fn echo_mixed(value: MixedState) -> MixedState {
+    value
+}
+
+/// Round-trip a pair without changing its positions.
+#[bridge]
+pub fn echo_tuple(value: (I64, U64)) -> (I64, U64) {
+    value
+}
+
 /// Echo `label`, or a placeholder when absent.
 #[bridge]
 pub fn maybe_label(label: Option<String>) -> String {
@@ -219,6 +327,14 @@ pub const CHANNEL_LABELS: &[&str] = &["chin_emg", "leg_movement"];
 /// Gain applied when none is configured.
 #[bridge]
 pub const DEFAULT_GAIN: f64 = 1.25;
+
+/// Largest exact sequence value.
+#[bridge]
+pub const MAX_EXACT: U64 = U64::new(u64::MAX);
+
+/// Exact signed and unsigned bounds.
+#[bridge]
+pub const EXACT_PAIR: (I64, U64) = (I64::new(i64::MIN), U64::new(u64::MAX));
 
 /// Echo arbitrary JSON.
 #[bridge]
@@ -285,7 +401,7 @@ impl Counter {
     }
 }
 
-/// A recording session opened through a factory.
+/// A processing session opened through a factory.
 pub struct Session {
     id: u32,
 }
@@ -375,9 +491,10 @@ fn grab(ptr: *mut u8) -> Env {
     env
 }
 
-/// Encode an args JSON object for a shim call.
+/// Encode an ABI-2 request envelope for a direct shim call.
 fn args(value: &Value) -> Vec<u8> {
-    serde_json::to_vec(value).expect("args encode")
+    let json = serde_json::to_vec(value).expect("args JSON encode");
+    rspyts_core::envelope::encode_request(&json, &[]).expect("args envelope encode")
 }
 
 fn expect_ok(env: &Env) -> &Value {
@@ -406,8 +523,8 @@ fn expect_err<'a>(env: &'a Env, code: &str) -> &'a Value {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn abi_version_is_one() {
-    assert_eq!(rspyts_abi_version(), 1);
+fn abi_version_is_two() {
+    assert_eq!(rspyts_abi_version(), 2);
 }
 
 #[test]
@@ -634,6 +751,53 @@ fn snake_case_override_controls_the_wire_names() {
     expect_err(&env, "invalidArgs");
 }
 
+#[test]
+fn exact_integer_boundaries_and_tuples_round_trip_through_shims() {
+    let value = json!({
+        "signed": i64::MIN.to_string(),
+        "unsigned": u64::MAX.to_string(),
+        "pair": ["9007199254740993", "9007199254740993"],
+        "dozen": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11],
+    });
+    let body = args(&json!({"value": value}));
+    let env = grab(unsafe { rspyts_fn__echo_exact(body.as_ptr(), body.len()) });
+    assert_eq!(*expect_ok(&env), value);
+
+    let pair = json!([i64::MAX.to_string(), u64::MAX.to_string()]);
+    let body = args(&json!({"value": pair}));
+    let env = grab(unsafe { rspyts_fn__echo_tuple(body.as_ptr(), body.len()) });
+    assert_eq!(*expect_ok(&env), pair);
+}
+
+#[test]
+fn exact_integer_wire_values_are_strict_and_range_checked() {
+    for invalid in [
+        json!([1, "1"]),
+        json!(["01", "1"]),
+        json!(["-0", "1"]),
+        json!(["9223372036854775808", "1"]),
+        json!(["1", "18446744073709551616"]),
+        json!(["1"]),
+        json!(["1", "2", "3"]),
+    ] {
+        let body = args(&json!({"value": invalid}));
+        let env = grab(unsafe { rspyts_fn__echo_tuple(body.as_ptr(), body.len()) });
+        expect_err(&env, "invalidArgs");
+    }
+}
+
+#[test]
+fn mixed_unit_and_data_enum_round_trips_through_the_shim() {
+    for value in [
+        json!({"type": "pending"}),
+        json!({"type": "ready", "sequence": u64::MAX.to_string()}),
+    ] {
+        let body = args(&json!({"value": value}));
+        let env = grab(unsafe { rspyts_fn__echo_mixed(body.as_ptr(), body.len()) });
+        assert_eq!(*expect_ok(&env), value);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Enum wire shapes (emitted serde attributes)
 // ---------------------------------------------------------------------------
@@ -687,6 +851,21 @@ fn data_enum_tag_override_is_honored() {
 }
 
 #[test]
+fn mixed_enum_serde_shape_matches_its_registered_contract() {
+    assert_eq!(
+        serde_json::to_value(MixedState::Pending).unwrap(),
+        json!({"type": "pending"})
+    );
+    assert_eq!(
+        serde_json::to_value(MixedState::Ready {
+            sequence: U64::new(u64::MAX),
+        })
+        .unwrap(),
+        json!({"type": "ready", "sequence": u64::MAX.to_string()})
+    );
+}
+
+#[test]
 fn struct_serde_round_trips_and_rejects_unknown_fields() {
     let everything = Everything {
         flag: false,
@@ -736,6 +915,134 @@ fn struct_serde_round_trips_and_rejects_unknown_fields() {
     assert!(serde_json::from_value::<Everything>(with_extra).is_err());
 }
 
+#[test]
+fn reflected_serde_names_match_the_registered_manifest_mechanically() {
+    use rspyts_core::ir::TypeDecl;
+
+    let manifest = rspyts_core::registry::build_manifest("expansion-fixture", "0.0.0");
+    let type_decl = |name: &str| {
+        manifest
+            .types
+            .iter()
+            .find(|decl| decl.name() == name)
+            .unwrap_or_else(|| panic!("missing type declaration {name}"))
+    };
+    let object_keys = |value: Value| {
+        let mut keys: Vec<String> = value
+            .as_object()
+            .expect("fixture serializes as an object")
+            .keys()
+            .cloned()
+            .collect();
+        keys.sort();
+        keys
+    };
+    let declared_fields = |decl: &TypeDecl| {
+        let TypeDecl::Struct { fields, .. } = decl else {
+            panic!("expected struct declaration")
+        };
+        let mut names: Vec<String> = fields.iter().map(|field| field.wire_name.clone()).collect();
+        names.sort();
+        names
+    };
+
+    let owned = serde_json::to_value(OwnedSerdeNames {
+        http2_id: 2,
+        display_code: String::from("ok"),
+    })
+    .unwrap();
+    assert_eq!(
+        object_keys(owned),
+        declared_fields(type_decl("OwnedSerdeNames"))
+    );
+
+    let adopted = serde_json::to_value(AdoptedRecord {
+        http2_id: 2,
+        display_name: String::from("record"),
+    })
+    .unwrap();
+    assert_eq!(
+        object_keys(adopted),
+        declared_fields(type_decl("AdoptedRecord"))
+    );
+
+    let defaults = serde_json::to_value(AdoptedDefaults { item_count: 3 }).unwrap();
+    assert_eq!(
+        object_keys(defaults),
+        declared_fields(type_decl("AdoptedDefaults"))
+    );
+
+    let TypeDecl::StringEnum { variants, .. } = type_decl("AdoptedMode") else {
+        panic!("expected string-enum declaration")
+    };
+    assert_eq!(
+        serde_json::to_value(AdoptedMode::FastPath).unwrap(),
+        json!(
+            variants
+                .iter()
+                .find(|v| v.name == "FastPath")
+                .unwrap()
+                .wire_name
+        )
+    );
+    assert_eq!(
+        serde_json::to_value(AdoptedMode::ManualOverride).unwrap(),
+        json!(
+            variants
+                .iter()
+                .find(|v| v.name == "ManualOverride")
+                .unwrap()
+                .wire_name
+        )
+    );
+
+    let value = serde_json::to_value(AdoptedMessage::HTTP2Ready {
+        request_id: 7,
+        url_value: String::from("https://example.test"),
+    })
+    .unwrap();
+    let TypeDecl::Enum { tag, variants, .. } = type_decl("AdoptedMessage") else {
+        panic!("expected data-enum declaration")
+    };
+    let variant = variants
+        .iter()
+        .find(|variant| value[tag] == variant.wire_name)
+        .expect("serialized tag matches a manifest variant");
+    let mut actual_keys = object_keys(value);
+    actual_keys.retain(|key| key != tag);
+    let mut expected_keys: Vec<String> = variant
+        .fields
+        .iter()
+        .map(|field| field.wire_name.clone())
+        .collect();
+    expected_keys.sort();
+    assert_eq!(actual_keys, expected_keys);
+
+    for (name, value, expected_inner) in [
+        (
+            "AdoptedId",
+            serde_json::to_value(AdoptedId(7)).unwrap(),
+            json!(7),
+        ),
+        (
+            "RecordId",
+            serde_json::to_value(RecordId(8)).unwrap(),
+            json!(8),
+        ),
+        (
+            "NamedCode",
+            serde_json::to_value(NamedCode {
+                value: String::from("ready"),
+            })
+            .unwrap(),
+            json!("ready"),
+        ),
+    ] {
+        assert_eq!(value, expected_inner);
+        assert!(matches!(type_decl(name), TypeDecl::Newtype { .. }));
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Error enums
 // ---------------------------------------------------------------------------
@@ -760,6 +1067,18 @@ fn error_enum_maps_variants_to_code_message_and_data() {
             "code": "overLimit",
             "message": "adding 9 exceeds the limit 5",
             "data": {"maxAllowed": 5, "attempted": 9},
+        })
+    );
+
+    let err = rspyts::BridgeErr::into_bridge_error(FixtureError::ExactLimit {
+        limit: U64::new(u64::MAX),
+    });
+    assert_eq!(
+        serde_json::to_value(&err).unwrap(),
+        json!({
+            "code": "exactLimit",
+            "message": format!("exact limit {} was rejected", u64::MAX),
+            "data": {"limit": u64::MAX.to_string()},
         })
     );
 }
@@ -889,6 +1208,22 @@ fn const_decls_capture_name_ty_and_serialized_value() {
     let gain = find("DEFAULT_GAIN");
     assert_eq!(gain.ty, Ty::F64);
     assert_eq!(gain.value, json!(1.25));
+
+    let max_exact = find("MAX_EXACT");
+    assert_eq!(max_exact.ty, Ty::U64);
+    assert_eq!(max_exact.value, json!(u64::MAX.to_string()));
+
+    let exact_pair = find("EXACT_PAIR");
+    assert_eq!(
+        exact_pair.ty,
+        Ty::Tuple {
+            items: vec![Ty::I64, Ty::U64],
+        }
+    );
+    assert_eq!(
+        exact_pair.value,
+        json!([i64::MIN.to_string(), u64::MAX.to_string()])
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -954,9 +1289,15 @@ fn impl_level_target_is_inherited_and_overridable() {
 #[test]
 fn json_passthrough_round_trips_arbitrary_shapes() {
     let payload = json!({"nested": [1, "two", {"three": null}], "flag": true});
-    let body = args(&json!({"value": payload}));
+    let body = args(&json!({"value": {"__rspyts_json__": payload}}));
     let env = grab(unsafe { rspyts_fn__echo_json(body.as_ptr(), body.len()) });
-    assert_eq!(*expect_ok(&env), payload);
+    assert_eq!(expect_ok(&env)["__rspyts_json__"], payload);
+
+    // Marker-shaped user data stays opaque inside the outer Json wrapper.
+    let collision = json!({"__rspyts_buf__": {"off": "user data"}});
+    let body = args(&json!({"value": {"__rspyts_json__": collision}}));
+    let env = grab(unsafe { rspyts_fn__echo_json(body.as_ptr(), body.len()) });
+    assert_eq!(expect_ok(&env)["__rspyts_json__"], collision);
 
     // The shim (target-scoped functions always keep their shim) still works.
     let body = args(&json!({"x": 21}));
@@ -1019,10 +1360,72 @@ fn manifest_snapshot_covers_every_registered_item() {
     let manifest = rspyts_core::registry::build_manifest("expansion-fixture", "0.0.0");
     let actual = serde_json::to_value(&manifest).unwrap();
     let expected = json!({
-        "abi": "0.1",
+        "abi": "2.0",
         "crateName": "expansion-fixture",
         "crateVersion": "0.0.0",
         "types": [
+            {
+                "kind": "struct",
+                "name": "AdoptedDefaults",
+                "docs": "Adoption without rename metadata follows Serde's ordinary field names.",
+                "origin": "rspyts",
+                "fields": [
+                    {"name": "item_count", "wireName": "item_count", "docs": "", "ty": {"kind": "u32"}, "optional": false},
+                ],
+            },
+            {
+                "kind": "newtype",
+                "name": "AdoptedId",
+                "docs": "A tuple newtype whose existing Serde contract is adopted.",
+                "origin": "rspyts",
+                "inner": {"kind": "u32"},
+            },
+            {
+                "kind": "enum",
+                "name": "AdoptedMessage",
+                "docs": "An adopted internally tagged data enum.",
+                "origin": "rspyts",
+                "tag": "eventKind",
+                "variants": [
+                    {
+                        "name": "HTTP2Ready",
+                        "wireName": "h_t_t_p2_ready",
+                        "docs": "",
+                        "fields": [
+                            {"name": "request_id", "wireName": "request-id", "docs": "", "ty": {"kind": "u32"}, "optional": false},
+                            {"name": "url_value", "wireName": "URL", "docs": "", "ty": {"kind": "string"}, "optional": false},
+                        ],
+                    },
+                    {
+                        "name": "Closed",
+                        "wireName": "closed",
+                        "docs": "",
+                        "fields": [
+                            {"name": "reason_code", "wireName": "reason_code", "docs": "", "ty": {"kind": "u32"}, "optional": false},
+                        ],
+                    },
+                ],
+            },
+            {
+                "kind": "stringEnum",
+                "name": "AdoptedMode",
+                "docs": "An adopted string enum with an explicit Serde casing contract.",
+                "origin": "rspyts",
+                "variants": [
+                    {"name": "FastPath", "wireName": "FAST_PATH", "docs": ""},
+                    {"name": "ManualOverride", "wireName": "manual", "docs": ""},
+                ],
+            },
+            {
+                "kind": "struct",
+                "name": "AdoptedRecord",
+                "docs": "An existing Serde struct adopted without duplicate derives.",
+                "origin": "rspyts",
+                "fields": [
+                    {"name": "http2_id", "wireName": "http2-id", "docs": "", "ty": {"kind": "u32"}, "optional": false},
+                    {"name": "display_name", "wireName": "display", "docs": "", "ty": {"kind": "string"}, "optional": false},
+                ],
+            },
             {
                 "kind": "stringEnum",
                 "name": "Channel",
@@ -1093,6 +1496,29 @@ fn manifest_snapshot_covers_every_registered_item() {
                 ],
             },
             {
+                "kind": "struct",
+                "name": "ExactRecord",
+                "docs": "Exact integers and fixed-length tuple shapes.",
+                "origin": "rspyts",
+                "fields": [
+                    {"name": "signed", "wireName": "signed", "docs": "", "ty": {"kind": "i64"}, "optional": false},
+                    {"name": "unsigned", "wireName": "unsigned", "docs": "", "ty": {"kind": "u64"}, "optional": false},
+                    {"name": "pair", "wireName": "pair", "docs": "", "ty": {"kind": "tuple", "items": [{"kind": "i64"}, {"kind": "u64"}]}, "optional": false},
+                    {
+                        "name": "dozen", "wireName": "dozen", "docs": "", "optional": false,
+                        "ty": {
+                            "kind": "tuple",
+                            "items": [
+                                {"kind": "u8"}, {"kind": "u8"}, {"kind": "u8"},
+                                {"kind": "u8"}, {"kind": "u8"}, {"kind": "u8"},
+                                {"kind": "u8"}, {"kind": "u8"}, {"kind": "u8"},
+                                {"kind": "u8"}, {"kind": "u8"}, {"kind": "u8"},
+                            ],
+                        },
+                    },
+                ],
+            },
+            {
                 "kind": "errorEnum",
                 "name": "FixtureError",
                 "docs": "Failure modes of the fixture class.",
@@ -1106,6 +1532,14 @@ fn manifest_snapshot_covers_every_registered_item() {
                         "fields": [
                             {"name": "max_allowed", "wireName": "maxAllowed", "docs": "", "ty": {"kind": "i32"}, "optional": false},
                             {"name": "attempted", "wireName": "attempted", "docs": "", "ty": {"kind": "i32"}, "optional": false},
+                        ],
+                    },
+                    {
+                        "name": "ExactLimit",
+                        "wireCode": "exactLimit",
+                        "docs": "An exact unsigned limit was rejected.",
+                        "fields": [
+                            {"name": "limit", "wireName": "limit", "docs": "", "ty": {"kind": "u64"}, "optional": false},
                         ],
                     },
                 ],
@@ -1122,6 +1556,31 @@ fn manifest_snapshot_covers_every_registered_item() {
                 ],
             },
             {
+                "kind": "enum",
+                "name": "MixedState",
+                "docs": "A mixed unit-and-data state.",
+                "origin": "rspyts",
+                "tag": "type",
+                "variants": [
+                    {"name": "Pending", "wireName": "pending", "docs": "", "fields": []},
+                    {
+                        "name": "Ready",
+                        "wireName": "ready",
+                        "docs": "",
+                        "fields": [
+                            {"name": "sequence", "wireName": "sequence", "docs": "", "ty": {"kind": "u64"}, "optional": false},
+                        ],
+                    },
+                ],
+            },
+            {
+                "kind": "newtype",
+                "name": "NamedCode",
+                "docs": "A named transparent newtype.",
+                "origin": "rspyts",
+                "inner": {"kind": "string"},
+            },
+            {
                 "kind": "struct",
                 "name": "NestedInfo",
                 "docs": "A nested payload.",
@@ -1129,6 +1588,23 @@ fn manifest_snapshot_covers_every_registered_item() {
                 "fields": [
                     {"name": "note", "wireName": "note", "docs": "Free-form note.", "ty": {"kind": "string"}, "optional": false},
                 ],
+            },
+            {
+                "kind": "struct",
+                "name": "OwnedSerdeNames",
+                "docs": "An owning contract whose Serde attributes are reflected by rspyts.",
+                "origin": "rspyts",
+                "fields": [
+                    {"name": "http2_id", "wireName": "HTTP2_ID", "docs": "", "ty": {"kind": "u32"}, "optional": false},
+                    {"name": "display_code", "wireName": "display-code", "docs": "", "ty": {"kind": "string"}, "optional": false},
+                ],
+            },
+            {
+                "kind": "newtype",
+                "name": "RecordId",
+                "docs": "An owning tuple newtype.",
+                "origin": "rspyts",
+                "inner": {"kind": "u32"},
             },
             {
                 "kind": "enum",
@@ -1189,6 +1665,20 @@ fn manifest_snapshot_covers_every_registered_item() {
                 "ty": {"kind": "f64"},
                 "value": 1.25,
             },
+            {
+                "name": "EXACT_PAIR",
+                "docs": "Exact signed and unsigned bounds.",
+                "origin": "rspyts",
+                "ty": {"kind": "tuple", "items": [{"kind": "i64"}, {"kind": "u64"}]},
+                "value": ["-9223372036854775808", "18446744073709551615"],
+            },
+            {
+                "name": "MAX_EXACT",
+                "docs": "Largest exact sequence value.",
+                "origin": "rspyts",
+                "ty": {"kind": "u64"},
+                "value": "18446744073709551615",
+            },
         ],
         "functions": [
             {
@@ -1222,6 +1712,16 @@ fn manifest_snapshot_covers_every_registered_item() {
                 "targets": ["python", "typescript"],
             },
             {
+                "name": "echo_exact",
+                "docs": "Round-trip exact integers and fixed-length tuples.",
+                "params": [
+                    {"name": "value", "wireName": "value", "ty": {"kind": "ref", "name": "ExactRecord"}},
+                ],
+                "ret": {"kind": "ref", "name": "ExactRecord"},
+                "err": null,
+                "targets": ["python", "typescript"],
+            },
+            {
                 "name": "echo_json",
                 "docs": "Echo arbitrary JSON.",
                 "params": [
@@ -1232,12 +1732,32 @@ fn manifest_snapshot_covers_every_registered_item() {
                 "targets": ["python", "typescript"],
             },
             {
+                "name": "echo_mixed",
+                "docs": "Round-trip a mixed unit-and-data enum.",
+                "params": [
+                    {"name": "value", "wireName": "value", "ty": {"kind": "ref", "name": "MixedState"}},
+                ],
+                "ret": {"kind": "ref", "name": "MixedState"},
+                "err": null,
+                "targets": ["python", "typescript"],
+            },
+            {
                 "name": "echo_snake",
                 "docs": "Round-trip a snake-cased struct.",
                 "params": [
                     {"name": "wire", "wireName": "wire", "ty": {"kind": "ref", "name": "SnakeWire"}},
                 ],
                 "ret": {"kind": "ref", "name": "SnakeWire"},
+                "err": null,
+                "targets": ["python", "typescript"],
+            },
+            {
+                "name": "echo_tuple",
+                "docs": "Round-trip a pair without changing its positions.",
+                "params": [
+                    {"name": "value", "wireName": "value", "ty": {"kind": "tuple", "items": [{"kind": "i64"}, {"kind": "u64"}]}},
+                ],
+                "ret": {"kind": "tuple", "items": [{"kind": "i64"}, {"kind": "u64"}]},
                 "err": null,
                 "targets": ["python", "typescript"],
             },
@@ -1451,6 +1971,20 @@ fn manifest_snapshot_covers_every_registered_item() {
             },
         ],
     });
+    for section in ["types", "constants", "functions", "classes"] {
+        let actual_items = actual[section].as_array().unwrap();
+        let expected_items = expected[section].as_array().unwrap();
+        assert_eq!(
+            actual_items.len(),
+            expected_items.len(),
+            "{section} length differs"
+        );
+        for (index, (actual_item, expected_item)) in
+            actual_items.iter().zip(expected_items).enumerate()
+        {
+            assert_eq!(actual_item, expected_item, "{section}[{index}] differs");
+        }
+    }
     assert_eq!(
         actual,
         expected,

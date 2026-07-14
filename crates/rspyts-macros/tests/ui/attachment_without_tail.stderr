@@ -1,0 +1,11 @@
+error: `Buf` and `Bytes` cannot appear in a bridged constant because that wire format has no attachment tail
+ --> tests/ui/attachment_without_tail.rs:4:30
+  |
+4 | pub const BAD_BUFFER: Option<Buf<u8>> = None;
+  |                              ^^^^^^^
+
+error: `Buf` and `Bytes` cannot appear in an application-error field because that wire format has no attachment tail
+ --> tests/ui/attachment_without_tail.rs:8:29
+  |
+8 |     Payload { bytes: Option<Bytes> },
+  |                             ^^^^^

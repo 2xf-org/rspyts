@@ -1,11 +1,18 @@
 [project]
 name = "rspyts"
-version = "0.1.0"
+version = "0.2.0"
 description = "Python runtime for rspyts: pydantic contracts and a ctypes loader for Rust cdylibs bridged with the rspyts ABI."
 readme = "README.md"
 license = "MIT"
 license-files = ["LICENSE"]
-requires-python = ">=3.13"
+requires-python = ">=3.11"
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+]
 dependencies = [
     "pydantic>=2.7",
     "numpy>=1.24",
@@ -39,5 +46,12 @@ line-length = 120
 [tool.ruff.lint]
 select = ["E", "F", "I", "N", "UP", "RUF"]
 
+[tool.vulture]
+paths = ["src", "tests"]
+ignore_names = ["model_config", "isolated_registry", "clean_env", "demo__*"]
+
 [tool.hatch.build.targets.wheel]
 packages = ["src/rspyts"]
+
+[tool.hatch.build.targets.sdist]
+exclude = ["/.gitignore", "/uv.lock"]

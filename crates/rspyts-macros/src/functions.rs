@@ -1,12 +1,12 @@
 //! Expansion of `#[bridge]` on free functions (ABI §3.1).
 //!
-//! For `pub fn analyze_signal(samples: &[f64], sample_rate: u32) -> …` the
+//! For `pub fn process_values(values: &[f64], batch_size: u32) -> …` the
 //! macro emits, next to the untouched function:
 //!
-//! 1. `struct __RspytsArgs_analyze_signal` — a `Deserialize` struct with
+//! 1. `struct __RspytsArgs_process_values` — a `Deserialize` struct with
 //!    one owned field per plain parameter, camelCase on the wire.
-//! 2. `unsafe extern "C" fn rspyts_fn__analyze_signal(args_ptr, args_len,
-//!    s0_ptr, s0_len, …) -> *mut u8` — the panic-safe shim.
+//! 2. `unsafe extern "C" fn rspyts_fn__process_values(args_ptr, args_len,
+//!    s0_ptr, s0_len, …) -> *mut u8` — the panic-contained shim.
 //! 3. An inventory registration building the `FnDecl` at manifest time.
 
 use crate::attrs::BridgeArgs;
@@ -22,9 +22,11 @@ pub fn expand_fn(args: BridgeArgs, item: syn::ItemFn) -> syn::Result<TokenStream
     args.deny_static("free functions; `static` marks a method inside a #[bridge] impl block")?;
     args.deny_tag("functions")?;
     args.deny_rename_all("functions")?;
+    args.deny_serde("functions; it adopts Serde derives on data types")?;
     sig::ensure_plain_signature(&item.sig, "functions")?;
 
     let params = sig::bridged_params(item.sig.inputs.iter())?;
+    sig::validate_param_wire_names(&params)?;
     let ret = sig::classify_ret(&item.sig.output);
 
     let fn_ident = &item.sig.ident;

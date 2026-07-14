@@ -1,42 +1,25 @@
 """
-Locating, loading, and calling a bridged cdylib (ABI §§2-4, §6).
-
-Notes:
-    Generated ``library.py`` modules instantiate one :class:`Library` per
-    bridged crate, baking in the crate name and the search directories from
-    ``rspyts.toml``, and anchoring relative entries at the generated
-    package's own directory::
-
-        LIB = Library(
-            name="basic_example",
-            search=["../../../rust/target/debug"],
-            anchor=Path(__file__).parent,
-        )
-
-    Loading is lazy (first call) and cached; the ABI major version is
-    checked before anything else crosses the boundary.
+Load and call a bridged native library.
 """
 
 from __future__ import annotations
 
+import collections.abc
 import ctypes
-import json
 import os
-import struct
+import pathlib
 import sys
 import threading
-from collections.abc import Mapping, Sequence
-from pathlib import Path
-from typing import Any
+import typing
 
 import numpy as np
 
-from rspyts import envelope, errors
+from . import envelope, errors
 
 __all__ = ["Library", "platform_filename"]
 
 ENV_VAR = "RSPYTS_LIBRARY"
-EXPECTED_ABI_VERSION = 1
+EXPECTED_ABI_VERSION = 2
 
 
 def platform_filename(name: str) -> str:
@@ -80,20 +63,20 @@ class Library:
     def __init__(
         self,
         name: str,
-        search: Sequence[str] = (),
-        anchor: str | Path | None = None,
+        search: collections.abc.Sequence[str] = (),
+        anchor: str | pathlib.Path | None = None,
     ) -> None:
         self.name = name
         self.search = tuple(search)
-        self.anchor = Path(anchor) if anchor is not None else None
-        self.explicit_path: Path | None = None
+        self.anchor = pathlib.Path(anchor) if anchor is not None else None
+        self.explicit_path: pathlib.Path | None = None
         self.cdll: ctypes.CDLL | None = None
         # Guards lazy loading only. Calls themselves need no Python-side
         # lock: ctypes releases the GIL for the duration of the C call and
         # the Rust side is internally synchronized (ABI §10).
         self.load_lock = threading.Lock()
 
-    def set_path(self, path: str | Path) -> None:
+    def set_path(self, path: str | pathlib.Path) -> None:
         """
         Override library resolution with an explicit file path.
 
@@ -112,9 +95,9 @@ class Library:
                 f"rspyts: library {self.name!r} is already loaded; "
                 "set_path must be called before the first bridged call"
             )
-        self.explicit_path = Path(path)
+        self.explicit_path = pathlib.Path(path)
 
-    def resolve_path(self) -> Path:
+    def resolve_path(self) -> pathlib.Path:
         """
         Resolve the on-disk path of the compiled library.
 
@@ -126,15 +109,15 @@ class Library:
         """
         env = os.environ.get(ENV_VAR)
         if env:
-            return Path(env)
+            return pathlib.Path(env)
         if self.explicit_path is not None:
             return self.explicit_path
         filename = platform_filename(self.name)
-        candidates: list[Path] = []
+        candidates: list[pathlib.Path] = []
         for entry in self.search:
-            directory = Path(entry)
+            directory = pathlib.Path(entry)
             if not directory.is_absolute():
-                directory = (self.anchor or Path.cwd()) / directory
+                directory = (self.anchor or pathlib.Path.cwd()) / directory
             candidate = directory / filename
             candidates.append(candidate)
             if candidate.is_file():
@@ -184,10 +167,11 @@ class Library:
     def call(
         self,
         symbol: str,
-        args_obj: Mapping[str, Any] | None,
-        slices: Sequence[tuple[Any, str]] = (),
+        args_obj: collections.abc.Mapping[str, typing.Any] | None,
+        slices: collections.abc.Sequence[tuple[typing.Any, str]] = (),
         handle: int | None = None,
-    ) -> Any:
+        error_types: errors.BridgeErrorRegistry | None = None,
+    ) -> typing.Any:
         """
         Invoke a bridged function and decode its envelope.
 
@@ -214,21 +198,15 @@ class Library:
             ValueError: If a plain argument carries a non-finite float.
         """
         cdll = self.load()
-        try:
-            encoded = json.dumps(args_obj or {}, separators=(",", ":"), allow_nan=False).encode()
-        except ValueError as e:
-            raise ValueError(
-                "rspyts: non-finite floats (NaN/Infinity) cannot cross the bridge in "
-                "JSON positions; pass them through slice or Buf parameters instead."
-            ) from e
+        encoded = envelope.build_request(args_obj)
 
-        # numpy allocations are naturally aligned, satisfying ABI §6's
-        # alignment requirement for input slices. The list keeps every
-        # (possibly converted) array alive until after the C call returns.
-        # np.require with "A" copies misaligned inputs (ascontiguousarray
-        # does not), upholding ABI §6's natural-alignment requirement.
+        # Rust receives shared slices while ctypes releases the GIL. Always
+        # copy into runtime-owned, naturally aligned storage so another
+        # Python or native thread cannot mutate an aliased writable ndarray
+        # during the call. The list keeps those private arrays alive until
+        # the foreign function returns.
         arrays = [
-            np.require(data, dtype=envelope.DTYPES[dt], requirements=("C", "A"))
+            np.require(data, dtype=envelope.DTYPES[dt], requirements=("C", "A", "O")).copy(order="C")
             for data, dt in slices
         ]
 
@@ -238,7 +216,7 @@ class Library:
         fn = getattr(cdll, symbol)
         fn.restype = ctypes.c_void_p
 
-        c_args: list[Any] = []
+        c_args: list[typing.Any] = []
         if handle is not None:
             c_args.append(ctypes.c_uint64(handle))
 
@@ -263,16 +241,24 @@ class Library:
         if ret is None:
             raise RuntimeError(f"rspyts: {symbol} returned a null envelope")
 
-        header = ctypes.string_at(ret, envelope.HEADER_LEN)
-        json_len, tail_len = struct.unpack_from("<II", header, 4)
+        # Read the fixed-size header in place first. This does not allocate a
+        # Python bytes object, so once `ret` is accepted we can always derive
+        # the exact length required by rspyts_free.
+        header = (ctypes.c_ubyte * envelope.HEADER_LEN).from_address(ret)
+        json_len = sum(int(header[4 + index]) << (8 * index) for index in range(4))
+        tail_len = sum(int(header[8 + index]) << (8 * index) for index in range(4))
         total = envelope.HEADER_LEN + json_len + tail_len
-        raw = ctypes.string_at(ret, total)
-        cdll.rspyts_free(ctypes.c_void_p(ret), ctypes.c_size_t(total))
+        try:
+            raw = ctypes.string_at(ret, total)
+        finally:
+            # Even malformed content or a host-side allocation failure must
+            # release the response with the header-derived exact length.
+            cdll.rspyts_free(ctypes.c_void_p(ret), ctypes.c_size_t(total))
 
         status, payload = envelope.parse_envelope(raw)
         if status == 0:
             return payload
-        errors.raise_bridge_error(status, payload)
+        errors.raise_bridge_error(status, payload, error_types)
 
     def call_drop(self, symbol: str, handle: int) -> None:
         """

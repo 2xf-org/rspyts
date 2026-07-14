@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  InstancePoisonedError,
   RspytsError,
   RspytsPanicError,
   StaleHandleError,
@@ -59,6 +60,14 @@ describe("error classes", () => {
     expect(base).not.toBeInstanceOf(RspytsPanicError);
     expect(base).not.toBeInstanceOf(StaleHandleError);
   });
+
+  it("gives poisoned instances an actionable standalone error", () => {
+    const error = new InstancePoisonedError();
+    expect(error).toBeInstanceOf(Error);
+    expect(error).not.toBeInstanceOf(RspytsError);
+    expect(error.name).toBe("InstancePoisonedError");
+    expect(error.message).toMatch(/instantiate a fresh module/);
+  });
 });
 
 describe("throwBridgeError", () => {
@@ -88,22 +97,40 @@ describe("throwBridgeError", () => {
   });
 
   it("prefers registered classes and passes data through", () => {
-    class WindowTooLargeError extends RspytsError {
+    class BatchTooLargeError extends RspytsError {
       constructor(message: string, data?: unknown) {
-        super(message, "errTestWindowTooLarge", data);
+        super(message, "errTestBatchTooLarge", data);
       }
     }
-    registerError("errTestWindowTooLarge", WindowTooLargeError);
+    registerError("errTestBatchTooLarge", BatchTooLargeError);
     const error = capture(() =>
       throwBridgeError(1, {
-        code: "errTestWindowTooLarge",
-        message: "window too large",
+        code: "errTestBatchTooLarge",
+        message: "batch too large",
         data: { max: 5 },
       }),
     );
-    expect(error).toBeInstanceOf(WindowTooLargeError);
+    expect(error).toBeInstanceOf(BatchTooLargeError);
     expect(error).toBeInstanceOf(RspytsError);
     expect((error as RspytsError).data).toEqual({ max: 5 });
+  });
+
+  it("prefers the call-scoped registry without leaking across packages", () => {
+    class FirstPackageError extends RspytsError {
+      constructor(message: string, data?: unknown) {
+        super(message, "sharedCode", data);
+      }
+    }
+    class SecondPackageError extends RspytsError {
+      constructor(message: string, data?: unknown) {
+        super(message, "sharedCode", data);
+      }
+    }
+    const payload = { code: "sharedCode", message: "scoped" };
+    const first = capture(() => throwBridgeError(1, payload, { sharedCode: FirstPackageError }));
+    const second = capture(() => throwBridgeError(1, payload, { sharedCode: SecondPackageError }));
+    expect(first).toBeInstanceOf(FirstPackageError);
+    expect(second).toBeInstanceOf(SecondPackageError);
   });
 
   it("lets a later registration replace an earlier one", () => {

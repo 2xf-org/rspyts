@@ -1,0 +1,16 @@
+error[E0277]: the trait bound `(u8, u8, u8, u8, u8, u8, u8, u8, u8, u8, u8, u8, u8): Bridged` is not satisfied
+ --> tests/ui/tuple_arity_thirteen.rs:5:17
+  |
+5 |     pub values: (u8, u8, u8, u8, u8, u8, u8, u8, u8, u8, u8, u8, u8),
+  |                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ the trait `Bridged` is not implemented for `(u8, u8, u8, u8, u8, u8, u8, u8, u8, u8, u8, u8, u8)`
+  |
+  = help: the following other types implement trait `Bridged`:
+            ()
+            (A, B)
+            (A, B, C)
+            (A, B, C, D)
+            (A, B, C, D, E)
+            (A, B, C, D, E, F)
+            (A, B, C, D, E, F, G)
+            (A, B, C, D, E, F, G, H)
+          and $N others

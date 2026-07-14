@@ -10,26 +10,26 @@
 //! use rspyts::{bridge, Buf};
 //!
 //! #[bridge]
-//! /// Parameters controlling the analysis pass.
-//! pub struct AnalysisParams {
-//!     /// Minimum event duration, in seconds.
-//!     pub min_duration_s: f64,
-//!     pub threshold: Option<f64>,
+//! /// Options controlling value processing.
+//! pub struct QueryOptions {
+//!     /// Minimum value to include.
+//!     pub minimum_value: f64,
+//!     pub tolerance: Option<f64>,
 //! }
 //!
 //! #[bridge(error)]
-//! pub enum AnalysisError {
-//!     InvalidSampleRate,
-//!     WindowTooLarge { max: u32 },
+//! pub enum QueryError {
+//!     InvalidBatchSize,
+//!     BatchTooLarge { max: u32 },
 //! }
 //!
 //! #[bridge]
-//! /// Analyze a signal buffer.
-//! pub fn analyze_signal(
-//!     samples: &[f64],
-//!     sample_rate: u32,
-//!     params: &AnalysisParams,
-//! ) -> Result<Buf<f64>, AnalysisError> {
+//! /// Process a buffer of numeric values.
+//! pub fn process_values(
+//!     values: &[f64],
+//!     batch_size: u32,
+//!     options: &QueryOptions,
+//! ) -> Result<Buf<f64>, QueryError> {
 //!     // …
 //! }
 //!
@@ -40,7 +40,7 @@
 //! `docs/design/type-system.md` (what can cross), `docs/design/abi.md`
 //! (how it crosses), and `docs/design/codegen.md` (what gets generated).
 
-pub use rspyts_core::{BridgeErr, BridgeError, Bridged, Buf, Json};
+pub use rspyts_core::{BridgeErr, BridgeError, Bridged, Buf, Bytes, I64, Json, U64};
 pub use rspyts_macros::bridge;
 
 /// Export the module-level rspyts symbols (`rspyts_abi_version`,

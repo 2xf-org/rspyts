@@ -2,26 +2,36 @@
  * End-to-end tests: TypeScript → WASM → envelope → typed results.
  *
  * Requires the WASM build:
- *   cargo build -p basic-example --target wasm32-unknown-unknown
+ *   rspyts build --config examples/basic/rspyts.toml
  */
 
 import { readFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import { beforeAll, describe, expect, it } from "vitest";
-import { RspytsError, RspytsPanicError, StaleHandleError } from "rspyts";
+import {
+  InstancePoisonedError,
+  RspytsError,
+  RspytsPanicError,
+  StaleHandleError,
+} from "rspyts";
 // Imported from ../src, not ../src/generated: the package's index.ts
 // re-exports the generated surface, so consumers never spell "generated".
 import {
+  BasicErrorSequenceTooLarge,
   createClient,
+  EXACT_BOUNDS,
+  MAX_EXACT_U64,
   MAX_WINDOW,
   ROUNDING_MODES,
   type BasicExampleClient,
+  type BinaryPacket,
+  type ExactNumbers,
   type Rounding,
 } from "../src";
 
 const WASM_PATH = fileURLToPath(
   new URL(
-    "../../../../target/wasm32-unknown-unknown/debug/basic_example.wasm",
+    "../../../../target/rspyts/wasm32-unknown-unknown/debug/basic_example.wasm",
     import.meta.url,
   ),
 );
@@ -73,11 +83,67 @@ describe("constants", () => {
     expect(client.roundValue(2.4, nearest)).toBe(2);
     expect(window).toBe(1024);
   });
+
+  it("preserve exact integer literal values", () => {
+    const max: 18446744073709551615n = MAX_EXACT_U64;
+    expect(max).toBe((1n << 64n) - 1n);
+    expect(EXACT_BOUNDS).toEqual([-(1n << 63n), (1n << 64n) - 1n]);
+  });
+});
+
+describe("exact integers", () => {
+  it("round-trips boundaries, nesting, tuples, and values beyond 2^53", () => {
+    const value: ExactNumbers = {
+      signed: -(1n << 63n),
+      unsigned: (1n << 64n) - 1n,
+      pair: [(1n << 53n) + 1n, (1n << 64n) - 1n],
+      history: [0n, (1n << 53n) + 1n, (1n << 64n) - 1n],
+    };
+    expect(client.echoExactNumbers(value)).toEqual(value);
+    expect(client.echoExactPair([(1n << 63n) - 1n, (1n << 64n) - 1n])).toEqual([
+      (1n << 63n) - 1n,
+      (1n << 64n) - 1n,
+    ]);
+  });
+
+  it("rejects out-of-range values before entering WASM", () => {
+    expect(() => client.validateSequence(-1n, 1n)).toThrowError(
+      /u64 value out of range: -1/,
+    );
+    expect(() => client.validateSequence(1n << 64n, 1n)).toThrowError(
+      /u64 value out of range/,
+    );
+    expect(() => client.echoExactPair([1n << 63n, 1n])).toThrowError(
+      /i64 value out of range/,
+    );
+  });
+
+  it("converts exact typed error data back to bigint", () => {
+    try {
+      client.validateSequence((1n << 64n) - 1n, (1n << 53n) + 1n);
+      expect.unreachable();
+    } catch (error) {
+      expect(error).toBeInstanceOf(BasicErrorSequenceTooLarge);
+      expect((error as RspytsError).data).toEqual({
+        value: (1n << 64n) - 1n,
+        maximum: (1n << 53n) + 1n,
+      });
+    }
+  });
+});
+
+describe("mixed enums", () => {
+  it("round-trips unit and data variants", () => {
+    expect(client.echoTransferState({ type: "pending" })).toEqual({ type: "pending" });
+    expect(
+      client.echoTransferState({ type: "complete", sequence: (1n << 64n) - 1n }),
+    ).toEqual({ type: "complete", sequence: (1n << 64n) - 1n });
+  });
 });
 
 describe("annotate", () => {
   it("round-trips schemaless JSON objects untouched", () => {
-    const metadata = { source: "sensor", nested: { tags: ["a", "b"], rev: 2 }, empty: null };
+    const metadata = { source: "fixture", nested: { tags: ["a", "b"], rev: 2 }, empty: null };
     expect(client.annotate(2.5, metadata)).toEqual({ ...metadata, value: 2.5 });
   });
 
@@ -113,11 +179,56 @@ describe("scale", () => {
   });
 
   it("rejects non-finite scalars loudly", () => {
-    // JSON.stringify turns Infinity into null, which Rust's deserializer
-    // rejects — a loud invalidArgs error, never silent corruption.
+    // Structured floats fail in the host before JSON can turn Infinity into
+    // null. Raw slice and Buf attachments still preserve non-finite values.
     expect(() => client.scale(new Float64Array([1]), Number.POSITIVE_INFINITY)).toThrowError(
-      expect.objectContaining({ code: "invalidArgs" }),
+      /non-finite numbers cannot cross in JSON positions/,
     );
+  });
+});
+
+describe("binary attachments", () => {
+  it("preserves empty and edge byte values", () => {
+    expect(client.echoBytes(new Uint8Array(0))).toEqual(new Uint8Array(0));
+    expect(client.echoBytes(new Uint8Array([0x00, 0x7f, 0x80, 0xff]))).toEqual(
+      new Uint8Array([0x00, 0x7f, 0x80, 0xff]),
+    );
+  });
+
+  it("round-trips nested buffers and a transparent newtype", () => {
+    const packet: BinaryPacket = {
+      id: 7,
+      payload: new Uint8Array([0x00, 0xff]),
+      samples: new Float64Array([1.5, -2.25]),
+      chunks: [new Int16Array([-32768, 0, 32767]), new Int16Array(0)],
+      channels: {
+        red: new Uint8Array([0, 127, 255]),
+        empty: new Uint8Array(0),
+      },
+    };
+
+    const out = client.echoBinaryPacket(packet);
+
+    expect(out.id).toBe(7);
+    expect(out.payload).toEqual(new Uint8Array([0x00, 0xff]));
+    expect(out.samples).toBeInstanceOf(Float64Array);
+    expect(Array.from(out.samples)).toEqual([1.5, -2.25]);
+    expect(out.chunks[0]).toBeInstanceOf(Int16Array);
+    expect(Array.from(out.chunks[0])).toEqual([-32768, 0, 32767]);
+    expect(out.chunks[1]).toEqual(new Int16Array(0));
+    expect(out.channels.red).toBeInstanceOf(Uint8Array);
+    expect(out.channels.red).toEqual(new Uint8Array([0, 127, 255]));
+    expect(out.channels.empty).toEqual(new Uint8Array(0));
+
+    expect(out.samples).not.toBe(packet.samples);
+    expect(out.chunks[0]).not.toBe(packet.chunks[0]);
+    expect(out.channels.red).not.toBe(packet.channels.red);
+    packet.samples[0] = 99;
+    packet.chunks[0][0] = 99;
+    packet.channels.red[0] = 99;
+    expect(out.samples[0]).toBe(1.5);
+    expect(out.chunks[0][0]).toBe(-32768);
+    expect(out.channels.red[0]).toBe(0);
   });
 });
 
@@ -345,8 +456,9 @@ describe("handle lifecycle", () => {
 // status-2 envelope (see docs/design/abi.md §9), and the instance may not
 // be reusable afterwards.
 describe("panics", () => {
-  it("a panic traps the instance instead of returning garbage", () => {
-    expect(() => client.simulatePanic()).toThrowError();
+  it("a panic traps and poisons the instance", () => {
+    expect(() => client.simulatePanic()).toThrowError(WebAssembly.RuntimeError);
+    expect(() => client.roundValue(1.5, "up")).toThrowError(InstancePoisonedError);
   });
 });
 

@@ -2,91 +2,106 @@
 
 <p align="center">
   <a href="https://github.com/2xf-org/rspyts/actions/workflows/validation.yml">
-    <img src="https://github.com/2xf-org/rspyts/actions/workflows/validation.yml/badge.svg">
-  </a>
-  <a href="https://opensource.org/licenses/MIT">
-    <img src="https://img.shields.io/badge/License-MIT-yellow.svg">
-  </a>
-  <a href="https://crates.io/crates/rspyts">
-    <img src="https://img.shields.io/crates/v/rspyts.svg">
-  </a>
-  <a href="https://pypi.org/project/rspyts/">
-    <img src="https://img.shields.io/pypi/v/rspyts.svg">
-  </a>
-  <a href="https://www.npmjs.com/package/rspyts">
-    <img src="https://img.shields.io/npm/v/rspyts.svg">
+    <img src="https://github.com/2xf-org/rspyts/actions/workflows/validation.yml/badge.svg" alt="Validation">
   </a>
 </p>
 
-Define it once in Rust, call it from Python and TypeScript.
+Define an API once in Rust, then call it from Python and TypeScript.
+
+rspyts generates typed clients from the compiled Rust crate. Python calls a
+native library through `ctypes`; TypeScript calls the same API through
+WebAssembly. Both use one small, documented ABI.
 
 ## Installing
 
+Rust 1.85+, Python 3.11+, and Node.js 22.12+ are supported.
+
+```sh
+cargo add rspyts
+cargo install rspyts-cli
+pip install rspyts
+npm install rspyts
 ```
-cargo add rspyts             # in your Rust crate
-cargo install rspyts-cli     # the `rspyts` binary
-pip install rspyts           # Python runtime
-npm install rspyts           # TypeScript runtime
-```
 
-Note that your crate's `crate-type` must include `"cdylib"`, and that `serde` (with the `derive` feature) is required as a direct dependency.
-
-## Documentation
-
-Documentation can be found [**here**](docs/). It covers the quickstart, how rspyts works, the Python and TypeScript guides, the architecture, and the normative design specs.
+The bridged Rust crate must build as a `cdylib` and depend directly on Serde
+with its `derive` feature. The [quickstart](docs/introduction/quickstart.md)
+contains a complete setup.
 
 ## Using
 
-Annotate the Rust you want to share:
+Annotate the Rust surface and export it once:
 
 ```rust
 use rspyts::bridge;
 
 #[bridge]
-/// Summary statistics for a list of numbers.
-pub struct Summary {
-    pub item_count: u32,
-    pub total: f64,
-    pub average: f64,
-    pub label: Option<String>,
+pub struct Greeting {
+    pub message: String,
 }
 
 #[bridge]
-/// Summarize a list of numbers.
-pub fn summarize(values: &[f64], label: Option<String>) -> Result<Summary, BasicError> {
-    // ...
+pub fn greet(name: String) -> Greeting {
+    Greeting {
+        message: format!("Hello, {name}!"),
+    }
 }
 
 rspyts::export!();
 ```
 
-Run `rspyts generate`. Call it from Python:
+Generate the clients and build the native and WebAssembly artifacts:
+
+```sh
+rspyts generate
+rspyts build
+```
+
+The generated Python wrapper is an ordinary typed function:
 
 ```python
-import numpy as np
-from basic_example.generated import summarize
+from greeting.generated import greet
 
-summary = summarize(np.array([2.0, 4.0, 6.0]), "demo")
-print(summary.average, summary.item_count)  # 4.0 3
+print(greet("Ada").message)
 ```
 
-And from TypeScript:
+The generated TypeScript client exposes the same contract:
 
 ```ts
-const client = createClient(await instantiate(await readFile(wasmPath)));
-console.log(client.summarize(new Float64Array([2, 4, 6]), "demo").average); // 4
+import { readFile } from "node:fs/promises";
+import { instantiate } from "rspyts";
+import { createClient } from "./generated/index.js";
+
+const module = await instantiate(await readFile("greeting.wasm"));
+console.log(createClient(module).greet("Ada").message);
 ```
 
-`BasicError` is a `#[bridge(error)]` enum that becomes real exception classes on both sides. The full crate — including a stateful `Counter` class held by handle — lives at [examples/basic](examples/basic).
+## How it works
 
-## Questions & Answers
+`#[bridge]` records types, functions, constants, errors, and stateful classes in
+the compiled crate. The CLI reads that manifest and writes deterministic
+Python, TypeScript, and JSON Schema output. `rspyts check` fails when committed
+generated code is stale.
 
-**How does this project differ from** `PyO3` **+** `wasm-bindgen`**?** Depth. PyO3 and wasm-bindgen are excellent, deep integrations into CPython and the JS host — tens of thousands of lines each, with their own semantics for ownership, errors, and garbage collection. rspyts needs less: move typed data, call functions, hold opaque state. Everything crosses one small, hand-specified C ABI, and both runtimes are thin consumers of it (Python via stock `ctypes`, TypeScript via plain WASM exports). The trade is no fine-grained object integration — you cannot subclass a Rust type in Python.
+Calls cross a symmetric binary envelope: structured values live in JSON, while
+bytes and numeric arrays travel in aligned binary attachments. Python receives
+pydantic models and typed exceptions. TypeScript receives interfaces,
+discriminated unions, typed arrays, and disposable handle-backed classes.
 
-**What can cross the boundary?** Structs, string enums, tagged data enums, typed errors, `Option`, `Vec`, string-keyed maps, constants (real importable values in both languages), `rspyts::Json` for schemaless payloads, and bulk numeric data as raw buffers (`&[T]` in, `Buf<T>` out — numpy arrays and JS typed arrays, no JSON in the hot path). Stateful objects stay in Rust behind opaque handles, built by a constructor or by static factories (`Recording::open`-style, including factory-only classes). Types shared between bridged crates are imported, not duplicated.
+The boundary is intentionally finite. Exact 64-bit integers use explicit
+`I64` and `U64` wrappers; asynchronous functions, callbacks, arbitrary Serde
+codecs, and implicit cross-language lifetimes are outside the contract. See
+the [documentation](docs/README.md) for the complete model.
 
-**What is not supported?** `u64`/`i64` (JSON's 2^53 ceiling), async, callbacks, datetimes, UUIDs, tuples, and generics. Each is a compile-time error at the Rust definition site, never a runtime surprise. The reasoning is written down in [docs/design/decisions.md](docs/design/decisions.md).
+## Development
 
-## License
+```sh
+cargo fmt --all --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace
 
-This project is licensed under the [MIT license](LICENSE).
+cd runtimes/python && uv sync --dev --locked && uv run pytest
+cd ../typescript && npm ci && npm run build && npm test
+```
+
+The [basic example](examples/basic/README.md) exercises the full native and
+WebAssembly path. Contributions are licensed under [MIT](LICENSE).

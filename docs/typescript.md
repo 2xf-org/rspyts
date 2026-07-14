@@ -1,169 +1,160 @@
 # TypeScript
 
-What `rspyts generate` gives you in TypeScript, and how to run it in browsers and Node. The generated layout and the runtime API are specified in [codegen.md §5](design/codegen.md); this guide is the user's view.
+`rspyts generate` writes a strict TypeScript client for your Rust WebAssembly
+module.
 
-The npm package `rspyts` loads and talks to the WASM build of your crate (`cargo build --target wasm32-unknown-unknown`). The generated code — `types.ts`, `constants.ts`, `errors.ts`, `client.ts`, `index.ts` — is plain strict TypeScript with no dependencies beyond that runtime. Examples below use the [basic example](../examples/basic)'s contract — `summarize`, `scale`, and the `Counter` class — plus a `Recording` class and a couple of constants that the basic crate doesn't ship, to illustrate factories and bridged consts.
+The npm runtime supports Node.js 22.12 or newer, with CI on Node.js 22.12+ and
+Node 24. Browser support uses standard WebAssembly APIs.
 
-## Instantiating the module
+## Load the module
 
-`instantiate` accepts whatever form of the `.wasm` bytes your environment produces — a `Response` (or a promise of one, for streaming compilation), a `BufferSource`, or a precompiled `WebAssembly.Module` — verifies the ABI version, and returns a `BridgeModule`.
+`instantiate` accepts a `WebAssembly.Module`, a `BufferSource`, a `Response`,
+or a promise of a `Response`. It verifies ABI version 2 and returns a
+`BridgeModule`.
 
-Vite and other modern bundlers — import the asset URL and let the browser stream-compile:
-
-```ts
-import { instantiate } from "rspyts";
-import wasmUrl from "./basic_example.wasm?url";
-
-const mod = await instantiate(fetch(wasmUrl));
-```
-
-Node — read the bytes:
+In Node:
 
 ```ts
 import { readFile } from "node:fs/promises";
+import { instantiate } from "rspyts";
 
 const mod = await instantiate(await readFile(wasmPath));
 ```
 
-Without bundler support, `new URL("./basic_example.wasm", import.meta.url)` resolves the asset relative to the current module. Note that streaming compilation requires the server to send `Content-Type: application/wasm` — check that before blaming anything else.
-
-If you compile once and cache the `WebAssembly.Module`, pass it straight in. Each `instantiate` call produces an independent instance with its own linear memory and its own handles; instances share nothing.
-
-## The client
-
-`createClient(mod)` returns an object with one typed method per bridged function and one class per bridged impl block, all bound to that module instance:
+In a browser or bundler:
 
 ```ts
-import { createClient } from "./generated";
+const mod = await instantiate(fetch(wasmUrl));
+```
+
+Streaming compilation needs `Content-Type: application/wasm`.
+
+## Use the generated client
+
+Bind the generated API to that module instance:
+
+```ts
+import { createClient } from "./generated/index.js";
 
 const client = createClient(mod);
-
-const summary = client.summarize(samples, "demo");   // { itemCount, total, average, label }
-const doubled = client.scale(samples, 2);            // Float64Array
-const counter = new client.Counter(10, "demo");
+const summary = client.summarize(new Float64Array([2, 4, 6]), "demo");
+console.log(summary.average);
 ```
 
-Calls are synchronous — WASM execution blocks the calling thread. For heavy workloads in a browser, instantiate and call inside a Web Worker; the API is identical there.
+Each client belongs to one WebAssembly instance. Instances have separate
+linear memory, allocators, and handle stores.
 
-Structs are plain interfaces with camelCase properties; `Option<T>` fields are `T | null` and optional on input. String enums are string-literal unions. Data enums are discriminated unions that narrow on their tag:
+Generated files contain interfaces, literal unions, constants, error classes,
+the client, and public re-exports. They have no dependency beyond `rspyts`.
+
+## Types
+
+- Structs become interfaces.
+- String enums become string-literal unions.
+- Tagged Rust enums become discriminated unions.
+- `Option<T>` becomes `T | null` and optional model fields may be omitted.
+- Exact Serde wire names are preserved; non-identifiers become quoted keys.
+- Unknown input fields are rejected when Rust deserializes the request.
+
+Structured `f32` and `f64` values must be finite. Generated clients validate
+returned structured floats recursively and normalize negative zero. Numeric
+buffers retain their raw IEEE values, including NaN and infinities.
+
+## Exact integers
+
+Rust `rspyts::I64` and `rspyts::U64` become `bigint`. Generated code checks
+the full range and converts through canonical decimal strings on the wire:
 
 ```ts
-switch (parsed.type) {
-  case "integer": return parsed.value;   // narrowed to the Integer variant
-  case "decimal": return Math.round(parsed.value);
-}
+const pair = client.echoExactPair([-(1n << 63n), (1n << 64n) - 1n]);
 ```
 
-Statics — including factories, statics that return `Self` in Rust — live on the class bound by the client:
+This works recursively through every supported composite, constant, and typed
+error payload. Bare Rust `i64` and `u64` remain unsupported.
 
-```ts
-using rec = client.Recording.open("night-1.edf");   // factory: a fresh handle
-console.log(rec.durationS());
-```
+## Schemaless JSON
 
-A factory-only class has no `new` signature at all; `new client.Recording(...)` throws. A factory-made instance disposes exactly like a constructed one.
+Rust `rspyts::Json` becomes `unknown`. Narrow or validate it before use.
+Values must still be valid JSON with finite numbers.
 
-## Constants
+An internal single-key wrapper keeps attachment-shaped user objects opaque to
+the protocol scanner. Generated code handles the wrapper; applications see the
+original value.
 
-Bridged `const` items need no module instance — they are plain exports with their values baked in at generation time, `as const` for maximal narrowing:
+## Bytes and typed arrays
 
-```ts
-import { CHANNEL_LABELS, SAMPLE_RATE_HZ } from "./generated";
+| Rust | TypeScript |
+|---|---|
+| `Bytes` | `Uint8Array` |
+| `Buf<u8>` | `Uint8Array` marked by generated code as numeric `u8` |
+| `Buf<T>` | matching typed array |
+| `&[T]` parameter | matching typed array |
+| `Vec<T>` | `T[]` |
 
-const window = SAMPLE_RATE_HZ * 30;   // SAMPLE_RATE_HZ: 256 (a literal type)
-```
+The numeric dtypes are `u8`, `i8`, `u16`, `i16`, `u32`, `i32`, `u64`,
+`i64`, `f32`, and `f64`. The 64-bit typed arrays use bigint elements.
 
-## Schemaless payloads — `rspyts::Json`
-
-A Rust `rspyts::Json` field or parameter types as `unknown` — deliberately not `any`. The compiler forces you to narrow or validate before touching it, which is honest: nothing checked its shape at the boundary. Prefer real bridged types wherever the shape is known.
-
-## Typed arrays in and out
-
-Rust `&[T]` parameters demand the matching typed array — `Float64Array` for `&[f64]`, `Int32Array` for `&[i32]`, and so on. Plain `number[]` is **not** accepted; the conversion cost should be visible in your code, not hidden in the runtime. The runtime copies the array into an aligned allocation in linear memory for the call and frees it afterwards.
-
-`Buf<T>` returns come back as typed arrays **copied out** of linear memory. This is deliberate: linear memory can grow and move, so views into it are never retained. What you get is safely yours, forever.
-
-## Handles
-
-Class instances are `u64` handles into Rust state, held as `bigint` internally. Rust memory is invisible to the JS garbage collector, so disposal is your job:
-
-```ts
-// Best: explicit resource management (TS 5.2+)
-{
-  using counter = new client.Counter(10, "demo");
-  counter.increment(5);
-  console.log(counter.currentValue());
-} // counter[Symbol.dispose]() → freed, deterministically
-
-// Equivalent, manual:
-const counter = new client.Counter(10, "demo");
-try {
-  counter.increment(5);
-} finally {
-  counter.free();
-}
-```
-
-`free()` and `Symbol.dispose` are idempotent — double-free is a no-op by ABI construction. Calling a method after `free()` throws `StaleHandleError`, an ordinary error, never memory corruption. A `FinalizationRegistry` frees leaked handles if the GC ever collects the wrapper, but it is a backstop, not a strategy: the GC has no idea how much Rust memory a handle pins and may never run. Always `using` or `free()`.
+The runtime encodes every element little-endian, copies input into aligned
+linear memory, and frees the allocation after the call. Returned arrays are
+copied out before Rust memory is freed, so they never alias WebAssembly memory
+or the input.
 
 ## Errors
 
-Error envelopes throw generated classes; check with `instanceof`:
+Error envelopes throw generated subclasses of `RspytsError`:
 
 ```ts
-import { RspytsError } from "rspyts";
-import { BasicError, BasicErrorEmptyInput } from "./generated";
-
 try {
   client.summarize(samples, null);
-} catch (e) {
-  if (e instanceof BasicErrorEmptyInput) {
-    // this specific variant; .data keys are wire-cased
-  } else if (e instanceof BasicError) {
-    // any other variant of this enum
-  } else if (e instanceof RspytsError) {
-    // bridge-level: .code, .message, .data
+} catch (error) {
+  if (error instanceof BasicErrorEmptyInput) {
+    console.log(error.code, error.data);
   } else {
-    throw e;
+    throw error;
   }
 }
 ```
 
-Every generated class extends `RspytsError`, which carries `.code` and `.data` and puts the human-readable message in `Error.message`.
+Generated clients pass one call-scoped error map per declared Rust error enum.
+Two packages may reuse a code without changing one another's `instanceof`
+behavior. `registerError` remains an optional global fallback for handwritten
+integrations.
 
-## Types from other crates
+## Handles and disposal
 
-When your bridged crate depends on another bridged crate, map the dependency's crate name to its own generated module in `rspyts.toml`:
-
-```toml
-[typescript.imports]
-"example-catalog" = "@example/catalog/generated"
-```
-
-The generated `types.ts` then imports instead of re-declaring — exactly the line you would write yourself:
+Rust classes stay behind `bigint` handles. Dispose them deterministically:
 
 ```ts
-import type { CatalogInfo } from "@example/catalog/generated";
+{
+  using counter = new client.Counter(10, "demo");
+  counter.increment(5);
+}
 ```
 
-so the type is *the same type* in both packages, and the dependency's error classes keep working with `instanceof` across them. An origin with no mapping is emitted locally: self-contained, but structurally-identical-yet-distinct declarations. Details in [codegen.md §9](design/codegen.md); a working two-crate setup lives at [examples/multi-crate](../examples/multi-crate).
+Or use `try/finally` and `counter.free()`. Both `free()` and
+`Symbol.dispose` are idempotent. `FinalizationRegistry` is a leak backstop,
+not a replacement for disposal.
 
-One caveat. On native targets a Rust panic surfaces as `RspytsPanicError`; on `wasm32-unknown-unknown` the panic strategy is *abort*, so a panic usually **traps the instance** first — you get a `WebAssembly.RuntimeError` instead. After a trap, treat the module as poisoned: discard it and `instantiate` a fresh one (keep the compiled `WebAssembly.Module` around to make that cheap). Either way, a panic is a Rust bug. The boundary contains it; it doesn't excuse it.
+## Traps and poisoned instances
 
-## Questions & Answers
+Ordinary Rust application errors use envelopes and leave the instance healthy.
+A panic on `wasm32-unknown-unknown` usually aborts and becomes a
+`WebAssembly.RuntimeError`. The runtime then marks that instance poisoned,
+skips unsafe cleanup, and makes later calls throw `InstancePoisonedError`.
 
-**How do I bundle the** `.wasm` **file?** Keep it an asset and fetch it — `?url` in Vite. Do not inline it as base64 unless it is tiny: that defeats streaming compilation and bloats the JS bundle by ~33%. Instantiate once and share the client; a lazy singleton promise works:
+Create a fresh instance. You may reuse a compiled `WebAssembly.Module`.
 
-```ts
-let clientP: Promise<Client> | undefined;
-export const getClient = () =>
-  (clientP ??= instantiate(fetch(wasmUrl)).then(createClient));
-```
+## Long-running work
 
-**Can I** `await` **a bridged call?** No. Calls are synchronous in v0.1, and there are no callbacks from Rust into JS ([ADR-6](design/decisions.md#adr-6-sync-only-in-v01)). Long-running calls belong in a Web Worker.
+Generated calls are synchronous. In a browser, put CPU-heavy bridge work in a
+Web Worker and transfer large result buffers when your application no longer
+needs the sender's view.
 
-**Why won't it take my** `number[]`**?** Because converting it costs a copy, and hidden copies are how hot paths die. Build a `Float64Array` yourself — `Float64Array.from(values)` — and the cost is visible at the call site.
+## Shipping
 
-**Where did** `u64` **go?** Nowhere good, which is why it isn't bridgeable: numbers above 2^53 lose precision in JS, and `BigInt` would infect every call site ([ADR-4](design/decisions.md#adr-4-u64i64-rejected-at-compile-time)). Handles use `bigint` internally, but that never surfaces in your types.
+Build release WebAssembly with `rspyts build --profile release`. Keep the
+`.wasm` file as an asset and instantiate it once per desired state domain.
+Commit generated TypeScript and run `rspyts check` in CI.
 
-**What targets does the generated code assume?** ES2022 or later. Any evergreen browser or Node 20+ works with no feature flags. Build the crate with `--release` for shipping — debug WASM builds are large and slow — and `wasm-opt -O` from Binaryen shrinks rspyts modules like any other.
+See the [quickstart](introduction/quickstart.md) and the complete
+[type system](design/type-system.md).

@@ -2,17 +2,20 @@
 //!
 //! A deliberately plain little library that nonetheless exercises every
 //! feature of the portable type system: structs, string enums, tagged data
-//! enums, error enums with data, optional values, zero-copy slice
-//! parameters, `Buf` returns, plain and fallible functions, bridged
-//! constants, schemaless [`Json`] passthrough, target-scoped functions,
-//! and a stateful handle class with statics and a factory.
+//! enums, error enums with data, optional values, borrowed slice
+//! parameters, owned `Buf` inputs and returns, plain and fallible functions, bridged
+//! constants, schemaless [`Json`] passthrough, binary values, nested owned
+//! buffers, transparent newtypes, target-scoped functions, and a stateful
+//! handle class with statics and a factory.
 //!
 //! Build the cdylib (`cargo build -p basic-example`), run
 //! `rspyts generate --config examples/basic/rspyts.toml`, and the Python
 //! and TypeScript packages next door gain fully typed access to everything
 //! below.
 
-use rspyts::{Buf, Json, bridge};
+use std::collections::BTreeMap;
+
+use rspyts::{Buf, Bytes, I64, Json, U64, bridge};
 
 /// The largest number of values [`summarize`] accepts in one call.
 #[bridge]
@@ -21,6 +24,14 @@ pub const MAX_WINDOW: u32 = 1024;
 /// Wire names of every [`Rounding`] mode, in declaration order.
 #[bridge]
 pub const ROUNDING_MODES: &[&str] = &["up", "down", "nearest", "halfEven"];
+
+/// Largest unsigned value that can cross the bridge exactly.
+#[bridge]
+pub const MAX_EXACT_U64: U64 = U64::new(u64::MAX);
+
+/// Signed and unsigned exact-integer bounds.
+#[bridge]
+pub const EXACT_BOUNDS: (I64, U64) = (I64::new(i64::MIN), U64::new(u64::MAX));
 
 /// Rounding strategy for [`round_value`].
 #[bridge]
@@ -41,6 +52,43 @@ pub struct Summary {
     pub average: f64,
     /// Optional label passed through untouched.
     pub label: Option<String>,
+}
+
+/// Stable identifier for a binary packet.
+///
+/// Transparent newtypes remain named in generated APIs and schemas while
+/// using the inner integer directly at runtime.
+#[bridge]
+pub struct PacketId(pub u32);
+
+/// Binary values and owned numeric buffers nested in ordinary data.
+#[bridge]
+pub struct BinaryPacket {
+    pub id: PacketId,
+    /// Opaque bytes, distinct from a numeric `u8` buffer on the wire.
+    pub payload: Bytes,
+    /// An aligned floating-point buffer.
+    pub samples: Buf<f64>,
+    /// Buffers can appear inside lists.
+    pub chunks: Vec<Buf<i16>>,
+    /// Buffers can also appear inside string-keyed maps.
+    pub channels: BTreeMap<String, Buf<u8>>,
+}
+
+/// Exact integers in plain, tuple, optional, and list positions.
+#[bridge]
+pub struct ExactNumbers {
+    pub signed: I64,
+    pub unsigned: U64,
+    pub pair: (I64, U64),
+    pub history: Option<Vec<U64>>,
+}
+
+/// A state that can be either tag-only or carry exact data.
+#[bridge]
+pub enum TransferState {
+    Pending,
+    Complete { sequence: U64 },
 }
 
 /// A number parsed from text.
@@ -66,6 +114,8 @@ pub enum BasicError {
     ZeroFactor { factor: f64 },
     /// The file could not be read.
     UnreadableFile { path: String },
+    /// An exact sequence exceeded the caller's exact limit.
+    SequenceTooLarge { value: U64, maximum: U64 },
 }
 
 impl std::fmt::Display for BasicError {
@@ -80,6 +130,9 @@ impl std::fmt::Display for BasicError {
                 write!(f, "factor must be non-zero, got {factor}")
             }
             BasicError::UnreadableFile { path } => write!(f, "cannot read `{path}`"),
+            BasicError::SequenceTooLarge { value, maximum } => {
+                write!(f, "sequence {value} exceeds maximum {maximum}")
+            }
         }
     }
 }
@@ -114,6 +167,48 @@ pub fn scale(values: &[f64], factor: f64) -> Result<Buf<f64>, BasicError> {
         return Err(BasicError::ZeroFactor { factor });
     }
     Ok(Buf::new(values.iter().map(|v| v * factor).collect()))
+}
+
+/// Return arbitrary bytes unchanged.
+#[bridge]
+pub fn echo_bytes(value: Bytes) -> Bytes {
+    value
+}
+
+/// Return a nested binary packet unchanged.
+///
+/// Every attachment is decoded into owned Rust storage before this function
+/// runs and encoded into a fresh response attachment afterwards.
+#[bridge]
+pub fn echo_binary_packet(value: BinaryPacket) -> BinaryPacket {
+    value
+}
+
+/// Return exact integers unchanged.
+#[bridge]
+pub fn echo_exact_numbers(value: ExactNumbers) -> ExactNumbers {
+    value
+}
+
+/// Return an exact pair unchanged.
+#[bridge]
+pub fn echo_exact_pair(value: (I64, U64)) -> (I64, U64) {
+    value
+}
+
+/// Return a mixed unit-and-data enum unchanged.
+#[bridge]
+pub fn echo_transfer_state(value: TransferState) -> TransferState {
+    value
+}
+
+/// Validate one exact sequence against another.
+#[bridge]
+pub fn validate_sequence(value: U64, maximum: U64) -> Result<U64, BasicError> {
+    if value > maximum {
+        return Err(BasicError::SequenceTooLarge { value, maximum });
+    }
+    Ok(value)
 }
 
 /// Round `value` according to `mode`.
@@ -291,6 +386,87 @@ mod tests {
         assert_eq!(
             scale(&[1.0, 2.0], 2.0).unwrap().into_inner(),
             vec![2.0, 4.0]
+        );
+    }
+
+    #[test]
+    fn bytes_preserve_empty_and_edge_values() {
+        assert!(echo_bytes(Bytes::new(Vec::new())).is_empty());
+        assert_eq!(
+            echo_bytes(Bytes::new(vec![0x00, 0x7f, 0x80, 0xff])).into_inner(),
+            vec![0x00, 0x7f, 0x80, 0xff]
+        );
+    }
+
+    #[test]
+    fn nested_owned_buffers_round_trip() {
+        let mut channels = BTreeMap::new();
+        channels.insert("red".to_string(), Buf::new(vec![0, 127, 255]));
+        channels.insert("empty".to_string(), Buf::new(Vec::new()));
+        let packet = echo_binary_packet(BinaryPacket {
+            id: PacketId(7),
+            payload: Bytes::new(vec![0, 255]),
+            samples: Buf::new(vec![1.5, -2.25]),
+            chunks: vec![Buf::new(vec![-32_768, 0, 32_767]), Buf::new(Vec::new())],
+            channels,
+        });
+
+        assert_eq!(packet.id.0, 7);
+        assert_eq!(packet.payload.as_slice(), &[0, 255]);
+        assert_eq!(packet.samples.0, vec![1.5, -2.25]);
+        assert_eq!(packet.chunks[0].0, vec![-32_768, 0, 32_767]);
+        assert!(packet.chunks[1].0.is_empty());
+        assert_eq!(packet.channels["red"].0, vec![0, 127, 255]);
+        assert!(packet.channels["empty"].0.is_empty());
+    }
+
+    #[test]
+    fn exact_numbers_preserve_all_boundaries_and_nesting() {
+        let value = ExactNumbers {
+            signed: I64::new(i64::MIN),
+            unsigned: U64::new(u64::MAX),
+            pair: (I64::new(9_007_199_254_740_993), U64::new(u64::MAX)),
+            history: Some(vec![U64::new(0), U64::new(u64::MAX)]),
+        };
+        let out = echo_exact_numbers(value);
+        assert_eq!(out.signed.get(), i64::MIN);
+        assert_eq!(out.unsigned.get(), u64::MAX);
+        assert_eq!(out.pair.0.get(), 9_007_199_254_740_993);
+        assert_eq!(out.history.unwrap()[1].get(), u64::MAX);
+        assert_eq!(MAX_EXACT_U64.get(), u64::MAX);
+        assert_eq!(EXACT_BOUNDS.0.get(), i64::MIN);
+    }
+
+    #[test]
+    fn exact_sequence_validation_keeps_typed_error_data() {
+        assert_eq!(
+            validate_sequence(U64::new(9_007_199_254_740_993), U64::new(u64::MAX))
+                .unwrap()
+                .get(),
+            9_007_199_254_740_993
+        );
+        assert!(matches!(
+            validate_sequence(U64::new(u64::MAX), U64::new(9_007_199_254_740_993)),
+            Err(BasicError::SequenceTooLarge { value, maximum })
+                if value.get() == u64::MAX && maximum.get() == 9_007_199_254_740_993
+        ));
+    }
+
+    #[test]
+    fn mixed_state_and_tuple_round_trip() {
+        assert!(matches!(
+            echo_transfer_state(TransferState::Pending),
+            TransferState::Pending
+        ));
+        assert!(matches!(
+            echo_transfer_state(TransferState::Complete {
+                sequence: U64::new(u64::MAX),
+            }),
+            TransferState::Complete { sequence } if sequence.get() == u64::MAX
+        ));
+        assert_eq!(
+            echo_exact_pair((I64::new(i64::MIN), U64::new(u64::MAX))),
+            (I64::new(i64::MIN), U64::new(u64::MAX))
         );
     }
 

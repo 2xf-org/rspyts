@@ -10,16 +10,18 @@ homepage.workspace = true
 authors.workspace = true
 keywords.workspace = true
 categories.workspace = true
+readme = "README.md"
+exclude = ["tests/**"]
 
 [lib]
 proc-macro = true
 
 [dependencies]
-heck = { workspace = true }
 proc-macro2 = { workspace = true }
 quote = { workspace = true }
 syn = { workspace = true }
 
 [dev-dependencies]
 rspyts = { path = "../rspyts" }
+serde = { workspace = true }
 trybuild = "1"

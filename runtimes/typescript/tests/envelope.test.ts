@@ -3,10 +3,14 @@ import { describe, expect, it } from "vitest";
 import {
   BUF_PLACEHOLDER_KEY,
   HEADER_LEN,
+  JSON_WRAPPER_KEY,
   STATUS_ERROR,
   STATUS_OK,
+  buildRequest,
   decodeEnvelope,
+  decodeRequest,
   substituteBuffers,
+  wireBuffer,
   type BufTypedArray,
   type Dtype,
 } from "../src/envelope.js";
@@ -16,21 +20,100 @@ function placeholder(off: number, len: number, dt: string): Record<string, unkno
   return { [BUF_PLACEHOLDER_KEY]: { off, len, dt } };
 }
 
+function valuesOf(array: BufTypedArray): Array<number | bigint> {
+  return Array.from(array as unknown as ArrayLike<number | bigint>);
+}
+
 interface DtypeCase {
   dt: Dtype;
   bytes: number;
-  ctor: new (values: number[]) => BufTypedArray;
-  values: number[];
+  ctor: Function;
+  make: () => BufTypedArray;
 }
 
 /** One representative value set per wire dtype, exact in every type. */
 const DTYPE_CASES: DtypeCase[] = [
-  { dt: "u8", bytes: 1, ctor: Uint8Array, values: [0, 127, 255] },
-  { dt: "i16", bytes: 2, ctor: Int16Array, values: [-32768, -1, 32767] },
-  { dt: "i32", bytes: 4, ctor: Int32Array, values: [-2147483648, 0, 2147483647] },
-  { dt: "f32", bytes: 4, ctor: Float32Array, values: [-0.5, 1.25, 1024] },
-  { dt: "f64", bytes: 8, ctor: Float64Array, values: [Math.PI, -1e300, 0.1] },
+  { dt: "u8", bytes: 1, ctor: Uint8Array, make: () => new Uint8Array([0, 127, 255]) },
+  { dt: "i8", bytes: 1, ctor: Int8Array, make: () => new Int8Array([-128, -1, 127]) },
+  { dt: "u16", bytes: 2, ctor: Uint16Array, make: () => new Uint16Array([0, 32768, 65535]) },
+  { dt: "i16", bytes: 2, ctor: Int16Array, make: () => new Int16Array([-32768, -1, 32767]) },
+  { dt: "u32", bytes: 4, ctor: Uint32Array, make: () => new Uint32Array([0, 2147483648, 4294967295]) },
+  { dt: "i32", bytes: 4, ctor: Int32Array, make: () => new Int32Array([-2147483648, 0, 2147483647]) },
+  { dt: "u64", bytes: 8, ctor: BigUint64Array, make: () => new BigUint64Array([0n, 1n << 63n, (1n << 64n) - 1n]) },
+  { dt: "i64", bytes: 8, ctor: BigInt64Array, make: () => new BigInt64Array([-(1n << 63n), -1n, (1n << 63n) - 1n]) },
+  { dt: "f32", bytes: 4, ctor: Float32Array, make: () => new Float32Array([-0.5, 1.25, 1024]) },
+  { dt: "f64", bytes: 8, ctor: Float64Array, make: () => new Float64Array([Math.PI, -1e300, 0.1]) },
 ];
+
+describe("buildRequest", () => {
+  it("encodes every dtype as a nested aligned little-endian attachment", () => {
+    const args = {
+      nested: DTYPE_CASES.map(({ dt, make }) => ({ [dt]: wireBuffer(make(), dt) })),
+    };
+    const request = buildRequest(args);
+    const decoded = decodeRequest(request);
+    const payload = decoded.payload as { nested: Array<Record<string, unknown>> };
+
+    for (const [index, { dt, bytes, make }] of DTYPE_CASES.entries()) {
+      const spec = (payload.nested[index]![dt] as Record<string, Record<string, unknown>>)[
+        BUF_PLACEHOLDER_KEY
+      ]!;
+      expect(spec["dt"], dt).toBe(dt);
+      expect(spec["len"], dt).toBe(make().length);
+      expect((spec["off"] as number) % bytes, dt).toBe(0);
+    }
+
+    const materialized = substituteBuffers(decoded.payload, decoded.tail) as {
+      nested: Array<Record<string, BufTypedArray>>;
+    };
+    for (const [index, { dt, make }] of DTYPE_CASES.entries()) {
+      expect(valuesOf(materialized.nested[index]![dt]!), dt).toEqual(valuesOf(make()));
+    }
+  });
+
+  it("frames plain JSON with an empty tail", () => {
+    const request = buildRequest({ a: 1, items: [true, null, "x"] });
+    const decoded = decodeRequest(request);
+    expect(decoded.payload).toEqual({ a: 1, items: [true, null, "x"] });
+    expect(decoded.tail.byteLength).toBe(0);
+    expect(Array.from(request.subarray(0, 4))).toEqual([0, 0, 0, 0]);
+  });
+
+  it("distinguishes bare bytes from explicitly marked numeric u8 buffers", () => {
+    const request = decodeRequest(
+      buildRequest({ bytes: new Uint8Array([0, 255]), numeric: wireBuffer(new Uint8Array([1]), "u8") }),
+    );
+    const payload = request.payload as Record<string, Record<string, Record<string, unknown>>>;
+    expect(payload["bytes"]![BUF_PLACEHOLDER_KEY]!["dt"]).toBe("bytes");
+    expect(payload["numeric"]![BUF_PLACEHOLDER_KEY]!["dt"]).toBe("u8");
+    const materialized = substituteBuffers(request.payload, request.tail) as {
+      bytes: Uint8Array;
+      numeric: Uint8Array;
+    };
+    expect(Array.from(materialized.bytes)).toEqual([0, 255]);
+    expect(Array.from(materialized.numeric)).toEqual([1]);
+
+    expect(() => buildRequest({ values: new Int8Array([1]) })).toThrow(/wireBuffer/);
+    expect(() => wireBuffer(new Uint8Array([1]), "i8")).toThrow(/requires a Int8Array/);
+  });
+
+  it("strictly decodes request direction, lengths, and reserved bytes", () => {
+    const request = buildRequest({ value: 1 });
+
+    const marker = request.slice();
+    marker[0] = 1;
+    expect(() => decodeRequest(marker)).toThrow(/invalid request marker/);
+
+    const reserved = request.slice();
+    reserved[2] = 1;
+    expect(() => decodeRequest(reserved)).toThrow(/reserved envelope/);
+
+    expect(() => decodeRequest(request.subarray(0, request.byteLength - 1))).toThrow(/truncated/);
+    const trailing = new Uint8Array(request.byteLength + 1);
+    trailing.set(request);
+    expect(() => decodeRequest(trailing)).toThrow(/trailing bytes/);
+  });
+});
 
 describe("decodeEnvelope", () => {
   it("decodes an ok envelope", () => {
@@ -41,9 +124,18 @@ describe("decodeEnvelope", () => {
 
   it("parses the little-endian header and splits json from tail", () => {
     const tail = new Uint8Array([9, 8, 7]);
-    const { status, payload } = decodeEnvelope(buildEnvelope(1, '"boom"', tail));
-    expect(status).toBe(STATUS_ERROR);
-    expect(payload).toBe("boom");
+    const { status, payload } = decodeEnvelope(buildEnvelope(0, '"done"', tail));
+    expect(status).toBe(STATUS_OK);
+    expect(payload).toBe("done");
+  });
+
+  it("rejects attachment tails on error and panic envelopes", () => {
+    expect(() => decodeEnvelope(buildEnvelope(1, '"boom"', new Uint8Array([7])))).toThrow(
+      /must not contain attachment bytes/,
+    );
+    expect(() => decodeEnvelope(buildEnvelope(2, '"boom"', new Uint8Array([7])))).toThrow(
+      /must not contain attachment bytes/,
+    );
   });
 
   it("substitutes placeholders in ok payloads", () => {
@@ -63,6 +155,21 @@ describe("decodeEnvelope", () => {
     expect((payload as { data: unknown }).data).toEqual(placeholder(0, 1, "u8"));
   });
 
+  it("keeps marker-shaped content inside Json opaque and unwraps it losslessly", () => {
+    const marker = placeholder(0, 1, "u8");
+    const json = JSON.stringify({ [JSON_WRAPPER_KEY]: { marker, nested: [{ marker }] } });
+    const { payload } = decodeEnvelope(buildEnvelope(0, json));
+    expect(payload).toEqual({ marker, nested: [{ marker }] });
+
+    const request = decodeRequest(
+      buildRequest({ value: { [JSON_WRAPPER_KEY]: { marker, nested: [{ marker }] } } }),
+    );
+    expect(request.tail.byteLength).toBe(0);
+    expect(request.payload).toEqual({
+      value: { [JSON_WRAPPER_KEY]: { marker, nested: [{ marker }] } },
+    });
+  });
+
   it("rejects envelopes shorter than the header", () => {
     expect(() => decodeEnvelope(new Uint8Array(4))).toThrow(/truncated envelope/);
   });
@@ -74,15 +181,30 @@ describe("decodeEnvelope", () => {
     );
   });
 
+  it("rejects unknown statuses, reserved bytes, trailing bytes, and malformed JSON", () => {
+    expect(() => decodeEnvelope(buildEnvelope(3, "null"))).toThrow(/invalid response status/);
+
+    const reserved = buildEnvelope(0, "null");
+    reserved[1] = 1;
+    expect(() => decodeEnvelope(reserved)).toThrow(/reserved envelope/);
+
+    const valid = buildEnvelope(0, "null");
+    const trailing = new Uint8Array(valid.byteLength + 1);
+    trailing.set(valid);
+    expect(() => decodeEnvelope(trailing)).toThrow(/trailing bytes/);
+
+    expect(() => decodeEnvelope(buildEnvelope(0, "{"))).toThrow(/malformed envelope JSON/);
+  });
+
   it("round-trips every dtype, tail view deliberately misaligned in the envelope", () => {
-    for (const { dt, bytes, ctor, values } of DTYPE_CASES) {
-      const data = new ctor(values);
+    for (const { dt, bytes, ctor, make } of DTYPE_CASES) {
+      const data = make();
       // Pad the JSON so the tail starts at an ODD offset inside the
       // envelope — unaligned relative to the backing buffer for every
       // multi-byte dtype. The decoder must copy, never view in place.
-      let payload: Record<string, unknown> = { buf: placeholder(0, values.length, dt), pad: "" };
+      let payload: Record<string, unknown> = { buf: placeholder(0, data.length, dt), pad: "" };
       if ((HEADER_LEN + JSON.stringify(payload).length) % 2 === 0) {
-        payload = { buf: placeholder(0, values.length, dt), pad: "x" };
+        payload = { buf: placeholder(0, data.length, dt), pad: "x" };
       }
       const json = JSON.stringify(payload);
       expect((HEADER_LEN + json.length) % 2, dt).toBe(1);
@@ -91,7 +213,7 @@ describe("decodeEnvelope", () => {
       expect(status, dt).toBe(STATUS_OK);
       const buf = (decoded as { buf: BufTypedArray }).buf;
       expect(buf, dt).toBeInstanceOf(ctor);
-      expect(Array.from(buf), dt).toEqual(Array.from(data));
+      expect(valuesOf(buf), dt).toEqual(valuesOf(data));
     }
   });
 
@@ -105,7 +227,7 @@ describe("decodeEnvelope", () => {
     expect(empty.length).toBe(0);
   });
 
-  it("walks into extra-key objects without substituting them", () => {
+  it("rejects placeholder keys with sibling fields", () => {
     const tail = new Uint8Array([5]);
     const json = JSON.stringify({
       outer: {
@@ -113,13 +235,7 @@ describe("decodeEnvelope", () => {
         inner: placeholder(0, 1, "u8"),
       },
     });
-    const { payload } = decodeEnvelope(buildEnvelope(0, json, tail));
-    const outer = (payload as { outer: Record<string, unknown> }).outer;
-    // The two-key object is NOT a placeholder, but the walk still recurses
-    // into it and substitutes the genuine placeholder underneath.
-    expect(outer[BUF_PLACEHOLDER_KEY]).toEqual({ off: 0, len: 1, dt: "u8" });
-    expect(outer["inner"]).toBeInstanceOf(Uint8Array);
-    expect(Array.from(outer["inner"] as Uint8Array)).toEqual([5]);
+    expect(() => decodeEnvelope(buildEnvelope(0, json, tail))).toThrow(/sibling fields/);
   });
 
   it("round-trips a 1 MiB payload", () => {
@@ -147,10 +263,20 @@ describe("decodeEnvelope", () => {
 
 describe("substituteBuffers", () => {
   it("materializes every dtype", () => {
-    const cases: Array<{ dt: string; data: ArrayLike<number> & { buffer: ArrayBufferLike }; expected: number[]; ctor: Function }> = [
+    const cases: Array<{
+      dt: string;
+      data: BufTypedArray;
+      expected: Array<number | bigint>;
+      ctor: Function;
+    }> = [
       { dt: "u8", data: new Uint8Array([1, 2, 255]), expected: [1, 2, 255], ctor: Uint8Array },
+      { dt: "i8", data: new Int8Array([-128, 0, 127]), expected: [-128, 0, 127], ctor: Int8Array },
+      { dt: "u16", data: new Uint16Array([0, 65535]), expected: [0, 65535], ctor: Uint16Array },
       { dt: "i16", data: new Int16Array([-3, 1000]), expected: [-3, 1000], ctor: Int16Array },
+      { dt: "u32", data: new Uint32Array([0, 4294967295]), expected: [0, 4294967295], ctor: Uint32Array },
       { dt: "i32", data: new Int32Array([-70000, 5]), expected: [-70000, 5], ctor: Int32Array },
+      { dt: "u64", data: new BigUint64Array([0n, (1n << 64n) - 1n]), expected: [0n, (1n << 64n) - 1n], ctor: BigUint64Array },
+      { dt: "i64", data: new BigInt64Array([-(1n << 63n), (1n << 63n) - 1n]), expected: [-(1n << 63n), (1n << 63n) - 1n], ctor: BigInt64Array },
       { dt: "f32", data: new Float32Array([1.5, -2.25]), expected: [1.5, -2.25], ctor: Float32Array },
       { dt: "f64", data: new Float64Array([Math.PI]), expected: [Math.PI], ctor: Float64Array },
     ];
@@ -158,7 +284,7 @@ describe("substituteBuffers", () => {
       const tail = new Uint8Array(data.buffer.slice(0));
       const result = substituteBuffers(placeholder(0, data.length, dt), tail);
       expect(result, dt).toBeInstanceOf(ctor);
-      expect(Array.from(result as ArrayLike<number>), dt).toEqual(expected);
+      expect(valuesOf(result as BufTypedArray), dt).toEqual(expected);
     }
   });
 
@@ -217,15 +343,15 @@ describe("substituteBuffers", () => {
     expect(Array.from(result)).toEqual([5, -6]);
   });
 
-  it("ignores objects where the placeholder key is not the sole key", () => {
+  it("rejects objects where the placeholder key is not the sole key", () => {
     const tail = new Uint8Array([1]);
     const value = { [BUF_PLACEHOLDER_KEY]: { off: 0, len: 1, dt: "u8" }, extra: 1 };
-    expect(substituteBuffers(value, tail)).toEqual(value);
+    expect(() => substituteBuffers(value, tail)).toThrow(/sibling fields/);
   });
 
-  it("copies from an unaligned tail offset for every dtype", () => {
-    for (const { dt, bytes, ctor, values } of DTYPE_CASES) {
-      const data = new ctor(values);
+  it("rejects unaligned placeholder offsets for multi-byte dtypes", () => {
+    for (const { dt, bytes, ctor, make } of DTYPE_CASES) {
+      const data = make();
       // One junk byte before the data puts every multi-byte dtype at an
       // offset that is NOT a multiple of its element size.
       const tail = new Uint8Array(1 + data.byteLength);
@@ -234,9 +360,15 @@ describe("substituteBuffers", () => {
       if (bytes > 1) {
         expect(1 % bytes, dt).not.toBe(0);
       }
-      const result = substituteBuffers(placeholder(1, values.length, dt), tail);
-      expect(result, dt).toBeInstanceOf(ctor);
-      expect(Array.from(result as BufTypedArray), dt).toEqual(Array.from(data));
+      if (bytes === 1) {
+        const result = substituteBuffers(placeholder(1, data.length, dt), tail);
+        expect(result, dt).toBeInstanceOf(ctor);
+        expect(valuesOf(result as BufTypedArray), dt).toEqual(valuesOf(data));
+      } else {
+        expect(() => substituteBuffers(placeholder(1, data.length, dt), tail), dt).toThrow(
+          /not aligned/,
+        );
+      }
     }
   });
 
@@ -302,6 +434,7 @@ describe("substituteBuffers", () => {
       { off: 0, dt: "u8" }, // no len
       { off: 0, len: 1 }, // no dt
       { off: 0, len: 1, dt: 8 }, // dt not a string
+      { off: 0, len: 1, dt: "u8", extra: true }, // extra field
     ];
     for (const body of bodies) {
       expect(() =>

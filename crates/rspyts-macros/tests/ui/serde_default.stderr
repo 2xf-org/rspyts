@@ -1,0 +1,5 @@
+error: unsupported Serde attribute `default` on this field; rspyts can reflect only `rename`. Use `rspyts::Json` for a deliberately schemaless custom wire contract
+ --> tests/ui/serde_default.rs:7:13
+  |
+7 |     #[serde(default)]
+  |             ^^^^^^^

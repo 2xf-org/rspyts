@@ -11,7 +11,7 @@
 use super::util::{collect_refs, pascal, ts_doc, ts_doc_from_lines, ts_header, ts_type};
 use heck::ToLowerCamelCase;
 use rspyts_core::ir::{
-    ClassDecl, ConstDecl, FnDecl, Manifest, ParamDecl, StaticDecl, Target, Ty, TypeDecl,
+    ClassDecl, ConstDecl, FieldDecl, FnDecl, Manifest, ParamDecl, StaticDecl, Target, Ty, TypeDecl,
 };
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -41,6 +41,11 @@ fn on_ts(targets: &[Target]) -> bool {
     targets.contains(&Target::Typescript)
 }
 
+fn ts_error_registry_name(name: &str) -> String {
+    let base = name.strip_suffix("Error").unwrap_or(name);
+    format!("{base}ErrorTypes")
+}
+
 // ----------------------------------------------------------------- types.ts
 
 fn types_ts(m: &Manifest, hash: &str, imports: &BTreeMap<String, String>) -> String {
@@ -65,8 +70,9 @@ fn types_ts(m: &Manifest, hash: &str, imports: &BTreeMap<String, String>) -> Str
         for (module, mut names) in by_module {
             names.sort_unstable();
             out.push_str(&format!(
-                "import type {{ {} }} from \"{module}\";\n",
-                names.join(", ")
+                "import type {{ {} }} from {};\n",
+                names.join(", "),
+                ts_string(module)
             ));
             all_names.extend(names);
         }
@@ -81,6 +87,13 @@ fn types_ts(m: &Manifest, hash: &str, imports: &BTreeMap<String, String>) -> Str
             continue;
         }
         match decl {
+            TypeDecl::Newtype {
+                name, docs, inner, ..
+            } => {
+                out.push('\n');
+                out.push_str(&ts_doc(docs, ""));
+                out.push_str(&format!("export type {name} = {};\n", ts_type(inner)));
+            }
             TypeDecl::Struct {
                 name, docs, fields, ..
             } => {
@@ -104,10 +117,8 @@ fn types_ts(m: &Manifest, hash: &str, imports: &BTreeMap<String, String>) -> Str
             } => {
                 out.push('\n');
                 out.push_str(&ts_doc(docs, ""));
-                let literals: Vec<String> = variants
-                    .iter()
-                    .map(|v| format!("\"{}\"", v.wire_name))
-                    .collect();
+                let literals: Vec<String> =
+                    variants.iter().map(|v| ts_string(&v.wire_name)).collect();
                 out.push_str(&format!("export type {name} = {};\n", literals.join(" | ")));
             }
             TypeDecl::Enum {
@@ -121,7 +132,8 @@ fn types_ts(m: &Manifest, hash: &str, imports: &BTreeMap<String, String>) -> Str
                 out.push_str(&ts_doc(docs, ""));
                 out.push_str(&format!("export type {name} ="));
                 for v in variants {
-                    let mut members = vec![format!("{tag}: \"{}\"", v.wire_name)];
+                    let mut members =
+                        vec![format!("{}: {}", ts_prop(tag), ts_string(&v.wire_name))];
                     members.extend(
                         v.fields
                             .iter()
@@ -143,15 +155,23 @@ fn types_ts(m: &Manifest, hash: &str, imports: &BTreeMap<String, String>) -> Str
 
 /// `name: T`, or `name?: Inner | null` for optional fields.
 fn ts_field(wire_name: &str, ty: &Ty, optional: bool) -> String {
-    let name = if is_ts_ident(wire_name) {
-        wire_name.to_string()
-    } else {
-        format!("\"{wire_name}\"")
-    };
+    let name = ts_prop(wire_name);
     match ty {
         Ty::Option { inner } => format!("{name}?: {} | null", ts_type(inner)),
         _ if optional => format!("{name}?: {}", ts_type(ty)),
         _ => format!("{name}: {}", ts_type(ty)),
+    }
+}
+
+fn ts_string(value: &str) -> String {
+    serde_json::to_string(value).expect("serializing a string cannot fail")
+}
+
+fn ts_prop(value: &str) -> String {
+    if is_ts_ident(value) {
+        value.to_string()
+    } else {
+        ts_string(value)
     }
 }
 
@@ -176,20 +196,129 @@ fn constants_ts(m: &Manifest, hash: &str) -> String {
     for c in &m.constants {
         out.push('\n');
         out.push_str(&ts_doc(&c.docs, ""));
-        out.push_str(&const_line(c));
+        out.push_str(&const_line(m, c));
     }
     out
 }
 
 /// One `export const NAME = <literal> as const;` line. `as const` is
 /// skipped for `null`, which cannot take a const assertion.
-fn const_line(c: &ConstDecl) -> String {
-    let literal = ts_json(&c.value);
+fn const_line(m: &Manifest, c: &ConstDecl) -> String {
+    let literal = ts_const_expr(m, &c.ty, &c.value);
     if c.value.is_null() {
         format!("export const {} = null;\n", c.name)
     } else {
         format!("export const {} = {literal} as const;\n", c.name)
     }
+}
+
+fn ts_const_expr(m: &Manifest, ty: &Ty, value: &serde_json::Value) -> String {
+    match ty {
+        Ty::Json => value
+            .get("__rspyts_json__")
+            .map(ts_json)
+            .unwrap_or_else(|| ts_json(value)),
+        Ty::I64 | Ty::U64 => value
+            .as_str()
+            .map(|value| format!("{value}n"))
+            .unwrap_or_else(|| ts_json(value)),
+        Ty::Option { inner } => {
+            if value.is_null() {
+                "null".to_string()
+            } else {
+                ts_const_expr(m, inner, value)
+            }
+        }
+        Ty::List { inner } => value.as_array().map_or_else(
+            || ts_json(value),
+            |items| {
+                format!(
+                    "[{}]",
+                    items
+                        .iter()
+                        .map(|item| ts_const_expr(m, inner, item))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            },
+        ),
+        Ty::Map { value: value_ty } => value.as_object().map_or_else(
+            || ts_json(value),
+            |entries| {
+                let rendered = entries
+                    .iter()
+                    .map(|(key, value)| {
+                        let key = if is_ts_ident(key) {
+                            key.clone()
+                        } else {
+                            serde_json::to_string(key).expect("key serializes")
+                        };
+                        format!("{key}: {}", ts_const_expr(m, value_ty, value))
+                    })
+                    .collect::<Vec<_>>();
+                format!("{{ {} }}", rendered.join(", "))
+            },
+        ),
+        Ty::Tuple { items } => value.as_array().map_or_else(
+            || ts_json(value),
+            |values| {
+                format!(
+                    "[{}]",
+                    items
+                        .iter()
+                        .zip(values)
+                        .map(|(ty, value)| ts_const_expr(m, ty, value))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            },
+        ),
+        Ty::Ref { name } => match super::util::find_type(m, name) {
+            Some(TypeDecl::Newtype { inner, .. }) => ts_const_expr(m, inner, value),
+            Some(TypeDecl::Struct { fields, .. }) => ts_const_object(m, fields, value, None),
+            Some(TypeDecl::Enum { tag, variants, .. }) => {
+                let fields = value
+                    .get(tag)
+                    .and_then(serde_json::Value::as_str)
+                    .and_then(|wire| variants.iter().find(|variant| variant.wire_name == wire))
+                    .map(|variant| variant.fields.as_slice())
+                    .unwrap_or(&[]);
+                ts_const_object(m, fields, value, Some(tag))
+            }
+            _ => ts_json(value),
+        },
+        _ => ts_json(value),
+    }
+}
+
+fn ts_const_object(
+    m: &Manifest,
+    fields: &[FieldDecl],
+    value: &serde_json::Value,
+    tag: Option<&str>,
+) -> String {
+    let Some(entries) = value.as_object() else {
+        return ts_json(value);
+    };
+    let rendered = entries
+        .iter()
+        .map(|(key, value)| {
+            let key_expr = if is_ts_ident(key) {
+                key.clone()
+            } else {
+                serde_json::to_string(key).expect("key serializes")
+            };
+            let rendered = if tag == Some(key.as_str()) {
+                ts_json(value)
+            } else if let Some(field) = fields.iter().find(|field| field.wire_name == *key) {
+                ts_const_expr(m, &field.ty, value)
+            } else {
+                ts_json(value)
+            };
+            format!("{key_expr}: {rendered}")
+        })
+        .collect::<Vec<_>>();
+    format!("{{ {} }}", rendered.join(", "))
 }
 
 /// A JSON value as a TypeScript literal expression.
@@ -243,6 +372,7 @@ fn errors_ts(m: &Manifest, hash: &str, imports: &BTreeMap<String, String>) -> St
             let names = foreign.entry(imports[t.origin()].as_str()).or_default();
             names.push(name.clone());
             names.extend(variants.iter().map(|v| format!("{name}{}", v.name)));
+            names.push(ts_error_registry_name(name));
         } else {
             local.push((name, docs, variants));
         }
@@ -256,17 +386,61 @@ fn errors_ts(m: &Manifest, hash: &str, imports: &BTreeMap<String, String>) -> St
 
     out.push('\n');
     if !local.is_empty() {
-        out.push_str("import { RspytsError, registerError } from \"rspyts\";\n");
+        let mut runtime = vec!["type BridgeErrorRegistry", "RspytsError"];
+        if local.iter().any(|(_, _, variants)| {
+            variants.iter().any(|variant| {
+                variant
+                    .fields
+                    .iter()
+                    .any(|field| contains_kind(m, &field.ty, ConversionKind::Float))
+            })
+        }) {
+            runtime.push("floatFromWire");
+        }
+        if local.iter().any(|(_, _, variants)| {
+            variants.iter().any(|variant| {
+                variant
+                    .fields
+                    .iter()
+                    .any(|field| contains_kind(m, &field.ty, ConversionKind::Json))
+            })
+        }) {
+            runtime.push("jsonFromWire");
+        }
+        if local.iter().any(|(_, _, variants)| {
+            variants.iter().any(|variant| {
+                variant
+                    .fields
+                    .iter()
+                    .any(|field| contains_kind(m, &field.ty, ConversionKind::I64))
+            })
+        }) {
+            runtime.push("i64FromWire");
+        }
+        if local.iter().any(|(_, _, variants)| {
+            variants.iter().any(|variant| {
+                variant
+                    .fields
+                    .iter()
+                    .any(|field| contains_kind(m, &field.ty, ConversionKind::U64))
+            })
+        }) {
+            runtime.push("u64FromWire");
+        }
+        out.push_str(&format!(
+            "import {{ {} }} from \"rspyts\";\n",
+            runtime.join(", ")
+        ));
     }
-    // Value imports: instantiating the foreign module also runs its own
-    // registerError calls, so imported errors need no local registration.
+    // Value imports include the foreign error classes and their scoped map.
     if !foreign.is_empty() {
         let mut all_names: Vec<String> = Vec::new();
         for (module, mut names) in foreign {
             names.sort();
             out.push_str(&format!(
-                "import {{ {} }} from \"{module}\";\n",
-                names.join(", ")
+                "import {{ {} }} from {};\n",
+                names.join(", "),
+                ts_string(module)
             ));
             all_names.extend(names);
         }
@@ -291,7 +465,7 @@ fn errors_ts(m: &Manifest, hash: &str, imports: &BTreeMap<String, String>) -> St
                 let entries: Vec<String> = v
                     .fields
                     .iter()
-                    .map(|f| format!("{}: {}", f.wire_name, ts_type(&f.ty)))
+                    .map(|f| format!("{}: {}", ts_prop(&f.wire_name), ts_type(&f.ty)))
                     .collect();
                 lines.push(format!("`.data`: {{ {} }}", entries.join("; ")));
             }
@@ -299,35 +473,70 @@ fn errors_ts(m: &Manifest, hash: &str, imports: &BTreeMap<String, String>) -> St
             out.push_str(&ts_doc_from_lines(&lines, ""));
             // The registry contract (BridgeErrorConstructor) bakes the code
             // into the subclass: throw sites pass only (message, data).
+            let data = ts_error_data_expr(m, &v.fields);
             out.push_str(&format!(
-                "export class {name}{} extends {name} {{\n  constructor(message: string, data?: unknown) {{\n    super(message, \"{}\", data);\n  }}\n}}\n",
-                v.name, v.wire_code
+                "export class {name}{} extends {name} {{\n  constructor(message: string, data?: unknown) {{\n    super(message, {}, {data});\n  }}\n}}\n",
+                v.name,
+                ts_string(&v.wire_code),
             ));
         }
-    }
-    if !local.is_empty() {
-        out.push('\n');
     }
     for (name, _, variants) in &local {
+        out.push('\n');
+        out.push_str(&format!(
+            "export const {} = {{\n",
+            ts_error_registry_name(name)
+        ));
         for v in *variants {
             out.push_str(&format!(
-                "registerError(\"{}\", {name}{});\n",
-                v.wire_code, v.name
+                "  {}: {name}{},\n",
+                ts_string(&v.wire_code),
+                v.name
             ));
         }
+        out.push_str("} as const satisfies BridgeErrorRegistry;\n");
     }
     out
+}
+
+fn ts_error_data_expr(m: &Manifest, fields: &[FieldDecl]) -> String {
+    let converted = ts_host_converted_fields("value", fields, m, 0, HostContext::Error);
+    if converted.is_empty() {
+        return "data".to_string();
+    }
+    let wire = format!(
+        "{{ {} }}",
+        fields
+            .iter()
+            .map(|field| ts_wire_field(field, m))
+            .collect::<Vec<_>>()
+            .join("; ")
+    );
+    format!(
+        "data === undefined ? undefined : ((value: {wire}) => ({{ ...value, {} }}))(data as {wire})",
+        converted.join(", ")
+    )
 }
 
 // ---------------------------------------------------------------- client.ts
 
 fn client_ts(m: &Manifest, hash: &str) -> String {
     let client_name = format!("{}Client", pascal(&m.crate_name));
-    let has_errors = m
-        .types
-        .iter()
-        .any(|t| matches!(t, TypeDecl::ErrorEnum { .. }));
     let fns: Vec<&FnDecl> = m.functions.iter().filter(|f| on_ts(&f.targets)).collect();
+    let has_errors = fns.iter().any(|function| function.err.is_some())
+        || m.classes.iter().any(|class| {
+            class
+                .constructor
+                .as_ref()
+                .is_some_and(|constructor| constructor.err.is_some())
+                || class
+                    .methods
+                    .iter()
+                    .any(|method| on_ts(&method.targets) && method.err.is_some())
+                || class.statics.iter().any(|static_method| {
+                    on_ts(&static_method.targets) && static_method.err.is_some()
+                })
+        });
     let has_calls = !fns.is_empty() || !m.classes.is_empty();
     let has_classes = !m.classes.is_empty();
     // Any class whose instances are made from a raw handle (factories,
@@ -378,6 +587,42 @@ fn client_ts(m: &Manifest, hash: &str) -> String {
     if has_calls {
         rspyts_names.push("callFn".to_string());
     }
+    if all_params
+        .iter()
+        .any(|param| contains_kind(m, &param.ty, ConversionKind::I64))
+    {
+        rspyts_names.push("i64ToWire".to_string());
+    }
+    if all_rets
+        .iter()
+        .any(|ret| contains_kind(m, ret, ConversionKind::I64))
+    {
+        rspyts_names.push("i64FromWire".to_string());
+    }
+    if all_params
+        .iter()
+        .any(|param| contains_kind(m, &param.ty, ConversionKind::U64))
+    {
+        rspyts_names.push("u64ToWire".to_string());
+    }
+    if all_rets
+        .iter()
+        .any(|ret| contains_kind(m, ret, ConversionKind::U64))
+    {
+        rspyts_names.push("u64FromWire".to_string());
+    }
+    if all_rets
+        .iter()
+        .any(|ret| contains_kind(m, ret, ConversionKind::Float))
+    {
+        rspyts_names.push("floatFromWire".to_string());
+    }
+    if all_params
+        .iter()
+        .any(|param| contains_kind(m, &param.ty, ConversionKind::Buf))
+    {
+        rspyts_names.push("wireBuffer".to_string());
+    }
     out.push_str(&format!(
         "import {{ {} }} from \"rspyts\";\n",
         rspyts_names.join(", ")
@@ -390,7 +635,7 @@ fn client_ts(m: &Manifest, hash: &str) -> String {
         ));
     }
     if has_errors {
-        out.push_str("import \"./errors\";\n");
+        out.push_str("import * as errors from \"./errors\";\n");
     }
 
     // Instance interfaces for handle classes.
@@ -493,10 +738,10 @@ fn client_ts(m: &Manifest, hash: &str) -> String {
     }
     out.push_str("  return {\n");
     for f in &fns {
-        out.push_str(&fn_property(f));
+        out.push_str(&fn_property(m, f));
     }
     for class in &m.classes {
-        out.push_str(&class_property(class));
+        out.push_str(&class_property(m, class));
     }
     out.push_str("  };\n}\n");
     out
@@ -556,14 +801,15 @@ const TS_RESERVED: &[&str] = &[
     "yield",
 ];
 
-/// The binding name for a parameter: its wire name, with a trailing
-/// underscore when the wire name is a reserved word. Wire keys in the
-/// args object always stay exact — only the binding is escaped.
-fn ts_binding(wire_name: &str) -> String {
-    if TS_RESERVED.contains(&wire_name) {
-        format!("{wire_name}_")
+/// Project a Rust parameter name to a stable TypeScript binding. Wire keys
+/// remain independent and exact in the request object.
+fn ts_binding(rust_name: &str) -> String {
+    let source = rust_name.strip_prefix("r#").unwrap_or(rust_name);
+    let name = source.to_lower_camel_case();
+    if TS_RESERVED.contains(&name.as_str()) {
+        format!("{name}_")
     } else {
-        wire_name.to_string()
+        name
     }
 }
 
@@ -571,24 +817,29 @@ fn ts_binding(wire_name: &str) -> String {
 fn ts_params(params: &[ParamDecl]) -> String {
     params
         .iter()
-        .map(|p| format!("{}: {}", ts_binding(&p.wire_name), ts_type(&p.ty)))
+        .map(|p| format!("{}: {}", ts_binding(&p.name), ts_type(&p.ty)))
         .collect::<Vec<_>>()
         .join(", ")
 }
 
 /// The `callFn(...)` argument list after the symbol: args object, then
 /// slices (when present or when a handle must follow), then the handle.
-fn call_args(params: &[ParamDecl], handle: Option<&str>) -> String {
+fn call_args(
+    m: &Manifest,
+    params: &[ParamDecl],
+    handle: Option<&str>,
+    err: Option<&str>,
+) -> String {
     let plain: Vec<String> = params
         .iter()
         .filter(|p| !matches!(p.ty, Ty::Slice { .. }))
         .map(|p| {
-            let binding = ts_binding(&p.wire_name);
-            if binding == p.wire_name {
+            let binding = ts_binding(&p.name);
+            let value = ts_wire_expr(&binding, &p.ty, m, 0).unwrap_or_else(|| binding.clone());
+            if binding == p.wire_name && value == binding {
                 binding
             } else {
-                // No shorthand: the wire key must stay exact.
-                format!("\"{}\": {binding}", p.wire_name)
+                format!("{}: {value}", ts_prop(&p.wire_name))
             }
         })
         .collect();
@@ -602,7 +853,7 @@ fn call_args(params: &[ParamDecl], handle: Option<&str>) -> String {
         .filter_map(|p| match p.ty {
             Ty::Slice { dt } => Some(format!(
                 "{{ data: {}, dt: \"{}\" }}",
-                ts_binding(&p.wire_name),
+                ts_binding(&p.name),
                 dt.wire_name()
             )),
             _ => None,
@@ -618,25 +869,356 @@ fn call_args(params: &[ParamDecl], handle: Option<&str>) -> String {
         out.push_str(", ");
         out.push_str(h);
     }
+    if let Some(error_name) = err {
+        if slices.is_empty() && handle.is_none() {
+            out.push_str(", [], undefined");
+        } else if !slices.is_empty() && handle.is_none() {
+            out.push_str(", undefined");
+        }
+        out.push_str(&format!(", errors.{}", ts_error_registry_name(error_name)));
+    }
     out
 }
 
+fn ts_wire_expr(expr: &str, ty: &Ty, m: &Manifest, depth: usize) -> Option<String> {
+    match ty {
+        Ty::Json => Some(format!("{{ \"__rspyts_json__\": {expr} }}")),
+        Ty::I64 => Some(format!("i64ToWire({expr})")),
+        Ty::U64 => Some(format!("u64ToWire({expr})")),
+        Ty::Buf { dt } => Some(format!("wireBuffer({expr}, \"{}\")", dt.wire_name())),
+        Ty::Option { inner } => ts_wire_expr(expr, inner, m, depth)
+            .map(|converted| format!("{expr} === null ? null : {converted}")),
+        Ty::List { inner } => {
+            let item = format!("item{depth}");
+            ts_wire_expr(&item, inner, m, depth + 1)
+                .map(|converted| format!("{expr}.map(({item}) => {converted})"))
+        }
+        Ty::Map { value } => {
+            let key = format!("key{depth}");
+            let item = format!("value{depth}");
+            ts_wire_expr(&item, value, m, depth + 1).map(|converted| {
+                format!(
+                    "Object.fromEntries(Object.entries({expr}).map(([{key}, {item}]) => [{key}, {converted}]))"
+                )
+            })
+        }
+        Ty::Tuple { items } => {
+            let mut changed = false;
+            let converted = items
+                .iter()
+                .enumerate()
+                .map(|(index, item)| {
+                    let access = format!("{expr}[{index}]");
+                    match ts_wire_expr(&access, item, m, depth + 1) {
+                        Some(converted) => {
+                            changed = true;
+                            converted
+                        }
+                        None => access,
+                    }
+                })
+                .collect::<Vec<_>>();
+            changed.then(|| format!("[{}]", converted.join(", ")))
+        }
+        Ty::Ref { name } => match super::util::find_type(m, name) {
+            Some(TypeDecl::Newtype { inner, .. }) => ts_wire_expr(expr, inner, m, depth),
+            Some(TypeDecl::Struct { fields, .. }) => {
+                let converted = ts_converted_fields(expr, fields, m, depth);
+                (!converted.is_empty())
+                    .then(|| format!("{{ ...{expr}, {} }}", converted.join(", ")))
+            }
+            Some(TypeDecl::Enum { tag, variants, .. }) => {
+                let access = ts_access(expr, tag);
+                let mut arms = Vec::new();
+                for variant in variants {
+                    let converted = ts_converted_fields(expr, &variant.fields, m, depth);
+                    if !converted.is_empty() {
+                        arms.push(format!(
+                            "{access} === {} ? {{ ...{expr}, {} }}",
+                            ts_string(&variant.wire_name),
+                            converted.join(", ")
+                        ));
+                    }
+                }
+                (!arms.is_empty()).then(|| format!("{} : {expr}", arms.join(" : ")))
+            }
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn ts_converted_fields(
+    expr: &str,
+    fields: &[rspyts_core::ir::FieldDecl],
+    m: &Manifest,
+    depth: usize,
+) -> Vec<String> {
+    fields
+        .iter()
+        .filter_map(|field| {
+            let access = ts_access(expr, &field.wire_name);
+            let converted = ts_wire_expr(&access, &field.ty, m, depth + 1)?;
+            let converted = if field.optional {
+                format!("{access} === undefined ? undefined : {converted}")
+            } else {
+                converted
+            };
+            let key = ts_prop(&field.wire_name);
+            Some(format!("{key}: {converted}"))
+        })
+        .collect()
+}
+
+fn ts_access(expr: &str, field: &str) -> String {
+    if is_ts_ident(field) {
+        format!("{expr}.{field}")
+    } else {
+        format!(
+            "{expr}[{}]",
+            serde_json::to_string(field).expect("field serializes")
+        )
+    }
+}
+
+#[derive(Clone, Copy)]
+enum ConversionKind {
+    Float,
+    I64,
+    Json,
+    U64,
+    Buf,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum HostContext {
+    Response,
+    Error,
+}
+
+fn contains_kind(m: &Manifest, ty: &Ty, kind: ConversionKind) -> bool {
+    fn visit(m: &Manifest, ty: &Ty, kind: ConversionKind, seen: &mut BTreeSet<String>) -> bool {
+        match ty {
+            Ty::F32 | Ty::F64 => matches!(kind, ConversionKind::Float),
+            Ty::I64 => matches!(kind, ConversionKind::I64),
+            Ty::Json => matches!(kind, ConversionKind::Json),
+            Ty::U64 => matches!(kind, ConversionKind::U64),
+            Ty::Buf { .. } => matches!(kind, ConversionKind::Buf),
+            Ty::Option { inner } | Ty::List { inner } => visit(m, inner, kind, seen),
+            Ty::Map { value } => visit(m, value, kind, seen),
+            Ty::Tuple { items } => items.iter().any(|item| visit(m, item, kind, seen)),
+            Ty::Ref { name } if seen.insert(name.clone()) => {
+                let found = match super::util::find_type(m, name) {
+                    Some(TypeDecl::Newtype { inner, .. }) => visit(m, inner, kind, seen),
+                    Some(TypeDecl::Struct { fields, .. }) => {
+                        fields.iter().any(|field| visit(m, &field.ty, kind, seen))
+                    }
+                    Some(TypeDecl::Enum { variants, .. }) => variants.iter().any(|variant| {
+                        variant
+                            .fields
+                            .iter()
+                            .any(|field| visit(m, &field.ty, kind, seen))
+                    }),
+                    _ => false,
+                };
+                seen.remove(name);
+                found
+            }
+            _ => false,
+        }
+    }
+
+    visit(m, ty, kind, &mut BTreeSet::new())
+}
+
+fn ts_wire_type(ty: &Ty, m: &Manifest) -> String {
+    match ty {
+        Ty::I64 | Ty::U64 => "string".to_string(),
+        Ty::Option { inner } => format!("{} | null", ts_wire_type(inner, m)),
+        Ty::List { inner } => {
+            let inner = ts_wire_type(inner, m);
+            if inner.contains(' ') {
+                format!("({inner})[]")
+            } else {
+                format!("{inner}[]")
+            }
+        }
+        Ty::Map { value } => format!("Record<string, {}>", ts_wire_type(value, m)),
+        Ty::Tuple { items } => format!(
+            "[{}]",
+            items
+                .iter()
+                .map(|item| ts_wire_type(item, m))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        Ty::Ref { name } => match super::util::find_type(m, name) {
+            Some(TypeDecl::Newtype { inner, .. }) => ts_wire_type(inner, m),
+            Some(TypeDecl::Struct { fields, .. }) => format!(
+                "{{ {} }}",
+                fields
+                    .iter()
+                    .map(|field| ts_wire_field(field, m))
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            ),
+            Some(TypeDecl::Enum { tag, variants, .. }) => variants
+                .iter()
+                .map(|variant| {
+                    let mut fields = vec![format!(
+                        "{}: {}",
+                        ts_prop(tag),
+                        ts_string(&variant.wire_name)
+                    )];
+                    fields.extend(variant.fields.iter().map(|field| ts_wire_field(field, m)));
+                    format!("{{ {} }}", fields.join("; "))
+                })
+                .collect::<Vec<_>>()
+                .join(" | "),
+            _ => name.clone(),
+        },
+        _ => ts_type(ty),
+    }
+}
+
+fn ts_wire_field(field: &FieldDecl, m: &Manifest) -> String {
+    let name = ts_prop(&field.wire_name);
+    match &field.ty {
+        Ty::Option { inner } => format!("{name}?: {} | null", ts_wire_type(inner, m)),
+        _ if field.optional => format!("{name}?: {}", ts_wire_type(&field.ty, m)),
+        _ => format!("{name}: {}", ts_wire_type(&field.ty, m)),
+    }
+}
+
+fn ts_host_expr(
+    expr: &str,
+    ty: &Ty,
+    m: &Manifest,
+    depth: usize,
+    context: HostContext,
+) -> Option<String> {
+    match ty {
+        Ty::Json if context == HostContext::Error => Some(format!("jsonFromWire({expr})")),
+        Ty::F32 | Ty::F64 => Some(format!("floatFromWire({expr})")),
+        Ty::I64 => Some(format!("i64FromWire({expr})")),
+        Ty::U64 => Some(format!("u64FromWire({expr})")),
+        Ty::Option { inner } => ts_host_expr(expr, inner, m, depth, context)
+            .map(|converted| format!("{expr} === null ? null : {converted}")),
+        Ty::List { inner } => {
+            let item = format!("item{depth}");
+            ts_host_expr(&item, inner, m, depth + 1, context)
+                .map(|converted| format!("{expr}.map(({item}) => {converted})"))
+        }
+        Ty::Map { value } => {
+            let key = format!("key{depth}");
+            let item = format!("value{depth}");
+            ts_host_expr(&item, value, m, depth + 1, context).map(|converted| {
+                format!(
+                    "Object.fromEntries(Object.entries({expr}).map(([{key}, {item}]) => [{key}, {converted}]))"
+                )
+            })
+        }
+        Ty::Tuple { items } => {
+            let mut changed = false;
+            let converted = items
+                .iter()
+                .enumerate()
+                .map(|(index, item)| {
+                    let access = format!("{expr}[{index}]");
+                    match ts_host_expr(&access, item, m, depth + 1, context) {
+                        Some(converted) => {
+                            changed = true;
+                            converted
+                        }
+                        None => access,
+                    }
+                })
+                .collect::<Vec<_>>();
+            changed.then(|| format!("[{}]", converted.join(", ")))
+        }
+        Ty::Ref { name } => match super::util::find_type(m, name) {
+            Some(TypeDecl::Newtype { inner, .. }) => ts_host_expr(expr, inner, m, depth, context),
+            Some(TypeDecl::Struct { fields, .. }) => {
+                let converted = ts_host_converted_fields(expr, fields, m, depth, context);
+                (!converted.is_empty())
+                    .then(|| format!("{{ ...{expr}, {} }}", converted.join(", ")))
+            }
+            Some(TypeDecl::Enum { tag, variants, .. }) => {
+                let access = ts_access(expr, tag);
+                let mut arms = Vec::new();
+                for variant in variants {
+                    let converted =
+                        ts_host_converted_fields(expr, &variant.fields, m, depth, context);
+                    if !converted.is_empty() {
+                        arms.push(format!(
+                            "{access} === {} ? {{ ...{expr}, {} }}",
+                            ts_string(&variant.wire_name),
+                            converted.join(", ")
+                        ));
+                    }
+                }
+                (!arms.is_empty()).then(|| format!("{} : {expr}", arms.join(" : ")))
+            }
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn ts_host_converted_fields(
+    expr: &str,
+    fields: &[FieldDecl],
+    m: &Manifest,
+    depth: usize,
+    context: HostContext,
+) -> Vec<String> {
+    fields
+        .iter()
+        .filter_map(|field| {
+            let access = ts_access(expr, &field.wire_name);
+            let converted = ts_host_expr(&access, &field.ty, m, depth + 1, context)?;
+            let converted = if field.optional {
+                format!("{access} === undefined ? undefined : {converted}")
+            } else {
+                converted
+            };
+            let key = ts_prop(&field.wire_name);
+            Some(format!("{key}: {converted}"))
+        })
+        .collect()
+}
+
+fn ts_decoded_expr(call: &str, ty: &Ty, m: &Manifest) -> String {
+    let host = ts_type(ty);
+    match ts_host_expr("value", ty, m, 0, HostContext::Response) {
+        Some(converted) => {
+            let wire = ts_wire_type(ty, m);
+            format!("((value: {wire}): {host} => ({converted}))({call} as {wire})")
+        }
+        None => format!("{call} as {host}"),
+    }
+}
+
 /// One `name: (…) => …` property of the returned client object.
-fn fn_property(f: &FnDecl) -> String {
+fn fn_property(m: &Manifest, f: &FnDecl) -> String {
     let name = f.name.to_lower_camel_case();
     let symbol = format!("rspyts_fn__{}", f.name);
     let params = ts_params(&f.params);
-    let call = format!("callFn(mod, \"{symbol}\", {})", call_args(&f.params, None));
+    let call = format!(
+        "callFn(mod, \"{symbol}\", {})",
+        call_args(m, &f.params, None, f.err.as_deref())
+    );
     if matches!(f.ret, Ty::Unit) {
         format!("    {name}: ({params}): void => {{\n      {call};\n    }},\n")
     } else {
         let ret = ts_type(&f.ret);
-        format!("    {name}: ({params}): {ret} =>\n      {call} as {ret},\n")
+        let decoded = ts_decoded_expr(&call, &f.ret, m);
+        format!("    {name}: ({params}): {ret} =>\n      {decoded},\n")
     }
 }
 
 /// One `Name: class { … }` property of the returned client object.
-fn class_property(class: &ClassDecl) -> String {
+fn class_property(m: &Manifest, class: &ClassDecl) -> String {
     let name = &class.name;
     let drop_symbol = format!("rspyts_cls__{name}__drop");
     let statics: Vec<&StaticDecl> = class.statics.iter().filter(|s| on_ts(&s.targets)).collect();
@@ -657,7 +1239,7 @@ fn class_property(class: &ClassDecl) -> String {
             ));
             out.push_str(&format!(
                 "        const raw = callFn(mod, \"rspyts_cls__{name}__new\", {}) as number;\n",
-                call_args(&ctor.params, None)
+                call_args(m, &ctor.params, None, ctor.err.as_deref())
             ));
             out.push_str("        this.#handle = BigInt(raw);\n");
         }
@@ -677,14 +1259,11 @@ fn class_property(class: &ClassDecl) -> String {
             if ctor.params.is_empty() {
                 out.push_str(&format!(
                     "          raw = callFn(mod, \"rspyts_cls__{name}__new\", {}) as number;\n",
-                    call_args(&ctor.params, None)
+                    call_args(m, &ctor.params, None, ctor.err.as_deref())
                 ));
             } else {
-                let bindings: Vec<String> = ctor
-                    .params
-                    .iter()
-                    .map(|p| ts_binding(&p.wire_name))
-                    .collect();
+                let bindings: Vec<String> =
+                    ctor.params.iter().map(|p| ts_binding(&p.name)).collect();
                 let types: Vec<String> = ctor.params.iter().map(|p| ts_type(&p.ty)).collect();
                 out.push_str(&format!(
                     "          const [{}] = args as [{}];\n",
@@ -693,7 +1272,7 @@ fn class_property(class: &ClassDecl) -> String {
                 ));
                 out.push_str(&format!(
                     "          raw = callFn(mod, \"rspyts_cls__{name}__new\", {}) as number;\n",
-                    call_args(&ctor.params, None)
+                    call_args(m, &ctor.params, None, ctor.err.as_deref())
                 ));
             }
             out.push_str("        }\n");
@@ -738,7 +1317,7 @@ fn class_property(class: &ClassDecl) -> String {
             ));
             out.push_str(&format!(
                 "        const raw = callFn(mod, \"{symbol}\", {}) as number;\n",
-                call_args(&s.params, None)
+                call_args(m, &s.params, None, s.err.as_deref())
             ));
             out.push_str("        return new this(INTERNAL, raw);\n");
             out.push_str("      }\n");
@@ -746,14 +1325,18 @@ fn class_property(class: &ClassDecl) -> String {
             out.push_str(&format!(
                 "      static {s_name}({}): void {{\n        callFn(mod, \"{symbol}\", {});\n      }}\n",
                 ts_params(&s.params),
-                call_args(&s.params, None)
+                call_args(m, &s.params, None, s.err.as_deref())
             ));
         } else {
             let ret = ts_type(&s.ret);
+            let call = format!(
+                "callFn(mod, \"{symbol}\", {})",
+                call_args(m, &s.params, None, s.err.as_deref())
+            );
+            let decoded = ts_decoded_expr(&call, &s.ret, m);
             out.push_str(&format!(
-                "      static {s_name}({}): {ret} {{\n        return callFn(mod, \"{symbol}\", {}) as {ret};\n      }}\n",
+                "      static {s_name}({}): {ret} {{\n        return {decoded};\n      }}\n",
                 ts_params(&s.params),
-                call_args(&s.params, None)
             ));
         }
     }
@@ -763,7 +1346,12 @@ fn class_property(class: &ClassDecl) -> String {
         let symbol = format!("rspyts_cls__{name}__{}", method.name);
         let call = format!(
             "callFn(mod, \"{symbol}\", {})",
-            call_args(&method.params, Some("this.#handle"))
+            call_args(
+                m,
+                &method.params,
+                Some("this.#handle"),
+                method.err.as_deref(),
+            )
         );
         out.push('\n');
         out.push_str(&ts_doc(&method.docs, "      "));
@@ -774,8 +1362,9 @@ fn class_property(class: &ClassDecl) -> String {
             ));
         } else {
             let ret = ts_type(&method.ret);
+            let decoded = ts_decoded_expr(&call, &method.ret, m);
             out.push_str(&format!(
-                "      {m_name}({}): {ret} {{\n        return {call} as {ret};\n      }}\n",
+                "      {m_name}({}): {ret} {{\n        return {decoded};\n      }}\n",
                 ts_params(&method.params)
             ));
         }
@@ -811,7 +1400,9 @@ fn index_ts(hash: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::super::test_manifest::{FOREIGN_ORIGIN, manifest, manifest_hash};
+    use super::super::test_manifest::{
+        FOREIGN_ORIGIN, binary_manifest, exact_manifest, manifest, manifest_hash,
+    };
     use super::super::util::VERSION;
     use super::*;
 
@@ -822,7 +1413,7 @@ mod tests {
     fn mapped_imports() -> BTreeMap<String, String> {
         [(
             FOREIGN_ORIGIN.to_string(),
-            "@example/catalog/generated".to_string(),
+            "shared-types-example".to_string(),
         )]
         .into_iter()
         .collect()
@@ -861,26 +1452,26 @@ mod tests {
             r#"// Code generated by rspyts v@VERSION@. DO NOT EDIT.
 // rspyts:manifest-hash sha256:@HASH@
 
-/** Parameters controlling the analysis pass. */
-export interface AnalysisParams {
-  /** Minimum duration, in seconds. */
-  minDurationS: number;
-  threshold?: number | null;
+/** Options controlling value processing. */
+export interface QueryOptions {
+  /** Minimum value to include. */
+  minimumValue: number;
+  tolerance?: number | null;
   metadata: unknown;
 }
 
-/** Catalog description reported by the device. */
-export interface CatalogInfo {
-  vendor: string;
-  channelCount: number;
+/** Description of an input source. */
+export interface SourceInfo {
+  name: string;
+  fieldCount: number;
 }
 
 export type Severity = "low" | "medium" | "high";
 
-/** Signal threshold transitions. */
-export type ThresholdEvent =
-  | { kind: "crossed"; atSample: number; value: number }
-  | { kind: "cleared"; atSample: number };
+/** Value-processing transitions. */
+export type ValueEvent =
+  | { kind: "accepted"; index: number; value: number }
+  | { kind: "rejected"; index: number };
 "#,
         );
         assert_text_eq(&emitted("types.ts"), &expected, "types.ts");
@@ -892,15 +1483,15 @@ export type ThresholdEvent =
             r#"// Code generated by rspyts v@VERSION@. DO NOT EDIT.
 // rspyts:manifest-hash sha256:@HASH@
 
-/** Baseline analysis parameters. */
-export const DEFAULT_PARAMS = { minDurationS: 0.5, threshold: null, metadata: { rev: 2 } } as const;
+/** Baseline processing options. */
+export const DEFAULT_OPTIONS = { minimumValue: 0.5, tolerance: null, metadata: { rev: 2 } } as const;
 
-export const DEFAULT_THRESHOLD = 0.75 as const;
+export const DEFAULT_LIMIT = 0.75 as const;
 
-/** Name reported by the analysis engine. */
-export const ENGINE_NAME = "neuro-engine" as const;
+/** Name reported by the value processor. */
+export const PROCESSOR_NAME = "vector-processor" as const;
 
-export const SUPPORTED_UNITS = ["uV", "mV"] as const;
+export const SUPPORTED_FORMATS = ["csv", "json"] as const;
 "#,
         );
         assert_text_eq(&emitted("constants.ts"), &expected, "constants.ts");
@@ -912,26 +1503,28 @@ export const SUPPORTED_UNITS = ["uV", "mV"] as const;
             r#"// Code generated by rspyts v@VERSION@. DO NOT EDIT.
 // rspyts:manifest-hash sha256:@HASH@
 
-import { RspytsError, registerError } from "rspyts";
+import { type BridgeErrorRegistry, RspytsError } from "rspyts";
 
-export class AnalysisError extends RspytsError {}
+export class QueryError extends RspytsError {}
 
-/** The sample rate must be positive. */
-export class AnalysisErrorInvalidSampleRate extends AnalysisError {
+/** The batch size must be positive. */
+export class QueryErrorInvalidBatchSize extends QueryError {
   constructor(message: string, data?: unknown) {
-    super(message, "invalidSampleRate", data);
+    super(message, "invalidBatchSize", data);
   }
 }
 
 /** `.data`: { max: number } */
-export class AnalysisErrorWindowTooLarge extends AnalysisError {
+export class QueryErrorBatchTooLarge extends QueryError {
   constructor(message: string, data?: unknown) {
-    super(message, "windowTooLarge", data);
+    super(message, "batchTooLarge", data);
   }
 }
 
-registerError("invalidSampleRate", AnalysisErrorInvalidSampleRate);
-registerError("windowTooLarge", AnalysisErrorWindowTooLarge);
+export const QueryErrorTypes = {
+  "invalidBatchSize": QueryErrorInvalidBatchSize,
+  "batchTooLarge": QueryErrorBatchTooLarge,
+} as const satisfies BridgeErrorRegistry;
 "#,
         );
         assert_text_eq(&emitted("errors.ts"), &expected, "errors.ts");
@@ -939,21 +1532,21 @@ registerError("windowTooLarge", AnalysisErrorWindowTooLarge);
 
     #[test]
     fn client_ts_matches_golden() {
-        // `preload` is Python-only and must not appear; `renderReport`
+        // `warm_up` is Python-only and must not appear; `renderSummary`
         // is TypeScript-only and must.
         let expected = golden(
             r#"// Code generated by rspyts v@VERSION@. DO NOT EDIT.
 // rspyts:manifest-hash sha256:@HASH@
 
-import { type BridgeModule, callDrop, callFn } from "rspyts";
-import type { AnalysisParams, CatalogInfo } from "./types";
-import "./errors";
+import { type BridgeModule, callDrop, callFn, floatFromWire } from "rspyts";
+import type { QueryOptions, SourceInfo } from "./types";
+import * as errors from "./errors";
 
-/** A recorded session backed by a native handle. */
-export interface Recording {
-  /** Total duration in seconds. */
-  durationS(): number;
-  info(): CatalogInfo;
+/** A processing session backed by a native handle. */
+export interface Session {
+  /** Current completion ratio. */
+  progress(): number;
+  info(): SourceInfo;
   /** Release the underlying Rust object. Safe to call more than once. */
   free(): void;
   [Symbol.dispose](): void;
@@ -963,7 +1556,7 @@ export interface Recording {
 export interface RunningStats {
   push(chunk: Float64Array): void;
   /** Snapshot current state. */
-  snapshot(): AnalysisParams;
+  snapshot(): QueryOptions;
   /** Release the underlying Rust object. Safe to call more than once. */
   free(): void;
   [Symbol.dispose](): void;
@@ -971,19 +1564,19 @@ export interface RunningStats {
 
 /** The typed surface of the `demo-crate` bridge module. */
 export interface DemoCrateClient {
-  /** Analyze a signal buffer. */
-  analyzeSignal(samples: Float64Array, sampleRate: number, params: AnalysisParams): Float64Array;
-  /** Render an HTML report. */
-  renderReport(): string;
-  Recording: {
-    /** Open a recording from disk. */
-    open(path: string): Recording;
+  /** Process a buffer of numeric values. */
+  processValues(values: Float64Array, batchSize: number, options: QueryOptions): Float64Array;
+  /** Render an HTML summary. */
+  renderSummary(): string;
+  Session: {
+    /** Open a processing session from disk. */
+    open(path: string): Session;
     defaultExtension(): string;
   };
   RunningStats: {
     new (window: number): RunningStats;
     /** Rebuild from a snapshot. */
-    resumed(state: AnalysisParams): RunningStats;
+    resumed(state: QueryOptions): RunningStats;
   };
 }
 
@@ -996,46 +1589,46 @@ const INTERNAL = Symbol("rspyts.internal");
 /** Bind the generated API to an instantiated bridge module. */
 export function createClient(mod: BridgeModule): DemoCrateClient {
   return {
-    analyzeSignal: (samples: Float64Array, sampleRate: number, params: AnalysisParams): Float64Array =>
-      callFn(mod, "rspyts_fn__analyze_signal", { sampleRate, params }, [{ data: samples, dt: "f64" }]) as Float64Array,
-    renderReport: (): string =>
-      callFn(mod, "rspyts_fn__render_report", {}) as string,
-    Recording: class {
+    processValues: (values: Float64Array, batchSize: number, options: QueryOptions): Float64Array =>
+      callFn(mod, "rspyts_fn__process_values", { batchSize, options: { ...options, metadata: { "__rspyts_json__": options.metadata } } }, [{ data: values, dt: "f64" }], undefined, errors.QueryErrorTypes) as Float64Array,
+    renderSummary: (): string =>
+      callFn(mod, "rspyts_fn__render_summary", {}) as string,
+    Session: class {
       #handle: bigint;
 
       constructor(internal: typeof INTERNAL, raw: number);
       constructor(...args: unknown[]) {
         if (args[0] !== INTERNAL) {
-          throw new Error("Recording cannot be constructed directly; use Recording.open(...)");
+          throw new Error("Session cannot be constructed directly; use Session.open(...)");
         }
         this.#handle = BigInt(args[1] as number);
         const handle = this.#handle;
-        finalizer.register(this, () => callDrop(mod, "rspyts_cls__Recording__drop", handle), this);
+        finalizer.register(this, () => callDrop(mod, "rspyts_cls__Session__drop", handle), this);
       }
 
-      /** Open a recording from disk. */
-      static open(path: string): Recording {
-        const raw = callFn(mod, "rspyts_cls__Recording__open", { path }) as number;
+      /** Open a processing session from disk. */
+      static open(path: string): Session {
+        const raw = callFn(mod, "rspyts_cls__Session__open", { path }, [], undefined, errors.QueryErrorTypes) as number;
         return new this(INTERNAL, raw);
       }
 
       static defaultExtension(): string {
-        return callFn(mod, "rspyts_cls__Recording__default_extension", {}) as string;
+        return callFn(mod, "rspyts_cls__Session__default_extension", {}) as string;
       }
 
-      /** Total duration in seconds. */
-      durationS(): number {
-        return callFn(mod, "rspyts_cls__Recording__duration_s", {}, [], this.#handle) as number;
+      /** Current completion ratio. */
+      progress(): number {
+        return ((value: number): number => (floatFromWire(value)))(callFn(mod, "rspyts_cls__Session__progress", {}, [], this.#handle) as number);
       }
 
-      info(): CatalogInfo {
-        return callFn(mod, "rspyts_cls__Recording__info", {}, [], this.#handle) as CatalogInfo;
+      info(): SourceInfo {
+        return callFn(mod, "rspyts_cls__Session__info", {}, [], this.#handle) as SourceInfo;
       }
 
       /** Release the underlying Rust object. Safe to call more than once. */
       free(): void {
         finalizer.unregister(this);
-        callDrop(mod, "rspyts_cls__Recording__drop", this.#handle);
+        callDrop(mod, "rspyts_cls__Session__drop", this.#handle);
       }
 
       [Symbol.dispose](): void {
@@ -1061,8 +1654,8 @@ export function createClient(mod: BridgeModule): DemoCrateClient {
       }
 
       /** Rebuild from a snapshot. */
-      static resumed(state: AnalysisParams): RunningStats {
-        const raw = callFn(mod, "rspyts_cls__RunningStats__resumed", { state }) as number;
+      static resumed(state: QueryOptions): RunningStats {
+        const raw = callFn(mod, "rspyts_cls__RunningStats__resumed", { state: { ...state, metadata: { "__rspyts_json__": state.metadata } } }) as number;
         return new this(INTERNAL, raw);
       }
 
@@ -1071,8 +1664,8 @@ export function createClient(mod: BridgeModule): DemoCrateClient {
       }
 
       /** Snapshot current state. */
-      snapshot(): AnalysisParams {
-        return callFn(mod, "rspyts_cls__RunningStats__snapshot", {}, [], this.#handle) as AnalysisParams;
+      snapshot(): QueryOptions {
+        return ((value: { minimumValue: number; tolerance?: number | null; metadata: unknown }): QueryOptions => ({ ...value, minimumValue: floatFromWire(value.minimumValue), tolerance: value.tolerance === undefined ? undefined : value.tolerance === null ? null : floatFromWire(value.tolerance) }))(callFn(mod, "rspyts_cls__RunningStats__snapshot", {}, [], this.#handle) as { minimumValue: number; tolerance?: number | null; metadata: unknown });
       }
 
       /** Release the underlying Rust object. Safe to call more than once. */
@@ -1114,18 +1707,16 @@ export * from "./types";
         let files = emit(&m, &hash, &mapped_imports());
         let types = &files.iter().find(|(n, _)| *n == "types.ts").unwrap().1;
         assert!(
-            types.contains(
-                "import type { CatalogInfo } from \"@example/catalog/generated\";\n"
-            ),
+            types.contains("import type { SourceInfo } from \"shared-types-example\";\n"),
             "{types}"
         );
         // Re-exported so `export * from "./types"` in index.ts surfaces it.
-        assert!(types.contains("export type { CatalogInfo };\n"), "{types}");
-        assert!(!types.contains("export interface CatalogInfo"), "{types}");
+        assert!(types.contains("export type { SourceInfo };\n"), "{types}");
+        assert!(!types.contains("export interface SourceInfo"), "{types}");
         // client.ts keeps importing it from "./types", which re-exports.
         let client = &files.iter().find(|(n, _)| *n == "client.ts").unwrap().1;
         assert!(
-            client.contains("import type { AnalysisParams, CatalogInfo } from \"./types\";"),
+            client.contains("import type { QueryOptions, SourceInfo } from \"./types\";"),
             "{client}"
         );
     }
@@ -1133,8 +1724,56 @@ export * from "./types";
     #[test]
     fn unmapped_foreign_types_are_emitted_locally() {
         let types = emitted("types.ts");
-        assert!(types.contains("export interface CatalogInfo {"), "{types}");
-        assert!(!types.contains("example"), "{types}");
+        assert!(types.contains("export interface SourceInfo {"), "{types}");
+        assert!(!types.contains("shared-types-example"), "{types}");
+    }
+
+    #[test]
+    fn binary_newtype_fixture_marks_only_numeric_u8_buffers() {
+        let m = binary_manifest();
+        let hash = manifest_hash(&m);
+        let files = emit(&m, &hash, &no_imports());
+        let types = &files.iter().find(|(n, _)| *n == "types.ts").unwrap().1;
+        let client = &files.iter().find(|(n, _)| *n == "client.ts").unwrap().1;
+
+        assert!(types.contains("export type PacketId = number;"));
+        assert!(types.contains("  payload: Uint8Array;"));
+        assert!(types.contains("  samples: Float64Array;"));
+        assert!(types.contains("  chunks: Int16Array[];"));
+        assert!(types.contains("  channels: Record<string, Uint8Array>;"));
+        assert!(client.contains("samples: wireBuffer(value.samples, \"f64\")"));
+        assert!(client.contains("wireBuffer(item1, \"i16\")"));
+        assert!(client.contains("wireBuffer(value1, \"u8\")"));
+        assert!(client.contains("echoBytes: (value: Uint8Array): Uint8Array =>\n      callFn(mod, \"rspyts_fn__echo_bytes\", { value })"));
+        assert!(client.contains("echoU8: (value: Uint8Array): Uint8Array =>\n      callFn(mod, \"rspyts_fn__echo_u8\", { value: wireBuffer(value, \"u8\") })"));
+    }
+
+    #[test]
+    fn exact_tuple_and_mixed_fixture_projects_recursive_conversions() {
+        let m = exact_manifest();
+        crate::validate::validate(&m).expect("fixture validates");
+        let hash = manifest_hash(&m);
+        let files = emit(&m, &hash, &no_imports());
+        let file = |name| files.iter().find(|(n, _)| *n == name).unwrap().1.as_str();
+        let types = file("types.ts");
+        let client = file("client.ts");
+        let constants = file("constants.ts");
+        let errors = file("errors.ts");
+
+        assert!(types.contains("export type SequenceId = bigint;"));
+        assert!(types.contains("  pair: [bigint, bigint];"));
+        assert!(types.contains("  | { type: \"pending\" }"));
+        assert!(types.contains("  | { type: \"ready\"; total: bigint }"));
+        assert!(client.contains("i64ToWire(value[0])"));
+        assert!(client.contains("u64ToWire(value[1])"));
+        assert!(client.contains("i64FromWire(value[0])"));
+        assert!(client.contains("u64FromWire(value[1])"));
+        assert!(client.contains("value.type === \"ready\""));
+        assert!(constants.contains(
+            "export const EXACT_PAIR = [-9223372036854775808n, 18446744073709551615n] as const;"
+        ));
+        assert!(constants.contains("export const MAX_SEQUENCE = 18446744073709551615n as const;"));
+        assert!(errors.contains("u64FromWire(value.exactLimit)"));
     }
 
     #[test]
@@ -1148,23 +1787,22 @@ export * from "./types";
         let hash = manifest_hash(&m);
         let files = emit(&m, &hash, &mapped_imports());
         let errors = &files.iter().find(|(n, _)| *n == "errors.ts").unwrap().1;
-        // A value import: loading the foreign module runs its own
-        // registerError calls, so no local registration is emitted.
+        // A value import carries the foreign registry into local wrappers.
         assert!(
             errors.contains(
-                "import { AnalysisError, AnalysisErrorInvalidSampleRate, \
-                 AnalysisErrorWindowTooLarge } from \"@example/catalog/generated\";\n"
+                "import { QueryError, QueryErrorBatchTooLarge, \
+                 QueryErrorInvalidBatchSize, QueryErrorTypes } from \"shared-types-example\";\n"
             ),
             "{errors}"
         );
         assert!(
             errors.contains(
-                "export { AnalysisError, AnalysisErrorInvalidSampleRate, \
-                 AnalysisErrorWindowTooLarge };\n"
+                "export { QueryError, QueryErrorBatchTooLarge, \
+                 QueryErrorInvalidBatchSize, QueryErrorTypes };\n"
             ),
             "{errors}"
         );
-        assert!(!errors.contains("export class AnalysisError"), "{errors}");
+        assert!(!errors.contains("export class QueryError"), "{errors}");
         assert!(!errors.contains("registerError("), "{errors}");
     }
 
@@ -1205,7 +1843,7 @@ export * from "./types";
             value: serde_json::Value::Null,
         };
         // `null as const` is a TS1355 error; plain `null` is emitted.
-        assert_eq!(const_line(&c), "export const MAYBE = null;\n");
+        assert_eq!(const_line(&manifest(), &c), "export const MAYBE = null;\n");
     }
 
     #[test]
@@ -1221,6 +1859,7 @@ export * from "./types";
 
     #[test]
     fn reserved_word_param_binds_with_underscore_and_exact_wire_key() {
+        let m = manifest();
         let f = FnDecl {
             name: "with_default".to_string(),
             docs: String::new(),
@@ -1236,11 +1875,14 @@ export * from "./types";
         // Signature binds `default_`; the args object keeps the exact
         // wire key with no shorthand.
         assert_eq!(ts_params(&f.params), "default_: number");
-        assert_eq!(call_args(&f.params, None), "{ \"default\": default_ }");
         assert_eq!(
-            fn_property(&f),
+            call_args(&m, &f.params, None, None),
+            "{ default: default_ }"
+        );
+        assert_eq!(
+            fn_property(&m, &f),
             "    withDefault: (default_: number): number =>\n      \
-             callFn(mod, \"rspyts_fn__with_default\", { \"default\": default_ }) as number,\n"
+             callFn(mod, \"rspyts_fn__with_default\", { default: default_ }) as number,\n"
         );
         // Non-reserved names keep the shorthand form.
         let plain = vec![ParamDecl {
@@ -1248,7 +1890,7 @@ export * from "./types";
             wire_name: "count".to_string(),
             ty: Ty::U32,
         }];
-        assert_eq!(call_args(&plain, None), "{ count }");
+        assert_eq!(call_args(&m, &plain, None, None), "{ count }");
     }
 
     #[test]
@@ -1258,6 +1900,10 @@ export * from "./types";
             "\"with-dash\": boolean"
         );
         assert_eq!(ts_field("plain", &Ty::Bool, false), "plain: boolean");
+        assert_eq!(
+            ts_field("line\n\"quote-dash", &Ty::Bool, false),
+            "\"line\\n\\\"quote-dash\": boolean"
+        );
     }
 
     #[test]
