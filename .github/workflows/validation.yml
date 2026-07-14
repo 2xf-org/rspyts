@@ -41,7 +41,7 @@ jobs:
     name: Rust (lint, test, wasm)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # rustfmt/clippy for the lint steps; the wasm32 target is needed to
       # prove the example crate compiles for the TypeScript (WASM) side.
@@ -72,7 +72,7 @@ jobs:
     name: Docs (rustdoc + links)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: rustdoc (deny warnings)
@@ -86,7 +86,7 @@ jobs:
     name: Rust (Windows)
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Test
@@ -96,7 +96,7 @@ jobs:
     name: Rust (macOS)
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Test
@@ -109,7 +109,7 @@ jobs:
     name: Rust coverage (report-only)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # llvm-tools-preview supplies the llvm-cov/llvm-profdata binaries
       # cargo-llvm-cov drives.
@@ -133,7 +133,7 @@ jobs:
       run:
         working-directory: runtimes/python
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # uv provisions the interpreter declared in pyproject.toml and manages
       # the virtualenv; no separate setup-python step is needed.
@@ -155,7 +155,7 @@ jobs:
       run:
         working-directory: runtimes/typescript
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - uses: actions/setup-node@v4
         with:
@@ -178,7 +178,7 @@ jobs:
     name: Example end-to-end
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - uses: dtolnay/rust-toolchain@stable
         with:
