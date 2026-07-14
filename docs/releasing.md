@@ -9,7 +9,10 @@ All in one commit:
 1. `Cargo.toml` (workspace root): `[workspace.package] version` **and** the three path-dependency pins in `[workspace.dependencies]` (`rspyts-core`, `rspyts-macros`, `rspyts`) — cargo publishes these as real version requirements.
 2. `runtimes/python/pyproject.toml`: `version`.
 3. `runtimes/typescript/package.json`: `version`.
-4. Run `cargo build` to refresh `Cargo.lock`, then regenerate the example (`cargo run -p rspyts-cli -- generate --config examples/basic/rspyts.toml`) so the generated-file headers carry the new version. Commit everything.
+4. `runtimes/python/src/rspyts/__init__.py`: `__version__`.
+5. Run `cargo build` to refresh `Cargo.lock`, `uv lock --directory runtimes/python`, and `npm install --package-lock-only --prefix runtimes/typescript`. Then regenerate the example (`cargo run -p rspyts-cli -- generate --config examples/basic/rspyts.toml`) so the generated-file headers carry the new version. Commit everything.
+
+The deploy workflow rejects tags that do not exactly match every package and lockfile version. Releases currently use stable `vX.Y.Z` tags; add explicit cross-ecosystem prerelease normalization before introducing prerelease tags.
 
 Note that the ABI version (`ABI_VERSION` in `crates/rspyts-core/src/lib.rs`) is **not** bumped on release — only when the boundary itself changes. Any change to [abi.md](design/abi.md)'s contract must bump it and update the shims, the Python runtime, and the TypeScript runtime in the same PR; runtimes reject modules with an unknown ABI major version, so a partial update fails loudly at load time.
 
@@ -31,7 +34,7 @@ Dependency order, each crate only after its dependencies are visible on the regi
 3. `rspyts`
 4. `rspyts-cli`
 
-The workflow does this sequentially with a wait-for-availability step between publishes (crates.io indexing is eventually consistent). PyPI and npm have no ordering constraint and publish in parallel afterwards.
+The workflow does this sequentially with a registry availability check between publishes (crates.io indexing is eventually consistent). PyPI and npm have no ordering constraint and publish in parallel with the crates.io chain.
 
 ## Required secrets and one-time setup
 
@@ -53,7 +56,9 @@ For the **first** release, the project does not exist on PyPI yet: use a *pendin
 
 ### `NPM_TOKEN` (repository secret)
 
-An npm **granular access token** (npmjs.com → Access Tokens → Generate New Token → Granular), permissions **Read and write**, scoped to the `rspyts` package only, with publish allowed. Add as repository secret `NPM_TOKEN`.
+The first publish needs an npm **granular access token** (npmjs.com → Access Tokens → Generate New Token → Granular), permissions **Read and write**, with package creation/publish allowed. Add it as repository secret `NPM_TOKEN`. The package cannot be scoped to `rspyts` until that package exists.
+
+After the first release, configure npm Trusted Publishing on the `rspyts` package for owner `2xf-org`, repository `rspyts`, workflow `deploy.yml`, then remove `NODE_AUTH_TOKEN` from the workflow and delete `NPM_TOKEN`. The npm publish job already grants `id-token: write` and uses a compatible npm/Node version.
 
 ## First-release checklist
 
