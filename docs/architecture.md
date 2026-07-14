@@ -62,7 +62,7 @@ Things that are always true, and where they are enforced:
 - **The caller frees.** Request buffers are allocated, owned, and freed by the caller; envelopes are returned to the caller, who frees them with `rspyts_free(ptr, 12 + json_len + tail_len)`. Rust never frees foreign requests; runtimes always free envelopes, even on error paths.
 - **Envelope capacity == length** (`envelope::seal`), so a single `(ptr, total_len)` pair frees the allocation exactly.
 - **Manifests and generated files are deterministic.** Sections sorted and uniqueness-asserted in `registry::build_manifest`; emitters iterate manifest order only. Same crate in, byte-identical files out — this is what makes committed generated code and the drift check work.
-- **Handles are never 0, never reused,** and stay below 2^53 (`handles::Slab`: per-type monotonic counter from 1), so they survive JSON and JS `number` transport. `__drop` is idempotent; stale handles produce a `staleHandle` error, not UB.
+- **Handles are never 0, never reused,** and enforced below 2^53 (`handles::Slab`: per-type monotonic counter from 1; `insert` refuses at `MAX_HANDLE`), so they survive JSON and JS `number` transport. `__drop` is idempotent; stale handles produce a `staleHandle` error, not UB.
 - **Unknown fields are rejected in both directions** (serde `deny_unknown_fields`, pydantic `extra="forbid"`). Wire compatibility is explicit, never accidental.
 - **Unbridgeable types fail at compile time.** `u64`, `i64`, tuples, and friends simply don't implement `Bridged` (`rspyts-core/src/bridged.rs`).
 

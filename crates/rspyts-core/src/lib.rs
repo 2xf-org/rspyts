@@ -8,8 +8,8 @@
 //!   Python, TypeScript, and JSON Schema.
 //! - [`envelope`] — the response envelope binary format (ABI §4) and the
 //!   `rspyts_alloc`/`rspyts_free` allocation rules (ABI §2).
-//! - [`bridged`] — the [`Bridged`](bridged::Bridged) trait mapping Rust
-//!   types onto the portable type system, plus [`Buf`](bridged::Buf) for
+//! - [`bridged`] — the [`bridged::Bridged`] trait mapping Rust
+//!   types onto the portable type system, plus [`bridged::Buf`] for
 //!   zero-JSON-copy numeric returns.
 //! - [`registry`] — `inventory`-based registration and deterministic
 //!   manifest assembly.

@@ -66,6 +66,22 @@ jobs:
       - name: Build example for wasm32
         run: cargo build -p basic-example --target wasm32-unknown-unknown
 
+  # Documentation must build warning-clean, and every relative markdown
+  # link must resolve — the docs' counterpart to the codegen drift gate.
+  docs:
+    name: Docs (rustdoc + links)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: rustdoc (deny warnings)
+        run: cargo doc --workspace --no-deps
+        env:
+          RUSTDOCFLAGS: -D warnings
+      - name: Markdown links
+        run: python3 .github/scripts/check_docs_links.py
+
   rust-windows:
     name: Rust (Windows)
     runs-on: windows-latest

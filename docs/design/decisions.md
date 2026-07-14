@@ -121,7 +121,7 @@ over its C ABI.
 
 **Consequences.** Distribution is trivial (the *user's* cdylib is the only
 native artifact), and long Rust calls run GIL-free so Python threads make
-real progress ([Python guide](../guide/python.md)). Cost: ctypes dispatch
+real progress ([Python guide](../python.md)). Cost: ctypes dispatch
 is slower than a C extension per call — amortized by the design's grain
 (few calls moving meaningful payloads, raw buffers for bulk data) rather
 than fought with native code.
@@ -170,23 +170,29 @@ foreign code cannot hold a mutable reference into Rust data — mutation is
 a method call on a class; and handle lifetimes are the caller's
 responsibility, softened by finalizer backstops in both runtimes.
 
-## ADR-8: Single-crate modules in v0.1
+## ADR-8: Types compose across crates; symbols do not (yet)
 
-**Context.** Exported symbols (`rspyts_fn__{name}`,
-`rspyts_cls__{Type}__{method}`) are not namespaced by crate, so linking two
-bridged crates into one cdylib is a symbol collision (ABI §3). Proper
-multi-crate modules need answers for symbol prefixing, manifest merging,
-cross-crate name collisions, and generated-package layout.
+**Context.** Two different things could be "multi-crate". Sharing *types*
+across bridged crates — `reports` using `catalog`'s `Annotation` with
+one identity in every projection — and linking several *function-defining*
+crates into one compiled module. The first is a manifest and codegen
+question; the second is a symbol-naming question, because exported symbols
+(`rspyts_fn__{name}`, `rspyts_cls__{Type}__{method}`) are not namespaced by
+crate (ABI §3).
 
-**Decision.** One bridged crate per compiled module in v0.1: the crate is
-the unit of contract. Crate-prefixed symbols behind a config key are the
-designated roadmap item, deferred until real usage shows the shape of the
-need.
+**Decision.** v0.1 ships cross-crate type sharing: registrations from
+dependency crates link into the dependent's module, every type carries its
+origin crate in the manifest, and `[python.imports]` / `[typescript.imports]`
+map origins onto real import paths so foreign types are imported, never
+duplicated (codegen §9). Function and class *symbols* remain one defining
+crate per compiled module: identically named functions or classes from two
+linked crates would collide, and `build_manifest` rejects duplicate names
+loudly. Crate-prefixed symbols behind a config key stay the roadmap item.
 
-**Consequences.** Symbol naming, manifest assembly, and codegen stay
-simple and collision-free. To aggregate items from several crates into one
-contract, re-export the definitions into a single bridged crate; to use
-several bridged crates side by side, load them as separate
-cdylibs/WASM instances (nothing prevents that — each carries its own
-allocator and manifest). Cost: no single-module composition of
-independently owned bridged crates, yet.
+**Consequences.** Shared vocabulary crates (pure `#[bridge]` types) compose
+freely and keep one identity everywhere — `examples/multi-crate` proves it
+end to end. Aggregating *behavior* from several crates into one module
+still means re-exporting into a single bridged crate, or loading separate
+cdylibs/WASM instances side by side (each carries its own allocator and
+manifest). Cost: no single-module composition of independently owned
+function-defining crates, yet.

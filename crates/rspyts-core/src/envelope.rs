@@ -41,7 +41,8 @@ pub fn alloc(len: usize) -> *mut u8 {
 /// envelope (ABI `rspyts_free`).
 ///
 /// # Safety
-/// `ptr` must originate from [`alloc`]/[`seal`] with exactly this `len`,
+/// `ptr` must originate from [`alloc`] or a sealed envelope with exactly
+/// this `len`,
 /// and must not be used afterwards.
 pub unsafe fn dealloc(ptr: *mut u8, len: usize) {
     unsafe {

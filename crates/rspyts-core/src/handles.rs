@@ -2,13 +2,20 @@
 //!
 //! Each `#[bridge] impl` expansion declares one
 //! `static SLAB: Slab<TheType> = Slab::new();`. Handles are `u64`,
-//! monotonically increasing from 1, never reused, and always below 2^53 in
-//! practice so they survive JSON and JS `number` transport.
+//! monotonically increasing from 1, never reused, and enforced below 2^53
+//! ([`MAX_HANDLE`]) so they survive JSON and JS `number` transport.
 
 use crate::error::BridgeError;
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+
+/// Handles must survive JSON and JS `number` transport, so they may never
+/// reach 2^53 (ABI §8). Enforced in [`Slab::insert`]; at one allocation
+/// per nanosecond the bound is ~104 days short of 300 years away, so the
+/// panic (surfacing as a status-2 envelope) is a correctness statement,
+/// not an expected event.
+pub const MAX_HANDLE: u64 = 1 << 53;
 
 pub struct Slab<T> {
     // BTreeMap because its `new` is const, sparing a OnceLock dance.
@@ -25,9 +32,23 @@ impl<T> Slab<T> {
         }
     }
 
+    /// Test-only constructor starting the counter near an arbitrary point,
+    /// so the exhaustion bound is actually testable.
+    #[cfg(test)]
+    const fn starting_at(next: u64) -> Self {
+        Self {
+            entries: Mutex::new(BTreeMap::new()),
+            next: AtomicU64::new(next),
+        }
+    }
+
     /// Store `value` and return its handle.
     pub fn insert(&self, value: T) -> u64 {
         let handle = self.next.fetch_add(1, Ordering::Relaxed);
+        assert!(
+            handle < MAX_HANDLE,
+            "rspyts: handle space exhausted (2^53 handles allocated)"
+        );
         self.entries
             .lock()
             .expect("rspyts: slab poisoned")
@@ -102,6 +123,15 @@ mod tests {
         SLAB.remove(h); // idempotent
         let err = SLAB.with(h, |_| ()).unwrap_err();
         assert_eq!(err.code, crate::error::codes::STALE_HANDLE);
+    }
+
+    #[test]
+    fn insert_panics_at_the_transport_bound() {
+        static SLAB: Slab<u8> = Slab::starting_at(MAX_HANDLE - 1);
+        assert_eq!(SLAB.insert(0), MAX_HANDLE - 1);
+        let exhausted = std::panic::catch_unwind(|| SLAB.insert(0));
+        assert!(exhausted.is_err());
+        SLAB.remove(MAX_HANDLE - 1);
     }
 
     #[test]
