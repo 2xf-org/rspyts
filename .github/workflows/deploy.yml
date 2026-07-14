@@ -3,12 +3,12 @@
 #   verify --> { publish-crates, publish-pypi, publish-npm } --> github-release
 #
 # One-time setup required before the first release (details in docs/releasing.md):
-#   - crates.io: a `CARGO_REGISTRY_TOKEN` repository secret with publish scope
-#     for the rspyts-* crates.
+#   - crates.io: Trusted Publishers registered for all four crates for this
+#     workflow file (deploy.yml) and the `crates-io` environment. No token.
 #   - PyPI: a Trusted Publisher registered on pypi.org for this repository,
 #     this workflow file (deploy.yml), and the `pypi` environment. No token.
-#   - npm: an `NPM_TOKEN` repository secret (granular token) allowed to
-#     publish the `rspyts` package.
+#   - npm: a Trusted Publisher registered for the rspyts package for this
+#     workflow file (deploy.yml) and the `npm` environment. No token.
 #   (Full walkthrough: docs/releasing.md.)
 
 name: Deploy
@@ -51,9 +51,15 @@ jobs:
     name: Publish to crates.io
     needs: verify
     runs-on: ubuntu-latest
+    environment: crates-io
+    permissions:
+      contents: read
+      id-token: write
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      - uses: rust-lang/crates-io-auth-action@v1
+        id: auth
 
       # Publish in dependency order: core -> macros -> facade -> CLI. Each
       # crate must be resolvable on crates.io before its dependents build
@@ -61,7 +67,7 @@ jobs:
       - name: Publish rspyts-core
         run: cargo publish --locked -p rspyts-core
         env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
 
       - name: Wait for rspyts-core
         run: .github/scripts/wait-for-crate.sh rspyts-core "${GITHUB_REF_NAME#v}"
@@ -69,7 +75,7 @@ jobs:
       - name: Publish rspyts-macros
         run: cargo publish --locked -p rspyts-macros
         env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
 
       - name: Wait for rspyts-macros
         run: .github/scripts/wait-for-crate.sh rspyts-macros "${GITHUB_REF_NAME#v}"
@@ -77,7 +83,7 @@ jobs:
       - name: Publish rspyts
         run: cargo publish --locked -p rspyts
         env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
 
       - name: Wait for rspyts
         run: .github/scripts/wait-for-crate.sh rspyts "${GITHUB_REF_NAME#v}"
@@ -85,7 +91,7 @@ jobs:
       - name: Publish rspyts-cli
         run: cargo publish --locked -p rspyts-cli
         env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
 
   publish-pypi:
     name: Publish to PyPI
@@ -118,18 +124,16 @@ jobs:
     name: Publish to npm
     needs: verify
     runs-on: ubuntu-latest
+    environment: npm
     permissions:
       contents: read
-      id-token: write # npm --provenance attestation
+      id-token: write # npm OIDC authentication and provenance attestation
     steps:
       - uses: actions/checkout@v4
 
-      # registry-url makes setup-node write an .npmrc that authenticates from
-      # NODE_AUTH_TOKEN, which is only injected on the publish step below.
       - uses: actions/setup-node@v4
         with:
           node-version: "24"
-          registry-url: "https://registry.npmjs.org"
 
       - name: Build
         working-directory: runtimes/typescript
@@ -137,14 +141,11 @@ jobs:
           npm ci
           npm run build
 
-      # --provenance attaches a Sigstore attestation binding the published
-      # tarball to this exact workflow run (uses the workflow-level
-      # id-token: write permission).
+      # npm exchanges this job's OIDC token for short-lived publish access;
+      # --provenance also binds the tarball to this exact workflow run.
       - name: Publish
         working-directory: runtimes/typescript
         run: npm publish --provenance --access public
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
   # Only after every registry has the artifacts: a GitHub release with notes
   # auto-generated from the merged PRs since the previous tag.

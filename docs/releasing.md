@@ -36,13 +36,13 @@ Dependency order, each crate only after its dependencies are visible on the regi
 
 The workflow does this sequentially with a registry availability check between publishes (crates.io indexing is eventually consistent). PyPI and npm have no ordering constraint and publish in parallel with the crates.io chain.
 
-## Required secrets and one-time setup
+## Trusted publishing and one-time setup
 
-The release workflow needs the following configured on the `2xf-org/rspyts` repository.
+All registries publish with GitHub Actions OIDC. The repository stores no long-lived registry credentials. Each publishing job uses a matching GitHub environment and receives a short-lived token for that run.
 
-### `CARGO_REGISTRY_TOKEN` (repository secret)
+### crates.io Trusted Publishing (no token)
 
-A crates.io API token with the `publish-new` + `publish-update` scopes (crates.io → Account Settings → API Tokens → New Token; restrict to the four crate names). Add it under Settings → Secrets and variables → Actions → New repository secret.
+For each of `rspyts-core`, `rspyts-macros`, `rspyts`, and `rspyts-cli`, configure a GitHub Trusted Publisher on crates.io with owner `2xf-org`, repository `rspyts`, workflow `deploy.yml`, and environment `crates-io`. Create the matching `crates-io` environment in the GitHub repository. The workflow's `rust-lang/crates-io-auth-action` step exchanges its GitHub OIDC identity for a short-lived Cargo registry token.
 
 ### PyPI Trusted Publishing (no token)
 
@@ -54,16 +54,15 @@ PyPI publishes via OIDC — there is no `PYPI_TOKEN`. One-time setup:
 
 For the **first** release, the project does not exist on PyPI yet: use a *pending* publisher instead (pypi.org → your account → **Publishing** → "Add a new pending publisher") with the same four values plus the project name `rspyts`. The first successful workflow run creates and claims the project.
 
-### `NPM_TOKEN` (repository secret)
+### npm Trusted Publishing (no token)
 
-The first publish needs an npm **granular access token** (npmjs.com → Access Tokens → Generate New Token → Granular), permissions **Read and write**, with package creation/publish allowed. Add it as repository secret `NPM_TOKEN`. The package cannot be scoped to `rspyts` until that package exists.
-
-After the first release, configure npm Trusted Publishing on the `rspyts` package for owner `2xf-org`, repository `rspyts`, workflow `deploy.yml`, then remove `NODE_AUTH_TOKEN` from the workflow and delete `NPM_TOKEN`. The npm publish job already grants `id-token: write` and uses a compatible npm/Node version.
+On npm, open the `rspyts` package settings and configure a GitHub Actions Trusted Publisher with owner `2xf-org`, repository `rspyts`, workflow `deploy.yml`, environment `npm`, and the `npm publish` action allowed. Create the matching `npm` environment in the GitHub repository. The workflow uses Node 24/npm 11 and `id-token: write`, so npm authenticates the publish through OIDC and emits provenance without an `NPM_TOKEN`.
 
 ## First-release checklist
 
-- crates.io names are claimed by the token owner. The first `cargo publish` of each crate registers the name to whoever owns `CARGO_REGISTRY_TOKEN`; make sure that account is the org owner, and add co-owners afterwards with `cargo owner --add`. There is no name reservation — publish `rspyts-core` → `rspyts-macros` → `rspyts` → `rspyts-cli` in order, same as always.
-- npm: the first publish of `rspyts` claims the package name for the token owner; grant the org team access afterwards.
+- crates.io and npm require a one-time bootstrap publish before Trusted Publishing can be attached to a new package. Use narrowly scoped, short-lived tokens for that bootstrap only, configure the Trusted Publishers immediately afterward, then revoke and delete the tokens.
+- crates.io has no name reservation — bootstrap-publish `rspyts-core` → `rspyts-macros` → `rspyts` → `rspyts-cli` in order, same as always. Add co-owners afterward with `cargo owner --add` if needed.
+- npm: the bootstrap publish of `rspyts` claims the package name for the publishing account; grant the org team access afterward if needed.
 - PyPI: the pending publisher (above) claims the project name on first publish.
 
 ## After the release
