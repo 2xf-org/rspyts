@@ -137,7 +137,7 @@ jobs:
 
       # uv provisions the interpreter declared in pyproject.toml and manages
       # the virtualenv; no separate setup-python step is needed.
-      - uses: astral-sh/setup-uv@v5
+      - uses: astral-sh/setup-uv@v7
 
       - name: Install
         run: uv sync --dev
@@ -186,7 +186,7 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      - uses: astral-sh/setup-uv@v5
+      - uses: astral-sh/setup-uv@v7
 
       - uses: actions/setup-node@v6
         with:
