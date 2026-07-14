@@ -72,10 +72,10 @@ fn workspace_version(start: &Path) -> Result<String> {
     )
 }
 
-fn read_toml(path: &Path) -> Result<toml::Value> {
+fn read_toml(path: &Path) -> Result<toml::Table> {
     let text = std::fs::read_to_string(path)
         .with_context(|| format!("cannot read `{}`", path.display()))?;
-    text.parse::<toml::Value>()
+    text.parse::<toml::Table>()
         .with_context(|| format!("cannot parse `{}`", path.display()))
 }
 
@@ -209,5 +209,25 @@ mod tests {
         .unwrap();
         assert_eq!(crate_meta(&member).unwrap().version, "1.2.3");
         std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn read_toml_parses_a_complete_document() {
+        let path = std::env::temp_dir().join(format!(
+            "rspyts-cli-toml-document-{}-{}.toml",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("unnamed")
+        ));
+        std::fs::write(
+            &path,
+            "[package]\nname = \"demo\"\nversion = \"1.2.3\"\n\n[lib]\ncrate-type = [\"cdylib\"]\n",
+        )
+        .unwrap();
+
+        let document = read_toml(&path).unwrap();
+        assert_eq!(document["package"]["name"].as_str(), Some("demo"));
+        assert_eq!(document["lib"]["crate-type"][0].as_str(), Some("cdylib"));
+
+        std::fs::remove_file(path).unwrap();
     }
 }
