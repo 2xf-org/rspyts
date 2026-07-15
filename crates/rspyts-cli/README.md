@@ -6,7 +6,7 @@ Rust `cdylib` built with [rspyts](https://crates.io/crates/rspyts).
 ## Install
 
 ```sh
-cargo install rspyts-cli
+cargo install rspyts-cli --version 0.3.1 --locked
 ```
 
 ## Commands
@@ -66,7 +66,7 @@ features = ["bridge"]
 no-default-features = false
 
 [python]
-out = "python/src/example/_generated"
+out = "python/src/example/generated"
 
 [typescript]
 out = "typescript/src/generated"
@@ -109,13 +109,13 @@ inputs, the configured Python output when present, and every staged artifact:
     "locked": true
   },
   "python": {
-    "out": "/workspace/python/src/example/_generated"
+    "out": "/workspace/python/src/example/generated"
   },
   "artifacts": [
     {
       "kind": "native",
       "target": "x86_64-unknown-linux-gnu",
-      "path": "/workspace/python/src/example/_generated/lib/libexample.so"
+      "path": "/workspace/python/src/example/generated/lib/libexample.so"
     }
   ]
 }

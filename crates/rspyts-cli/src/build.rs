@@ -1060,7 +1060,7 @@ mod tests {
 
         let native = source_dir.join("librenamed_target.dylib");
         std::fs::write(&native, b"native").unwrap();
-        let python_out = root.join("python/src/demo/_generated");
+        let python_out = root.join("python/src/demo/generated");
         let python_staging = StagingContext {
             python_out: Some(&python_out),
             ..debug_staging

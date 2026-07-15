@@ -17,7 +17,7 @@ statics and a factory.
 
 ```
 rust/         the single source of truth (#[bridge] + rspyts::export!())
-python/       pip package wrapping generated models, private codecs, and calls
+python/       pip package wrapping generated models, codecs, and calls
 typescript/   npm package wrapping the generated code (src/generated)
 schema/       generated JSON Schema bundle
 rspyts.toml   codegen config

@@ -83,7 +83,7 @@ pub struct Config {
 
 #[derive(Debug)]
 pub struct PythonConfig {
-    /// The wholly-owned `_generated` package directory.
+    /// The wholly-owned generated package directory.
     pub out: PathBuf,
     /// Origin crate name → Python import path. Bridged types whose
     /// origin appears here are imported from that package instead of
@@ -160,13 +160,13 @@ features = []
 no-default-features = false
 
 [python]
-out = "../python/src/my_package/_generated"
+out = "../python/src/my_package/generated"
 # `rspyts build` stages the host cdylib in `<out>/lib` by default.
 
 # Bridged types defined in a dependency crate can be imported from that
 # crate's own generated package instead of re-emitted here:
 # [python.imports]
-# "other-crate" = "other_package._generated"
+# "other-crate" = "other_package.generated"
 
 [typescript]
 out = "../typescript/src/generated"
@@ -213,7 +213,7 @@ mod tests {
             no-default-features = true
 
             [python]
-            out = "python/_generated"
+            out = "python/generated"
 
             [typescript]
             out = "ts/generated"
@@ -227,7 +227,7 @@ mod tests {
         assert!(cfg.contract.no_default_features);
         assert_eq!(
             cfg.python.as_ref().unwrap().out,
-            Path::new("/project/python/_generated")
+            Path::new("/project/python/generated")
         );
         assert_eq!(
             cfg.typescript.unwrap().out,
@@ -245,7 +245,7 @@ mod tests {
 
             [python.imports]
             "shared-types" = "shared_types.generated"
-            "other-crate" = "other_package._generated"
+            "other-crate" = "other_package.generated"
 
             [typescript]
             out = "ts"
@@ -261,7 +261,7 @@ mod tests {
         );
         assert_eq!(
             py.imports.get("other-crate").map(String::as_str),
-            Some("other_package._generated")
+            Some("other_package.generated")
         );
         let ts = cfg.typescript.unwrap();
         assert_eq!(

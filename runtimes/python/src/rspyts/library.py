@@ -39,13 +39,13 @@ def platform_filename(name: str) -> str:
     return f"lib{stem}.so"
 
 
-def _checked_fingerprint(value: object, *, source: str) -> str:
+def checked_fingerprint(value: object, *, source: str) -> str:
     if type(value) is not str or FINGERPRINT_PATTERN.fullmatch(value) is None:
         raise RuntimeError(f"rspyts: {source} must be a lowercase 64-character SHA-256 fingerprint")
     return value
 
 
-def _checked_handle(handle: object) -> int:
+def checked_handle(handle: object) -> int:
     if type(handle) is not int:
         raise TypeError(f"rspyts: handle must be an exact integer, got {type(handle).__name__}")
     if not 1 <= handle <= MAX_HANDLE:
@@ -68,7 +68,7 @@ class Library:
         self.search = tuple(search)
         self.anchor = pathlib.Path(anchor) if anchor is not None else None
         self.expected_contract_fingerprint = (
-            _checked_fingerprint(expected_contract_fingerprint, source="expected contract fingerprint")
+            checked_fingerprint(expected_contract_fingerprint, source="expected contract fingerprint")
             if expected_contract_fingerprint is not None
             else None
         )
@@ -146,13 +146,13 @@ class Library:
             ret = cdll.rspyts_contract_fingerprint()
             if ret is None:
                 raise RuntimeError("rspyts: rspyts_contract_fingerprint returned a null envelope")
-            raw = self._copy_and_free_response(cdll, int(ret))
+            raw = self.copy_and_free_response(cdll, int(ret))
             status, response = envelope.parse_envelope(raw)
             if status != 0:
                 raise RuntimeError(f"rspyts: rspyts_contract_fingerprint failed with status {status}")
             if response.tail:
                 raise RuntimeError("rspyts: rspyts_contract_fingerprint returned attachment bytes")
-            fingerprint = _checked_fingerprint(response.value, source="module contract fingerprint")
+            fingerprint = checked_fingerprint(response.value, source="module contract fingerprint")
             expected = self.expected_contract_fingerprint
             if expected is not None and fingerprint != expected:
                 raise RuntimeError(
@@ -191,7 +191,7 @@ class Library:
 
         c_args: list[typing.Any] = []
         if handle is not None:
-            c_args.append(ctypes.c_uint64(_checked_handle(handle)))
+            c_args.append(ctypes.c_uint64(checked_handle(handle)))
 
         request_len = len(encoded)
         request_ptr = cdll.rspyts_alloc(request_len)
@@ -212,7 +212,7 @@ class Library:
         if ret is None:
             raise RuntimeError(f"rspyts: {symbol} returned a null envelope")
 
-        raw = self._copy_and_free_response(cdll, int(ret))
+        raw = self.copy_and_free_response(cdll, int(ret))
         status, response = envelope.parse_envelope(raw)
         if status == 0:
             return response
@@ -226,10 +226,10 @@ class Library:
         except AttributeError as exc:
             raise RuntimeError(f"rspyts: module has no export {symbol!r}") from exc
         fn.restype = None
-        fn(ctypes.c_uint64(_checked_handle(handle)))
+        fn(ctypes.c_uint64(checked_handle(handle)))
 
     @staticmethod
-    def _copy_and_free_response(cdll: ctypes.CDLL, ret: int) -> bytes:
+    def copy_and_free_response(cdll: ctypes.CDLL, ret: int) -> bytes:
         """Copy one owned native response and free it with its exact header-derived length."""
         header = (ctypes.c_ubyte * envelope.HEADER_LEN).from_address(ret)
         json_len = sum(int(header[4 + index]) << (8 * index) for index in range(4))

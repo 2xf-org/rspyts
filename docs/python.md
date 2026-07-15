@@ -11,9 +11,9 @@ pydantic v2 are its only runtime dependencies.
 The generated directory contains:
 
 ```text
-__init__.py   public re-exports
-models.py     host-only pydantic models and enums
-_codecs.py    private schema-directed ABI codecs
+__init__.py  public re-exports
+models.py    host-only pydantic models and enums
+codecs.py    schema-directed ABI codecs
 constants.py bridged constants
 errors.py    exception classes and scoped error maps
 functions.py free-function wrappers
@@ -51,7 +51,7 @@ Bridged structs subclass `rspyts.Contract`.
 `Contract` is deliberately not pydantic's global strict mode. It uses the
 normal pydantic conversion rules plus the bridge's own range, shape, alias,
 and unknown-field checks when applications construct models. Generated return
-decoders take the stricter path. The generated private `_codecs.py` module
+decoders take the stricter path. The generated `codecs.py` module
 validates the exact wire shape before constructing a model, so a Rust `f64`
 returned as a JSON string, an integer returned as a boolean, or any equivalent
 nested mismatch is rejected instead of being hidden by pydantic coercion.
@@ -59,6 +59,10 @@ Named types use one reusable codec in each needed direction; wrappers do not
 repeat a model's conversion logic. Exact integers, string enums, tagged enums,
 tuples, and attachments are converted to their idiomatic Python host forms
 during that validation.
+
+The runtime and generated Python package must use the same rspyts release.
+rspyts 0.3.1 renamed the 0.3.0 single-underscore generator modules and helpers;
+regenerate every Python output when upgrading rather than mixing releases.
 
 String enums become `StrEnum` classes. Tagged Rust enums become one model per
 variant plus a discriminated union.

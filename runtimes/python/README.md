@@ -28,10 +28,10 @@ before the first call if the Python bindings and native module differ.
 
 ## Generated-code contract
 
-Low-level codec primitives live in `rspyts._internal`, not at package top
-level. Each generated package owns a private `_codecs.py`, calls
-`_internal.require_emitter_api(3)`, uses the single `Library.call()` path, and
-passes its `_internal.Response` through every schema-directed decoder. A
+Low-level codec primitives live in `rspyts.internal`. Each generated package
+owns `codecs.py`, calls `internal.require_emitter_api(4)`, uses the single
+`Library.call()` path, and passes its `internal.Response` through every
+schema-directed decoder. A
 response explicitly owns both `value` and `tail`; container decoders return
 child `Response` values carrying the same tail.
 
@@ -40,8 +40,9 @@ and returns the JSON value unchanged, while `json_from_wire` stops traversal at
 the schema-declared JSON position. Objects whose keys look like attachment
 metadata therefore remain ordinary JSON.
 
-This `_internal` surface is an emitter/runtime contract, not an application
-API. `EMITTER_API_VERSION` changes whenever generated code must migrate.
+This `internal` surface is the explicit emitter/runtime contract rather than
+the ordinary application API. `EMITTER_API_VERSION` changes whenever generated
+code must migrate.
 
 ## Native wheels with Hatch
 
@@ -50,7 +51,7 @@ instead of maintaining a project-specific packaging script:
 
 ```toml
 [build-system]
-requires = ["hatchling", "rspyts[hatch]==0.3.0"]
+requires = ["hatchling", "rspyts[hatch]==0.3.1"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.hooks.rspyts]

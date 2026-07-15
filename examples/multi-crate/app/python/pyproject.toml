@@ -3,7 +3,7 @@ name = "multi-crate-app"
 version = "0.1.0"
 description = "Python surface of the multi-crate-app crate (rspyts multi-crate example)."
 requires-python = ">=3.11"
-dependencies = ["rspyts", "shared-types", "pydantic>=2.7"]
+dependencies = ["rspyts==0.3.1", "shared-types", "pydantic>=2.7"]
 
 [dependency-groups]
 dev = ["pytest>=8", "ruff>=0.5"]
