@@ -12,7 +12,7 @@ This builds one Rust function and calls it from Python and TypeScript.
 Install the generator and target:
 
 ```sh
-cargo install rspyts-cli
+cargo install rspyts-cli --version 0.3.1 --locked
 rustup target add wasm32-unknown-unknown
 ```
 
@@ -31,7 +31,7 @@ rust-version = "1.85"
 crate-type = ["cdylib"]
 
 [dependencies]
-rspyts = "0.3"
+rspyts = "=0.3.1"
 ```
 
 Create `rust/src/lib.rs`:
@@ -120,7 +120,7 @@ rust/target/rspyts/wasm32-unknown-unknown/debug/demo_bridge.wasm
 Install the runtime:
 
 ```sh
-python -m pip install rspyts numpy
+python -m pip install rspyts==0.3.1 numpy
 ```
 
 With `python/src` on `PYTHONPATH`:
@@ -144,7 +144,7 @@ and finally the generated package's fixed `lib` directory.
 Install the runtime:
 
 ```sh
-npm install rspyts
+npm install rspyts@0.3.1
 ```
 
 Use the generated client after your application loads the `.wasm` bytes:

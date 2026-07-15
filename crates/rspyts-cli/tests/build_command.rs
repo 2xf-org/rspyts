@@ -74,7 +74,7 @@ pub unsafe extern "C" fn rspyts_free(ptr: *mut u8, len: usize) {
 path = "rust"
 
 [python]
-out = "python/src/fixture_package/_generated"
+out = "python/src/fixture_package/generated"
 "#,
         )
         .expect("write fixture rspyts.toml");
@@ -115,7 +115,7 @@ fn build_is_the_only_command_that_stages_artifacts() {
 
     let artifact = fixture
         .root
-        .join("python/src/fixture_package/_generated/lib")
+        .join("python/src/fixture_package/generated/lib")
         .join(platform_filename("fixture-package"));
     assert!(
         !artifact.exists(),
@@ -141,7 +141,7 @@ fn build_is_the_only_command_that_stages_artifacts() {
     assert_eq!(report["crate"]["name"], "fixture-package");
     assert_eq!(
         report["python"],
-        serde_json::json!({"out": fixture.root.join("python/src/fixture_package/_generated")})
+        serde_json::json!({"out": fixture.root.join("python/src/fixture_package/generated")})
     );
 
     let artifacts = report["artifacts"].as_array().expect("artifact array");
@@ -171,7 +171,7 @@ fn build_is_the_only_command_that_stages_artifacts() {
     let generated_loader = std::fs::read_to_string(
         fixture
             .root
-            .join("python/src/fixture_package/_generated/library.py"),
+            .join("python/src/fixture_package/generated/library.py"),
     )
     .expect("read generated loader");
     assert!(generated_loader.contains("        \"lib\","));
@@ -310,11 +310,11 @@ fn check_is_read_only_for_clean_and_drifted_sources() {
 
     let artifact = fixture
         .root
-        .join("python/src/fixture_package/_generated/lib")
+        .join("python/src/fixture_package/generated/lib")
         .join(platform_filename("fixture-package"));
     let generated_file = fixture
         .root
-        .join("python/src/fixture_package/_generated/functions.py");
+        .join("python/src/fixture_package/generated/functions.py");
     let original_generated =
         std::fs::read_to_string(&generated_file).expect("read generated source");
     const LAST_KNOWN_GOOD: &[u8] = b"previously-staged-native-library";
@@ -384,7 +384,7 @@ fn invalid_manifest_check_leaves_previous_library_untouched() {
 
     let artifact = fixture
         .root
-        .join("python/src/fixture_package/_generated/lib")
+        .join("python/src/fixture_package/generated/lib")
         .join(platform_filename("fixture-package"));
     const LAST_KNOWN_GOOD: &[u8] = b"previously-staged-native-library";
     std::fs::create_dir_all(artifact.parent().expect("artifact parent"))
@@ -433,7 +433,7 @@ fn invalid_manifest_generate_and_manifest_leave_previous_library_untouched() {
 
         let artifact = fixture
             .root
-            .join("python/src/fixture_package/_generated/lib")
+            .join("python/src/fixture_package/generated/lib")
             .join(platform_filename("fixture-package"));
         const LAST_KNOWN_GOOD: &[u8] = b"previously-staged-native-library";
         std::fs::create_dir_all(artifact.parent().expect("artifact parent"))

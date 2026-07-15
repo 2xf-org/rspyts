@@ -66,7 +66,7 @@ def copy_fixture(destination: pathlib.Path) -> pathlib.Path:
     text = text.replace(source, "")
     text = text.replace(
         'requires = ["hatchling"]',
-        'requires = ["hatchling>=1.27,<2.0", "rspyts[hatch]==0.3.0"]',
+        'requires = ["hatchling>=1.27,<2.0", "rspyts[hatch]==0.3.1"]',
     )
     text += '\n[tool.hatch.build.hooks.rspyts]\nconfig = "../rspyts.toml"\n'
     pyproject.write_text(text)

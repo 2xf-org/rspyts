@@ -23,7 +23,7 @@ imports, regenerate shared-types before the app and keep both generated
 packages on the same rspyts release; run `rspyts check` for both configs when
 upgrading.
 
-The app still generates private codecs locally for the retained foreign
+The app still generates codecs locally for the retained foreign
 types. Only the public host declaration is shared, so packages do not expose or
 couple themselves to another package's generator internals.
 
