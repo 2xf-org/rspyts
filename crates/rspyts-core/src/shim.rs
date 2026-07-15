@@ -17,9 +17,10 @@
 //! producing a status-2 envelope — the shim is identical, the platform is
 //! just less forgiving.)
 
-use crate::bridged::SliceElem;
+use crate::bridged::{Bridged, SliceElem};
 use crate::envelope;
 use crate::error::{BridgeErr, BridgeError};
+use crate::ir::ParamDecl;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use std::mem::ManuallyDrop;
@@ -40,6 +41,22 @@ where
     }
 }
 
+/// Run a user-value shim body and encode its success through the declared
+/// native Rust bridge type. Module metadata and opaque class-handle shims use
+/// [`run`] instead because their payloads are ABI infrastructure, not user
+/// values.
+pub fn run_typed<T, F>(body: F) -> *mut u8
+where
+    T: Serialize + Bridged,
+    F: FnOnce() -> Result<T, BridgeError>,
+{
+    match catch_unwind(AssertUnwindSafe(body)) {
+        Ok(Ok(value)) => encode_typed_success(value),
+        Ok(Err(err)) => envelope::encode_err(&err),
+        Err(payload) => envelope::encode_panic(&panic_message(payload)),
+    }
+}
+
 /// Serialize and destroy a successful value behind separate unwind barriers.
 ///
 /// `ManuallyDrop` prevents a serialization panic from beginning a second
@@ -49,6 +66,33 @@ where
 fn encode_success<T: Serialize>(value: T) -> *mut u8 {
     let mut value = ManuallyDrop::new(value);
     let encoded = catch_unwind(AssertUnwindSafe(|| envelope::encode_ok(&*value)));
+    let dropped = catch_unwind(AssertUnwindSafe(|| unsafe {
+        ManuallyDrop::drop(&mut value);
+    }));
+
+    match (encoded, dropped) {
+        (Ok(ptr), Ok(())) => ptr,
+        (Ok(ptr), Err(payload)) => {
+            let len = unsafe { envelope::total_len(ptr) };
+            unsafe { envelope::dealloc(ptr, len) };
+            envelope::encode_panic(&panic_message(payload))
+        }
+        (Err(payload), Ok(())) => envelope::encode_panic(&panic_message(payload)),
+        (Err(encode_payload), Err(drop_payload)) => envelope::encode_panic(&format!(
+            "{}; value destruction also panicked: {}",
+            panic_message(encode_payload),
+            panic_message(drop_payload)
+        )),
+    }
+}
+
+/// Serialize, schema-normalize, and destroy a successful user value behind
+/// separate unwind barriers.
+fn encode_typed_success<T: Serialize + Bridged>(value: T) -> *mut u8 {
+    let mut value = ManuallyDrop::new(value);
+    let encoded = catch_unwind(AssertUnwindSafe(|| {
+        envelope::encode_typed_ok(&*value, &T::inventory_return_ty())
+    }));
     let dropped = catch_unwind(AssertUnwindSafe(|| unsafe {
         ManuallyDrop::drop(&mut value);
     }));
@@ -85,7 +129,7 @@ fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
     }
 }
 
-/// Deserialize an ABI-2 request envelope.
+/// Deserialize an ABI-3 request envelope.
 ///
 /// # Safety
 /// `(ptr, len)` must describe `len` readable bytes (the caller-owned
@@ -103,6 +147,30 @@ pub unsafe fn decode_args<T: DeserializeOwned>(
         let decoded = envelope::decode_request(bytes).map_err(BridgeError::invalid_args)?;
         envelope::with_request_tail(decoded.tail, || serde_json::from_slice(decoded.json))
             .map_err(BridgeError::invalid_args)
+    }
+}
+
+/// Deserialize an ABI-3 request envelope after schema-directed conversion
+/// from wire JSON to ordinary Rust Serde values.
+///
+/// # Safety
+/// `(ptr, len)` follows the same requirements as [`decode_args`].
+pub unsafe fn decode_typed_args<T: DeserializeOwned>(
+    ptr: *const u8,
+    len: usize,
+    params: &[ParamDecl],
+) -> Result<T, BridgeError> {
+    unsafe {
+        if len == 0 {
+            return crate::wire::deserialize_params(serde_json::json!({}), params)
+                .map_err(BridgeError::invalid_args);
+        }
+        let bytes = std::slice::from_raw_parts(ptr, len);
+        let decoded = envelope::decode_request(bytes).map_err(BridgeError::invalid_args)?;
+        envelope::with_request_tail(decoded.tail, || {
+            let value = serde_json::from_slice(decoded.json).map_err(BridgeError::invalid_args)?;
+            crate::wire::deserialize_params(value, params).map_err(BridgeError::invalid_args)
+        })
     }
 }
 
@@ -143,6 +211,46 @@ mod tests {
         assert_eq!(decoded.status, envelope::STATUS_OK);
         assert_eq!(decoded.json, b"41");
         unsafe { envelope::dealloc(ptr, envelope::total_len(ptr)) };
+    }
+
+    #[test]
+    fn run_typed_encodes_native_exact_integers_as_wire_strings() {
+        let ptr = run_typed(|| Ok::<_, BridgeError>(i64::MIN));
+        let (status, json, tail) = envelope::decode_owned(ptr);
+        assert_eq!(status, envelope::STATUS_OK);
+        assert_eq!(json, format!(r#""{}""#, i64::MIN).as_bytes());
+        assert!(tail.is_empty());
+    }
+
+    #[test]
+    fn run_typed_uses_return_context_for_unit_aliases() {
+        type Nothing = ();
+        let ptr = run_typed(|| Ok::<Nothing, BridgeError>(()));
+        let (status, json, tail) = envelope::decode_owned(ptr);
+        assert_eq!(status, envelope::STATUS_OK);
+        assert_eq!(json, b"null");
+        assert!(tail.is_empty());
+        assert_eq!(
+            <Nothing as Bridged>::inventory_return_ty(),
+            crate::ir::Ty::Unit
+        );
+    }
+
+    #[test]
+    fn typed_normalization_failure_discards_partial_attachment_tail() {
+        let unsafe_json = serde_json::Value::from(9_007_199_254_740_992_u64);
+        let ptr = run_typed(|| Ok::<_, BridgeError>((crate::Buf::new(vec![1_u8, 2]), unsafe_json)));
+        let (status, json, tail) = envelope::decode_owned(ptr);
+        assert_eq!(status, envelope::STATUS_PANIC);
+        assert!(tail.is_empty());
+        let value: serde_json::Value = serde_json::from_slice(&json).unwrap();
+        assert!(
+            value["message"]
+                .as_str()
+                .unwrap()
+                .contains("not exactly representable")
+        );
+        assert!(envelope::tail_push(&[1], 1).is_none());
     }
 
     #[test]
@@ -220,6 +328,55 @@ mod tests {
         struct NoArgs {}
         let parsed: Result<NoArgs, _> = unsafe { decode_args(std::ptr::null(), 0) };
         assert!(parsed.is_ok());
+    }
+
+    #[test]
+    fn decode_typed_args_normalizes_exact_integers_and_requires_option_params() {
+        #[derive(Debug, serde::Deserialize, PartialEq)]
+        struct Args {
+            exact: i64,
+            maybe: Option<u64>,
+        }
+        let params = [
+            ParamDecl {
+                name: "exact".into(),
+                wire_name: "exact".into(),
+                ty: crate::ir::Ty::I64,
+            },
+            ParamDecl {
+                name: "maybe".into(),
+                wire_name: "maybe".into(),
+                ty: crate::ir::Ty::Option {
+                    inner: Box::new(crate::ir::Ty::U64),
+                },
+            },
+        ];
+
+        let request = envelope::encode_request(
+            br#"{"exact":"-9223372036854775808","maybe":"18446744073709551615"}"#,
+            &[],
+        )
+        .unwrap();
+        let decoded: Args =
+            unsafe { decode_typed_args(request.as_ptr(), request.len(), &params) }.unwrap();
+        assert_eq!(
+            decoded,
+            Args {
+                exact: i64::MIN,
+                maybe: Some(u64::MAX)
+            }
+        );
+
+        let missing = envelope::encode_request(br#"{"exact":"0"}"#, &[]).unwrap();
+        let error = unsafe { decode_typed_args::<Args>(missing.as_ptr(), missing.len(), &params) }
+            .unwrap_err();
+        assert_eq!(error.code, crate::error::codes::INVALID_ARGS);
+        assert!(error.message.contains("missing required field `maybe`"));
+
+        let numeric = envelope::encode_request(br#"{"exact":0,"maybe":null}"#, &[]).unwrap();
+        assert!(
+            unsafe { decode_typed_args::<Args>(numeric.as_ptr(), numeric.len(), &params) }.is_err()
+        );
     }
 
     #[derive(Debug, serde::Deserialize)]

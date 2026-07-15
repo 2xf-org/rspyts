@@ -2,6 +2,8 @@
 # Cargo resolves from the workspace root; the Python and npm runtime packages
 # each live under runtimes/ with their own manifests. The example packages
 # depend on the local runtimes by path, so they need no separate entries.
+# Cooldowns apply only to routine version updates; Dependabot security updates
+# remain immediate.
 
 version: 2
 updates:
@@ -10,6 +12,8 @@ updates:
     directory: "/"
     schedule:
       interval: "weekly"
+    cooldown:
+      default-days: 7
     ignore:
       # libloading 0.9 raises its MSRV to Rust 1.88; rspyts supports 1.85.
       - dependency-name: "libloading"
@@ -20,12 +24,16 @@ updates:
     directory: "/runtimes/python"
     schedule:
       interval: "weekly"
+    cooldown:
+      default-days: 7
 
   # TypeScript runtime package (package.json).
   - package-ecosystem: "npm"
     directory: "/runtimes/typescript"
     schedule:
       interval: "weekly"
+    cooldown:
+      default-days: 7
     groups:
       vitest:
         patterns:
@@ -42,6 +50,8 @@ updates:
     directory: "/"
     schedule:
       interval: "weekly"
+    cooldown:
+      default-days: 7
     groups:
       actions:
         patterns:

@@ -3,28 +3,15 @@
 
 [crate]
 path = "rust"
-
-[build]
 features = []
 no-default-features = false
-profile = "dev"
-targets = ["wasm32-unknown-unknown"]
-locked = true
 
 [python]
-enabled = true
 out = "python/src/basic_example/generated"
-# Relative entries resolve against the generated package directory at
-# import time; these reach the workspace target/ dir six levels up.
-library_search = [
-    "../../../../../../target/debug",
-    "../../../../../../target/release",
-]
+# `rspyts build` stages the host library in `generated/lib` by default.
 
 [typescript]
-enabled = true
 out = "typescript/src/generated"
 
 [schema]
-enabled = true
 out = "schema"

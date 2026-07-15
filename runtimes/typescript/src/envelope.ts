@@ -1,6 +1,5 @@
 /**
- * Strict request/response envelope codecs (ABI §4) and substitution of
- * `__rspyts_buf__` tail placeholders with typed arrays (ABI §6).
+ * Strict ABI-3 request/response envelope codecs (ABI §4).
  *
  * Both directions use one 12-byte little-endian header. Byte zero is a
  * zero request marker on calls and a closed 0/1/2 status on responses:
@@ -146,14 +145,14 @@ export const DTYPE: Record<Dtype, DtypeInfo> = {
  * major version.
  */
 export const BUF_PLACEHOLDER_KEY = "__rspyts_buf__";
-export const JSON_WRAPPER_KEY = "__rspyts_json__";
 
 const utf8Decoder = new TextDecoder("utf-8", { fatal: true });
 const utf8Encoder = new TextEncoder();
+const WIRE_BUFFER_MARKER: unique symbol = Symbol("rspyts.wireBuffer");
 
 /** Explicit marker for a numeric typed array nested in request JSON. */
 export interface WireBuffer {
-  readonly __rspytsWireBuffer: true;
+  readonly [WIRE_BUFFER_MARKER]: true;
   readonly data: BufTypedArray;
   readonly dt: Dtype;
 }
@@ -166,18 +165,20 @@ export function wireBuffer(data: BufTypedArray, dt: Dtype): WireBuffer {
       `rspyts: buffer dtype "${dt}" requires a ${info.ctor.name}, got ${data.constructor.name}`,
     );
   }
-  return Object.freeze({ __rspytsWireBuffer: true, data, dt });
+  return Object.freeze({ [WIRE_BUFFER_MARKER]: true as const, data, dt });
 }
 
-/** Encode JSON plus aligned numeric attachments as a strict ABI-2 request. */
+/** Validate and copy a transparent schema-declared JSON request value. */
+export function jsonToWire(value: unknown): unknown {
+  return checkedJsonValue(value);
+}
+
+/** Encode JSON plus aligned attachments as a strict ABI-3 request. */
 export function buildRequest(args: unknown): Uint8Array {
   const chunks: Uint8Array[] = [];
   let tailLen = 0;
 
   const encode = (value: unknown): unknown => {
-    if (isJsonWrapper(value)) {
-      return { [JSON_WRAPPER_KEY]: checkedJson(value[JSON_WRAPPER_KEY], new Set()) };
-    }
     if (isWireBuffer(value)) {
       const info = DTYPE[value.dt];
       if (!(value.data instanceof info.ctor)) {
@@ -218,7 +219,7 @@ export function buildRequest(args: unknown): Uint8Array {
       return value.map(encode);
     }
     if (value !== null && typeof value === "object") {
-      const output: Record<string, unknown> = {};
+      const output = Object.create(null) as Record<string, unknown>;
       for (const [key, item] of Object.entries(value)) {
         output[key] = encode(item);
       }
@@ -256,13 +257,9 @@ export function buildRequest(args: unknown): Uint8Array {
   return request;
 }
 
-function isJsonWrapper(value: unknown): value is Record<typeof JSON_WRAPPER_KEY, unknown> {
-  return (
-    value !== null &&
-    typeof value === "object" &&
-    Object.keys(value).length === 1 &&
-    Object.prototype.hasOwnProperty.call(value, JSON_WRAPPER_KEY)
-  );
+/** Validate and copy one transparent, schema-declared JSON value. */
+export function checkedJsonValue(value: unknown): unknown {
+  return checkedJson(value, new Set());
 }
 
 function checkedJson(value: unknown, seen: Set<object>): unknown {
@@ -272,6 +269,9 @@ function checkedJson(value: unknown, seen: Set<object>): unknown {
   if (typeof value === "number") {
     if (!Number.isFinite(value)) {
       throw new TypeError("rspyts: Json values must contain only finite JSON numbers");
+    }
+    if (Number.isInteger(value) && !Number.isSafeInteger(value)) {
+      throw new TypeError("rspyts: Json integral numbers must be safe integers");
     }
     return Object.is(value, -0) ? 0 : value;
   }
@@ -284,15 +284,38 @@ function checkedJson(value: unknown, seen: Set<object>): unknown {
   seen.add(value);
   try {
     if (Array.isArray(value)) {
+      const ownKeys = Reflect.ownKeys(value);
+      for (let index = 0; index < value.length; index++) {
+        if (!Object.prototype.hasOwnProperty.call(value, index)) {
+          throw new TypeError("rspyts: Json arrays cannot contain sparse holes");
+        }
+      }
+      for (const key of ownKeys) {
+        if (key === "length") continue;
+        if (typeof key !== "string" || !/^(?:0|[1-9][0-9]*)$/.test(key) || Number(key) >= value.length) {
+          throw new TypeError("rspyts: Json arrays cannot contain non-element own properties");
+        }
+        const descriptor = Object.getOwnPropertyDescriptor(value, key)!;
+        if (!descriptor.enumerable || !("value" in descriptor)) {
+          throw new TypeError("rspyts: Json array elements must be enumerable data properties");
+        }
+      }
       return value.map((item) => checkedJson(item, seen));
     }
     const prototype = Object.getPrototypeOf(value);
     if (prototype !== Object.prototype && prototype !== null) {
       throw new TypeError("rspyts: Json objects must be plain objects");
     }
-    const output: Record<string, unknown> = {};
-    for (const [key, item] of Object.entries(value)) {
-      output[key] = checkedJson(item, seen);
+    const output = Object.create(null) as Record<string, unknown>;
+    for (const key of Reflect.ownKeys(value)) {
+      if (typeof key !== "string") {
+        throw new TypeError("rspyts: Json objects cannot contain symbol properties");
+      }
+      const descriptor = Object.getOwnPropertyDescriptor(value, key)!;
+      if (!descriptor.enumerable || !("value" in descriptor)) {
+        throw new TypeError("rspyts: Json object fields must be enumerable data properties");
+      }
+      output[key] = checkedJson(descriptor.value, seen);
     }
     return output;
   } finally {
@@ -305,36 +328,34 @@ function isWireBuffer(value: unknown): value is WireBuffer {
   return (
     candidate !== null &&
     typeof candidate === "object" &&
-    candidate.__rspytsWireBuffer === true &&
+    candidate[WIRE_BUFFER_MARKER] === true &&
     typeof candidate.dt === "string" &&
     Object.prototype.hasOwnProperty.call(DTYPE, candidate.dt)
   );
 }
 
-/** A decoded envelope: `payload` is the parsed JSON, with every buffer
- * placeholder already replaced by a typed array when `status` is ok. */
+/** A validated response status, parsed JSON value, and owned tail bytes. */
 export interface DecodedEnvelope {
   status: number;
-  payload: unknown;
+  value: unknown;
+  tail: Uint8Array;
 }
 
 /** A validated request, retained in wire form for conformance diagnostics. */
 export interface DecodedRequest {
-  payload: unknown;
+  value: unknown;
   tail: Uint8Array;
 }
 
-/** Strictly decode an ABI-2 request envelope. */
+/** Decode ABI-3 request framing and JSON without interpreting object shapes. */
 export function decodeRequest(bytes: Uint8Array): DecodedRequest {
   const decoded = decodeFrame(bytes, true);
-  transformBuffers(decoded.payload, decoded.tail, false);
-  return { payload: decoded.payload, tail: decoded.tail };
+  return { value: decoded.value, tail: decoded.tail };
 }
 
 /**
- * Decode a complete envelope. Placeholders are substituted only for
- * status-ok payloads — error payloads never carry them (their tail is
- * always empty, ABI §4/§5).
+ * Decode a complete ABI-3 response without interpreting schema-directed
+ * attachment shapes. Error and panic responses must have an empty tail.
  */
 export function decodeEnvelope(bytes: Uint8Array): DecodedEnvelope {
   const decoded = decodeFrame(bytes, false);
@@ -342,17 +363,13 @@ export function decodeEnvelope(bytes: Uint8Array): DecodedEnvelope {
     if (decoded.tail.byteLength !== 0) {
       throw new Error("rspyts: error and panic envelopes must not contain attachment bytes");
     }
-    return { status: decoded.status, payload: decoded.payload };
   }
-  return {
-    status: decoded.status,
-    payload: transformBuffers(decoded.payload, decoded.tail, true),
-  };
+  return decoded;
 }
 
 interface RawEnvelope {
   status: number;
-  payload: unknown;
+  value: unknown;
   tail: Uint8Array;
 }
 
@@ -388,56 +405,40 @@ function decodeFrame(bytes: Uint8Array, request: boolean): RawEnvelope {
   }
   const json = bytes.subarray(HEADER_LEN, HEADER_LEN + jsonLen);
   const tail = bytes.subarray(HEADER_LEN + jsonLen, total);
-  let payload: unknown;
+  let value: unknown;
   try {
-    payload = JSON.parse(utf8Decoder.decode(json));
+    value = JSON.parse(utf8Decoder.decode(json));
   } catch (error) {
     throw new Error(`rspyts: malformed envelope JSON: ${String(error)}`, { cause: error });
   }
-  return { status, payload, tail };
+  return { status, value, tail };
 }
 
-/**
- * Recursively replace every `{"__rspyts_buf__": {off, len, dt}}`
- * placeholder in `value` with a typed array holding the corresponding
- * elements of `tail`. The placeholder key is reserved: an object that
- * contains it must contain no sibling keys.
- *
- * The result is always a copy: `tail` is a view whose `byteOffset` need
- * not be a multiple of the element size (the tail merely follows the JSON
- * bytes inside the envelope), so constructing a typed array directly over
- * `tail.buffer` could throw on alignment. Copying the bytes into a fresh
- * buffer first sidesteps alignment entirely and guarantees the returned
- * array is independent of the envelope's lifetime.
- */
-export function substituteBuffers(value: unknown, tail: Uint8Array): unknown {
-  return transformBuffers(value, tail, true);
+function validateBufPlaceholder(value: unknown, tail: Uint8Array): CheckedBuffer {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+    throw new TypeError("rspyts: expected a buffer attachment wrapper");
+  }
+  const object = value as Record<string, unknown>;
+  const keys = Object.keys(object);
+  if (keys.length !== 1 || !Object.prototype.hasOwnProperty.call(object, BUF_PLACEHOLDER_KEY)) {
+    throw new TypeError("rspyts: expected a buffer attachment wrapper");
+  }
+  return validateBuf(object[BUF_PLACEHOLDER_KEY], tail);
 }
 
-function transformBuffers(value: unknown, tail: Uint8Array, materialize: boolean): unknown {
-  if (Array.isArray(value)) {
-    return value.map((item) => transformBuffers(item, tail, materialize));
+/** Materialize a buffer only at a generated schema-declared attachment position. */
+export function bufferFromEnvelope(
+  value: unknown,
+  tail: Uint8Array,
+  expected: AttachmentDtype,
+): BufTypedArray {
+  const checked = validateBufPlaceholder(value, tail);
+  if (checked.dt !== expected) {
+    throw new TypeError(
+      `rspyts: expected a ${expected} buffer attachment, got ${checked.dt}`,
+    );
   }
-  if (value !== null && typeof value === "object") {
-    const obj = value as Record<string, unknown>;
-    const keys = Object.keys(obj);
-    if (keys.length === 1 && Object.prototype.hasOwnProperty.call(obj, JSON_WRAPPER_KEY)) {
-      return materialize ? obj[JSON_WRAPPER_KEY] : value;
-    }
-    if (Object.prototype.hasOwnProperty.call(obj, BUF_PLACEHOLDER_KEY)) {
-      if (keys.length !== 1) {
-        throw new Error("rspyts: buffer placeholder cannot have sibling fields");
-      }
-      const checked = validateBuf(obj[BUF_PLACEHOLDER_KEY], tail);
-      return materialize ? materializeBuf(checked, tail) : value;
-    }
-    const out: Record<string, unknown> = {};
-    for (const key of keys) {
-      out[key] = transformBuffers(obj[key], tail, materialize);
-    }
-    return out;
-  }
-  return value;
+  return materializeBuf(checked, tail);
 }
 
 interface CheckedBuffer {

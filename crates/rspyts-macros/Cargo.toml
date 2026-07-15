@@ -17,11 +17,17 @@ exclude = ["tests/**"]
 proc-macro = true
 
 [dependencies]
+heck = { workspace = true }
 proc-macro2 = { workspace = true }
 quote = { workspace = true }
 syn = { workspace = true }
 
 [dev-dependencies]
+# Intentionally path-only: the compile-fail tests exercise the public facade,
+# while that facade depends on this crate. A registry version here would create
+# an unpublished-version cycle during `cargo package`; Cargo omits this
+# test-only path dependency from the published manifest.
 rspyts = { path = "../rspyts" }
 serde = { workspace = true }
+serde_json = { workspace = true }
 trybuild = "1"

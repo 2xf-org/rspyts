@@ -8,6 +8,7 @@
 use crate::casing::RenameRule;
 use proc_macro2::{Span, TokenStream};
 use syn::parse::{ParseStream, Parser};
+use syn::punctuated::Punctuated;
 use syn::spanned::Spanned;
 use syn::{Meta, Token};
 
@@ -177,6 +178,12 @@ pub fn deny_bridge_attrs(attrs: &[syn::Attribute], what: &str) -> syn::Result<()
         if !is_bridge_attr(attr) {
             continue;
         }
+        if required_span(attr)?.is_some() {
+            return Err(syn::Error::new_spanned(
+                attr,
+                "#[bridge(required)] applies only to a direct `Option<T>` object field",
+            ));
+        }
         let nested = match &attr.meta {
             Meta::List(list) => list.tokens.clone(),
             _ => TokenStream::new(),
@@ -188,6 +195,75 @@ pub fn deny_bridge_attrs(attrs: &[syn::Attribute], what: &str) -> syn::Result<()
         ));
     }
     Ok(())
+}
+
+/// Parse and remove the one field-level bridge attribute.
+///
+/// An unannotated direct `Option<T>` is omittable. `#[bridge(required)]`
+/// keeps that same nullable value shape while requiring the containing
+/// object key to be present. No other bridge argument applies to a field.
+pub fn take_field_required(
+    attrs: &mut Vec<syn::Attribute>,
+    is_direct_option: bool,
+    what: &str,
+) -> syn::Result<bool> {
+    let mut kept = Vec::with_capacity(attrs.len());
+    let mut required = false;
+    for attr in std::mem::take(attrs) {
+        if !is_bridge_attr(&attr) {
+            kept.push(attr);
+            continue;
+        }
+        if required_span(&attr)?.is_some() {
+            if required {
+                return Err(syn::Error::new_spanned(
+                    attr,
+                    "duplicate #[bridge(required)] attribute",
+                ));
+            }
+            if !is_direct_option {
+                return Err(syn::Error::new_spanned(
+                    attr,
+                    "#[bridge(required)] applies only to a direct `Option<T>` field",
+                ));
+            }
+            required = true;
+            continue;
+        }
+
+        let nested = match &attr.meta {
+            Meta::List(list) => list.tokens.clone(),
+            _ => TokenStream::new(),
+        };
+        BridgeArgs::parse(nested)?;
+        return Err(syn::Error::new_spanned(
+            attr,
+            format!("#[bridge] does not apply to {what}; only `required` is supported"),
+        ));
+    }
+    *attrs = kept;
+    Ok(!is_direct_option || required)
+}
+
+/// Return the span of an exact `required` field argument, if present.
+/// Mixed argument lists are rejected here instead of being partially
+/// consumed and accidentally changing the meaning of another marker.
+fn required_span(attr: &syn::Attribute) -> syn::Result<Option<Span>> {
+    let Meta::List(list) = &attr.meta else {
+        return Ok(None);
+    };
+    let metas = Punctuated::<Meta, Token![,]>::parse_terminated.parse2(list.tokens.clone())?;
+    let Some(required) = metas.iter().find(|meta| meta.path().is_ident("required")) else {
+        return Ok(None);
+    };
+    require_bare(required, "required")?;
+    if metas.len() != 1 {
+        return Err(syn::Error::new_spanned(
+            &list.tokens,
+            "`required` cannot be combined with other #[bridge] arguments",
+        ));
+    }
+    Ok(Some(required.span()))
 }
 
 fn deny(span: Option<Span>, name: &str, context: &str) -> syn::Result<()> {
@@ -346,5 +422,46 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(msg.contains("unknown #[bridge] argument"), "{msg}");
+    }
+
+    #[test]
+    fn required_is_stripped_only_from_direct_option_fields() {
+        let mut field: syn::Field = syn::parse_quote! {
+            #[bridge(required)]
+            #[serde(rename = "wireValue")]
+            pub value: Option<String>
+        };
+        assert!(take_field_required(&mut field.attrs, true, "struct fields").unwrap());
+        assert_eq!(field.attrs.len(), 1);
+        assert!(field.attrs[0].path().is_ident("serde"));
+
+        let mut omittable: syn::Field = syn::parse_quote! {
+            pub value: std::option::Option<String>
+        };
+        assert!(!take_field_required(&mut omittable.attrs, true, "struct fields").unwrap());
+
+        let mut non_option: syn::Field = syn::parse_quote! {
+            #[bridge(required)]
+            pub value: String
+        };
+        let msg = take_field_required(&mut non_option.attrs, false, "struct fields")
+            .unwrap_err()
+            .to_string();
+        assert!(msg.contains("direct `Option<T>` field"), "{msg}");
+    }
+
+    #[test]
+    fn required_rejects_values_and_mixed_arguments() {
+        let mut valued: syn::Field = syn::parse_quote! {
+            #[bridge(required = true)]
+            pub value: Option<String>
+        };
+        assert!(take_field_required(&mut valued.attrs, true, "struct fields").is_err());
+
+        let mut mixed: syn::Field = syn::parse_quote! {
+            #[bridge(required, error)]
+            pub value: Option<String>
+        };
+        assert!(take_field_required(&mut mixed.attrs, true, "struct fields").is_err());
     }
 }

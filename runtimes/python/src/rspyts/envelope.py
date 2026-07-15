@@ -1,31 +1,21 @@
-"""
-Strict request and response envelope codecs.
-"""
+"""Strict ABI 3 request and response envelope codecs."""
 
 from __future__ import annotations
 
 import collections.abc
+import dataclasses
 import json
 import struct
 import typing
 
 import numpy as np
 
-__all__ = [
-    "DTYPES",
-    "HEADER_LEN",
-    "build_request",
-    "decode_request",
-    "parse_envelope",
-    "substitute_buffers",
-]
+__all__ = ["DTYPES", "HEADER_LEN", "Response", "build_request", "decode_request", "parse_envelope"]
 
 HEADER_LEN = 12
 BUF_KEY = "__rspyts_buf__"
-JSON_KEY = "__rspyts_json__"
 
-# Wire dtype names (ABI §6) to numpy dtypes. Also used by Library.call for
-# input slices; the wire names are frozen — never extend without an ABI bump.
+# Wire dtype names are frozen for ABI 3.
 DTYPES: dict[str, type[np.generic]] = {
     "u8": np.uint8,
     "i8": np.int8,
@@ -43,18 +33,27 @@ DTYPE_NAMES = {np.dtype(dtype): name for name, dtype in DTYPES.items()}
 MAX_U32 = 2**32 - 1
 
 
+@dataclasses.dataclass(frozen=True, slots=True)
+class Response:
+    """One decoded value together with its owned response attachment tail."""
+
+    value: typing.Any
+    tail: bytes = b""
+
+    def __post_init__(self) -> None:
+        if type(self.tail) is not bytes:
+            raise TypeError(f"rspyts: response tail must be owned bytes, got {type(self.tail).__name__}")
+
+    def child(self, value: typing.Any) -> Response:
+        """Carry this response's attachment context to a schema-known child value."""
+        return Response(value, self.tail)
+
+
 def build_request(args_obj: collections.abc.Mapping[str, typing.Any] | None) -> bytes:
-    """
-    Encode arguments and nested numpy attachments as an ABI-2 request.
-    """
+    """Encode structured arguments and nested attachments as an ABI 3 request."""
     tail = bytearray()
 
     def encode(value: typing.Any) -> typing.Any:
-        if isinstance(value, collections.abc.Mapping) and set(value) == {JSON_KEY}:
-            # Schemaless Json is opaque to attachment discovery. json.dumps
-            # below still rejects non-JSON Python objects and non-finite
-            # numbers inside the wrapper.
-            return {JSON_KEY: value[JSON_KEY]}
         if isinstance(value, (bytes, bytearray, memoryview)):
             data = bytes(value)
             off = len(tail)
@@ -74,13 +73,17 @@ def build_request(args_obj: collections.abc.Mapping[str, typing.Any] | None) -> 
             tail.extend(wire.tobytes(order="C"))
             return {BUF_KEY: {"off": off, "len": array.size, "dt": dt}}
         if isinstance(value, collections.abc.Mapping):
+            if any(type(key) is not str for key in value):
+                raise TypeError("rspyts: request object keys must be exact strings")
             return {key: encode(item) for key, item in value.items()}
         if isinstance(value, (list, tuple)):
             return [encode(item) for item in value]
         if isinstance(value, float) and value == 0:
-            return 0.0  # canonicalize the JSON representation of -0.0
+            return 0.0
         return value
 
+    if args_obj is not None and not isinstance(args_obj, collections.abc.Mapping):
+        raise TypeError("rspyts: request arguments must be a mapping or None")
     transformed = encode(args_obj or {})
     try:
         body = json.dumps(transformed, separators=(",", ":"), allow_nan=False).encode()
@@ -89,51 +92,32 @@ def build_request(args_obj: collections.abc.Mapping[str, typing.Any] | None) -> 
             "rspyts: non-finite floats (NaN/Infinity) cannot cross the bridge in "
             "JSON positions; pass them through slice or Buf parameters instead."
         ) from exc
+    except (TypeError, OverflowError) as exc:
+        raise TypeError(f"rspyts: request contains a non-JSON value: {exc}") from exc
     if len(body) > MAX_U32 or len(tail) > MAX_U32:
         raise ValueError("rspyts: request envelope component exceeds the 4 GiB limit")
     return bytes([0, 0, 0, 0]) + struct.pack("<II", len(body), len(tail)) + body + tail
 
 
-def decode_request(raw: bytes) -> tuple[typing.Any, bytes]:
-    """
-    Strictly decode an ABI-2 request for diagnostics.
-    """
-    status, payload, tail = decode_frame(raw, request=True)
+def decode_request(raw: bytes) -> Response:
+    """Strictly decode ABI 3 request framing without interpreting schema positions."""
+    status, response = _decode_frame(raw, request=True)
     assert status == 0
-    walk_buffers(payload, tail, materialize=False)
-    return payload, tail
+    return response
 
 
-def parse_envelope(raw: bytes) -> tuple[int, typing.Any]:
-    """
-    Decode a complete envelope into ``(status, payload)``.
-
-    Args:
-        raw: The full allocation (header + JSON + tail).
-
-    Returns:
-        The status byte and the payload, with every buffer placeholder
-        replaced per :func:`substitute_buffers`.
-    """
-    status, payload, tail = decode_frame(raw, request=False)
-    if status == 0:
-        return status, walk_buffers(payload, tail, materialize=True)
-    if tail:
+def parse_envelope(raw: bytes) -> tuple[int, Response]:
+    """Decode one complete response without scanning schema-dependent object shapes."""
+    status, response = _decode_frame(raw, request=False)
+    if status != 0 and response.tail:
         raise ValueError("rspyts: error and panic envelopes must not contain attachment bytes")
-    return status, payload
+    return status, response
 
 
-def decode_frame(raw: bytes, *, request: bool) -> tuple[int, typing.Any, bytes]:
-    """
-    Validate and decode the shared envelope layout.
-
-    Args:
-        raw: Complete envelope bytes.
-        request: Whether to apply request marker rules.
-
-    Returns:
-        Status, decoded JSON payload, and binary tail.
-    """
+def _decode_frame(raw: bytes, *, request: bool) -> tuple[int, Response]:
+    """Validate and decode the shared envelope layout."""
+    if type(raw) is not bytes:
+        raise TypeError(f"rspyts: envelope must be owned bytes, got {type(raw).__name__}")
     if len(raw) < HEADER_LEN:
         raise ValueError(f"rspyts: truncated envelope header: expected {HEADER_LEN} bytes, got {len(raw)}")
     status = raw[0]
@@ -157,78 +141,40 @@ def decode_frame(raw: bytes, *, request: bool) -> tuple[int, typing.Any, bytes]:
         )
     except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
         raise ValueError(f"rspyts: malformed envelope JSON: {exc}") from exc
-    return status, payload, raw[json_end:total]
+    return status, Response(payload, raw[json_end:total])
 
 
-def substitute_buffers(obj: typing.Any, tail: bytes) -> typing.Any:
-    """
-    Recursively replace ``__rspyts_buf__`` placeholders with numpy arrays.
-
-    Notes:
-        A dict that is exactly ``{"__rspyts_buf__": {...}}`` becomes an
-        array copied out of ``tail``; dicts and lists are walked at any
-        depth; all other values pass through unchanged. The single-key
-        check cannot misfire on user data: wire field names come from Rust
-        identifiers and can never be ``__rspyts_buf__``.
-
-    Args:
-        obj: The decoded JSON payload (or any fragment of it).
-        tail: The raw numeric tail of the envelope.
-
-    Returns:
-        The payload with every placeholder replaced by an owned array.
-    """
-    return walk_buffers(obj, tail, materialize=True)
-
-
-def walk_buffers(obj: typing.Any, tail: bytes, *, materialize: bool) -> typing.Any:
-    """
-    Validate placeholders and optionally copy their attachment values.
-
-    Args:
-        obj: JSON value to walk.
-        tail: Binary attachment tail.
-        materialize: Whether to replace placeholders with host values.
-
-    Returns:
-        The walked value.
-    """
-    if isinstance(obj, dict):
-        if set(obj) == {JSON_KEY}:
-            return obj[JSON_KEY] if materialize else obj
-        if BUF_KEY in obj:
-            if len(obj) != 1:
-                raise ValueError("rspyts: buffer placeholder cannot have sibling fields")
-            spec = obj[BUF_KEY]
-            if not isinstance(spec, dict) or set(spec) != {"off", "len", "dt"}:
-                raise ValueError("rspyts: malformed buffer placeholder body")
-            off, length, dt = spec["off"], spec["len"], spec["dt"]
-            if (
-                type(off) is not int
-                or type(length) is not int
-                or not isinstance(dt, str)
-                or off < 0
-                or length < 0
-                or (dt != "bytes" and dt not in DTYPES)
-            ):
-                raise ValueError(f"rspyts: malformed buffer placeholder: {spec!r}")
-            if dt == "bytes":
-                end = off + length
-                if end > len(tail):
-                    raise ValueError(f"rspyts: buffer range {off}..{end} exceeds tail length {len(tail)}")
-                return bytes(tail[off:end]) if materialize else obj
-            dtype = np.dtype(DTYPES[dt])
-            if off % dtype.itemsize != 0:
-                raise ValueError(f"rspyts: buffer offset {off} is not aligned to {dtype.itemsize} bytes for {dt}")
-            end = off + length * dtype.itemsize
-            if end > len(tail):
-                raise ValueError(f"rspyts: buffer range {off}..{end} exceeds tail length {len(tail)}")
-            if not materialize:
-                return obj
-            wire_dtype = dtype.newbyteorder("<")
-            array = np.frombuffer(tail, dtype=wire_dtype, count=length, offset=off)
-            return array.astype(dtype, copy=True)
-        return {key: walk_buffers(value, tail, materialize=materialize) for key, value in obj.items()}
-    if isinstance(obj, list):
-        return [walk_buffers(item, tail, materialize=materialize) for item in obj]
-    return obj
+def materialize_attachment(response: Response, expected_dtype: str) -> bytes | np.ndarray:
+    """Validate and copy one attachment at a schema-declared response position."""
+    obj = response.value
+    if type(obj) is not dict or set(obj) != {BUF_KEY}:
+        raise TypeError("rspyts: expected a buffer attachment wrapper")
+    spec = obj[BUF_KEY]
+    if type(spec) is not dict or set(spec) != {"off", "len", "dt"}:
+        raise ValueError("rspyts: malformed buffer placeholder body")
+    off, length, dt = spec["off"], spec["len"], spec["dt"]
+    if (
+        type(off) is not int
+        or type(length) is not int
+        or type(dt) is not str
+        or off < 0
+        or length < 0
+        or (dt != "bytes" and dt not in DTYPES)
+    ):
+        raise ValueError(f"rspyts: malformed buffer placeholder: {spec!r}")
+    if dt != expected_dtype:
+        raise TypeError(f"rspyts: expected a {expected_dtype} buffer attachment, got {dt}")
+    if dt == "bytes":
+        end = off + length
+        if end > len(response.tail):
+            raise ValueError(f"rspyts: buffer range {off}..{end} exceeds tail length {len(response.tail)}")
+        return bytes(response.tail[off:end])
+    dtype = np.dtype(DTYPES[dt])
+    if off % dtype.itemsize != 0:
+        raise ValueError(f"rspyts: buffer offset {off} is not aligned to {dtype.itemsize} bytes for {dt}")
+    end = off + length * dtype.itemsize
+    if end > len(response.tail):
+        raise ValueError(f"rspyts: buffer range {off}..{end} exceeds tail length {len(response.tail)}")
+    wire_dtype = dtype.newbyteorder("<")
+    array = np.frombuffer(response.tail, dtype=wire_dtype, count=length, offset=off)
+    return array.astype(dtype, copy=True)

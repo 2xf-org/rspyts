@@ -3,11 +3,9 @@
 # Jobs:
 #   rust          - rustfmt + clippy + full test suite + WASM build proof (Linux).
 #   rust-msrv     - locked workspace check on the declared Rust 1.85 floor.
-#   rust-windows  - test suite on Windows. Lints are platform-independent, so
-#   rust-macos      the non-Linux jobs only re-run the tests.
-#   rust-coverage - cargo-llvm-cov summary over the workspace (report-only).
+#   rust-os       - test suite on Windows and macOS.
 #   python        - lint + tests on Python 3.11 through 3.14.
-#   python-os     - main-branch Python 3.11 spots on macOS and Windows.
+#   python-os     - main/release Python 3.11 and native-wheel spots on all OSes.
 #   typescript    - build + tests on Node 22 and 24.
 #   package-metadata - floor consistency and all six registry artifacts.
 #   example-e2e   - the examples end to end: codegen drift gates, native
@@ -16,14 +14,19 @@
 #                   example, then the multi-crate example (cross-crate
 #                   type identity through [python.imports]/[typescript.imports]).
 #
-# Coverage gates live next to the tests, not here: pytest-cov addopts in the
-# two pyproject.toml files, vitest thresholds behind `npm run test:cov` in the
-# two vitest.config.ts files. Rust coverage is reported but never gated.
+# Coverage gates live next to the Python and TypeScript tests: pytest-cov
+# addopts in pyproject.toml and vitest thresholds behind `npm run test:cov`.
 
 name: Validation
 
 on:
   workflow_call:
+    inputs:
+      ref:
+        description: "Git ref to validate; defaults to the triggering event ref"
+        required: false
+        type: string
+        default: ""
   push:
     branches: [main]
   pull_request:
@@ -39,6 +42,7 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+  VALIDATION_REF: ${{ inputs.ref || github.ref }}
 
 jobs:
   rust:
@@ -46,6 +50,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          ref: ${{ env.VALIDATION_REF }}
+          persist-credentials: false
 
       # rustfmt/clippy for the lint steps; the wasm32 target is needed to
       # prove the example crate compiles for the TypeScript (WASM) side.
@@ -68,7 +75,7 @@ jobs:
       # Dogfood the target-aware builder and its stable staging layout.
       - name: Build and stage example artifacts
         run: |
-          cargo run -p rspyts-cli -- build --config examples/basic/rspyts.toml
+          cargo run -p rspyts-cli -- build --config examples/basic/rspyts.toml --target wasm32-unknown-unknown --locked
           test -f target/rspyts/wasm32-unknown-unknown/debug/basic_example.wasm
 
   rust-msrv:
@@ -76,6 +83,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          ref: ${{ env.VALIDATION_REF }}
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@98effd2fc0b766278e30ab86762dd5e9a8531399 # 1.85.0
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
       - name: Check locked workspace
@@ -88,6 +98,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          ref: ${{ env.VALIDATION_REF }}
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
       - name: rustdoc (deny warnings)
@@ -100,49 +113,26 @@ jobs:
           args: --offline --no-progress './**/*.md'
           fail: true
 
-  rust-windows:
-    name: Rust (Windows)
-    runs-on: windows-latest
+  rust-os:
+    name: Rust (${{ matrix.name }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Windows
+            os: windows-latest
+          - name: macOS
+            os: macos-latest
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          ref: ${{ env.VALIDATION_REF }}
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
       - name: Test
         run: cargo test --workspace
-
-  rust-macos:
-    name: Rust (macOS)
-    runs-on: macos-latest
-    steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
-      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-      - name: Test
-        run: cargo test --workspace
-
-  # Report-only, no --fail-under gate: most of the workspace is proc-macro
-  # code whose expansion llvm-cov attributes back to the macro source, which
-  # skews line coverage badly enough that a threshold would gate on noise.
-  rust-coverage:
-    name: Rust coverage (report-only)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
-
-      # llvm-tools-preview supplies the llvm-cov/llvm-profdata binaries
-      # cargo-llvm-cov drives.
-      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
-        with:
-          components: llvm-tools-preview
-
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-
-      - uses: taiki-e/install-action@43aecc8d72668fbcfe75c31400bc4f890f1c5853 # v2
-        with:
-          tool: cargo-llvm-cov
-
-      - name: Coverage summary
-        run: cargo llvm-cov --workspace --summary-only
 
   python:
     name: Python runtime (${{ matrix.python }})
@@ -154,46 +144,64 @@ jobs:
     defaults:
       run:
         working-directory: runtimes/python
+    env:
+      PYTHON_VERSION: ${{ matrix.python }}
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          ref: ${{ env.VALIDATION_REF }}
+          persist-credentials: false
 
       # uv provisions the interpreter declared in pyproject.toml and manages
       # the virtualenv; no separate setup-python step is needed.
       - uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7
+        with:
+          version: "0.10.9"
 
       - name: Install
-        run: uv sync --dev --locked --python ${{ matrix.python }}
+        run: uv sync --dev --extra hatch --locked --python "$PYTHON_VERSION"
 
       - name: Lint
-        run: uv run --python ${{ matrix.python }} ruff check .
+        run: uv run --no-sync --python "$PYTHON_VERSION" ruff check .
 
       - name: Static analysis
         if: matrix.python == '3.11'
         run: |
-          uv run --python ${{ matrix.python }} ty check src
-          uv run --python ${{ matrix.python }} vulture
+          uv run --no-sync --python "$PYTHON_VERSION" ty check src
+          uv run --no-sync --python "$PYTHON_VERSION" vulture
 
       - name: Test
-        run: uv run --python ${{ matrix.python }} pytest
+        run: uv run --no-sync --python "$PYTHON_VERSION" pytest
 
   python-os:
     name: Python 3.11 (${{ matrix.os }})
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        os: [macos-latest, windows-latest]
+        os: [ubuntu-latest, macos-latest, windows-latest]
     defaults:
       run:
         working-directory: runtimes/python
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          ref: ${{ env.VALIDATION_REF }}
+          persist-credentials: false
       - uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7
+        with:
+          version: "0.10.9"
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
       - name: Install
-        run: uv sync --dev --locked --python 3.11
+        run: uv sync --dev --extra hatch --locked --python 3.11
       - name: Test
-        run: uv run --frozen --python 3.11 pytest
+        run: uv run --no-sync --python 3.11 pytest
+      - name: Install workspace CLI
+        working-directory: ${{ github.workspace }}
+        run: cargo install --path crates/rspyts-cli --locked
+      - name: Native wheel smoke
+        run: uv run --no-sync --python 3.11 python ../../scripts/ci/smoke-native-wheel.py
 
   python-minimum:
     name: Python minimum dependencies
@@ -203,11 +211,16 @@ jobs:
         working-directory: runtimes/python
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          ref: ${{ env.VALIDATION_REF }}
+          persist-credentials: false
       - uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7
+        with:
+          version: "0.10.9"
       - name: Install lowest direct dependency versions
-        run: uv sync --resolution lowest-direct --upgrade --python 3.11
+        run: uv sync --dev --extra hatch --resolution lowest-direct --upgrade --python 3.11
       - name: Test
-        run: uv run --frozen --python 3.11 pytest
+        run: uv run --no-sync --python 3.11 pytest
 
   typescript:
     name: TypeScript runtime (Node ${{ matrix.node }})
@@ -221,6 +234,9 @@ jobs:
         working-directory: runtimes/typescript
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          ref: ${{ env.VALIDATION_REF }}
+          persist-credentials: false
 
       - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
         with:
@@ -248,26 +264,36 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          ref: ${{ env.VALIDATION_REF }}
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
       - uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7
+        with:
+          version: "0.10.9"
       - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
         with:
-          node-version: "24"
+          node-version: "24.18.0"
       - name: Check release versions
         run: |
           version=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "rspyts") | .version')
           test "$(jq -r .version runtimes/typescript/package.json)" = "$version"
           test "$(sed -n 's/^version = "\([^"]*\)"/\1/p' runtimes/python/pyproject.toml | head -1)" = "$version"
+          test "$(sed -n 's/^__version__ = "\([^"]*\)"/\1/p' runtimes/python/src/rspyts/__init__.py | head -1)" = "$version"
       - name: Check crates.io packages
         run: |
           for crate in rspyts-core rspyts-macros rspyts rspyts-cli; do
-            cargo package --list --locked --allow-dirty -p "$crate"
+            cargo package --list --locked -p "$crate"
           done
       - name: Check PyPI package
         working-directory: runtimes/python
         run: |
-          uv build --out-dir "$RUNNER_TEMP/rspyts-python"
-          uvx --from twine twine check --strict "$RUNNER_TEMP"/rspyts-python/*
+          uv build \
+            --build-constraints ../../scripts/release/python-build-constraints.txt \
+            --out-dir "$RUNNER_TEMP/rspyts-python"
+          uvx --from 'twine==6.1.0' twine check --strict "$RUNNER_TEMP"/rspyts-python/*
+          sdist=$(find "$RUNNER_TEMP/rspyts-python" -maxdepth 1 -name '*.tar.gz' -print -quit)
+          ../../scripts/release/check-python-sdist.py "$sdist" .
       - name: Check npm package
         working-directory: runtimes/typescript
         run: |
@@ -275,6 +301,8 @@ jobs:
           npm run build
           npm run check:surface
           npm pack --dry-run
+      - name: Test release checks
+        run: python3 -m unittest discover -s scripts/release/tests -v
 
   # Full pipeline over the examples: they are the only place where
   # the macros, the CLI, both runtimes, and both build targets meet.
@@ -283,6 +311,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          ref: ${{ env.VALIDATION_REF }}
+          persist-credentials: false
 
       - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
         with:
@@ -291,6 +322,8 @@ jobs:
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
 
       - uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7
+        with:
+          version: "0.10.9"
 
       - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
         with:
@@ -299,8 +332,8 @@ jobs:
       # One config builds and stages both the native cdylib and WASM module.
       - name: Build and stage basic artifacts
         run: |
-          cargo run -p rspyts-cli -- build --config examples/basic/rspyts.toml
-          test -f target/rspyts/x86_64-unknown-linux-gnu/debug/libbasic_example.so
+          cargo run -p rspyts-cli -- build --config examples/basic/rspyts.toml --target host --target wasm32-unknown-unknown --locked
+          test -f examples/basic/python/src/basic_example/generated/lib/libbasic_example.so
           test -f target/rspyts/wasm32-unknown-unknown/debug/basic_example.wasm
 
       # Codegen drift gate: the generated Python/TypeScript/schema committed
@@ -311,12 +344,8 @@ jobs:
 
       - name: Python example tests
         working-directory: examples/basic/python
-        env:
-          # RSPYTS_LIBRARY is the highest-priority library resolution path
-          # (codegen §4.1); pointing it at the artifact built above keeps the
-          # test independent of the library_search list in rspyts.toml.
-          RSPYTS_LIBRARY: ${{ github.workspace }}/target/rspyts/x86_64-unknown-linux-gnu/debug/libbasic_example.so
         run: |
+          unset RSPYTS_LIBRARY_BASIC_EXAMPLE
           uv sync --locked
           uv run pytest
 
@@ -342,11 +371,11 @@ jobs:
       # Build both standalone modules through their own checked-in configs.
       - name: Build and stage multi-crate artifacts
         run: |
-          cargo run -p rspyts-cli -- build --config examples/multi-crate/shared/rspyts.toml
-          cargo run -p rspyts-cli -- build --config examples/multi-crate/app/rspyts.toml
-          test -f target/rspyts/x86_64-unknown-linux-gnu/debug/libshared_types_module.so
-          test -f target/rspyts/wasm32-unknown-unknown/debug/shared_types_module.wasm
-          test -f target/rspyts/x86_64-unknown-linux-gnu/debug/libmulti_crate_app.so
+          cargo run -p rspyts-cli -- build --config examples/multi-crate/shared/rspyts.toml --target host --target wasm32-unknown-unknown --locked
+          cargo run -p rspyts-cli -- build --config examples/multi-crate/app/rspyts.toml --target host --target wasm32-unknown-unknown --locked
+          test -f examples/multi-crate/shared/python/src/shared_types/generated/lib/libshared_types.so
+          test -f target/rspyts/wasm32-unknown-unknown/debug/shared_types.wasm
+          test -f examples/multi-crate/app/python/src/multi_crate_app/generated/lib/libmulti_crate_app.so
           test -f target/rspyts/wasm32-unknown-unknown/debug/multi_crate_app.wasm
 
       # Drift gates for both configs — the app's generated code must keep
@@ -367,9 +396,8 @@ jobs:
       # Import smoke tests: multi_crate_app.Point IS shared_types.Point.
       - name: Python multi-crate tests
         working-directory: examples/multi-crate/app/python
-        env:
-          RSPYTS_LIBRARY: ${{ github.workspace }}/target/rspyts/x86_64-unknown-linux-gnu/debug/libmulti_crate_app.so
         run: |
+          unset RSPYTS_LIBRARY_MULTI_CRATE_APP
           uv sync --locked
           uv run pytest
 
@@ -378,7 +406,9 @@ jobs:
       - name: TypeScript multi-crate tests
         run: |
           (cd examples/multi-crate/shared/typescript && npm ci && npm run typecheck)
-          cd examples/multi-crate/app/typescript
-          npm ci
-          npm run typecheck
-          npm test
+          (
+            cd examples/multi-crate/app/typescript || exit 1
+            npm ci
+            npm run typecheck
+            npm test
+          )

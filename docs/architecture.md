@@ -10,7 +10,7 @@ runtimes.
 | `crates/rspyts` | Public Rust facade: `#[bridge]`, bridge types, errors, and `export!()` |
 | `crates/rspyts-macros` | Macro parsing, validation, shims, and manifest registrations |
 | `crates/rspyts-core` | ABI envelopes, attachments, handles, manifest IR, registry, and shim helpers |
-| `crates/rspyts-cli` | Build discovery, manifest loading, validation, emitters, drift checks, and manifest diffs |
+| `crates/rspyts-cli` | Build discovery, manifest loading, validation, emitters, drift checks, and manifest inspection |
 | `runtimes/python` | PyPI runtime: pydantic base, ctypes loader, envelope codec, and errors |
 | `runtimes/typescript` | npm runtime: WebAssembly loader, envelope codec, calls, poisoning, and errors |
 | `examples` | End-to-end contracts used by CI |
@@ -24,8 +24,8 @@ Suppose Python calls a generated `summarize(values, label)` wrapper.
 
 1. The wrapper dumps ordinary parameters with exact wire names.
 2. The runtime copies the numeric slice into private, aligned numpy storage.
-3. `Library` lazily loads the cdylib and checks ABI version 2.
-4. The runtime creates one ABI-2 request envelope and calls the exported shim.
+3. `Library` lazily loads the cdylib, verifies ABI version 3 and the contract fingerprint.
+4. The runtime creates one ABI-3 request envelope and calls the exported shim.
 5. The shim validates the request, borrows the staged slice, and calls Rust.
 6. Rust serializes the result into one response envelope.
 7. Python copies attachments out, frees the Rust allocation, and validates the

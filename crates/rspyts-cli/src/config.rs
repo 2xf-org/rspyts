@@ -4,7 +4,7 @@
 //! directory. Unknown keys are rejected so typos surface as errors
 //! instead of silently disabling an emitter.
 
-use crate::build::BuildOptions;
+use crate::build::ContractOptions;
 use anyhow::{Context, Result, ensure};
 use serde::Deserialize;
 use std::collections::BTreeMap;
@@ -19,39 +19,6 @@ struct RawConfig {
     python: Option<RawPython>,
     typescript: Option<RawTypescript>,
     schema: Option<RawSchema>,
-    #[serde(default)]
-    build: RawBuild,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct RawBuild {
-    #[serde(default)]
-    features: Vec<String>,
-    #[serde(default, rename = "no-default-features")]
-    no_default_features: bool,
-    #[serde(default = "default_profile")]
-    profile: String,
-    #[serde(default)]
-    targets: Vec<String>,
-    #[serde(default)]
-    locked: bool,
-}
-
-impl Default for RawBuild {
-    fn default() -> Self {
-        Self {
-            features: Vec::new(),
-            no_default_features: false,
-            profile: default_profile(),
-            targets: Vec::new(),
-            locked: false,
-        }
-    }
-}
-
-fn default_profile() -> String {
-    "dev".to_string()
 }
 
 #[derive(Debug, Deserialize)]
@@ -59,12 +26,18 @@ fn default_profile() -> String {
 struct RawCrate {
     #[serde(default = "default_crate_path")]
     path: String,
+    #[serde(default)]
+    features: Vec<String>,
+    #[serde(default, rename = "no-default-features")]
+    no_default_features: bool,
 }
 
 impl Default for RawCrate {
     fn default() -> Self {
         Self {
             path: default_crate_path(),
+            features: Vec::new(),
+            no_default_features: false,
         }
     }
 }
@@ -73,41 +46,25 @@ fn default_crate_path() -> String {
     ".".to_string()
 }
 
-fn default_enabled() -> bool {
-    true
-}
-
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawPython {
-    #[serde(default = "default_enabled")]
-    enabled: bool,
     out: String,
     #[serde(default)]
-    library_search: Vec<String>,
-    #[serde(default)]
     imports: BTreeMap<String, String>,
-    #[serde(default)]
-    exclude: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawTypescript {
-    #[serde(default = "default_enabled")]
-    enabled: bool,
     out: String,
     #[serde(default)]
     imports: BTreeMap<String, String>,
-    #[serde(default)]
-    exclude: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawSchema {
-    #[serde(default = "default_enabled")]
-    enabled: bool,
     out: String,
 }
 
@@ -120,27 +77,18 @@ pub struct Config {
     pub python: Option<PythonConfig>,
     pub typescript: Option<TypescriptConfig>,
     pub schema: Option<SchemaConfig>,
-    /// Cargo inputs shared by generate, check, and artifact staging.
-    pub build: BuildOptions,
+    /// Cargo feature selection that defines the compiled contract.
+    pub contract: ContractOptions,
 }
 
 #[derive(Debug)]
 pub struct PythonConfig {
     /// The wholly-owned `_generated` package directory.
     pub out: PathBuf,
-    /// Library search directories, kept verbatim: they are relative to
-    /// the generated package directory *at import time*, not to the
-    /// config file, so the emitter bakes them in unchanged.
-    pub library_search: Vec<String>,
     /// Origin crate name → Python import path. Bridged types whose
     /// origin appears here are imported from that package instead of
     /// re-emitted locally (codegen.md §9).
     pub imports: BTreeMap<String, String>,
-    /// Glob patterns of items dropped from this projection
-    /// (codegen.md §1). Matched against item names: functions, classes,
-    /// types, and constants by name; methods and statics as
-    /// `Class.method`.
-    pub exclude: Vec<String>,
 }
 
 #[derive(Debug)]
@@ -150,9 +98,6 @@ pub struct TypescriptConfig {
     /// whose origin appears here are imported from that module instead
     /// of re-emitted locally (codegen.md §9).
     pub imports: BTreeMap<String, String>,
-    /// Glob patterns of items dropped from this projection (see
-    /// [`PythonConfig::exclude`]).
-    pub exclude: Vec<String>,
 }
 
 #[derive(Debug)]
@@ -187,34 +132,19 @@ fn resolve(raw: RawConfig, base: &Path) -> Result<Config> {
             base.join(p)
         }
     };
-    let build = BuildOptions::new(
-        raw.build.features,
-        raw.build.no_default_features,
-        raw.build.profile,
-        raw.build.targets,
-        raw.build.locked,
-    )?;
+    let contract = ContractOptions::new(raw.krate.features, raw.krate.no_default_features)?;
     Ok(Config {
         crate_dir: join(&raw.krate.path),
-        python: raw.python.filter(|s| s.enabled).map(|s| PythonConfig {
+        python: raw.python.map(|s| PythonConfig {
             out: join(&s.out),
-            library_search: s.library_search,
             imports: s.imports,
-            exclude: s.exclude,
         }),
-        typescript: raw
-            .typescript
-            .filter(|s| s.enabled)
-            .map(|s| TypescriptConfig {
-                out: join(&s.out),
-                imports: s.imports,
-                exclude: s.exclude,
-            }),
-        schema: raw
-            .schema
-            .filter(|s| s.enabled)
-            .map(|s| SchemaConfig { out: join(&s.out) }),
-        build,
+        typescript: raw.typescript.map(|s| TypescriptConfig {
+            out: join(&s.out),
+            imports: s.imports,
+        }),
+        schema: raw.schema.map(|s| SchemaConfig { out: join(&s.out) }),
+        contract,
     })
 }
 
@@ -225,26 +155,13 @@ pub const INIT_TEMPLATE: &str = r#"# rspyts configuration. All relative paths re
 [crate]
 # Directory containing the bridged crate's Cargo.toml.
 path = "."
-
-[build]
-# Cargo inputs shared by generate, check, and build.
+# Cargo feature selection is part of the generated contract.
 features = []
 no-default-features = false
-profile = "dev"
-targets = ["wasm32-unknown-unknown"]
-locked = true
 
 [python]
-enabled = true
 out = "../python/src/my_package/_generated"
-# Candidate directories searched for the compiled cdylib at import time,
-# relative to the generated package directory. The RSPYTS_LIBRARY env var
-# and Library.set_path() always take precedence.
-library_search = ["../../../../target/debug", "../../../../target/release"]
-
-# Items to drop from this projection (simple globs; methods and statics
-# match as "Class.method"):
-# exclude = ["render_*", "Session.warm_up"]
+# `rspyts build` stages the host cdylib in `<out>/lib` by default.
 
 # Bridged types defined in a dependency crate can be imported from that
 # crate's own generated package instead of re-emitted here:
@@ -252,16 +169,13 @@ library_search = ["../../../../target/debug", "../../../../target/release"]
 # "other-crate" = "other_package._generated"
 
 [typescript]
-enabled = true
 out = "../typescript/src/generated"
-# exclude = ["load_values"]
 
 # Same idea for TypeScript, mapping to a module specifier:
 # [typescript.imports]
 # "other-crate" = "@scope/other/generated"
 
 [schema]
-enabled = true
 out = "../schema"
 "#;
 
@@ -295,18 +209,11 @@ mod tests {
             r#"
             [crate]
             path = "rust"
-
-            [build]
             features = ["serde", "fast-path"]
             no-default-features = true
-            profile = "release"
-            targets = ["wasm32-unknown-unknown"]
-            locked = true
 
             [python]
-            enabled = true
             out = "python/_generated"
-            library_search = ["../target/debug"]
 
             [typescript]
             out = "ts/generated"
@@ -316,18 +223,11 @@ mod tests {
             "#,
         );
         assert_eq!(cfg.crate_dir, Path::new("/project/rust"));
-        assert_eq!(cfg.build.features, vec!["serde", "fast-path"]);
-        assert!(cfg.build.no_default_features);
-        assert_eq!(cfg.build.profile, "release");
-        assert_eq!(cfg.build.targets, vec!["wasm32-unknown-unknown"]);
-        assert!(cfg.build.locked);
+        assert_eq!(cfg.contract.features, vec!["serde", "fast-path"]);
+        assert!(cfg.contract.no_default_features);
         assert_eq!(
             cfg.python.as_ref().unwrap().out,
             Path::new("/project/python/_generated")
-        );
-        assert_eq!(
-            cfg.python.unwrap().library_search,
-            vec!["../target/debug".to_string()]
         );
         assert_eq!(
             cfg.typescript.unwrap().out,
@@ -373,27 +273,9 @@ mod tests {
     #[test]
     fn imports_default_to_empty() {
         let cfg = parse("[python]\nout = \"py\"\n\n[typescript]\nout = \"ts\"\n");
-        assert!(cfg.python.unwrap().imports.is_empty());
+        let python = cfg.python.unwrap();
+        assert!(python.imports.is_empty());
         assert!(cfg.typescript.unwrap().imports.is_empty());
-    }
-
-    #[test]
-    fn exclude_lists_parse_and_default_to_empty() {
-        let cfg = parse(
-            r#"
-            [python]
-            out = "py"
-            exclude = ["render_*", "Session.warm_up"]
-
-            [typescript]
-            out = "ts"
-            "#,
-        );
-        assert_eq!(
-            cfg.python.unwrap().exclude,
-            vec!["render_*".to_string(), "Session.warm_up".to_string()]
-        );
-        assert!(cfg.typescript.unwrap().exclude.is_empty());
     }
 
     #[test]
@@ -403,13 +285,24 @@ mod tests {
         assert!(cfg.python.is_none());
         assert!(cfg.typescript.is_none());
         assert!(cfg.schema.is_none());
-        assert_eq!(cfg.build, BuildOptions::default());
+        assert_eq!(cfg.contract, ContractOptions::default());
     }
 
     #[test]
-    fn disabled_section_is_dropped() {
-        let cfg = parse("[python]\nenabled = false\nout = \"x\"\n");
-        assert!(cfg.python.is_none());
+    fn removed_output_knobs_are_rejected() {
+        for text in [
+            "[python]\nout = \"x\"\nenabled = false\n",
+            "[python]\nout = \"x\"\nlibrary_search = [\"fallback\"]\n",
+            "[python]\nout = \"x\"\nexclude = [\"foo\"]\n",
+            "[typescript]\nout = \"x\"\nenabled = false\n",
+            "[typescript]\nout = \"x\"\nexclude = [\"foo\"]\n",
+            "[schema]\nout = \"x\"\nenabled = false\n",
+            "[build]\nfeatures = []\n",
+            "[crate]\nprofile = \"release\"\n",
+            "[crate]\nlocked = true\n",
+        ] {
+            assert!(toml::from_str::<RawConfig>(text).is_err(), "{text}");
+        }
     }
 
     #[test]
@@ -422,23 +315,10 @@ mod tests {
     }
 
     #[test]
-    fn unknown_build_keys_are_rejected() {
-        let err = toml::from_str::<RawConfig>("[build]\nprofil = \"release\"\n").unwrap_err();
-        assert!(err.to_string().contains("profil"), "{err}");
-    }
-
-    #[test]
-    fn invalid_build_values_are_rejected() {
-        for text in [
-            "[build]\nprofile = \"\"\n",
-            "[build]\nprofile = \"bad profile\"\n",
-            "[build]\ntargets = [\"\"]\n",
-            "[build]\ntargets = [\"bad target\"]\n",
-            "[build]\nfeatures = [\"bad feature\"]\n",
-        ] {
-            let raw: RawConfig = toml::from_str(text).unwrap();
-            assert!(resolve(raw, Path::new("/project")).is_err(), "{text}");
-        }
+    fn invalid_contract_features_are_rejected() {
+        let text = "[crate]\nfeatures = [\"bad feature\"]\n";
+        let raw: RawConfig = toml::from_str(text).unwrap();
+        assert!(resolve(raw, Path::new("/project")).is_err(), "{text}");
     }
 
     #[test]

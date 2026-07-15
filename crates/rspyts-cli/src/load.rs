@@ -1,20 +1,19 @@
 //! Loading the compiled cdylib and retrieving its manifest.
 //!
 //! The CLI is itself a foreign caller of the module it just built: it
-//! `dlopen`s the artifact, verifies `rspyts_abi_version() == 2`, calls
-//! `rspyts_manifest()`, decodes the response envelope (ABI §4), and
-//! frees the envelope through the module's own `rspyts_free`.
+//! `dlopen`s the artifact, verifies `rspyts_abi_version() == 3`, calls
+//! `rspyts_manifest()`, decodes the response envelope (ABI §4), validates
+//! the manifest's full ABI version, and frees the envelope through the
+//! module's own `rspyts_free`.
 
 use anyhow::{Context, Result, bail, ensure};
 use rspyts_core::envelope;
 use rspyts_core::ir::Manifest;
 use std::path::Path;
 
-/// The deserialized manifest plus the exact JSON bytes it arrived as
-/// (hashed into every generated file header for provenance).
+/// A manifest read from a freshly compiled bridge module.
 pub struct LoadedManifest {
     pub manifest: Manifest,
-    pub json: Vec<u8>,
 }
 
 type AbiVersionFn = unsafe extern "C" fn() -> u32;
@@ -66,44 +65,7 @@ pub fn load_manifest(path: &Path) -> Result<LoadedManifest> {
         }
         let manifest: Manifest = serde_json::from_slice(&json)
             .context("cannot deserialize the module manifest — CLI/crate version mismatch?")?;
-        let manifest_major = parse_manifest_abi_major(&manifest.abi)?;
-        ensure!(
-            manifest_major == rspyts_core::ABI_VERSION,
-            "module manifest reports ABI `{}`, but its numeric export and this CLI require major {}",
-            manifest.abi,
-            rspyts_core::ABI_VERSION
-        );
-        Ok(LoadedManifest { manifest, json })
-    }
-}
-
-fn parse_manifest_abi_major(value: &str) -> Result<u32> {
-    let (major, minor) = value
-        .split_once('.')
-        .with_context(|| format!("module manifest ABI `{value}` is not in `major.minor` form"))?;
-    ensure!(
-        !major.is_empty() && !minor.is_empty() && !minor.contains('.'),
-        "module manifest ABI `{value}` is not in `major.minor` form"
-    );
-    let major = major
-        .parse::<u32>()
-        .with_context(|| format!("module manifest ABI `{value}` has a non-numeric major"))?;
-    minor
-        .parse::<u32>()
-        .with_context(|| format!("module manifest ABI `{value}` has a non-numeric minor"))?;
-    Ok(major)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::parse_manifest_abi_major;
-
-    #[test]
-    fn manifest_abi_parser_is_strict() {
-        assert_eq!(parse_manifest_abi_major("2.0").unwrap(), 2);
-        assert_eq!(parse_manifest_abi_major("12.34").unwrap(), 12);
-        for invalid in ["2", "2.", ".0", "2.0.1", "v2.0", "2.x"] {
-            assert!(parse_manifest_abi_major(invalid).is_err(), "{invalid}");
-        }
+        crate::validate::validate_manifest_abi(&manifest.abi)?;
+        Ok(LoadedManifest { manifest })
     }
 }

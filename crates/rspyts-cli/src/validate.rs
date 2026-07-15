@@ -6,10 +6,32 @@
 //! Every check reports the offending item by name; all problems are
 //! collected before failing so one run shows everything.
 
-use rspyts_core::ir::{FieldDecl, Manifest, ParamDecl, Target, Ty, TypeDecl};
+use crate::emit::util::{pascal, py_error_registry_name, ts_error_registry_name};
+use heck::ToLowerCamelCase;
+use rspyts_core::ir::{ClassDecl, FieldDecl, Manifest, ParamDecl, Target, Ty, TypeDecl};
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
+
+/// Reject any manifest that does not use this CLI's exact ABI vocabulary.
+pub(crate) fn validate_manifest_abi(value: &str) -> anyhow::Result<()> {
+    let (major, minor) = value
+        .split_once('.')
+        .ok_or_else(|| anyhow::anyhow!("manifest ABI `{value}` is not in `major.minor` form"))?;
+    anyhow::ensure!(
+        !major.is_empty()
+            && !minor.is_empty()
+            && major.bytes().all(|byte| byte.is_ascii_digit())
+            && minor.bytes().all(|byte| byte.is_ascii_digit()),
+        "manifest ABI `{value}` is not in `major.minor` form"
+    );
+    anyhow::ensure!(
+        value == rspyts_core::ABI_VERSION_STR,
+        "unsupported manifest ABI `{value}`; this rspyts CLI requires `{}`",
+        rspyts_core::ABI_VERSION_STR
+    );
+    Ok(())
+}
 
 /// What kind of declaration a name refers to.
 #[derive(Clone, Copy, PartialEq)]
@@ -33,6 +55,16 @@ impl Kind {
     }
 }
 
+fn declaration_kind(declaration: &TypeDecl) -> Kind {
+    match declaration {
+        TypeDecl::Newtype { .. } => Kind::Newtype,
+        TypeDecl::Struct { .. } => Kind::Struct,
+        TypeDecl::Enum { .. } => Kind::Enum,
+        TypeDecl::StringEnum { .. } => Kind::StringEnum,
+        TypeDecl::ErrorEnum { .. } => Kind::ErrorEnum,
+    }
+}
+
 /// Where a [`Ty`] appears; determines which shapes are legal.
 #[derive(Clone, Copy, PartialEq)]
 enum Pos {
@@ -48,8 +80,6 @@ enum Pos {
     Field,
 }
 
-const RESERVED_WIRE_KEYS: [&str; 2] = ["__rspyts_buf__", "__rspyts_json__"];
-
 impl Pos {
     fn nested(self) -> Pos {
         match self {
@@ -62,6 +92,7 @@ impl Pos {
 
 /// Validate `manifest`, returning one error carrying every finding.
 pub fn validate(manifest: &Manifest) -> anyhow::Result<()> {
+    validate_manifest_abi(&manifest.abi)?;
     let attachment_types = attachment_types(manifest);
     let mut v = Validator {
         kinds: BTreeMap::new(),
@@ -69,61 +100,12 @@ pub fn validate(manifest: &Manifest) -> anyhow::Result<()> {
         errors: Vec::new(),
     };
     for ty in &manifest.types {
-        let kind = match ty {
-            TypeDecl::Newtype { .. } => Kind::Newtype,
-            TypeDecl::Struct { .. } => Kind::Struct,
-            TypeDecl::Enum { .. } => Kind::Enum,
-            TypeDecl::StringEnum { .. } => Kind::StringEnum,
-            TypeDecl::ErrorEnum { .. } => Kind::ErrorEnum,
-        };
+        let kind = declaration_kind(ty);
         v.kinds.insert(ty.name().to_string(), kind);
     }
     v.check_newtype_cycles(manifest);
-
-    // Types, classes, functions, and constants all land in the one
-    // generated module namespace, so their names must be unique.
-    let mut namespace: BTreeMap<&str, Vec<&'static str>> = BTreeMap::new();
-    let mut projections: BTreeMap<String, Vec<String>> = BTreeMap::new();
-    for ty in &manifest.types {
-        let kind = v.kinds[ty.name()];
-        namespace
-            .entry(ty.name())
-            .or_default()
-            .push(kind.describe());
-        for projected in projected_names(ty) {
-            projections.entry(projected).or_default().push(format!(
-                "{} `{}`",
-                kind.describe(),
-                ty.name()
-            ));
-        }
-    }
-    for class in &manifest.classes {
-        namespace.entry(&class.name).or_default().push("class");
-    }
-    for f in &manifest.functions {
-        namespace.entry(&f.name).or_default().push("function");
-    }
-    for c in &manifest.constants {
-        namespace.entry(&c.name).or_default().push("constant");
-    }
-    for (name, kinds) in &namespace {
-        if kinds.len() > 1 {
-            v.errors.push(format!(
-                "`{name}` collides with itself: declared as {} — types, classes, functions, and \
-                 constants share the generated module namespace",
-                kinds.join(" and ")
-            ));
-        }
-    }
-    for (name, owners) in &projections {
-        if owners.len() > 1 {
-            v.errors.push(format!(
-                "generated type name `{name}` collides between {}",
-                owners.join(" and ")
-            ));
-        }
-    }
+    v.check_structural_cycles(manifest);
+    v.check_projected_names(manifest);
 
     for ty in &manifest.types {
         match ty {
@@ -140,7 +122,6 @@ pub fn validate(manifest: &Manifest) -> anyhow::Result<()> {
                 variants,
                 ..
             } => {
-                v.check_reserved_key(&format!("enum `{name}` discriminator"), tag);
                 v.check_unique_strings(
                     &format!("enum `{name}` variant wire names"),
                     variants.iter().map(|variant| variant.wire_name.as_str()),
@@ -212,6 +193,7 @@ pub fn validate(manifest: &Manifest) -> anyhow::Result<()> {
     }
 
     for class in &manifest.classes {
+        v.check_class_member_names(class);
         if let Some(ctor) = &class.constructor {
             let ctx = format!("class `{}` constructor", class.name);
             v.check_param_wire_names(&ctx, &ctor.params);
@@ -263,6 +245,238 @@ struct Validator {
 }
 
 impl Validator {
+    /// Validate every public name after projecting the manifest into each
+    /// host language.  The two maps intentionally stay separate: a spelling
+    /// used only by Python must not make an otherwise-safe TypeScript-only
+    /// declaration invalid (and vice versa).
+    fn check_projected_names(&mut self, manifest: &Manifest) {
+        let mut python = BTreeMap::<String, Vec<String>>::new();
+        let mut typescript = BTreeMap::<String, Vec<String>>::new();
+
+        add_projected_name(
+            &mut python,
+            "__all__",
+            "generated Python package export list",
+        );
+        add_projected_name(
+            &mut typescript,
+            "createClient",
+            "generated TypeScript client factory",
+        );
+        add_projected_name(
+            &mut typescript,
+            format!("{}Client", pascal(&manifest.crate_name)),
+            format!(
+                "generated TypeScript client interface for crate `{}`",
+                manifest.crate_name
+            ),
+        );
+
+        for declaration in &manifest.types {
+            let kind = declaration_kind(declaration);
+            let owner = format!(
+                "{} `{}` from `{}`",
+                kind.describe(),
+                declaration.name(),
+                declaration.origin()
+            );
+            add_projected_name(&mut python, declaration.name(), &owner);
+            add_projected_name(&mut typescript, declaration.name(), &owner);
+
+            match declaration {
+                TypeDecl::Enum { name, variants, .. } => {
+                    // Python emits one model class per data-enum variant.
+                    // TypeScript represents data enums as a union only.
+                    for variant in variants {
+                        add_projected_name(
+                            &mut python,
+                            format!("{name}{}", variant.name),
+                            format!(
+                                "enum `{name}` variant `{}` from `{}`",
+                                variant.name,
+                                declaration.origin()
+                            ),
+                        );
+                    }
+                }
+                TypeDecl::ErrorEnum { name, variants, .. } => {
+                    // Both hosts expose one concrete error class per variant.
+                    for variant in variants {
+                        let projected = format!("{name}{}", variant.name);
+                        let variant_owner = format!(
+                            "error enum `{name}` variant `{}` from `{}`",
+                            variant.name,
+                            declaration.origin()
+                        );
+                        add_projected_name(&mut python, &projected, &variant_owner);
+                        add_projected_name(&mut typescript, projected, variant_owner);
+                    }
+                    add_projected_name(
+                        &mut python,
+                        py_error_registry_name(name),
+                        format!(
+                            "generated Python registry for error enum `{name}` from `{}`",
+                            declaration.origin()
+                        ),
+                    );
+                    add_projected_name(
+                        &mut typescript,
+                        ts_error_registry_name(name),
+                        format!(
+                            "generated TypeScript registry for error enum `{name}` from `{}`",
+                            declaration.origin()
+                        ),
+                    );
+                }
+                TypeDecl::Newtype { .. }
+                | TypeDecl::Struct { .. }
+                | TypeDecl::StringEnum { .. } => {}
+            }
+        }
+
+        for class in &manifest.classes {
+            let owner = format!("class `{}`", class.name);
+            add_projected_name(&mut python, &class.name, &owner);
+            add_projected_name(&mut typescript, &class.name, &owner);
+        }
+        for constant in &manifest.constants {
+            let owner = format!("constant `{}` from `{}`", constant.name, constant.origin);
+            add_projected_name(&mut python, &constant.name, &owner);
+            add_projected_name(&mut typescript, &constant.name, owner);
+        }
+        for function in &manifest.functions {
+            if function.targets.contains(&Target::Python) {
+                add_projected_name(
+                    &mut python,
+                    &function.name,
+                    format!("function `{}`", function.name),
+                );
+            }
+        }
+
+        report_projected_collisions(&mut self.errors, "Python", "package root export", python);
+        report_projected_collisions(
+            &mut self.errors,
+            "TypeScript",
+            "module root export",
+            typescript,
+        );
+
+        // TypeScript free functions and classes are properties of the client,
+        // not root values. They still share one projected member namespace.
+        let mut client = BTreeMap::<String, Vec<String>>::new();
+        for function in &manifest.functions {
+            if function.targets.contains(&Target::Typescript) {
+                add_projected_name(
+                    &mut client,
+                    function.name.to_lower_camel_case(),
+                    format!("function `{}`", function.name),
+                );
+            }
+        }
+        for class in &manifest.classes {
+            add_projected_name(
+                &mut client,
+                &class.name,
+                format!("class `{}` constructor property", class.name),
+            );
+        }
+        report_projected_collisions(&mut self.errors, "TypeScript", "client member", client);
+    }
+
+    fn check_class_member_names(&mut self, class: &ClassDecl) {
+        let mut python = BTreeMap::<String, Vec<String>>::new();
+        for reserved in [
+            "handle",
+            "__init__",
+            "__new__",
+            "__copy__",
+            "__deepcopy__",
+            "__reduce__",
+            "__reduce_ex__",
+            "close",
+            "__enter__",
+            "__exit__",
+            "__del__",
+        ] {
+            add_projected_name(
+                &mut python,
+                reserved,
+                format!("generated runtime member `{reserved}`"),
+            );
+        }
+        for method in &class.methods {
+            if method.targets.contains(&Target::Python) {
+                add_projected_name(
+                    &mut python,
+                    &method.name,
+                    format!("method `{}`", method.name),
+                );
+            }
+        }
+        for static_method in &class.statics {
+            if static_method.targets.contains(&Target::Python) {
+                add_projected_name(
+                    &mut python,
+                    &static_method.name,
+                    format!("static `{}`", static_method.name),
+                );
+            }
+        }
+        report_projected_collisions(
+            &mut self.errors,
+            "Python",
+            &format!("class `{}` member", class.name),
+            python,
+        );
+
+        let mut ts_instance = BTreeMap::<String, Vec<String>>::new();
+        for reserved in ["constructor", "free", "dispose"] {
+            add_projected_name(
+                &mut ts_instance,
+                reserved,
+                format!("reserved generated lifecycle member `{reserved}`"),
+            );
+        }
+        for method in &class.methods {
+            if method.targets.contains(&Target::Typescript) {
+                add_projected_name(
+                    &mut ts_instance,
+                    method.name.to_lower_camel_case(),
+                    format!("method `{}`", method.name),
+                );
+            }
+        }
+        report_projected_collisions(
+            &mut self.errors,
+            "TypeScript",
+            &format!("class `{}` instance member", class.name),
+            ts_instance,
+        );
+
+        let mut ts_static = BTreeMap::<String, Vec<String>>::new();
+        add_projected_name(
+            &mut ts_static,
+            "prototype",
+            "reserved JavaScript class static `prototype`",
+        );
+        for static_method in &class.statics {
+            if static_method.targets.contains(&Target::Typescript) {
+                add_projected_name(
+                    &mut ts_static,
+                    static_method.name.to_lower_camel_case(),
+                    format!("static `{}`", static_method.name),
+                );
+            }
+        }
+        report_projected_collisions(
+            &mut self.errors,
+            "TypeScript",
+            &format!("class `{}` static member", class.name),
+            ts_static,
+        );
+    }
+
     fn check_newtype_cycles(&mut self, manifest: &Manifest) {
         let aliases: BTreeMap<&str, &Ty> = manifest
             .types
@@ -277,6 +491,52 @@ impl Validator {
             if alias_reaches(name, name, &aliases, &mut path) {
                 self.errors.push(format!(
                     "newtype `{name}` is recursive through transparent aliases — newtypes must resolve to a concrete non-recursive wire shape"
+                ));
+            }
+        }
+    }
+
+    fn check_structural_cycles(&mut self, manifest: &Manifest) {
+        let mut graph: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        let mut structural = BTreeSet::new();
+        for declaration in &manifest.types {
+            let mut refs = Vec::new();
+            match declaration {
+                TypeDecl::Newtype { inner, .. } => collect_refs(inner, &mut refs),
+                TypeDecl::Struct { name, fields, .. } => {
+                    structural.insert(name.clone());
+                    for field in fields {
+                        collect_refs(&field.ty, &mut refs);
+                    }
+                }
+                TypeDecl::Enum { name, variants, .. } => {
+                    structural.insert(name.clone());
+                    for variant in variants {
+                        for field in &variant.fields {
+                            collect_refs(&field.ty, &mut refs);
+                        }
+                    }
+                }
+                TypeDecl::StringEnum { .. } | TypeDecl::ErrorEnum { .. } => {}
+            }
+            graph.insert(
+                declaration.name().to_string(),
+                refs.into_iter().map(str::to_string).collect(),
+            );
+        }
+
+        let mut reported = BTreeSet::new();
+        for start in structural {
+            if reported.contains(&start) {
+                continue;
+            }
+            let mut path = vec![start.clone()];
+            let mut visiting = BTreeSet::from([start.clone()]);
+            if reference_cycle(&start, &start, &graph, &mut visiting, &mut path) {
+                reported.extend(path.iter().cloned());
+                self.errors.push(format!(
+                    "data type `{start}` participates in a recursive reference cycle `{}` — data contracts must have finite non-recursive wire shapes",
+                    path.join(" -> ")
                 ));
             }
         }
@@ -300,18 +560,16 @@ impl Validator {
                 .filter(|param| !matches!(param.ty, Ty::Slice { .. }))
                 .map(|param| param.wire_name.as_str()),
         );
-        for param in params {
-            if !matches!(param.ty, Ty::Slice { .. }) {
-                self.check_reserved_key(
-                    &format!("{ctx} parameter `{}` wire name", param.name),
-                    &param.wire_name,
-                );
-            }
-        }
     }
 
     fn check_fields(&mut self, ctx: &str, fields: &[FieldDecl]) {
         for f in fields {
+            if !f.required && !matches!(f.ty, Ty::Option { .. }) {
+                self.errors.push(format!(
+                    "{ctx} field `{}` has inconsistent required metadata — only a direct `Option<T>` field may be omitted",
+                    f.name
+                ));
+            }
             self.check(&f.ty, Pos::Field, &format!("{ctx} field `{}`", f.name));
         }
     }
@@ -322,10 +580,6 @@ impl Validator {
             fields.iter().map(|field| field.wire_name.as_str()),
         );
         for field in fields {
-            self.check_reserved_key(
-                &format!("{ctx} field `{}` wire name", field.name),
-                &field.wire_name,
-            );
             if tag == Some(field.wire_name.as_str()) {
                 self.errors.push(format!(
                     "{ctx} field `{}` uses discriminator key `{}` — tag and data fields must be distinct",
@@ -345,14 +599,6 @@ impl Validator {
         }
     }
 
-    fn check_reserved_key(&mut self, ctx: &str, value: &str) {
-        if RESERVED_WIRE_KEYS.contains(&value) {
-            self.errors.push(format!(
-                "{ctx} uses reserved envelope key `{value}`; use another Serde rename"
-            ));
-        }
-    }
-
     fn contains_attachment(&self, ty: &Ty) -> bool {
         match ty {
             Ty::Bytes | Ty::Buf { .. } => true,
@@ -366,6 +612,12 @@ impl Validator {
 
     fn check_const(&mut self, manifest: &Manifest, ty: &Ty, value: &Value, ctx: &str) {
         match ty {
+            Ty::Null => {
+                if !value.is_null() {
+                    self.errors
+                        .push(format!("{ctx} must contain the JSON null value"));
+                }
+            }
             Ty::F32 | Ty::F64 => {
                 if value.as_f64().is_none_or(|number| !number.is_finite()) {
                     self.errors.push(format!(
@@ -524,6 +776,7 @@ impl Validator {
             | Ty::F64
             | Ty::String
             | Ty::Bytes
+            | Ty::Null
             | Ty::Buf { .. }
             | Ty::Json => {}
         }
@@ -556,6 +809,34 @@ fn alias_reaches<'a>(
     false
 }
 
+fn reference_cycle(
+    start: &str,
+    current: &str,
+    graph: &BTreeMap<String, Vec<String>>,
+    visiting: &mut BTreeSet<String>,
+    path: &mut Vec<String>,
+) -> bool {
+    let Some(next_names) = graph.get(current) else {
+        return false;
+    };
+    for next in next_names {
+        if next == start {
+            path.push(start.to_string());
+            return true;
+        }
+        if !graph.contains_key(next) || !visiting.insert(next.clone()) {
+            continue;
+        }
+        path.push(next.clone());
+        if reference_cycle(start, next, graph, visiting, path) {
+            return true;
+        }
+        path.pop();
+        visiting.remove(next);
+    }
+    false
+}
+
 fn collect_refs<'a>(ty: &'a Ty, out: &mut Vec<&'a str>) {
     match ty {
         Ty::Ref { name } => out.push(name),
@@ -570,25 +851,27 @@ fn collect_refs<'a>(ty: &'a Ty, out: &mut Vec<&'a str>) {
     }
 }
 
-fn projected_names(decl: &TypeDecl) -> Vec<String> {
-    match decl {
-        TypeDecl::Newtype { name, .. }
-        | TypeDecl::Struct { name, .. }
-        | TypeDecl::StringEnum { name, .. } => vec![name.clone()],
-        TypeDecl::Enum { name, variants, .. } => std::iter::once(name.clone())
-            .chain(
-                variants
-                    .iter()
-                    .map(|variant| format!("{name}{}", variant.name)),
-            )
-            .collect(),
-        TypeDecl::ErrorEnum { name, variants, .. } => std::iter::once(name.clone())
-            .chain(
-                variants
-                    .iter()
-                    .map(|variant| format!("{name}{}", variant.name)),
-            )
-            .collect(),
+fn add_projected_name(
+    names: &mut BTreeMap<String, Vec<String>>,
+    name: impl Into<String>,
+    owner: impl Into<String>,
+) {
+    names.entry(name.into()).or_default().push(owner.into());
+}
+
+fn report_projected_collisions(
+    errors: &mut Vec<String>,
+    target: &str,
+    namespace: &str,
+    names: BTreeMap<String, Vec<String>>,
+) {
+    for (name, owners) in names {
+        if owners.len() > 1 {
+            errors.push(format!(
+                "{target} {namespace} `{name}` collides between {} — rename one of the declarations before generating bindings",
+                owners.join(" and ")
+            ));
+        }
     }
 }
 
@@ -639,15 +922,70 @@ fn ty_contains_attachment(ty: &Ty, attachment_types: &BTreeSet<String>) -> bool 
 mod tests {
     use super::*;
     use crate::emit::test_manifest::{exact_manifest, manifest};
-    use rspyts_core::ir::{Dtype, FnDecl, VariantDecl};
+    use rspyts_core::ir::{
+        ConstDecl, Dtype, ErrorVariantDecl, FnDecl, MethodDecl, StaticDecl, VariantDecl,
+    };
 
     fn base() -> Manifest {
         manifest()
     }
 
+    fn method(name: &str, targets: Vec<Target>) -> MethodDecl {
+        MethodDecl {
+            name: name.to_string(),
+            docs: String::new(),
+            mutable: false,
+            params: vec![],
+            ret: Ty::Unit,
+            err: None,
+            targets,
+        }
+    }
+
+    fn static_method(name: &str, targets: Vec<Target>) -> StaticDecl {
+        StaticDecl {
+            name: name.to_string(),
+            docs: String::new(),
+            params: vec![],
+            ret: Ty::Unit,
+            err: None,
+            returns_self: false,
+            targets,
+        }
+    }
+
     #[test]
     fn the_test_manifest_is_valid() {
         validate(&base()).expect("test manifest validates");
+    }
+
+    #[test]
+    fn exact_manifest_abi_is_supported() {
+        let manifest = base();
+        assert_eq!(manifest.abi, rspyts_core::ABI_VERSION_STR);
+        validate(&manifest).expect("current ABI manifest validates");
+    }
+
+    #[test]
+    fn every_other_manifest_abi_is_rejected() {
+        for abi in ["2.0", "2.1", "3.1", "4.0"] {
+            let mut manifest = base();
+            manifest.abi = abi.to_string();
+            let message = validate(&manifest).unwrap_err().to_string();
+            assert!(
+                message.contains(&format!("unsupported manifest ABI `{abi}`")),
+                "{message}"
+            );
+            assert!(message.contains("requires `3.0`"), "{message}");
+        }
+    }
+
+    #[test]
+    fn manifest_abi_parser_requires_numeric_major_dot_minor() {
+        for abi in ["3", "3.", ".0", "3.0.1", "v3.0", "3.x", "3.-1"] {
+            let message = validate_manifest_abi(abi).unwrap_err().to_string();
+            assert!(message.contains("not in `major.minor` form"), "{message}");
+        }
     }
 
     #[test]
@@ -769,6 +1107,72 @@ mod tests {
     }
 
     #[test]
+    fn option_recurses_and_presence_is_explicit() {
+        let mut m = base();
+        m.functions[0].params[1].ty = Ty::Option {
+            inner: Box::new(Ty::Slice { dt: Dtype::F64 }),
+        };
+        let msg = validate(&m).unwrap_err().to_string();
+        assert!(
+            msg.contains("slices are only valid as top-level parameters"),
+            "{msg}"
+        );
+
+        let mut m = base();
+        let TypeDecl::Struct { fields, .. } = &mut m.types[1] else {
+            panic!("types[1] should be the struct");
+        };
+        fields[0].ty = Ty::Option {
+            inner: Box::new(Ty::String),
+        };
+        fields[0].required = true;
+        validate(&m).expect("a required Option field accepts null but not omission");
+
+        let TypeDecl::Struct { fields, .. } = &mut m.types[1] else {
+            panic!("types[1] should be the struct");
+        };
+        fields[0].ty = Ty::String;
+        fields[0].required = false;
+        let msg = validate(&m).unwrap_err().to_string();
+        assert!(msg.contains("inconsistent required metadata"), "{msg}");
+    }
+
+    #[test]
+    fn null_is_legal_in_data_fields() {
+        let mut m = base();
+        let TypeDecl::Struct { fields, .. } = &mut m.types[1] else {
+            panic!("types[1] should be the struct");
+        };
+        fields[0].ty = Ty::Null;
+        fields[0].required = true;
+        let default = m
+            .constants
+            .iter_mut()
+            .find(|constant| constant.name == "DEFAULT_OPTIONS")
+            .unwrap();
+        default.value["minimumValue"] = Value::Null;
+        validate(&m).unwrap();
+    }
+
+    #[test]
+    fn null_constants_reject_non_null_manifest_values() {
+        let mut m = base();
+        let index = m.constants.len();
+        m.constants.push(rspyts_core::ir::ConstDecl {
+            name: "NOT_NULL".to_string(),
+            docs: String::new(),
+            origin: "test".to_string(),
+            ty: Ty::Null,
+            value: Value::Bool(false),
+        });
+        let msg = validate(&m).unwrap_err().to_string();
+        assert!(msg.contains("must contain the JSON null value"), "{msg}");
+
+        m.constants[index].value = Value::Null;
+        validate(&m).unwrap();
+    }
+
+    #[test]
     fn unknown_err_name_is_rejected() {
         let mut m = base();
         m.functions[0].err = Some("NoSuchError".into());
@@ -793,7 +1197,11 @@ mod tests {
         m.classes[0].name = "QueryOptions".into();
         let msg = validate(&m).unwrap_err().to_string();
         assert!(
-            msg.contains("`QueryOptions` collides with itself: declared as struct and class"),
+            msg.contains("Python package root export `QueryOptions` collides between struct"),
+            "{msg}"
+        );
+        assert!(
+            msg.contains("TypeScript module root export `QueryOptions` collides between struct"),
             "{msg}"
         );
     }
@@ -804,11 +1212,184 @@ mod tests {
         m.constants[0].name = "process_values".into();
         let msg = validate(&m).unwrap_err().to_string();
         assert!(
-            msg.contains(
-                "`process_values` collides with itself: declared as function and constant"
-            ),
+            msg.contains("Python package root export `process_values` collides between constant"),
             "{msg}"
         );
+        assert!(!msg.contains("TypeScript module root export `process_values`"));
+    }
+
+    #[test]
+    fn generated_error_registry_names_are_target_aware_and_include_foreign_types() {
+        let mut m = base();
+        m.types.push(TypeDecl::ErrorEnum {
+            name: "Query".into(),
+            docs: String::new(),
+            origin: "mapped-foreign-crate".into(),
+            variants: vec![ErrorVariantDecl {
+                name: "Other".into(),
+                wire_code: "other".into(),
+                docs: String::new(),
+                fields: vec![],
+            }],
+        });
+        let msg = validate(&m).unwrap_err().to_string();
+        assert!(
+            msg.contains("Python package root export `QUERY_ERROR_TYPES` collides"),
+            "{msg}"
+        );
+        assert!(msg.contains("error enum `QueryError`"), "{msg}");
+        assert!(msg.contains("error enum `Query`"), "{msg}");
+        assert!(
+            msg.contains("TypeScript module root export `QueryErrorTypes` collides"),
+            "{msg}"
+        );
+    }
+
+    #[test]
+    fn generated_error_registries_collide_with_target_root_declarations() {
+        let mut m = base();
+        m.constants.push(ConstDecl {
+            name: "QUERY_ERROR_TYPES".into(),
+            docs: String::new(),
+            origin: "test".into(),
+            ty: Ty::String,
+            value: Value::String(String::new()),
+        });
+        m.constants.push(ConstDecl {
+            name: "QueryErrorTypes".into(),
+            docs: String::new(),
+            origin: "test".into(),
+            ty: Ty::String,
+            value: Value::String(String::new()),
+        });
+        let msg = validate(&m).unwrap_err().to_string();
+        assert!(
+            msg.contains("Python package root export `QUERY_ERROR_TYPES` collides"),
+            "{msg}"
+        );
+        assert!(
+            msg.contains("TypeScript module root export `QueryErrorTypes` collides"),
+            "{msg}"
+        );
+        assert!(!msg.contains("Python package root export `QueryErrorTypes`"));
+        assert!(!msg.contains("TypeScript module root export `QUERY_ERROR_TYPES`"));
+    }
+
+    #[test]
+    fn synthesized_typescript_client_roots_collide_with_foreign_dtos() {
+        let mut m = base();
+        for name in ["DemoCrateClient", "createClient"] {
+            m.types.push(TypeDecl::Struct {
+                name: name.into(),
+                docs: String::new(),
+                origin: "mapped-foreign-crate".into(),
+                fields: vec![],
+            });
+        }
+        let msg = validate(&m).unwrap_err().to_string();
+        assert!(
+            msg.contains("TypeScript module root export `DemoCrateClient` collides"),
+            "{msg}"
+        );
+        assert!(
+            msg.contains("generated TypeScript client interface for crate `demo-crate`"),
+            "{msg}"
+        );
+        assert!(
+            msg.contains("TypeScript module root export `createClient` collides"),
+            "{msg}"
+        );
+        assert!(msg.contains("mapped-foreign-crate"), "{msg}");
+    }
+
+    #[test]
+    fn typescript_client_member_projection_collisions_are_rejected() {
+        let mut m = base();
+        m.functions.push(FnDecl {
+            name: "render__summary".into(),
+            docs: String::new(),
+            params: vec![],
+            ret: Ty::Unit,
+            err: None,
+            targets: vec![Target::Typescript],
+        });
+        let msg = validate(&m).unwrap_err().to_string();
+        assert!(
+            msg.contains("TypeScript client member `renderSummary` collides"),
+            "{msg}"
+        );
+        assert!(msg.contains("function `render_summary`"), "{msg}");
+        assert!(msg.contains("function `render__summary`"), "{msg}");
+    }
+
+    #[test]
+    fn typescript_only_functions_do_not_collide_with_root_helpers() {
+        let mut m = base();
+        m.functions.push(FnDecl {
+            name: "create_client".into(),
+            docs: String::new(),
+            params: vec![],
+            ret: Ty::Unit,
+            err: None,
+            targets: vec![Target::Typescript],
+        });
+        validate(&m).expect("a client property and module-root function use separate namespaces");
+    }
+
+    #[test]
+    fn class_runtime_members_and_host_projections_are_validated_per_target() {
+        let mut m = base();
+        let class = &mut m.classes[1];
+        class.methods.push(method("close", vec![Target::Python]));
+        class.methods.push(method("free", vec![Target::Typescript]));
+        class
+            .methods
+            .push(method("constructor", vec![Target::Typescript]));
+        class
+            .methods
+            .push(method("dispose", vec![Target::Typescript]));
+        class
+            .methods
+            .push(method("read_value", vec![Target::Typescript]));
+        class
+            .methods
+            .push(method("read__value", vec![Target::Typescript]));
+        class
+            .statics
+            .push(static_method("handle", vec![Target::Python]));
+        class
+            .statics
+            .push(static_method("prototype", vec![Target::Typescript]));
+
+        let msg = validate(&m).unwrap_err().to_string();
+        for expected in [
+            "Python class `RunningStats` member `close` collides",
+            "Python class `RunningStats` member `handle` collides",
+            "TypeScript class `RunningStats` instance member `constructor` collides",
+            "TypeScript class `RunningStats` instance member `dispose` collides",
+            "TypeScript class `RunningStats` instance member `free` collides",
+            "TypeScript class `RunningStats` instance member `readValue` collides",
+            "TypeScript class `RunningStats` static member `prototype` collides",
+        ] {
+            assert!(msg.contains(expected), "missing `{expected}` in:\n{msg}");
+        }
+    }
+
+    #[test]
+    fn lifecycle_names_remain_legal_when_scoped_to_the_safe_host() {
+        let mut m = base();
+        let class = &mut m.classes[1];
+        class
+            .methods
+            .push(method("close", vec![Target::Typescript]));
+        class.methods.push(method("free", vec![Target::Python]));
+        class
+            .methods
+            .push(method("constructor", vec![Target::Python]));
+        class
+            .methods
+            .push(method("__init__", vec![Target::Typescript]));
+        validate(&m).expect("target-scoped names that do not collide stay valid");
     }
 
     #[test]
@@ -828,7 +1409,9 @@ mod tests {
     #[test]
     fn attachments_are_rejected_in_constants_and_error_data() {
         let mut m = base();
-        m.constants[0].ty = Ty::Bytes;
+        m.constants[0].ty = Ty::Option {
+            inner: Box::new(Ty::Bytes),
+        };
         let variants = m
             .types
             .iter_mut()
@@ -842,7 +1425,9 @@ mod tests {
             .find(|variant| !variant.fields.is_empty())
             .expect("error enum has a data variant")
             .fields[0]
-            .ty = Ty::Buf { dt: Dtype::U8 };
+            .ty = Ty::Option {
+            inner: Box::new(Ty::Buf { dt: Dtype::U8 }),
+        };
         let msg = validate(&m).unwrap_err().to_string();
         assert!(msg.contains("constants have no attachment tail"), "{msg}");
         assert!(
@@ -852,12 +1437,11 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_and_reserved_wire_names_are_rejected() {
+    fn duplicate_wire_names_are_rejected() {
         let mut m = base();
         if let TypeDecl::Struct { fields, .. } = &mut m.types[1] {
             fields[0].wire_name = "same".into();
             fields[1].wire_name = "same".into();
-            fields[2].wire_name = "__rspyts_json__".into();
         } else {
             panic!("types[1] should be the struct");
         }
@@ -865,11 +1449,20 @@ mod tests {
         m.functions[0].params[2].wire_name = "sameParam".into();
         let msg = validate(&m).unwrap_err().to_string();
         assert!(msg.contains("duplicate value `same`"), "{msg}");
-        assert!(
-            msg.contains("reserved envelope key `__rspyts_json__`"),
-            "{msg}"
-        );
         assert!(msg.contains("duplicate value `sameParam`"), "{msg}");
+    }
+
+    #[test]
+    fn marker_shaped_wire_names_are_legal() {
+        let mut m = base();
+        if let TypeDecl::Struct { fields, .. } = &mut m.types[1] {
+            fields[0].wire_name = "__proto__".into();
+            fields[1].wire_name = "__rspyts_buf__".into();
+            fields[2].wire_name = "__rspyts_json__".into();
+        } else {
+            panic!("types[1] should be the struct");
+        }
+        validate(&m).expect("schema-directed codecs make marker-shaped keys unambiguous");
     }
 
     #[test]
@@ -911,9 +1504,10 @@ mod tests {
         );
         assert!(msg.contains("uses discriminator key"), "{msg}");
         assert!(
-            msg.contains("generated type name `EventAccepted` collides"),
+            msg.contains("Python package root export `EventAccepted` collides"),
             "{msg}"
         );
+        assert!(!msg.contains("TypeScript module root export `EventAccepted`"));
     }
 
     #[test]
@@ -1031,6 +1625,35 @@ mod tests {
         let msg = validate(&m).unwrap_err().to_string();
         assert!(
             msg.contains("recursive through transparent aliases"),
+            "{msg}"
+        );
+    }
+
+    #[test]
+    fn recursive_data_contracts_are_rejected() {
+        let mut m = base();
+        m.types.push(TypeDecl::Struct {
+            name: "Node".into(),
+            docs: String::new(),
+            origin: "test".into(),
+            fields: vec![FieldDecl {
+                name: "children".into(),
+                wire_name: "children".into(),
+                docs: String::new(),
+                ty: Ty::List {
+                    inner: Box::new(Ty::Ref {
+                        name: "Node".into(),
+                    }),
+                },
+                required: true,
+            }],
+        });
+        m.functions[0].ret = Ty::Ref {
+            name: "Node".into(),
+        };
+        let msg = validate(&m).unwrap_err().to_string();
+        assert!(
+            msg.contains("recursive reference cycle `Node -> Node`"),
             "{msg}"
         );
     }

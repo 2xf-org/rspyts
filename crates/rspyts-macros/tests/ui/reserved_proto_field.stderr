@@ -1,0 +1,6 @@
+error: struct field wire name `__proto__` is unsafe for JavaScript object projection
+ --> tests/ui/reserved_proto_field.rs:7:5
+  |
+7 | /     #[serde(rename = "__proto__")]
+8 | |     pub value: String,
+  | |_____________________^

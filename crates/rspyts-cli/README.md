@@ -1,6 +1,7 @@
 # rspyts-cli
 
-`rspyts-cli` provides the `rspyts` code generator for crates built with the [rspyts](https://crates.io/crates/rspyts) facade. It builds a bridged Rust `cdylib`, reads its embedded manifest, validates the bridge surface, and emits Python, TypeScript, and JSON Schema files.
+`rspyts-cli` generates Python, TypeScript, and JSON Schema contracts from a
+Rust `cdylib` built with [rspyts](https://crates.io/crates/rspyts).
 
 ## Install
 
@@ -12,44 +13,60 @@ cargo install rspyts-cli
 
 ```text
 rspyts init [--dir <path>]
-rspyts generate [--config <path>] [build overrides]
-rspyts check [--config <path>] [build overrides]
-rspyts build [--config <path>] [build overrides] [--target <triple>...]
-rspyts manifest [--config <path>] [build overrides]
-rspyts diff [--fail-on=breaking|any] <old.json> <new.json>
+rspyts generate [--config <path>] [cargo options]
+rspyts check [--config <path>] [cargo options]
+rspyts manifest [--config <path>] [cargo options]
+rspyts build [--config <path>] [cargo options] [--target host|<triple>...] [--out-dir <path>] [--output-format text|json]
 ```
 
-- `init` writes a commented starter `rspyts.toml` without overwriting an existing file.
-- `generate` builds the configured crate and replaces enabled generated outputs.
-- `check` runs the same pipeline without writing and exits nonzero when committed output has drifted.
-- `build` compiles the host plus configured targets and stages stable artifacts
-  beneath Cargo's target directory at
-  `rspyts/<target>/<profile>/<platform filename>`.
-- `manifest` builds the host module and writes its complete, validated,
-  pretty-printed manifest to stdout. Build diagnostics stay on stderr, so
-  redirecting stdout produces a clean snapshot.
-- `diff` compares two complete manifest snapshots. It reports removals and
-  every non-documentation change inside an existing declaration as breaking;
-  only whole new top-level declarations are additive. Documentation and crate
-  version changes are informational. Output is deterministic and ABI changes
-  are reported first.
+Each command has one responsibility:
 
-All relative paths resolve from the configuration file. Unknown configuration keys are rejected. A minimal configuration is:
+- `generate` compiles and validates the host bridge, then writes generated
+  source.
+- `check` compiles and validates the same bridge, compares the expected source
+  with the filesystem, and never writes generated source or staged libraries.
+- `manifest` prints the complete validated manifest and never stages a
+  library. Cargo diagnostics remain on stderr, so redirected stdout is clean.
+- `build` is the only command that stages compiled artifacts. It does not
+  generate source or validate generated-source drift.
+- `init` writes a starter `rspyts.toml` without overwriting an existing file.
+
+`build` selects the host when no `--target` is passed. Once `--target` is
+present, it selects exactly the listed values; use the literal `host` to
+include the host alongside explicit Rust target triples. Values may be
+repeated or comma-separated:
+
+```sh
+rspyts build                                      # host only
+rspyts build --release --target wasm32-unknown-unknown
+rspyts build --release --target host,wasm32-unknown-unknown
+```
+
+A host build is staged in `<python.out>/lib` when Python output is configured,
+or in Cargo's `target/rspyts/native/<profile>` directory otherwise. Explicit
+targets are staged in `target/rspyts/<target>/<profile>`. `--out-dir` puts a
+single selected artifact directly in the specified directory, which is useful
+for wheel and archive assembly without mutating a source package:
+
+```sh
+rspyts build --release --locked --out-dir "$WHEEL_INPUT" --output-format json
+```
+
+Staging uses an atomic replacement, so readers do not observe partial files.
+
+## Configuration
+
+Paths resolve from the configuration file. A section exists when its output is
+wanted and is omitted when it is not. Unknown keys are rejected.
 
 ```toml
 [crate]
 path = "rust"
-
-[build]
-features = []
+features = ["bridge"]
 no-default-features = false
-profile = "dev"
-targets = ["wasm32-unknown-unknown"]
-locked = true
 
 [python]
-out = "python/src/example/generated"
-library_search = ["../../../../../target/debug"]
+out = "python/src/example/_generated"
 
 [typescript]
 out = "typescript/src/generated"
@@ -58,39 +75,56 @@ out = "typescript/src/generated"
 out = "schema"
 ```
 
-`generate` and `check` use the configured features, default-feature policy,
-profile, and lockfile policy when compiling the host cdylib. Configured
-targets are intentionally ignored by those commands because only a native
-library can be loaded to read the manifest; a warning points to `rspyts
-build`. The build command stages the native artifact and every configured
-target. For the default `dev` profile, for example:
+Generated Python always looks for its native library in the fixed `lib`
+directory. Cross-crate type imports remain explicit language mappings:
 
-```text
-target/rspyts/x86_64-unknown-linux-gnu/debug/libexample.so
-target/rspyts/wasm32-unknown-unknown/debug/example.wasm
+```toml
+[python.imports]
+"shared-types" = "shared_types.generated"
+
+[typescript.imports]
+"shared-types" = "@scope/shared-types/generated"
 ```
 
-CLI overrides replace config values: `--features`, `--no-features`,
-`--no-default-features`/`--default-features`, `--profile`/`--release`, and
-`--locked`/`--unlocked`. On `build`, repeated or comma-separated `--target`
-replaces `targets`; `--no-targets` stages only the host. Dev, release, and
-custom profiles use separate staging directories and never overwrite one
-another.
+The positive cargo overrides are `--features`, `--no-default-features`,
+`--release`, and `--locked`. Crate features are contract inputs and therefore
+live in `[crate]`; build profile and lock enforcement are invocation choices.
+Commands use Cargo's development profile without lock enforcement unless
+`--release` or `--locked` is passed.
 
-Here, reproducible means locked dependency resolution plus explicit
-features, profile, and target inputs with stable output paths. Compiler and
-linker versions still determine bytes; the command does not claim
-bit-for-bit reproducible compilation across toolchains.
+## Machine-readable builds
 
-`diff` exits `1` for breaking changes and `0` otherwise. Pass
-`--fail-on=any` when CI should also reject additive or informational changes.
-Unreadable, malformed, or semantically invalid manifest inputs exit `3`.
+`build --output-format json` prints one versioned report to stdout. Progress
+and Cargo diagnostics stay on stderr. Format version 1 contains resolved Cargo
+inputs, the configured Python output when present, and every staged artifact:
 
-Exit codes are stable: `0` success, `1` generated drift or a selected diff
-policy failure, `2` usage or configuration error, and `3` build, load, input,
-validation, or write failure. Use `rspyts check` in CI after committed
-generated files have been produced with `rspyts generate`.
+```json
+{
+  "formatVersion": 1,
+  "crate": { "name": "example", "version": "1.0.0" },
+  "build": {
+    "features": ["bridge"],
+    "noDefaultFeatures": false,
+    "profile": "release",
+    "locked": true
+  },
+  "python": {
+    "out": "/workspace/python/src/example/_generated"
+  },
+  "artifacts": [
+    {
+      "kind": "native",
+      "target": "x86_64-unknown-linux-gnu",
+      "path": "/workspace/python/src/example/_generated/lib/libexample.so"
+    }
+  ]
+}
+```
 
-See the complete [code generation specification](https://github.com/2xf-org/rspyts/blob/main/docs/design/codegen.md) and [quickstart](https://github.com/2xf-org/rspyts/blob/main/docs/introduction/quickstart.md).
+Consumers should reject unsupported report versions instead of guessing at
+new fields.
+
+Exit codes are `0` for success, `1` for generated drift, `2` for usage or
+configuration errors, and `3` for build, load, validation, or write failures.
 
 Licensed under MIT.

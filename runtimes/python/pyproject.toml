@@ -1,6 +1,6 @@
 [project]
 name = "rspyts"
-version = "0.2.0"
+version = "0.3.0"
 description = "Python runtime for rspyts: pydantic contracts and a ctypes loader for Rust cdylibs bridged with the rspyts ABI."
 readme = "README.md"
 license = "MIT"
@@ -18,14 +18,25 @@ dependencies = [
     "numpy>=1.24",
 ]
 
+[project.optional-dependencies]
+hatch = [
+    "hatchling>=1.27,<2.0",
+    "packaging>=24",
+    "pefile>=2023.2.7; sys_platform == 'win32'",
+    "pyelftools>=0.31; sys_platform == 'linux'",
+]
+
+[project.entry-points.hatch]
+rspyts = "rspyts.hatch"
+
 [project.urls]
 Homepage = "https://github.com/2xf-org/rspyts"
 Repository = "https://github.com/2xf-org/rspyts"
 Issues = "https://github.com/2xf-org/rspyts/issues"
 
 [build-system]
-requires = ["hatchling"]
-build-backend = "hatchling.build"
+requires = ["uv_build>=0.11.28,<0.12"]
+build-backend = "uv_build"
 
 [dependency-groups]
 dev = [
@@ -50,8 +61,6 @@ select = ["E", "F", "I", "N", "UP", "RUF"]
 paths = ["src", "tests"]
 ignore_names = ["model_config", "isolated_registry", "clean_env", "demo__*"]
 
-[tool.hatch.build.targets.wheel]
-packages = ["src/rspyts"]
-
-[tool.hatch.build.targets.sdist]
-exclude = ["/.gitignore", "/uv.lock"]
+[tool.uv.build-backend]
+source-include = ["tests/**"]
+source-exclude = ["/.gitignore", "/uv.lock"]

@@ -13,10 +13,7 @@ __all__ = [
     "RspytsPanicError",
     "StaleHandleError",
     "raise_bridge_error",
-    "register_error",
 ]
-
-REGISTRY: dict[str, type[BridgeError]] = {}
 
 
 class BridgeError(Exception):
@@ -66,34 +63,9 @@ class StaleHandleError(BridgeError):
 BridgeErrorRegistry: typing.TypeAlias = collections.abc.Mapping[str, type[BridgeError]]
 
 
-def register_error(code: str, cls: type[BridgeError]) -> None:
-    """
-    Map an error ``code`` to the exception class raised for it.
-
-    Notes:
-        This process-wide compatibility hook is useful for handwritten
-        integrations. Generated clients use call-scoped maps so unrelated
-        packages may safely reuse the same error code. Later global
-        registrations for the same code win.
-
-    Args:
-        code: The wire error code.
-        cls: The exception class to raise for that code.
-
-    Raises:
-        TypeError: If ``cls`` is not a :class:`BridgeError` subclass.
-    """
-    if not (isinstance(cls, type) and issubclass(cls, BridgeError)):
-        raise TypeError(f"register_error requires a BridgeError subclass, got {cls!r}")
-    REGISTRY[code] = cls
-
-
-register_error("staleHandle", StaleHandleError)
-
-
 def raise_bridge_error(
     status: int,
-    payload: dict[str, typing.Any],
+    payload: object,
     error_types: BridgeErrorRegistry | None = None,
 ) -> typing.NoReturn:
     """
@@ -107,7 +79,31 @@ def raise_bridge_error(
         BridgeError: The registered subclass for ``payload["code"]``
             (status 1), or :class:`RspytsPanicError` (status 2).
     """
+    if status not in (1, 2):
+        raise ValueError(f"rspyts: cannot raise a bridge error for response status {status}")
+    if type(payload) is not dict:
+        raise ValueError(f"rspyts: error payload must be a JSON object, got {type(payload).__name__}")
+    fields = typing.cast(dict[object, object], payload)
+    allowed = {"code", "message", "data"}
+    if "code" not in fields or "message" not in fields:
+        raise ValueError("rspyts: error payload requires exact 'code' and 'message' fields")
+    unknown = set(fields) - allowed
+    if unknown:
+        raise ValueError(f"rspyts: error payload has unexpected fields: {sorted(unknown)!r}")
+    code = fields["code"]
+    message = fields["message"]
+    if type(code) is not str or not code:
+        raise ValueError("rspyts: error payload 'code' must be a non-empty JSON string")
+    if type(message) is not str:
+        raise ValueError("rspyts: error payload 'message' must be a JSON string")
+    data = fields.get("data")
     if status == 2:
-        raise RspytsPanicError(payload["message"], code=payload["code"], data=payload.get("data"))
-    cls = (error_types or {}).get(payload["code"]) or REGISTRY.get(payload["code"], BridgeError)
-    raise cls(payload["message"], code=payload["code"], data=payload.get("data"))
+        if code != "panic":
+            raise ValueError(f"rspyts: panic payload must use code 'panic', got {code!r}")
+        raise RspytsPanicError(message, code=code, data=data)
+    cls = (error_types or {}).get(code)
+    if cls is None:
+        cls = StaleHandleError if code == "staleHandle" else BridgeError
+    if not (isinstance(cls, type) and issubclass(cls, BridgeError)):
+        raise TypeError(f"rspyts: error registry entry for {code!r} is not a BridgeError subclass")
+    raise cls(message, code=code, data=data)

@@ -1,14 +1,17 @@
 //! The TypeScript emitter (codegen.md §5, §8).
 //!
-//! Produces `client.ts`, `constants.ts`, `errors.ts`, `index.ts`, and
-//! `types.ts`. Output targets ES2022, 2-space indent, semicolons,
+//! Produces `client.ts`, private `codecs.ts`, `constants.ts`, `errors.ts`,
+//! `index.ts`, and `types.ts`. Output targets ES2022, 2-space indent, semicolons,
 //! double quotes, `strict` tsc. The surface is camelCase throughout —
 //! identical to the wire names, so values need no key mapping at
 //! runtime. Types whose origin crate has an entry in
 //! `[typescript.imports]` are imported from that module instead of
 //! re-emitted (codegen.md §9).
 
-use super::util::{collect_refs, pascal, ts_doc, ts_doc_from_lines, ts_header, ts_type};
+use super::util::{
+    collect_refs, int_bounds, pascal, ts_doc, ts_doc_from_lines, ts_error_registry_name, ts_header,
+    ts_type, ts_typed_array,
+};
 use heck::ToLowerCamelCase;
 use rspyts_core::ir::{
     ClassDecl, ConstDecl, FieldDecl, FnDecl, Manifest, ParamDecl, StaticDecl, Target, Ty, TypeDecl,
@@ -23,6 +26,7 @@ pub fn emit(
 ) -> Vec<(&'static str, String)> {
     vec![
         ("client.ts", client_ts(m, hash)),
+        ("codecs.ts", codecs_ts(m, hash)),
         ("constants.ts", constants_ts(m, hash)),
         ("errors.ts", errors_ts(m, hash, imports)),
         ("index.ts", index_ts(hash)),
@@ -41,11 +45,6 @@ fn on_ts(targets: &[Target]) -> bool {
     targets.contains(&Target::Typescript)
 }
 
-fn ts_error_registry_name(name: &str) -> String {
-    let base = name.strip_suffix("Error").unwrap_or(name);
-    format!("{base}ErrorTypes")
-}
-
 // ----------------------------------------------------------------- types.ts
 
 fn types_ts(m: &Manifest, hash: &str, imports: &BTreeMap<String, String>) -> String {
@@ -53,7 +52,7 @@ fn types_ts(m: &Manifest, hash: &str, imports: &BTreeMap<String, String>) -> Str
     let mut any = false;
 
     // Imported foreign data types: import for local use, re-export so
-    // `index.ts`'s `export * from "./types"` surfaces them.
+    // `index.ts`'s `export * from "./types.js"` surfaces them.
     let mut by_module: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
     for decl in &m.types {
         if matches!(decl, TypeDecl::ErrorEnum { .. }) || !is_imported(m, decl, imports) {
@@ -72,7 +71,7 @@ fn types_ts(m: &Manifest, hash: &str, imports: &BTreeMap<String, String>) -> Str
             out.push_str(&format!(
                 "import type {{ {} }} from {};\n",
                 names.join(", "),
-                ts_string(module)
+                ts_module_specifier(module)
             ));
             all_names.extend(names);
         }
@@ -104,7 +103,7 @@ fn types_ts(m: &Manifest, hash: &str, imports: &BTreeMap<String, String>) -> Str
                     out.push_str(&ts_doc(&f.docs, "  "));
                     out.push_str(&format!(
                         "  {};\n",
-                        ts_field(&f.wire_name, &f.ty, f.optional)
+                        ts_field(&f.wire_name, &f.ty, f.required)
                     ));
                 }
                 out.push_str("}\n");
@@ -137,7 +136,7 @@ fn types_ts(m: &Manifest, hash: &str, imports: &BTreeMap<String, String>) -> Str
                     members.extend(
                         v.fields
                             .iter()
-                            .map(|f| ts_field(&f.wire_name, &f.ty, f.optional)),
+                            .map(|f| ts_field(&f.wire_name, &f.ty, f.required)),
                     );
                     out.push_str(&format!("\n  | {{ {} }}", members.join("; ")));
                 }
@@ -150,16 +149,16 @@ fn types_ts(m: &Manifest, hash: &str, imports: &BTreeMap<String, String>) -> Str
     if !any {
         out.push_str("\nexport {};\n");
     }
-    out
+    wrap_ts_source(&out, 120)
 }
 
 /// `name: T`, or `name?: Inner | null` for optional fields.
-fn ts_field(wire_name: &str, ty: &Ty, optional: bool) -> String {
+fn ts_field(wire_name: &str, ty: &Ty, required: bool) -> String {
     let name = ts_prop(wire_name);
-    match ty {
-        Ty::Option { inner } => format!("{name}?: {} | null", ts_type(inner)),
-        _ if optional => format!("{name}?: {}", ts_type(ty)),
-        _ => format!("{name}: {}", ts_type(ty)),
+    if required {
+        format!("{name}: {}", ts_type(ty))
+    } else {
+        format!("{name}?: {}", ts_type(ty))
     }
 }
 
@@ -167,9 +166,43 @@ fn ts_string(value: &str) -> String {
     serde_json::to_string(value).expect("serializing a string cannot fail")
 }
 
+/// Render an import-map target as an ESM module specifier. Relative targets
+/// name generated TypeScript modules, so their runtime-facing specifier must
+/// point at the emitted JavaScript file. Bare/package specifiers stay exact.
+fn ts_module_specifier(value: &str) -> String {
+    let value = if value.starts_with("./") || value.starts_with("../") {
+        if let Some(stem) = value.strip_suffix(".ts") {
+            format!("{stem}.js")
+        } else if value.ends_with(".js")
+            || value
+                .rsplit('/')
+                .next()
+                .is_some_and(|part| part.contains('.'))
+        {
+            value.to_string()
+        } else {
+            format!("{value}.js")
+        }
+    } else {
+        value.to_string()
+    };
+    ts_string(&value)
+}
+
 fn ts_prop(value: &str) -> String {
+    if value == "__proto__" {
+        return format!("[{}]", ts_string(value));
+    }
     if is_ts_ident(value) {
         value.to_string()
+    } else {
+        ts_string(value)
+    }
+}
+
+fn ts_quoted_prop(value: &str) -> String {
+    if value == "__proto__" {
+        format!("[{}]", ts_string(value))
     } else {
         ts_string(value)
     }
@@ -191,14 +224,14 @@ fn constants_ts(m: &Manifest, hash: &str) -> String {
     let mut out = ts_header(hash);
     if m.constants.is_empty() {
         out.push_str("\nexport {};\n");
-        return out;
+        return wrap_ts_source(&out, 120);
     }
     for c in &m.constants {
         out.push('\n');
         out.push_str(&ts_doc(&c.docs, ""));
         out.push_str(&const_line(m, c));
     }
-    out
+    wrap_ts_source(&out, 120)
 }
 
 /// One `export const NAME = <literal> as const;` line. `as const` is
@@ -214,10 +247,7 @@ fn const_line(m: &Manifest, c: &ConstDecl) -> String {
 
 fn ts_const_expr(m: &Manifest, ty: &Ty, value: &serde_json::Value) -> String {
     match ty {
-        Ty::Json => value
-            .get("__rspyts_json__")
-            .map(ts_json)
-            .unwrap_or_else(|| ts_json(value)),
+        Ty::Json => ts_json(value),
         Ty::I64 | Ty::U64 => value
             .as_str()
             .map(|value| format!("{value}n"))
@@ -248,11 +278,7 @@ fn ts_const_expr(m: &Manifest, ty: &Ty, value: &serde_json::Value) -> String {
                 let rendered = entries
                     .iter()
                     .map(|(key, value)| {
-                        let key = if is_ts_ident(key) {
-                            key.clone()
-                        } else {
-                            serde_json::to_string(key).expect("key serializes")
-                        };
+                        let key = ts_prop(key);
                         format!("{key}: {}", ts_const_expr(m, value_ty, value))
                     })
                     .collect::<Vec<_>>();
@@ -303,11 +329,7 @@ fn ts_const_object(
     let rendered = entries
         .iter()
         .map(|(key, value)| {
-            let key_expr = if is_ts_ident(key) {
-                key.clone()
-            } else {
-                serde_json::to_string(key).expect("key serializes")
-            };
+            let key_expr = ts_prop(key);
             let rendered = if tag == Some(key.as_str()) {
                 ts_json(value)
             } else if let Some(field) = fields.iter().find(|field| field.wire_name == *key) {
@@ -340,11 +362,7 @@ fn ts_json(value: &serde_json::Value) -> String {
             let rendered: Vec<String> = entries
                 .iter()
                 .map(|(k, v)| {
-                    let key = if is_ts_ident(k) {
-                        k.clone()
-                    } else {
-                        serde_json::to_string(k).expect("key serializes")
-                    };
+                    let key = ts_prop(k);
                     format!("{key}: {}", ts_json(v))
                 })
                 .collect();
@@ -381,56 +399,20 @@ fn errors_ts(m: &Manifest, hash: &str, imports: &BTreeMap<String, String>) -> St
     let mut out = ts_header(hash);
     if local.is_empty() && foreign.is_empty() {
         out.push_str("\nexport {};\n");
-        return out;
+        return wrap_ts_source(&out, 120);
     }
 
     out.push('\n');
     if !local.is_empty() {
-        let mut runtime = vec!["type BridgeErrorRegistry", "RspytsError"];
-        if local.iter().any(|(_, _, variants)| {
-            variants.iter().any(|variant| {
-                variant
-                    .fields
-                    .iter()
-                    .any(|field| contains_kind(m, &field.ty, ConversionKind::Float))
-            })
-        }) {
-            runtime.push("floatFromWire");
+        out.push_str(
+            "import { type BridgeErrorRegistry, RspytsError, wireResponse } from \"rspyts/internal/abi3\";\n",
+        );
+        if local
+            .iter()
+            .any(|(_, _, variants)| variants.iter().any(|variant| !variant.fields.is_empty()))
+        {
+            out.push_str("import * as codecs from \"./codecs.js\";\n");
         }
-        if local.iter().any(|(_, _, variants)| {
-            variants.iter().any(|variant| {
-                variant
-                    .fields
-                    .iter()
-                    .any(|field| contains_kind(m, &field.ty, ConversionKind::Json))
-            })
-        }) {
-            runtime.push("jsonFromWire");
-        }
-        if local.iter().any(|(_, _, variants)| {
-            variants.iter().any(|variant| {
-                variant
-                    .fields
-                    .iter()
-                    .any(|field| contains_kind(m, &field.ty, ConversionKind::I64))
-            })
-        }) {
-            runtime.push("i64FromWire");
-        }
-        if local.iter().any(|(_, _, variants)| {
-            variants.iter().any(|variant| {
-                variant
-                    .fields
-                    .iter()
-                    .any(|field| contains_kind(m, &field.ty, ConversionKind::U64))
-            })
-        }) {
-            runtime.push("u64FromWire");
-        }
-        out.push_str(&format!(
-            "import {{ {} }} from \"rspyts\";\n",
-            runtime.join(", ")
-        ));
     }
     // Value imports include the foreign error classes and their scoped map.
     if !foreign.is_empty() {
@@ -440,7 +422,7 @@ fn errors_ts(m: &Manifest, hash: &str, imports: &BTreeMap<String, String>) -> St
             out.push_str(&format!(
                 "import {{ {} }} from {};\n",
                 names.join(", "),
-                ts_string(module)
+                ts_module_specifier(module)
             ));
             all_names.extend(names);
         }
@@ -473,7 +455,7 @@ fn errors_ts(m: &Manifest, hash: &str, imports: &BTreeMap<String, String>) -> St
             out.push_str(&ts_doc_from_lines(&lines, ""));
             // The registry contract (BridgeErrorConstructor) bakes the code
             // into the subclass: throw sites pass only (message, data).
-            let data = ts_error_data_expr(m, &v.fields);
+            let data = ts_error_data_expr(name, &v.name, &v.fields);
             out.push_str(&format!(
                 "export class {name}{} extends {name} {{\n  constructor(message: string, data?: unknown) {{\n    super(message, {}, {data});\n  }}\n}}\n",
                 v.name,
@@ -490,32 +472,397 @@ fn errors_ts(m: &Manifest, hash: &str, imports: &BTreeMap<String, String>) -> St
         for v in *variants {
             out.push_str(&format!(
                 "  {}: {name}{},\n",
-                ts_string(&v.wire_code),
+                ts_quoted_prop(&v.wire_code),
                 v.name
             ));
         }
         out.push_str("} as const satisfies BridgeErrorRegistry;\n");
     }
-    out
+    wrap_ts_source(&out, 120)
 }
 
-fn ts_error_data_expr(m: &Manifest, fields: &[FieldDecl]) -> String {
-    let converted = ts_host_converted_fields("value", fields, m, 0, HostContext::Error);
-    if converted.is_empty() {
+fn ts_error_data_expr(error: &str, variant: &str, fields: &[FieldDecl]) -> String {
+    if fields.is_empty() {
         return "data".to_string();
     }
-    let wire = format!(
-        "{{ {} }}",
-        fields
-            .iter()
-            .map(|field| ts_wire_field(field, m))
-            .collect::<Vec<_>>()
-            .join("; ")
-    );
     format!(
-        "data === undefined ? undefined : ((value: {wire}) => ({{ ...value, {} }}))(data as {wire})",
-        converted.join(", ")
+        "data === undefined ? undefined : codecs.decode{error}{variant}Data(wireResponse(data))"
     )
+}
+
+// ---------------------------------------------------------------- codecs.ts
+
+/// Generator/runtime plumbing. This module is imported by `client.ts` and
+/// `errors.ts`, but deliberately never re-exported by `index.ts`.
+fn codecs_ts(m: &Manifest, hash: &str) -> String {
+    let (encode_names, decode_names) = codec_type_requirements(m);
+    let mut body = String::new();
+
+    for name in &encode_names {
+        let declaration = super::util::find_type(m, name).expect("validated type reference");
+        body.push_str(&named_encoder(m, declaration));
+    }
+    for name in &decode_names {
+        let declaration = super::util::find_type(m, name).expect("validated type reference");
+        body.push_str(&named_decoder(m, declaration));
+    }
+    for declaration in &m.types {
+        let TypeDecl::ErrorEnum { name, variants, .. } = declaration else {
+            continue;
+        };
+        for variant in variants.iter().filter(|variant| !variant.fields.is_empty()) {
+            body.push_str(&error_data_decoder(m, name, &variant.name, &variant.fields));
+        }
+    }
+    for function in m
+        .functions
+        .iter()
+        .filter(|function| on_ts(&function.targets))
+    {
+        body.push_str(&args_encoder(m, &fn_args_codec(function), &function.params));
+        body.push_str(&result_decoder(
+            m,
+            &fn_result_codec(function),
+            &function.ret,
+        ));
+    }
+    for class in &m.classes {
+        if let Some(constructor) = &class.constructor {
+            body.push_str(&args_encoder(
+                m,
+                &ctor_args_codec(class),
+                &constructor.params,
+            ));
+        }
+        for method in class.methods.iter().filter(|method| on_ts(&method.targets)) {
+            body.push_str(&args_encoder(
+                m,
+                &method_args_codec(class, &method.name),
+                &method.params,
+            ));
+            body.push_str(&result_decoder(
+                m,
+                &method_result_codec(class, &method.name),
+                &method.ret,
+            ));
+        }
+        for method in class.statics.iter().filter(|method| on_ts(&method.targets)) {
+            body.push_str(&args_encoder(
+                m,
+                &static_args_codec(class, &method.name),
+                &method.params,
+            ));
+            if !method.returns_self {
+                body.push_str(&result_decoder(
+                    m,
+                    &static_result_codec(class, &method.name),
+                    &method.ret,
+                ));
+            }
+        }
+    }
+
+    let mut out = ts_header(hash);
+    if body.is_empty() {
+        out.push_str("\nexport {};\n");
+        return wrap_ts_source(&out, 120);
+    }
+
+    let runtime_helpers = [
+        "boolFromWire",
+        "boundedIntFromWire",
+        "bufferFromWire",
+        "bytesFromWire",
+        "enumFromWire",
+        "f32FromWire",
+        "floatFromWire",
+        "i64FromWire",
+        "i64ToWire",
+        "jsonFromWire",
+        "jsonToWire",
+        "listFromWire",
+        "mapFromWire",
+        "nullFromWire",
+        "objectFromWire",
+        "stringEnumFromWire",
+        "stringFromWire",
+        "tupleFromWire",
+        "type WireResponse",
+        "u64FromWire",
+        "u64ToWire",
+        "wireBuffer",
+    ];
+    let used = runtime_helpers
+        .into_iter()
+        .filter(|helper| body.contains(helper.trim_start_matches("type ")))
+        .collect::<Vec<_>>();
+    out.push('\n');
+    if !used.is_empty() {
+        out.push_str(&format!(
+            "import {{ {} }} from \"rspyts/internal/abi3\";\n",
+            used.join(", ")
+        ));
+    }
+    let mut types = encode_names;
+    types.extend(decode_names);
+    if !types.is_empty() {
+        out.push_str(&format!(
+            "import type {{ {} }} from \"./types.js\";\n",
+            types.into_iter().collect::<Vec<_>>().join(", ")
+        ));
+    }
+    out.push_str(&body);
+    wrap_ts_source(&out, 120)
+}
+
+fn codec_type_requirements(m: &Manifest) -> (BTreeSet<String>, BTreeSet<String>) {
+    let mut encode = BTreeSet::new();
+    let mut decode = BTreeSet::new();
+    for function in m
+        .functions
+        .iter()
+        .filter(|function| on_ts(&function.targets))
+    {
+        for parameter in &function.params {
+            collect_codec_refs(m, &parameter.ty, &mut encode);
+        }
+        collect_codec_refs(m, &function.ret, &mut decode);
+    }
+    for class in &m.classes {
+        if let Some(constructor) = &class.constructor {
+            for parameter in &constructor.params {
+                collect_codec_refs(m, &parameter.ty, &mut encode);
+            }
+        }
+        for method in class.methods.iter().filter(|method| on_ts(&method.targets)) {
+            for parameter in &method.params {
+                collect_codec_refs(m, &parameter.ty, &mut encode);
+            }
+            collect_codec_refs(m, &method.ret, &mut decode);
+        }
+        for method in class.statics.iter().filter(|method| on_ts(&method.targets)) {
+            for parameter in &method.params {
+                collect_codec_refs(m, &parameter.ty, &mut encode);
+            }
+            if !method.returns_self {
+                collect_codec_refs(m, &method.ret, &mut decode);
+            }
+        }
+    }
+    for declaration in &m.types {
+        if let TypeDecl::ErrorEnum { variants, .. } = declaration {
+            for variant in variants {
+                for field in &variant.fields {
+                    collect_codec_refs(m, &field.ty, &mut decode);
+                }
+            }
+        }
+    }
+    (encode, decode)
+}
+
+fn collect_codec_refs(m: &Manifest, ty: &Ty, names: &mut BTreeSet<String>) {
+    match ty {
+        Ty::Ref { name } => {
+            if !names.insert(name.clone()) {
+                return;
+            }
+            let Some(declaration) = super::util::find_type(m, name) else {
+                return;
+            };
+            match declaration {
+                TypeDecl::Newtype { inner, .. } => collect_codec_refs(m, inner, names),
+                TypeDecl::Struct { fields, .. } => {
+                    for field in fields {
+                        collect_codec_refs(m, &field.ty, names);
+                    }
+                }
+                TypeDecl::Enum { variants, .. } => {
+                    for variant in variants {
+                        for field in &variant.fields {
+                            collect_codec_refs(m, &field.ty, names);
+                        }
+                    }
+                }
+                TypeDecl::StringEnum { .. } | TypeDecl::ErrorEnum { .. } => {}
+            }
+        }
+        Ty::Option { inner } | Ty::List { inner } => collect_codec_refs(m, inner, names),
+        Ty::Map { value } => collect_codec_refs(m, value, names),
+        Ty::Tuple { items } => {
+            for item in items {
+                collect_codec_refs(m, item, names);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn named_encoder(m: &Manifest, declaration: &TypeDecl) -> String {
+    let name = declaration.name();
+    let expression = match declaration {
+        TypeDecl::Newtype { inner, .. } => {
+            ts_wire_expr("value", inner, m, 0).unwrap_or_else(|| "value".to_string())
+        }
+        TypeDecl::Struct { fields, .. } => {
+            let fields = ts_converted_fields("value", fields, m, 0);
+            if fields.is_empty() {
+                "value".to_string()
+            } else {
+                format!("{{ ...value, {} }}", fields.join(", "))
+            }
+        }
+        TypeDecl::Enum { tag, variants, .. } => {
+            let access = ts_access("value", tag);
+            let arms = variants
+                .iter()
+                .filter_map(|variant| {
+                    let fields = ts_converted_fields("value", &variant.fields, m, 0);
+                    (!fields.is_empty()).then(|| {
+                        format!(
+                            "{access} === {} ? {{ ...value, {} }}",
+                            ts_string(&variant.wire_name),
+                            fields.join(", ")
+                        )
+                    })
+                })
+                .collect::<Vec<_>>();
+            if arms.is_empty() {
+                "value".to_string()
+            } else {
+                format!("{} : value", arms.join(" : "))
+            }
+        }
+        TypeDecl::StringEnum { .. } => "value".to_string(),
+        TypeDecl::ErrorEnum { .. } => return String::new(),
+    }
+    .replace("codecs.", "");
+    format!(
+        "\nexport function encode{name}(value: {name}): unknown {{\n  return {expression};\n}}\n"
+    )
+}
+
+fn named_decoder(m: &Manifest, declaration: &TypeDecl) -> String {
+    let name = declaration.name();
+    let ty = Ty::Ref {
+        name: name.to_string(),
+    };
+    let expression = match declaration {
+        TypeDecl::Newtype { inner, .. } => ts_response_expr("response", inner, m, 0),
+        TypeDecl::Struct { fields, .. } => ts_response_object("response", &ty, fields, m, 0),
+        TypeDecl::StringEnum { variants, .. } => {
+            let variants = variants
+                .iter()
+                .map(|variant| ts_string(&variant.wire_name))
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("stringEnumFromWire(response, [{variants}])")
+        }
+        TypeDecl::Enum { tag, variants, .. } => {
+            ts_response_enum("response", &ty, tag, variants, m, 0)
+        }
+        TypeDecl::ErrorEnum { .. } => return String::new(),
+    }
+    .replace("codecs.", "");
+    format!(
+        "\nexport function decode{name}(response: WireResponse): {name} {{\n  return {expression};\n}}\n"
+    )
+}
+
+fn error_data_decoder(m: &Manifest, error: &str, variant: &str, fields: &[FieldDecl]) -> String {
+    let required = fields
+        .iter()
+        .filter(|field| field.required)
+        .map(|field| ts_string(&field.wire_name))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let optional = fields
+        .iter()
+        .filter(|field| !field.required)
+        .map(|field| ts_string(&field.wire_name))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let converted = ts_response_object_fields("value", fields, m, 1).replace("codecs.", "");
+    let host = fields
+        .iter()
+        .map(|field| ts_field(&field.wire_name, &field.ty, field.required))
+        .collect::<Vec<_>>()
+        .join("; ");
+    format!(
+        "\nexport function decode{error}{variant}Data(response: WireResponse): {{ {host} }} {{\n  const value = objectFromWire(response, [{required}], [{optional}]);\n  return {{ {converted} }};\n}}\n"
+    )
+}
+
+fn args_encoder(m: &Manifest, name: &str, params: &[ParamDecl]) -> String {
+    let plain = params
+        .iter()
+        .filter(|parameter| !matches!(parameter.ty, Ty::Slice { .. }))
+        .collect::<Vec<_>>();
+    let signature = plain
+        .iter()
+        .map(|parameter| {
+            format!(
+                "{}: {}",
+                ts_binding(&parameter.name),
+                ts_type(&parameter.ty)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    let fields = plain
+        .iter()
+        .map(|parameter| {
+            let binding = ts_binding(&parameter.name);
+            let value = ts_wire_expr(&binding, &parameter.ty, m, 0)
+                .unwrap_or_else(|| binding.clone())
+                .replace("codecs.", "");
+            format!("{}: {value}", ts_prop(&parameter.wire_name))
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "\nexport function {name}({signature}): Record<string, unknown> {{\n  return {{ {fields} }};\n}}\n"
+    )
+}
+
+fn result_decoder(m: &Manifest, name: &str, ty: &Ty) -> String {
+    let converted = ts_response_expr("response", ty, m, 0).replace("codecs.", "");
+    if matches!(ty, Ty::Unit) {
+        format!("\nexport function {name}(response: WireResponse): void {{\n  {converted};\n}}\n")
+    } else {
+        format!(
+            "\nexport function {name}(response: WireResponse): {} {{\n  return {converted};\n}}\n",
+            ts_type(ty)
+        )
+    }
+}
+
+fn fn_args_codec(function: &FnDecl) -> String {
+    format!("encodeFn{}Args", pascal(&function.name))
+}
+
+fn fn_result_codec(function: &FnDecl) -> String {
+    format!("decodeFn{}Result", pascal(&function.name))
+}
+
+fn ctor_args_codec(class: &ClassDecl) -> String {
+    format!("encodeClass{}ConstructorArgs", class.name)
+}
+
+fn method_args_codec(class: &ClassDecl, method: &str) -> String {
+    format!("encodeClass{}Method{}Args", class.name, pascal(method))
+}
+
+fn method_result_codec(class: &ClassDecl, method: &str) -> String {
+    format!("decodeClass{}Method{}Result", class.name, pascal(method))
+}
+
+fn static_args_codec(class: &ClassDecl, method: &str) -> String {
+    format!("encodeClass{}Static{}Args", class.name, pascal(method))
+}
+
+fn static_result_codec(class: &ClassDecl, method: &str) -> String {
+    format!("decodeClass{}Static{}Result", class.name, pascal(method))
 }
 
 // ---------------------------------------------------------------- client.ts
@@ -580,62 +927,31 @@ fn client_ts(m: &Manifest, hash: &str) -> String {
 
     let mut out = ts_header(hash);
     out.push('\n');
-    let mut rspyts_names = vec!["type BridgeModule".to_string()];
+    let mut rspyts_names = vec![
+        "type BridgeModule".to_string(),
+        "verifyModuleContract".to_string(),
+    ];
     if has_classes {
         rspyts_names.push("callDrop".to_string());
+        rspyts_names.push("boundedIntFromWire".to_string());
     }
     if has_calls {
         rspyts_names.push("callFn".to_string());
     }
-    if all_params
-        .iter()
-        .any(|param| contains_kind(m, &param.ty, ConversionKind::I64))
-    {
-        rspyts_names.push("i64ToWire".to_string());
-    }
-    if all_rets
-        .iter()
-        .any(|ret| contains_kind(m, ret, ConversionKind::I64))
-    {
-        rspyts_names.push("i64FromWire".to_string());
-    }
-    if all_params
-        .iter()
-        .any(|param| contains_kind(m, &param.ty, ConversionKind::U64))
-    {
-        rspyts_names.push("u64ToWire".to_string());
-    }
-    if all_rets
-        .iter()
-        .any(|ret| contains_kind(m, ret, ConversionKind::U64))
-    {
-        rspyts_names.push("u64FromWire".to_string());
-    }
-    if all_rets
-        .iter()
-        .any(|ret| contains_kind(m, ret, ConversionKind::Float))
-    {
-        rspyts_names.push("floatFromWire".to_string());
-    }
-    if all_params
-        .iter()
-        .any(|param| contains_kind(m, &param.ty, ConversionKind::Buf))
-    {
-        rspyts_names.push("wireBuffer".to_string());
-    }
     out.push_str(&format!(
-        "import {{ {} }} from \"rspyts\";\n",
+        "import {{ {} }} from \"rspyts/internal/abi3\";\n",
         rspyts_names.join(", ")
     ));
+    out.push_str("import * as codecs from \"./codecs.js\";\n");
     if !type_imports.is_empty() {
         let names: Vec<String> = type_imports.into_iter().collect();
         out.push_str(&format!(
-            "import type {{ {} }} from \"./types\";\n",
+            "import type {{ {} }} from \"./types.js\";\n",
             names.join(", ")
         ));
     }
     if has_errors {
-        out.push_str("import * as errors from \"./errors\";\n");
+        out.push_str("import * as errors from \"./errors.js\";\n");
     }
 
     // Instance interfaces for handle classes.
@@ -719,7 +1035,9 @@ fn client_ts(m: &Manifest, hash: &str) -> String {
     if has_classes {
         out.push('\n');
         out.push_str("// Best-effort backstop: drops handles that were never free()d.\n");
-        out.push_str("const finalizer = new FinalizationRegistry<() => void>((drop) => drop());\n");
+        out.push_str(
+            "const rspytsFinalizationRegistryConstructor = (\n  globalThis as unknown as {\n    FinalizationRegistry?: new (callback: (drop: () => void) => void) => {\n      register(target: object, drop: () => void, token?: object): void;\n      unregister(token: object): boolean;\n    };\n  }\n).FinalizationRegistry;\nconst finalizer =\n  rspytsFinalizationRegistryConstructor === undefined\n    ? {\n        register(_target: object, _drop: () => void, _token?: object): void {},\n        unregister(_token: object): boolean {\n          return false;\n        },\n      }\n    : new rspytsFinalizationRegistryConstructor((drop) => drop());\n",
+        );
     }
     if needs_internal {
         out.push('\n');
@@ -732,9 +1050,13 @@ fn client_ts(m: &Manifest, hash: &str) -> String {
     out.push_str(&format!(
         "export function createClient(mod: BridgeModule): {client_name} {{\n"
     ));
+    out.push_str(&format!(
+        "  verifyModuleContract(mod, {});\n",
+        ts_string(hash)
+    ));
     if fns.is_empty() && m.classes.is_empty() {
         out.push_str("  return {};\n}\n");
-        return out;
+        return wrap_ts_source(&out, 120);
     }
     out.push_str("  return {\n");
     for f in &fns {
@@ -744,7 +1066,7 @@ fn client_ts(m: &Manifest, hash: &str) -> String {
         out.push_str(&class_property(m, class));
     }
     out.push_str("  };\n}\n");
-    out
+    wrap_ts_source(&out, 120)
 }
 
 /// Reserved words (including strict-mode ones, which apply everywhere in
@@ -822,81 +1144,62 @@ fn ts_params(params: &[ParamDecl]) -> String {
         .join(", ")
 }
 
-/// The `callFn(...)` argument list after the symbol: args object, then
-/// slices (when present or when a handle must follow), then the handle.
-fn call_args(
-    m: &Manifest,
+fn call_args_codec(
     params: &[ParamDecl],
+    codec: &str,
     handle: Option<&str>,
     err: Option<&str>,
 ) -> String {
-    let plain: Vec<String> = params
+    let bindings = params
         .iter()
-        .filter(|p| !matches!(p.ty, Ty::Slice { .. }))
-        .map(|p| {
-            let binding = ts_binding(&p.name);
-            let value = ts_wire_expr(&binding, &p.ty, m, 0).unwrap_or_else(|| binding.clone());
-            if binding == p.wire_name && value == binding {
-                binding
-            } else {
-                format!("{}: {value}", ts_prop(&p.wire_name))
-            }
-        })
-        .collect();
-    let args = if plain.is_empty() {
-        "{}".to_string()
-    } else {
-        format!("{{ {} }}", plain.join(", "))
-    };
-    let slices: Vec<String> = params
+        .filter(|parameter| !matches!(parameter.ty, Ty::Slice { .. }))
+        .map(|parameter| ts_binding(&parameter.name))
+        .collect::<Vec<_>>();
+    let mut out = format!("codecs.{codec}({})", bindings.join(", "));
+    let slices = params
         .iter()
-        .filter_map(|p| match p.ty {
+        .filter_map(|parameter| match parameter.ty {
             Ty::Slice { dt } => Some(format!(
                 "{{ data: {}, dt: \"{}\" }}",
-                ts_binding(&p.name),
+                ts_binding(&parameter.name),
                 dt.wire_name()
             )),
             _ => None,
         })
-        .collect();
-    let mut out = args;
+        .collect::<Vec<_>>();
     if !slices.is_empty() {
         out.push_str(&format!(", [{}]", slices.join(", ")));
-    } else if handle.is_some() {
+    } else if handle.is_some() || err.is_some() {
         out.push_str(", []");
     }
-    if let Some(h) = handle {
-        out.push_str(", ");
-        out.push_str(h);
+    if let Some(handle) = handle {
+        out.push_str(&format!(", {handle}"));
+    } else if err.is_some() {
+        out.push_str(", undefined");
     }
-    if let Some(error_name) = err {
-        if slices.is_empty() && handle.is_none() {
-            out.push_str(", [], undefined");
-        } else if !slices.is_empty() && handle.is_none() {
-            out.push_str(", undefined");
-        }
-        out.push_str(&format!(", errors.{}", ts_error_registry_name(error_name)));
+    if let Some(error) = err {
+        out.push_str(&format!(", errors.{}", ts_error_registry_name(error)));
     }
     out
 }
 
-fn ts_wire_expr(expr: &str, ty: &Ty, m: &Manifest, depth: usize) -> Option<String> {
+fn ts_wire_expr(expr: &str, ty: &Ty, _m: &Manifest, depth: usize) -> Option<String> {
     match ty {
-        Ty::Json => Some(format!("{{ \"__rspyts_json__\": {expr} }}")),
+        Ty::Json => Some(format!("jsonToWire({expr})")),
         Ty::I64 => Some(format!("i64ToWire({expr})")),
         Ty::U64 => Some(format!("u64ToWire({expr})")),
         Ty::Buf { dt } => Some(format!("wireBuffer({expr}, \"{}\")", dt.wire_name())),
-        Ty::Option { inner } => ts_wire_expr(expr, inner, m, depth)
+        Ty::Option { inner } => ts_wire_expr(expr, inner, _m, depth)
             .map(|converted| format!("{expr} === null ? null : {converted}")),
         Ty::List { inner } => {
             let item = format!("item{depth}");
-            ts_wire_expr(&item, inner, m, depth + 1)
-                .map(|converted| format!("{expr}.map(({item}) => {converted})"))
+            ts_wire_expr(&item, inner, _m, depth + 1)
+                .map(|converted| format!("{expr}.map(({item}) => ({converted}))"))
         }
         Ty::Map { value } => {
             let key = format!("key{depth}");
             let item = format!("value{depth}");
-            ts_wire_expr(&item, value, m, depth + 1).map(|converted| {
+            ts_wire_expr(&item, value, _m, depth + 1).map(|converted| {
                 format!(
                     "Object.fromEntries(Object.entries({expr}).map(([{key}, {item}]) => [{key}, {converted}]))"
                 )
@@ -909,7 +1212,7 @@ fn ts_wire_expr(expr: &str, ty: &Ty, m: &Manifest, depth: usize) -> Option<Strin
                 .enumerate()
                 .map(|(index, item)| {
                     let access = format!("{expr}[{index}]");
-                    match ts_wire_expr(&access, item, m, depth + 1) {
+                    match ts_wire_expr(&access, item, _m, depth + 1) {
                         Some(converted) => {
                             changed = true;
                             converted
@@ -920,30 +1223,7 @@ fn ts_wire_expr(expr: &str, ty: &Ty, m: &Manifest, depth: usize) -> Option<Strin
                 .collect::<Vec<_>>();
             changed.then(|| format!("[{}]", converted.join(", ")))
         }
-        Ty::Ref { name } => match super::util::find_type(m, name) {
-            Some(TypeDecl::Newtype { inner, .. }) => ts_wire_expr(expr, inner, m, depth),
-            Some(TypeDecl::Struct { fields, .. }) => {
-                let converted = ts_converted_fields(expr, fields, m, depth);
-                (!converted.is_empty())
-                    .then(|| format!("{{ ...{expr}, {} }}", converted.join(", ")))
-            }
-            Some(TypeDecl::Enum { tag, variants, .. }) => {
-                let access = ts_access(expr, tag);
-                let mut arms = Vec::new();
-                for variant in variants {
-                    let converted = ts_converted_fields(expr, &variant.fields, m, depth);
-                    if !converted.is_empty() {
-                        arms.push(format!(
-                            "{access} === {} ? {{ ...{expr}, {} }}",
-                            ts_string(&variant.wire_name),
-                            converted.join(", ")
-                        ));
-                    }
-                }
-                (!arms.is_empty()).then(|| format!("{} : {expr}", arms.join(" : ")))
-            }
-            _ => None,
-        },
+        Ty::Ref { name } => Some(format!("codecs.encode{name}({expr})")),
         _ => None,
     }
 }
@@ -959,7 +1239,7 @@ fn ts_converted_fields(
         .filter_map(|field| {
             let access = ts_access(expr, &field.wire_name);
             let converted = ts_wire_expr(&access, &field.ty, m, depth + 1)?;
-            let converted = if field.optional {
+            let converted = if !field.required {
                 format!("{access} === undefined ? undefined : {converted}")
             } else {
                 converted
@@ -981,244 +1261,211 @@ fn ts_access(expr: &str, field: &str) -> String {
     }
 }
 
-#[derive(Clone, Copy)]
-enum ConversionKind {
-    Float,
-    I64,
-    Json,
-    U64,
-    Buf,
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum HostContext {
-    Response,
-    Error,
-}
-
-fn contains_kind(m: &Manifest, ty: &Ty, kind: ConversionKind) -> bool {
-    fn visit(m: &Manifest, ty: &Ty, kind: ConversionKind, seen: &mut BTreeSet<String>) -> bool {
-        match ty {
-            Ty::F32 | Ty::F64 => matches!(kind, ConversionKind::Float),
-            Ty::I64 => matches!(kind, ConversionKind::I64),
-            Ty::Json => matches!(kind, ConversionKind::Json),
-            Ty::U64 => matches!(kind, ConversionKind::U64),
-            Ty::Buf { .. } => matches!(kind, ConversionKind::Buf),
-            Ty::Option { inner } | Ty::List { inner } => visit(m, inner, kind, seen),
-            Ty::Map { value } => visit(m, value, kind, seen),
-            Ty::Tuple { items } => items.iter().any(|item| visit(m, item, kind, seen)),
-            Ty::Ref { name } if seen.insert(name.clone()) => {
-                let found = match super::util::find_type(m, name) {
-                    Some(TypeDecl::Newtype { inner, .. }) => visit(m, inner, kind, seen),
-                    Some(TypeDecl::Struct { fields, .. }) => {
-                        fields.iter().any(|field| visit(m, &field.ty, kind, seen))
-                    }
-                    Some(TypeDecl::Enum { variants, .. }) => variants.iter().any(|variant| {
-                        variant
-                            .fields
-                            .iter()
-                            .any(|field| visit(m, &field.ty, kind, seen))
-                    }),
-                    _ => false,
-                };
-                seen.remove(name);
-                found
-            }
-            _ => false,
-        }
-    }
-
-    visit(m, ty, kind, &mut BTreeSet::new())
-}
-
-fn ts_wire_type(ty: &Ty, m: &Manifest) -> String {
+/// Recursively validate one successful wire value before projecting it to
+/// its public host type. Every cast emitted around an inline object wire type
+/// is downstream of the corresponding exact shape/tag check.
+fn ts_response_expr(expr: &str, ty: &Ty, _m: &Manifest, depth: usize) -> String {
     match ty {
-        Ty::I64 | Ty::U64 => "string".to_string(),
-        Ty::Option { inner } => format!("{} | null", ts_wire_type(inner, m)),
-        Ty::List { inner } => {
-            let inner = ts_wire_type(inner, m);
-            if inner.contains(' ') {
-                format!("({inner})[]")
-            } else {
-                format!("{inner}[]")
-            }
+        Ty::Null | Ty::Unit => format!("nullFromWire({expr})"),
+        Ty::Bool => format!("boolFromWire({expr})"),
+        Ty::U8 | Ty::U16 | Ty::U32 | Ty::I8 | Ty::I16 | Ty::I32 => {
+            let (minimum, maximum) = int_bounds(ty).expect("guarded above");
+            format!("boundedIntFromWire({expr}, {minimum}, {maximum})")
         }
-        Ty::Map { value } => format!("Record<string, {}>", ts_wire_type(value, m)),
-        Ty::Tuple { items } => format!(
-            "[{}]",
-            items
-                .iter()
-                .map(|item| ts_wire_type(item, m))
-                .collect::<Vec<_>>()
-                .join(", ")
+        Ty::F32 => format!("f32FromWire({expr})"),
+        Ty::F64 => format!("floatFromWire({expr})"),
+        Ty::String => format!("stringFromWire({expr})"),
+        Ty::Bytes => format!("bytesFromWire({expr})"),
+        Ty::Buf { dt } => format!(
+            "(bufferFromWire({expr}, {}) as {})",
+            ts_string(dt.wire_name()),
+            ts_typed_array(*dt)
         ),
-        Ty::Ref { name } => match super::util::find_type(m, name) {
-            Some(TypeDecl::Newtype { inner, .. }) => ts_wire_type(inner, m),
-            Some(TypeDecl::Struct { fields, .. }) => format!(
-                "{{ {} }}",
-                fields
-                    .iter()
-                    .map(|field| ts_wire_field(field, m))
-                    .collect::<Vec<_>>()
-                    .join("; ")
-            ),
-            Some(TypeDecl::Enum { tag, variants, .. }) => variants
-                .iter()
-                .map(|variant| {
-                    let mut fields = vec![format!(
-                        "{}: {}",
-                        ts_prop(tag),
-                        ts_string(&variant.wire_name)
-                    )];
-                    fields.extend(variant.fields.iter().map(|field| ts_wire_field(field, m)));
-                    format!("{{ {} }}", fields.join("; "))
-                })
-                .collect::<Vec<_>>()
-                .join(" | "),
-            _ => name.clone(),
-        },
-        _ => ts_type(ty),
-    }
-}
-
-fn ts_wire_field(field: &FieldDecl, m: &Manifest) -> String {
-    let name = ts_prop(&field.wire_name);
-    match &field.ty {
-        Ty::Option { inner } => format!("{name}?: {} | null", ts_wire_type(inner, m)),
-        _ if field.optional => format!("{name}?: {}", ts_wire_type(&field.ty, m)),
-        _ => format!("{name}: {}", ts_wire_type(&field.ty, m)),
-    }
-}
-
-fn ts_host_expr(
-    expr: &str,
-    ty: &Ty,
-    m: &Manifest,
-    depth: usize,
-    context: HostContext,
-) -> Option<String> {
-    match ty {
-        Ty::Json if context == HostContext::Error => Some(format!("jsonFromWire({expr})")),
-        Ty::F32 | Ty::F64 => Some(format!("floatFromWire({expr})")),
-        Ty::I64 => Some(format!("i64FromWire({expr})")),
-        Ty::U64 => Some(format!("u64FromWire({expr})")),
-        Ty::Option { inner } => ts_host_expr(expr, inner, m, depth, context)
-            .map(|converted| format!("{expr} === null ? null : {converted}")),
+        // Json stays wrapped through generic envelope decoding; schema-aware
+        // conversion is what distinguishes it from an ordinary string map.
+        Ty::Json => format!("jsonFromWire({expr})"),
+        Ty::I64 => format!("i64FromWire({expr})"),
+        Ty::U64 => format!("u64FromWire({expr})"),
+        Ty::Option { inner } => format!(
+            "{expr}.value === null ? null : {}",
+            ts_response_expr(expr, inner, _m, depth)
+        ),
         Ty::List { inner } => {
             let item = format!("item{depth}");
-            ts_host_expr(&item, inner, m, depth + 1, context)
-                .map(|converted| format!("{expr}.map(({item}) => {converted})"))
+            let converted = ts_response_expr(&item, inner, _m, depth + 1);
+            format!("listFromWire({expr}).map(({item}) => ({converted}))")
         }
         Ty::Map { value } => {
             let key = format!("key{depth}");
             let item = format!("value{depth}");
-            ts_host_expr(&item, value, m, depth + 1, context).map(|converted| {
-                format!(
-                    "Object.fromEntries(Object.entries({expr}).map(([{key}, {item}]) => [{key}, {converted}]))"
-                )
-            })
+            let converted = ts_response_expr(&item, value, _m, depth + 1);
+            format!(
+                "Object.fromEntries(Object.entries(mapFromWire({expr})).map(([{key}, {item}]) => [{key}, {converted}]))"
+            )
         }
         Ty::Tuple { items } => {
-            let mut changed = false;
+            let value = format!("value{depth}");
             let converted = items
                 .iter()
                 .enumerate()
                 .map(|(index, item)| {
-                    let access = format!("{expr}[{index}]");
-                    match ts_host_expr(&access, item, m, depth + 1, context) {
-                        Some(converted) => {
-                            changed = true;
-                            converted
-                        }
-                        None => access,
-                    }
+                    ts_response_expr(&format!("{value}[{index}]"), item, _m, depth + 1)
                 })
-                .collect::<Vec<_>>();
-            changed.then(|| format!("[{}]", converted.join(", ")))
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!(
+                "(({value}: WireResponse[]): {} => [{converted}])(tupleFromWire({expr}, {}))",
+                ts_type(ty),
+                items.len()
+            )
         }
-        Ty::Ref { name } => match super::util::find_type(m, name) {
-            Some(TypeDecl::Newtype { inner, .. }) => ts_host_expr(expr, inner, m, depth, context),
-            Some(TypeDecl::Struct { fields, .. }) => {
-                let converted = ts_host_converted_fields(expr, fields, m, depth, context);
-                (!converted.is_empty())
-                    .then(|| format!("{{ ...{expr}, {} }}", converted.join(", ")))
-            }
-            Some(TypeDecl::Enum { tag, variants, .. }) => {
-                let access = ts_access(expr, tag);
-                let mut arms = Vec::new();
-                for variant in variants {
-                    let converted =
-                        ts_host_converted_fields(expr, &variant.fields, m, depth, context);
-                    if !converted.is_empty() {
-                        arms.push(format!(
-                            "{access} === {} ? {{ ...{expr}, {} }}",
-                            ts_string(&variant.wire_name),
-                            converted.join(", ")
-                        ));
-                    }
-                }
-                (!arms.is_empty()).then(|| format!("{} : {expr}", arms.join(" : ")))
-            }
-            _ => None,
-        },
-        _ => None,
+        Ty::Ref { name } => format!("codecs.decode{name}({expr})"),
+        // Slices are parameters only and validation rejects them in returns.
+        Ty::Slice { .. } => expr.to_string(),
     }
 }
 
-fn ts_host_converted_fields(
+fn ts_response_object(
+    expr: &str,
+    ty: &Ty,
+    fields: &[FieldDecl],
+    m: &Manifest,
+    depth: usize,
+) -> String {
+    let host = ts_type(ty);
+    let value = format!("value{depth}");
+    let required = fields
+        .iter()
+        .filter(|field| field.required)
+        .map(|field| ts_string(&field.wire_name))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let optional = fields
+        .iter()
+        .filter(|field| !field.required)
+        .map(|field| ts_string(&field.wire_name))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let converted = ts_response_object_fields(&value, fields, m, depth + 1);
+    format!(
+        "(({value}: Record<string, WireResponse>): {host} => ({{ {converted} }}))(objectFromWire({expr}, [{required}], [{optional}]))"
+    )
+}
+
+fn ts_response_object_fields(
     expr: &str,
     fields: &[FieldDecl],
     m: &Manifest,
     depth: usize,
-    context: HostContext,
-) -> Vec<String> {
+) -> String {
     fields
         .iter()
-        .filter_map(|field| {
+        .map(|field| {
             let access = ts_access(expr, &field.wire_name);
-            let converted = ts_host_expr(&access, &field.ty, m, depth + 1, context)?;
-            let converted = if field.optional {
-                format!("{access} === undefined ? undefined : {converted}")
-            } else {
-                converted
-            };
             let key = ts_prop(&field.wire_name);
-            Some(format!("{key}: {converted}"))
+            let converted = ts_response_expr(&access, &field.ty, m, depth);
+            if !field.required {
+                format!(
+                    "...(Object.prototype.hasOwnProperty.call({expr}, {}) ? {{ {key}: {converted} }} : {{}})",
+                    ts_string(&field.wire_name)
+                )
+            } else {
+                format!("{key}: {converted}")
+            }
         })
-        .collect()
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
-fn ts_decoded_expr(call: &str, ty: &Ty, m: &Manifest) -> String {
+fn ts_response_enum(
+    expr: &str,
+    ty: &Ty,
+    tag: &str,
+    variants: &[rspyts_core::ir::VariantDecl],
+    m: &Manifest,
+    depth: usize,
+) -> String {
     let host = ts_type(ty);
-    match ts_host_expr("value", ty, m, 0, HostContext::Response) {
-        Some(converted) => {
-            let wire = ts_wire_type(ty, m);
-            format!("((value: {wire}): {host} => ({converted}))({call} as {wire})")
-        }
-        None => format!("{call} as {host}"),
-    }
+    let value = format!("value{depth}");
+    let shapes = variants
+        .iter()
+        .map(|variant| {
+            let required = variant
+                .fields
+                .iter()
+                .filter(|field| field.required)
+                .map(|field| ts_string(&field.wire_name))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let optional = variant
+                .fields
+                .iter()
+                .filter(|field| !field.required)
+                .map(|field| ts_string(&field.wire_name))
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!(
+                "{}: {{ required: [{required}], optional: [{optional}] }}",
+                ts_quoted_prop(&variant.wire_name)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    let arms = variants
+        .iter()
+        .enumerate()
+        .map(|(index, variant)| {
+            let converted = ts_response_object_fields(&value, &variant.fields, m, depth + 1);
+            let tag_field = format!("{}: {}", ts_prop(tag), ts_string(&variant.wire_name));
+            let fields = if converted.is_empty() {
+                tag_field
+            } else {
+                format!("{tag_field}, {converted}")
+            };
+            let object = format!("{{ {fields} }}");
+            if index + 1 == variants.len() {
+                object
+            } else {
+                format!(
+                    "stringFromWire({}) === {} ? {object} : ",
+                    ts_access(&value, tag),
+                    ts_string(&variant.wire_name)
+                )
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("");
+    format!(
+        "(({value}: Record<string, WireResponse>): {host} => ({arms}))(enumFromWire({expr}, {}, {{ {shapes} }}))",
+        ts_string(tag)
+    )
 }
 
 /// One `name: (…) => …` property of the returned client object.
-fn fn_property(m: &Manifest, f: &FnDecl) -> String {
+fn fn_property(_m: &Manifest, f: &FnDecl) -> String {
     let name = f.name.to_lower_camel_case();
     let symbol = format!("rspyts_fn__{}", f.name);
     let params = ts_params(&f.params);
     let call = format!(
         "callFn(mod, \"{symbol}\", {})",
-        call_args(m, &f.params, None, f.err.as_deref())
+        call_args_codec(&f.params, &fn_args_codec(f), None, f.err.as_deref())
     );
     if matches!(f.ret, Ty::Unit) {
-        format!("    {name}: ({params}): void => {{\n      {call};\n    }},\n")
+        format!(
+            "    {name}: ({params}): void => {{\n      codecs.{}({call});\n    }},\n",
+            fn_result_codec(f)
+        )
     } else {
         let ret = ts_type(&f.ret);
-        let decoded = ts_decoded_expr(&call, &f.ret, m);
-        format!("    {name}: ({params}): {ret} =>\n      {decoded},\n")
+        format!(
+            "    {name}: ({params}): {ret} =>\n      codecs.{}({call}),\n",
+            fn_result_codec(f)
+        )
     }
 }
 
 /// One `Name: class { … }` property of the returned client object.
-fn class_property(m: &Manifest, class: &ClassDecl) -> String {
+fn class_property(_m: &Manifest, class: &ClassDecl) -> String {
     let name = &class.name;
     let drop_symbol = format!("rspyts_cls__{name}__drop");
     let statics: Vec<&StaticDecl> = class.statics.iter().filter(|s| on_ts(&s.targets)).collect();
@@ -1238,8 +1485,8 @@ fn class_property(m: &Manifest, class: &ClassDecl) -> String {
                 ts_params(&ctor.params)
             ));
             out.push_str(&format!(
-                "        const raw = callFn(mod, \"rspyts_cls__{name}__new\", {}) as number;\n",
-                call_args(m, &ctor.params, None, ctor.err.as_deref())
+                "        const raw = boundedIntFromWire(callFn(mod, \"rspyts_cls__{name}__new\", {}), 1, Number.MAX_SAFE_INTEGER);\n",
+                call_args_codec(&ctor.params, &ctor_args_codec(class), None, ctor.err.as_deref())
             ));
             out.push_str("        this.#handle = BigInt(raw);\n");
         }
@@ -1258,8 +1505,8 @@ fn class_property(m: &Manifest, class: &ClassDecl) -> String {
             out.push_str("        } else {\n");
             if ctor.params.is_empty() {
                 out.push_str(&format!(
-                    "          raw = callFn(mod, \"rspyts_cls__{name}__new\", {}) as number;\n",
-                    call_args(m, &ctor.params, None, ctor.err.as_deref())
+                    "          raw = boundedIntFromWire(callFn(mod, \"rspyts_cls__{name}__new\", {}), 1, Number.MAX_SAFE_INTEGER);\n",
+                    call_args_codec(&ctor.params, &ctor_args_codec(class), None, ctor.err.as_deref())
                 ));
             } else {
                 let bindings: Vec<String> =
@@ -1271,8 +1518,8 @@ fn class_property(m: &Manifest, class: &ClassDecl) -> String {
                     types.join(", ")
                 ));
                 out.push_str(&format!(
-                    "          raw = callFn(mod, \"rspyts_cls__{name}__new\", {}) as number;\n",
-                    call_args(m, &ctor.params, None, ctor.err.as_deref())
+                    "          raw = boundedIntFromWire(callFn(mod, \"rspyts_cls__{name}__new\", {}), 1, Number.MAX_SAFE_INTEGER);\n",
+                    call_args_codec(&ctor.params, &ctor_args_codec(class), None, ctor.err.as_deref())
                 ));
             }
             out.push_str("        }\n");
@@ -1316,27 +1563,33 @@ fn class_property(m: &Manifest, class: &ClassDecl) -> String {
                 ts_params(&s.params)
             ));
             out.push_str(&format!(
-                "        const raw = callFn(mod, \"{symbol}\", {}) as number;\n",
-                call_args(m, &s.params, None, s.err.as_deref())
+                "        const raw = boundedIntFromWire(callFn(mod, \"{symbol}\", {}), 1, Number.MAX_SAFE_INTEGER);\n",
+                call_args_codec(&s.params, &static_args_codec(class, &s.name), None, s.err.as_deref())
             ));
             out.push_str("        return new this(INTERNAL, raw);\n");
             out.push_str("      }\n");
         } else if matches!(s.ret, Ty::Unit) {
             out.push_str(&format!(
-                "      static {s_name}({}): void {{\n        callFn(mod, \"{symbol}\", {});\n      }}\n",
+                "      static {s_name}({}): void {{\n        codecs.{}(callFn(mod, \"{symbol}\", {}));\n      }}\n",
                 ts_params(&s.params),
-                call_args(m, &s.params, None, s.err.as_deref())
+                static_result_codec(class, &s.name),
+                call_args_codec(&s.params, &static_args_codec(class, &s.name), None, s.err.as_deref())
             ));
         } else {
             let ret = ts_type(&s.ret);
             let call = format!(
                 "callFn(mod, \"{symbol}\", {})",
-                call_args(m, &s.params, None, s.err.as_deref())
+                call_args_codec(
+                    &s.params,
+                    &static_args_codec(class, &s.name),
+                    None,
+                    s.err.as_deref()
+                )
             );
-            let decoded = ts_decoded_expr(&call, &s.ret, m);
             out.push_str(&format!(
-                "      static {s_name}({}): {ret} {{\n        return {decoded};\n      }}\n",
+                "      static {s_name}({}): {ret} {{\n        return codecs.{}({call});\n      }}\n",
                 ts_params(&s.params),
+                static_result_codec(class, &s.name),
             ));
         }
     }
@@ -1346,9 +1599,9 @@ fn class_property(m: &Manifest, class: &ClassDecl) -> String {
         let symbol = format!("rspyts_cls__{name}__{}", method.name);
         let call = format!(
             "callFn(mod, \"{symbol}\", {})",
-            call_args(
-                m,
+            call_args_codec(
                 &method.params,
+                &method_args_codec(class, &method.name),
                 Some("this.#handle"),
                 method.err.as_deref(),
             )
@@ -1357,15 +1610,16 @@ fn class_property(m: &Manifest, class: &ClassDecl) -> String {
         out.push_str(&ts_doc(&method.docs, "      "));
         if matches!(method.ret, Ty::Unit) {
             out.push_str(&format!(
-                "      {m_name}({}): void {{\n        {call};\n      }}\n",
-                ts_params(&method.params)
+                "      {m_name}({}): void {{\n        codecs.{}({call});\n      }}\n",
+                ts_params(&method.params),
+                method_result_codec(class, &method.name),
             ));
         } else {
             let ret = ts_type(&method.ret);
-            let decoded = ts_decoded_expr(&call, &method.ret, m);
             out.push_str(&format!(
-                "      {m_name}({}): {ret} {{\n        return {decoded};\n      }}\n",
-                ts_params(&method.params)
+                "      {m_name}({}): {ret} {{\n        return codecs.{}({call});\n      }}\n",
+                ts_params(&method.params),
+                method_result_codec(class, &method.name),
             ));
         }
     }
@@ -1386,15 +1640,106 @@ fn class_property(m: &Manifest, class: &ClassDecl) -> String {
     out
 }
 
+/// Deterministically wrap generated implementation lines. The emitter owns
+/// formatting so checked-in output stays readable without a downstream
+/// formatter. Breaks occur only at TypeScript whitespace-safe delimiters.
+fn wrap_ts_source(source: &str, width: usize) -> String {
+    let mut out = String::with_capacity(source.len() + source.len() / 20);
+    for line in source.lines() {
+        wrap_ts_line(&mut out, line, width);
+    }
+    out
+}
+
+fn wrap_ts_line(out: &mut String, line: &str, width: usize) {
+    if line.len() <= width || line.trim_start().starts_with("//") {
+        out.push_str(line);
+        out.push('\n');
+        return;
+    }
+
+    let leading = &line[..line.len() - line.trim_start().len()];
+    let continuation = format!("{leading}    ");
+    let mut remaining = line.trim_start();
+    let mut prefix = leading;
+    while prefix.len() + remaining.len() > width {
+        let available = width.saturating_sub(prefix.len());
+        let points = ts_wrap_points(remaining);
+        let split = points
+            .iter()
+            .copied()
+            .rfind(|point| *point <= available && *point >= 16)
+            .or_else(|| points.iter().copied().find(|point| *point > available));
+        let Some(split) = split else {
+            break;
+        };
+        out.push_str(prefix);
+        out.push_str(remaining[..split].trim_end());
+        out.push('\n');
+        remaining = remaining[split..].trim_start();
+        prefix = &continuation;
+    }
+    out.push_str(prefix);
+    out.push_str(remaining);
+    out.push('\n');
+}
+
+fn ts_wrap_points(line: &str) -> Vec<usize> {
+    let bytes = line.as_bytes();
+    let mut points = Vec::new();
+    let mut quote = None;
+    let mut escaped = false;
+    let mut index = 0;
+    while index < bytes.len() {
+        let byte = bytes[index];
+        if let Some(active) = quote {
+            if escaped {
+                escaped = false;
+            } else if byte == b'\\' {
+                escaped = true;
+            } else if byte == active {
+                quote = None;
+            }
+            index += 1;
+            continue;
+        }
+        if matches!(byte, b'\"' | b'\'' | b'`') {
+            quote = Some(byte);
+            index += 1;
+            continue;
+        }
+        match byte {
+            b',' | b'(' | b'[' | b'{' => points.push(index + 1),
+            b'?' | b':' if surrounded_by_spaces(bytes, index) => points.push(index),
+            b'=' if bytes.get(index + 1) == Some(&b'>') => points.push(index + 2),
+            b'&' if bytes.get(index + 1) == Some(&b'&') => points.push(index),
+            b'&' if surrounded_by_spaces(bytes, index) => points.push(index),
+            b'|' if bytes.get(index + 1) == Some(&b'|') => points.push(index),
+            b'|' if surrounded_by_spaces(bytes, index) => points.push(index),
+            _ => {}
+        }
+        index += 1;
+    }
+    points.sort_unstable();
+    points.dedup();
+    points
+}
+
+fn surrounded_by_spaces(bytes: &[u8], index: usize) -> bool {
+    index > 0
+        && bytes[index - 1].is_ascii_whitespace()
+        && bytes.get(index + 1).is_some_and(u8::is_ascii_whitespace)
+}
+
 // ----------------------------------------------------------------- index.ts
 
 fn index_ts(hash: &str) -> String {
     let mut out = ts_header(hash);
     out.push('\n');
-    out.push_str("export * from \"./client\";\n");
-    out.push_str("export * from \"./constants\";\n");
-    out.push_str("export * from \"./errors\";\n");
-    out.push_str("export * from \"./types\";\n");
+    out.push_str("export * from \"./client.js\";\n");
+    out.push_str("export * from \"./constants.js\";\n");
+    out.push_str("export * from \"./errors.js\";\n");
+    out.push_str("export * from \"./types.js\";\n");
     out
 }
 
@@ -1403,517 +1748,207 @@ mod tests {
     use super::super::test_manifest::{
         FOREIGN_ORIGIN, binary_manifest, exact_manifest, manifest, manifest_hash,
     };
-    use super::super::util::VERSION;
     use super::*;
 
-    fn no_imports() -> BTreeMap<String, String> {
-        BTreeMap::new()
+    fn rendered(manifest: &Manifest) -> Vec<(&'static str, String)> {
+        emit(manifest, &manifest_hash(manifest), &BTreeMap::new())
     }
 
-    fn mapped_imports() -> BTreeMap<String, String> {
-        [(
-            FOREIGN_ORIGIN.to_string(),
-            "shared-types-example".to_string(),
-        )]
-        .into_iter()
-        .collect()
-    }
-
-    fn emitted(file: &str) -> String {
-        let m = manifest();
-        let hash = manifest_hash(&m);
-        emit(&m, &hash, &no_imports())
-            .into_iter()
-            .find(|(name, _)| *name == file)
-            .expect("file exists")
+    fn file<'a>(files: &'a [(&str, String)], name: &str) -> &'a str {
+        files
+            .iter()
+            .find(|(candidate, _)| *candidate == name)
+            .expect("generated file exists")
             .1
-    }
-
-    fn golden(body: &str) -> String {
-        let hash = manifest_hash(&manifest());
-        body.replace("@VERSION@", VERSION).replace("@HASH@", &hash)
-    }
-
-    fn assert_text_eq(actual: &str, expected: &str, file: &str) {
-        if actual != expected {
-            let diff = similar::TextDiff::from_lines(expected, actual);
-            panic!(
-                "{file} does not match its golden:\n{}",
-                diff.unified_diff()
-                    .context_radius(3)
-                    .header("expected", "actual")
-            );
-        }
+            .as_str()
     }
 
     #[test]
-    fn types_ts_matches_golden() {
-        let expected = golden(
-            r#"// Code generated by rspyts v@VERSION@. DO NOT EDIT.
-// rspyts:manifest-hash sha256:@HASH@
-
-/** Options controlling value processing. */
-export interface QueryOptions {
-  /** Minimum value to include. */
-  minimumValue: number;
-  tolerance?: number | null;
-  metadata: unknown;
-}
-
-/** Description of an input source. */
-export interface SourceInfo {
-  name: string;
-  fieldCount: number;
-}
-
-export type Severity = "low" | "medium" | "high";
-
-/** Value-processing transitions. */
-export type ValueEvent =
-  | { kind: "accepted"; index: number; value: number }
-  | { kind: "rejected"; index: number };
-"#,
+    fn emits_private_codecs_and_only_the_abi3_runtime_path() {
+        let files = rendered(&manifest());
+        assert_eq!(
+            files.iter().map(|(name, _)| *name).collect::<Vec<_>>(),
+            [
+                "client.ts",
+                "codecs.ts",
+                "constants.ts",
+                "errors.ts",
+                "index.ts",
+                "types.ts",
+            ]
         );
-        assert_text_eq(&emitted("types.ts"), &expected, "types.ts");
+        let client = file(&files, "client.ts");
+        assert!(client.contains("from \"rspyts/internal/abi3\""), "{client}");
+        assert!(client.contains("verifyModuleContract"), "{client}");
+        assert!(client.contains("callFn"), "{client}");
+        assert!(!client.contains("callFnRaw"), "{client}");
+        assert!(!client.contains("from \"rspyts\""), "{client}");
+        assert!(!file(&files, "index.ts").contains("codecs"));
     }
 
     #[test]
-    fn constants_ts_matches_golden() {
-        let expected = golden(
-            r#"// Code generated by rspyts v@VERSION@. DO NOT EDIT.
-// rspyts:manifest-hash sha256:@HASH@
-
-/** Baseline processing options. */
-export const DEFAULT_OPTIONS = { minimumValue: 0.5, tolerance: null, metadata: { rev: 2 } } as const;
-
-export const DEFAULT_LIMIT = 0.75 as const;
-
-/** Name reported by the value processor. */
-export const PROCESSOR_NAME = "vector-processor" as const;
-
-export const SUPPORTED_FORMATS = ["csv", "json"] as const;
-"#,
-        );
-        assert_text_eq(&emitted("constants.ts"), &expected, "constants.ts");
-    }
-
-    #[test]
-    fn errors_ts_matches_golden() {
-        let expected = golden(
-            r#"// Code generated by rspyts v@VERSION@. DO NOT EDIT.
-// rspyts:manifest-hash sha256:@HASH@
-
-import { type BridgeErrorRegistry, RspytsError } from "rspyts";
-
-export class QueryError extends RspytsError {}
-
-/** The batch size must be positive. */
-export class QueryErrorInvalidBatchSize extends QueryError {
-  constructor(message: string, data?: unknown) {
-    super(message, "invalidBatchSize", data);
-  }
-}
-
-/** `.data`: { max: number } */
-export class QueryErrorBatchTooLarge extends QueryError {
-  constructor(message: string, data?: unknown) {
-    super(message, "batchTooLarge", data);
-  }
-}
-
-export const QueryErrorTypes = {
-  "invalidBatchSize": QueryErrorInvalidBatchSize,
-  "batchTooLarge": QueryErrorBatchTooLarge,
-} as const satisfies BridgeErrorRegistry;
-"#,
-        );
-        assert_text_eq(&emitted("errors.ts"), &expected, "errors.ts");
-    }
-
-    #[test]
-    fn client_ts_matches_golden() {
-        // `warm_up` is Python-only and must not appear; `renderSummary`
-        // is TypeScript-only and must.
-        let expected = golden(
-            r#"// Code generated by rspyts v@VERSION@. DO NOT EDIT.
-// rspyts:manifest-hash sha256:@HASH@
-
-import { type BridgeModule, callDrop, callFn, floatFromWire } from "rspyts";
-import type { QueryOptions, SourceInfo } from "./types";
-import * as errors from "./errors";
-
-/** A processing session backed by a native handle. */
-export interface Session {
-  /** Current completion ratio. */
-  progress(): number;
-  info(): SourceInfo;
-  /** Release the underlying Rust object. Safe to call more than once. */
-  free(): void;
-  [Symbol.dispose](): void;
-}
-
-/** Streaming statistics over a sliding window. */
-export interface RunningStats {
-  push(chunk: Float64Array): void;
-  /** Snapshot current state. */
-  snapshot(): QueryOptions;
-  /** Release the underlying Rust object. Safe to call more than once. */
-  free(): void;
-  [Symbol.dispose](): void;
-}
-
-/** The typed surface of the `demo-crate` bridge module. */
-export interface DemoCrateClient {
-  /** Process a buffer of numeric values. */
-  processValues(values: Float64Array, batchSize: number, options: QueryOptions): Float64Array;
-  /** Render an HTML summary. */
-  renderSummary(): string;
-  Session: {
-    /** Open a processing session from disk. */
-    open(path: string): Session;
-    defaultExtension(): string;
-  };
-  RunningStats: {
-    new (window: number): RunningStats;
-    /** Rebuild from a snapshot. */
-    resumed(state: QueryOptions): RunningStats;
-  };
-}
-
-// Best-effort backstop: drops handles that were never free()d.
-const finalizer = new FinalizationRegistry<() => void>((drop) => drop());
-
-// Gates the internal constructor path that wraps a fresh handle.
-const INTERNAL = Symbol("rspyts.internal");
-
-/** Bind the generated API to an instantiated bridge module. */
-export function createClient(mod: BridgeModule): DemoCrateClient {
-  return {
-    processValues: (values: Float64Array, batchSize: number, options: QueryOptions): Float64Array =>
-      callFn(mod, "rspyts_fn__process_values", { batchSize, options: { ...options, metadata: { "__rspyts_json__": options.metadata } } }, [{ data: values, dt: "f64" }], undefined, errors.QueryErrorTypes) as Float64Array,
-    renderSummary: (): string =>
-      callFn(mod, "rspyts_fn__render_summary", {}) as string,
-    Session: class {
-      #handle: bigint;
-
-      constructor(internal: typeof INTERNAL, raw: number);
-      constructor(...args: unknown[]) {
-        if (args[0] !== INTERNAL) {
-          throw new Error("Session cannot be constructed directly; use Session.open(...)");
-        }
-        this.#handle = BigInt(args[1] as number);
-        const handle = this.#handle;
-        finalizer.register(this, () => callDrop(mod, "rspyts_cls__Session__drop", handle), this);
-      }
-
-      /** Open a processing session from disk. */
-      static open(path: string): Session {
-        const raw = callFn(mod, "rspyts_cls__Session__open", { path }, [], undefined, errors.QueryErrorTypes) as number;
-        return new this(INTERNAL, raw);
-      }
-
-      static defaultExtension(): string {
-        return callFn(mod, "rspyts_cls__Session__default_extension", {}) as string;
-      }
-
-      /** Current completion ratio. */
-      progress(): number {
-        return ((value: number): number => (floatFromWire(value)))(callFn(mod, "rspyts_cls__Session__progress", {}, [], this.#handle) as number);
-      }
-
-      info(): SourceInfo {
-        return callFn(mod, "rspyts_cls__Session__info", {}, [], this.#handle) as SourceInfo;
-      }
-
-      /** Release the underlying Rust object. Safe to call more than once. */
-      free(): void {
-        finalizer.unregister(this);
-        callDrop(mod, "rspyts_cls__Session__drop", this.#handle);
-      }
-
-      [Symbol.dispose](): void {
-        this.free();
-      }
-    },
-    RunningStats: class {
-      #handle: bigint;
-
-      constructor(window: number);
-      constructor(internal: typeof INTERNAL, raw: number);
-      constructor(...args: unknown[]) {
-        let raw: number;
-        if (args[0] === INTERNAL) {
-          raw = args[1] as number;
-        } else {
-          const [window] = args as [number];
-          raw = callFn(mod, "rspyts_cls__RunningStats__new", { window }) as number;
-        }
-        this.#handle = BigInt(raw);
-        const handle = this.#handle;
-        finalizer.register(this, () => callDrop(mod, "rspyts_cls__RunningStats__drop", handle), this);
-      }
-
-      /** Rebuild from a snapshot. */
-      static resumed(state: QueryOptions): RunningStats {
-        const raw = callFn(mod, "rspyts_cls__RunningStats__resumed", { state: { ...state, metadata: { "__rspyts_json__": state.metadata } } }) as number;
-        return new this(INTERNAL, raw);
-      }
-
-      push(chunk: Float64Array): void {
-        callFn(mod, "rspyts_cls__RunningStats__push", {}, [{ data: chunk, dt: "f64" }], this.#handle);
-      }
-
-      /** Snapshot current state. */
-      snapshot(): QueryOptions {
-        return ((value: { minimumValue: number; tolerance?: number | null; metadata: unknown }): QueryOptions => ({ ...value, minimumValue: floatFromWire(value.minimumValue), tolerance: value.tolerance === undefined ? undefined : value.tolerance === null ? null : floatFromWire(value.tolerance) }))(callFn(mod, "rspyts_cls__RunningStats__snapshot", {}, [], this.#handle) as { minimumValue: number; tolerance?: number | null; metadata: unknown });
-      }
-
-      /** Release the underlying Rust object. Safe to call more than once. */
-      free(): void {
-        finalizer.unregister(this);
-        callDrop(mod, "rspyts_cls__RunningStats__drop", this.#handle);
-      }
-
-      [Symbol.dispose](): void {
-        this.free();
-      }
-    },
-  };
-}
-"#,
-        );
-        assert_text_eq(&emitted("client.ts"), &expected, "client.ts");
-    }
-
-    #[test]
-    fn index_ts_matches_golden() {
-        let expected = golden(
-            r#"// Code generated by rspyts v@VERSION@. DO NOT EDIT.
-// rspyts:manifest-hash sha256:@HASH@
-
-export * from "./client";
-export * from "./constants";
-export * from "./errors";
-export * from "./types";
-"#,
-        );
-        assert_text_eq(&emitted("index.ts"), &expected, "index.ts");
-    }
-
-    #[test]
-    fn mapped_foreign_types_are_imported_not_emitted() {
-        let m = manifest();
-        let hash = manifest_hash(&m);
-        let files = emit(&m, &hash, &mapped_imports());
-        let types = &files.iter().find(|(n, _)| *n == "types.ts").unwrap().1;
+    fn named_references_use_one_named_codec_call() {
+        let files = rendered(&exact_manifest());
+        let client = file(&files, "client.ts");
+        let codecs = file(&files, "codecs.ts");
         assert!(
-            types.contains("import type { SourceInfo } from \"shared-types-example\";\n"),
+            client.contains("codecs.encodeFnRoundTripExactArgs("),
+            "{client}"
+        );
+        assert!(
+            client.contains("codecs.decodeFnRoundTripExactResult"),
+            "{client}"
+        );
+        assert!(
+            codecs.contains("export function encodeExactRecord"),
+            "{codecs}"
+        );
+        assert!(
+            codecs.contains("sequence: encodeSequenceId(value.sequence)"),
+            "{codecs}"
+        );
+        assert!(
+            codecs.contains("return { value: encodeExactRecord(value) }"),
+            "{codecs}"
+        );
+        assert!(!client.contains("objectFromWire"), "{client}");
+        assert!(!client.contains("u64FromWire"), "{client}");
+    }
+
+    #[test]
+    fn response_codecs_keep_explicit_tail_context_for_nested_buffers() {
+        let files = rendered(&binary_manifest());
+        let codecs = file(&files, "codecs.ts");
+        assert!(codecs.contains("response: WireResponse"), "{codecs}");
+        assert!(
+            codecs.contains("bufferFromWire(value0.samples, \"f64\")")
+                || codecs.contains("bufferFromWire(value0[\"samples\"], \"f64\")"),
+            "{codecs}"
+        );
+        assert!(codecs.contains("decodeBinaryPacket(response)"), "{codecs}");
+    }
+
+    #[test]
+    fn json_is_transparent_and_exact_integers_are_bigints() {
+        let mut manifest = exact_manifest();
+        manifest.constants.push(ConstDecl {
+            name: "MARKER_SHAPED_JSON".to_string(),
+            docs: String::new(),
+            origin: manifest.crate_name.clone(),
+            ty: Ty::Json,
+            value: serde_json::json!({"__rspyts_json__": {"kept": true}}),
+        });
+        let files = rendered(&manifest);
+        let types = file(&files, "types.ts");
+        let constants = file(&files, "constants.ts");
+        let codecs = file(&files, "codecs.ts");
+        assert!(
+            types.contains("export type SequenceId = bigint;"),
             "{types}"
         );
-        // Re-exported so `export * from "./types"` in index.ts surfaces it.
-        assert!(types.contains("export type { SourceInfo };\n"), "{types}");
-        assert!(!types.contains("export interface SourceInfo"), "{types}");
-        // client.ts keeps importing it from "./types", which re-exports.
-        let client = &files.iter().find(|(n, _)| *n == "client.ts").unwrap().1;
+        assert!(constants.contains("18446744073709551615n"), "{constants}");
         assert!(
-            client.contains("import type { QueryOptions, SourceInfo } from \"./types\";"),
-            "{client}"
+            constants.contains("__rspyts_json__") && constants.contains("kept: true"),
+            "{constants}"
+        );
+        assert!(codecs.contains("jsonToWire"), "{codecs}");
+        assert!(codecs.contains("jsonFromWire"), "{codecs}");
+        assert!(!codecs.contains("__rspyts_json__"), "{codecs}");
+    }
+
+    #[test]
+    fn required_controls_presence_and_option_controls_nullability() {
+        let files = rendered(&manifest());
+        let types = file(&files, "types.ts");
+        assert!(types.contains("minimumValue: number;"), "{types}");
+        assert!(types.contains("tolerance?: number | null;"), "{types}");
+    }
+
+    #[test]
+    fn error_data_uses_an_empty_tail_response_codec() {
+        let files = rendered(&manifest());
+        let errors = file(&files, "errors.ts");
+        let codecs = file(&files, "codecs.ts");
+        assert!(errors.contains("wireResponse(data)"), "{errors}");
+        assert!(errors.contains("rspyts/internal/abi3"), "{errors}");
+        assert!(
+            codecs.contains("decodeQueryErrorBatchTooLargeData"),
+            "{codecs}"
         );
     }
 
     #[test]
-    fn unmapped_foreign_types_are_emitted_locally() {
-        let types = emitted("types.ts");
-        assert!(types.contains("export interface SourceInfo {"), "{types}");
-        assert!(!types.contains("shared-types-example"), "{types}");
-    }
-
-    #[test]
-    fn binary_newtype_fixture_marks_only_numeric_u8_buffers() {
-        let m = binary_manifest();
-        let hash = manifest_hash(&m);
-        let files = emit(&m, &hash, &no_imports());
-        let types = &files.iter().find(|(n, _)| *n == "types.ts").unwrap().1;
-        let client = &files.iter().find(|(n, _)| *n == "client.ts").unwrap().1;
-
-        assert!(types.contains("export type PacketId = number;"));
-        assert!(types.contains("  payload: Uint8Array;"));
-        assert!(types.contains("  samples: Float64Array;"));
-        assert!(types.contains("  chunks: Int16Array[];"));
-        assert!(types.contains("  channels: Record<string, Uint8Array>;"));
-        assert!(client.contains("samples: wireBuffer(value.samples, \"f64\")"));
-        assert!(client.contains("wireBuffer(item1, \"i16\")"));
-        assert!(client.contains("wireBuffer(value1, \"u8\")"));
-        assert!(client.contains("echoBytes: (value: Uint8Array): Uint8Array =>\n      callFn(mod, \"rspyts_fn__echo_bytes\", { value })"));
-        assert!(client.contains("echoU8: (value: Uint8Array): Uint8Array =>\n      callFn(mod, \"rspyts_fn__echo_u8\", { value: wireBuffer(value, \"u8\") })"));
-    }
-
-    #[test]
-    fn exact_tuple_and_mixed_fixture_projects_recursive_conversions() {
-        let m = exact_manifest();
-        crate::validate::validate(&m).expect("fixture validates");
-        let hash = manifest_hash(&m);
-        let files = emit(&m, &hash, &no_imports());
-        let file = |name| files.iter().find(|(n, _)| *n == name).unwrap().1.as_str();
-        let types = file("types.ts");
-        let client = file("client.ts");
-        let constants = file("constants.ts");
-        let errors = file("errors.ts");
-
-        assert!(types.contains("export type SequenceId = bigint;"));
-        assert!(types.contains("  pair: [bigint, bigint];"));
-        assert!(types.contains("  | { type: \"pending\" }"));
-        assert!(types.contains("  | { type: \"ready\"; total: bigint }"));
-        assert!(client.contains("i64ToWire(value[0])"));
-        assert!(client.contains("u64ToWire(value[1])"));
-        assert!(client.contains("i64FromWire(value[0])"));
-        assert!(client.contains("u64FromWire(value[1])"));
-        assert!(client.contains("value.type === \"ready\""));
-        assert!(constants.contains(
-            "export const EXACT_PAIR = [-9223372036854775808n, 18446744073709551615n] as const;"
-        ));
-        assert!(constants.contains("export const MAX_SEQUENCE = 18446744073709551615n as const;"));
-        assert!(errors.contains("u64FromWire(value.exactLimit)"));
-    }
-
-    #[test]
-    fn mapped_foreign_error_enums_are_imported_not_emitted() {
-        let mut m = manifest();
-        if let TypeDecl::ErrorEnum { origin, .. } = &mut m.types[0] {
-            *origin = FOREIGN_ORIGIN.to_string();
-        } else {
-            panic!("types[0] should be the error enum");
-        }
-        let hash = manifest_hash(&m);
-        let files = emit(&m, &hash, &mapped_imports());
-        let errors = &files.iter().find(|(n, _)| *n == "errors.ts").unwrap().1;
-        // A value import carries the foreign registry into local wrappers.
+    fn retained_imported_types_still_have_local_wire_codecs() {
+        let manifest = manifest();
+        let imports = BTreeMap::from([(
+            FOREIGN_ORIGIN.to_string(),
+            "shared-types-example".to_string(),
+        )]);
+        let files = emit(&manifest, &manifest_hash(&manifest), &imports);
         assert!(
-            errors.contains(
-                "import { QueryError, QueryErrorBatchTooLarge, \
-                 QueryErrorInvalidBatchSize, QueryErrorTypes } from \"shared-types-example\";\n"
-            ),
-            "{errors}"
+            file(&files, "types.ts").contains("from \"shared-types-example\""),
+            "{}",
+            file(&files, "types.ts")
         );
         assert!(
-            errors.contains(
-                "export { QueryError, QueryErrorBatchTooLarge, \
-                 QueryErrorInvalidBatchSize, QueryErrorTypes };\n"
-            ),
-            "{errors}"
-        );
-        assert!(!errors.contains("export class QueryError"), "{errors}");
-        assert!(!errors.contains("registerError("), "{errors}");
-    }
-
-    #[test]
-    fn class_without_statics_keeps_the_plain_constructor_path() {
-        let mut m = manifest();
-        // Drop the factory-only class and RunningStats's factory: no
-        // class routes through INTERNAL anymore.
-        m.classes.remove(0);
-        m.classes[0].statics.clear();
-        let hash = manifest_hash(&m);
-        let files = emit(&m, &hash, &no_imports());
-        let client = &files.iter().find(|(n, _)| *n == "client.ts").unwrap().1;
-        assert!(!client.contains("INTERNAL"), "{client}");
-        assert!(
-            client.contains("  RunningStats: new (window: number) => RunningStats;\n"),
-            "{client}"
-        );
-        assert!(
-            client.contains(
-                "      constructor(window: number) {\n        \
-                 const raw = callFn(mod, \"rspyts_cls__RunningStats__new\", { window }) as number;\n"
-            ),
-            "{client}"
+            file(&files, "codecs.ts").contains("decodeSourceInfo"),
+            "{}",
+            file(&files, "codecs.ts")
         );
     }
 
     #[test]
-    fn null_constants_skip_the_const_assertion() {
-        use rspyts_core::ir::ConstDecl;
-        let c = ConstDecl {
-            name: "MAYBE".to_string(),
+    fn every_generated_typescript_file_has_bounded_lines() {
+        let mut manifest = exact_manifest();
+        manifest.constants.push(ConstDecl {
+            name: "LARGE_CATALOG".to_string(),
             docs: String::new(),
-            origin: "demo-crate".to_string(),
-            ty: Ty::Option {
-                inner: Box::new(Ty::F64),
+            origin: manifest.crate_name.clone(),
+            ty: Ty::List {
+                inner: Box::new(Ty::String),
             },
-            value: serde_json::Value::Null,
-        };
-        // `null as const` is a TS1355 error; plain `null` is emitted.
-        assert_eq!(const_line(&manifest(), &c), "export const MAYBE = null;\n");
-    }
-
-    #[test]
-    fn ts_json_renders_literals_and_quotes_non_identifier_keys() {
-        use serde_json::json;
-        assert_eq!(
-            ts_json(&json!({"with-dash": 1, "plain": true})),
-            "{ \"with-dash\": 1, plain: true }"
-        );
-        assert_eq!(ts_json(&json!([1.5, null, "x"])), "[1.5, null, \"x\"]");
-        assert_eq!(ts_json(&json!({})), "{}");
-    }
-
-    #[test]
-    fn reserved_word_param_binds_with_underscore_and_exact_wire_key() {
-        let m = manifest();
-        let f = FnDecl {
-            name: "with_default".to_string(),
+            value: serde_json::Value::Array(
+                (0..40)
+                    .map(|index| serde_json::Value::String(format!("catalog-entry-{index}")))
+                    .collect(),
+            ),
+        });
+        manifest.types.push(TypeDecl::StringEnum {
+            name: "LargeCatalogKind".to_string(),
             docs: String::new(),
-            params: vec![ParamDecl {
-                name: "default".to_string(),
-                wire_name: "default".to_string(),
-                ty: Ty::U32,
-            }],
-            ret: Ty::U32,
-            err: None,
-            targets: Target::all(),
-        };
-        // Signature binds `default_`; the args object keeps the exact
-        // wire key with no shorthand.
-        assert_eq!(ts_params(&f.params), "default_: number");
-        assert_eq!(
-            call_args(&m, &f.params, None, None),
-            "{ default: default_ }"
-        );
-        assert_eq!(
-            fn_property(&m, &f),
-            "    withDefault: (default_: number): number =>\n      \
-             callFn(mod, \"rspyts_fn__with_default\", { default: default_ }) as number,\n"
-        );
-        // Non-reserved names keep the shorthand form.
-        let plain = vec![ParamDecl {
-            name: "count".to_string(),
-            wire_name: "count".to_string(),
-            ty: Ty::U32,
-        }];
-        assert_eq!(call_args(&m, &plain, None, None), "{ count }");
+            origin: manifest.crate_name.clone(),
+            variants: (0..40)
+                .map(|index| rspyts_core::ir::StringVariantDecl {
+                    name: format!("CatalogEntry{index}"),
+                    wire_name: format!("catalog-entry-{index}"),
+                    docs: String::new(),
+                })
+                .collect(),
+        });
+        let files = rendered(&manifest);
+        for name in [
+            "client.ts",
+            "codecs.ts",
+            "constants.ts",
+            "errors.ts",
+            "index.ts",
+            "types.ts",
+        ] {
+            let longest = file(&files, name)
+                .lines()
+                .map(str::len)
+                .max()
+                .unwrap_or_default();
+            assert!(longest <= 160, "{name} has a {longest}-character line");
+        }
     }
 
     #[test]
-    fn quoted_property_names_when_not_identifiers() {
+    fn module_specifiers_and_prototype_keys_are_safe() {
         assert_eq!(
-            ts_field("with-dash", &Ty::Bool, false),
-            "\"with-dash\": boolean"
+            ts_module_specifier("../shared/generated"),
+            "\"../shared/generated.js\""
         );
-        assert_eq!(ts_field("plain", &Ty::Bool, false), "plain: boolean");
-        assert_eq!(
-            ts_field("line\n\"quote-dash", &Ty::Bool, false),
-            "\"line\\n\\\"quote-dash\": boolean"
-        );
-    }
-
-    #[test]
-    fn json_type_projects_to_unknown() {
-        assert_eq!(ts_type(&Ty::Json), "unknown");
-        assert_eq!(
-            ts_type(&Ty::List {
-                inner: Box::new(Ty::Json)
-            }),
-            "unknown[]"
-        );
+        assert_eq!(ts_prop("__proto__"), "[\"__proto__\"]");
     }
 }

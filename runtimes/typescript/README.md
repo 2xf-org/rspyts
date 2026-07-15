@@ -23,16 +23,104 @@ npm install rspyts
 
 ## Public API
 
-- `instantiate` validates and wraps an rspyts WebAssembly module.
-- `BridgeModule` describes the validated module and its memory.
-- `callFn` and `callDrop` are used by generated clients.
+- `instantiate(source, { expectedContractFingerprint? })` validates the ABI-3
+  module, required exports, memory, and its deterministic contract
+  fingerprint. Supplying the generated 64-character lowercase SHA-256 also
+  rejects a stale or wrong binary during loading.
+- `BridgeModule` exposes the validated exports, memory, and loaded
+  `contractFingerprint`.
+- `ContractFingerprintMismatchError` reports the expected and actual
+  fingerprints when generated bindings and a module do not match.
 - `RspytsError`, `RspytsPanicError`, and `StaleHandleError` form the bridge error hierarchy.
 - `InstancePoisonedError` stops calls after a WebAssembly runtime trap; create
   a fresh module instance before retrying.
-- `i64ToWire`, `u64ToWire`, `i64FromWire`, and `u64FromWire` are the
-  range-checked exact-`bigint` conversion surface used by generated clients.
 
-The package exports only the support surface required by generated code; application code should normally use its generated `createClient`.
+Application code should normally use this root surface plus its generated
+`createClient`. Generator plumbing is deliberately isolated at
+`rspyts/internal/abi3`.
+
+## Exact emitter API
+
+ABI-3 generated code imports only the following versioned, semver-exempt
+subpath:
+
+```ts
+import {
+  type BridgeErrorRegistry,
+  type BridgeModule,
+  type SliceArg,
+  type WireResponse,
+  type WireVariantShape,
+  RspytsError,
+  boolFromWire,
+  boundedIntFromWire,
+  bufferFromWire,
+  bytesFromWire,
+  callDrop,
+  callFn,
+  enumFromWire,
+  f32FromWire,
+  floatFromWire,
+  i64FromWire,
+  i64ToWire,
+  jsonFromWire,
+  jsonToWire,
+  listFromWire,
+  mapFromWire,
+  nullFromWire,
+  objectFromWire,
+  stringEnumFromWire,
+  stringFromWire,
+  tupleFromWire,
+  u64FromWire,
+  u64ToWire,
+  verifyModuleContract,
+  wireBuffer,
+  wireResponse,
+} from "rspyts/internal/abi3";
+```
+
+The call contract has one path:
+
+```ts
+interface WireResponse<T = unknown> {
+  readonly value: T;
+  readonly tail: Uint8Array;
+}
+
+function callFn(
+  mod: BridgeModule,
+  symbol: string,
+  args: unknown,
+  slices?: SliceArg[],
+  handle?: bigint,
+  errorTypes?: BridgeErrorRegistry,
+): WireResponse;
+
+function callDrop(mod: BridgeModule, symbol: string, handle: bigint): void;
+function verifyModuleContract(mod: BridgeModule, expected: string): void;
+```
+
+Every successful-return decoder consumes `WireResponse`, never a bare value.
+Scalar decoders return their host scalar. `listFromWire` and `tupleFromWire`
+return `WireResponse[]`; `mapFromWire`, `objectFromWire`, and `enumFromWire`
+return records whose values are child `WireResponse` objects carrying the same
+explicit tail. `bufferFromWire` and `bytesFromWire` validate exact wrapper
+shape, dtype, alignment, and bounds before copying attachment bytes. The
+remaining decoder signatures are recorded in `etc/public-surface.d.ts` and
+checked in CI.
+
+`wireBuffer` brands numeric request attachments with a collision-proof host
+symbol. `jsonToWire` and `jsonFromWire` validate and copy ordinary JSON without
+adding a wire wrapper: reserved-looking keys stay application data at a
+schema-declared `Json` position. `wireResponse(value)` creates empty-tail
+context for generated error-data conversion.
+
+Generated `createClient` calls
+`verifyModuleContract(mod, "<manifest sha256>")` before exposing operations.
+The module export `rspyts_contract_fingerprint()` is an owned success envelope
+whose JSON value is the exact lowercase 64-character SHA-256 and whose tail is
+empty; the runtime copies and frees it with normal ABI ownership rules.
 
 ## Documentation
 
@@ -43,6 +131,7 @@ Documentation can be found in the repository: the [TypeScript guide](https://git
 ```
 npm ci
 npm run typecheck
+npm run lint
 npm test
 npm run build
 npm run check:surface

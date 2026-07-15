@@ -23,9 +23,11 @@ pip install rspyts
 npm install rspyts
 ```
 
-The bridged Rust crate must build as a `cdylib` and depend directly on Serde
-with its `derive` feature. The [quickstart](docs/introduction/quickstart.md)
-contains a complete setup.
+The bridged Rust crate must build as a `cdylib` and depend on `rspyts`.
+An `rlib` output is needed only when another Rust crate also links the crate;
+a direct Serde dependency is needed only when user code names Serde itself,
+for example with `#[bridge(serde)]`. The
+[quickstart](docs/introduction/quickstart.md) contains a complete setup.
 
 ## Using
 
@@ -87,9 +89,10 @@ bytes and numeric arrays travel in aligned binary attachments. Python receives
 pydantic models and typed exceptions. TypeScript receives interfaces,
 discriminated unions, typed arrays, and disposable handle-backed classes.
 
-The boundary is intentionally finite. Exact 64-bit integers use explicit
-`I64` and `U64` wrappers; asynchronous functions, callbacks, arbitrary Serde
-codecs, and implicit cross-language lifetimes are outside the contract. See
+The boundary is intentionally finite. Native `i64` and `u64` become exact
+decimal strings only at the wire boundary, while `serde_json::Value` remains
+transparent JSON. Asynchronous functions, callbacks, arbitrary Serde codecs,
+and implicit cross-language lifetimes are outside the contract. See
 the [documentation](docs/README.md) for the complete model.
 
 ## Development

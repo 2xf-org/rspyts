@@ -1,0 +1,11 @@
+error: bridged member `dispose` projects to `dispose`, which collides with generated TypeScript class lifecycle member `dispose`; rename it or scope it to Python with `#[bridge(target = "python")]`
+  --> tests/ui/method_named_dispose.rs:12:12
+   |
+12 |     pub fn dispose(&self) {}
+   |            ^^^^^^^
+
+error: `constructor` does not apply to this item; it marks the constructor method inside a #[bridge] impl block
+ --> tests/ui/method_named_dispose.rs:7:14
+  |
+7 |     #[bridge(constructor)]
+  |              ^^^^^^^^^^^
