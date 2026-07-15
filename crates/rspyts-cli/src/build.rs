@@ -961,40 +961,40 @@ mod tests {
             cargo_metadata_args(true),
             ["metadata", "--format-version=1", "--no-deps", "--locked"]
         );
-        let metadata = br#"{
-            "target_directory":"/workspace/target",
-            "packages":[
+        let workspace = std::env::current_dir().unwrap().join("metadata-fixture");
+        let target_directory = workspace.join("target");
+        let dependency_manifest = workspace.join("dependency/Cargo.toml");
+        let demo_manifest = workspace.join("demo/Cargo.toml");
+        let metadata = serde_json::to_vec(&serde_json::json!({
+            "target_directory": target_directory,
+            "packages": [
                 {
-                    "id":"path+file:///workspace/dependency#0.1.0",
-                    "name":"dependency",
-                    "manifest_path":"/workspace/dependency/Cargo.toml",
-                    "targets":[{"name":"actual_bridge","crate_types":["cdylib"]}]
+                    "id": "path+file:///workspace/dependency#0.1.0",
+                    "name": "dependency",
+                    "manifest_path": dependency_manifest,
+                    "targets": [{"name": "actual_bridge", "crate_types": ["cdylib"]}]
                 },
                 {
-                    "id":"path+file:///workspace/demo#demo-package@1.2.3",
-                    "name":"demo-package",
-                    "manifest_path":"/workspace/demo/Cargo.toml",
-                    "targets":[{"name":"actual_bridge","crate_types":["rlib","cdylib"]}]
+                    "id": "path+file:///workspace/demo#demo-package@1.2.3",
+                    "name": "demo-package",
+                    "manifest_path": demo_manifest,
+                    "targets": [{"name": "actual_bridge", "crate_types": ["rlib", "cdylib"]}]
                 }
             ]
-        }"#;
+        }))
+        .unwrap();
         assert_eq!(
-            parse_cargo_package(
-                metadata,
-                Path::new("/workspace/demo/Cargo.toml"),
-                "demo-package"
-            )
-            .unwrap(),
+            parse_cargo_package(&metadata, &demo_manifest, "demo-package").unwrap(),
             CargoPackage {
                 package_id: "path+file:///workspace/demo#demo-package@1.2.3".into(),
                 cdylib_target: "actual_bridge".into(),
-                target_directory: PathBuf::from("/workspace/target"),
+                target_directory,
             }
         );
         assert!(
             parse_cargo_package(
-                metadata,
-                Path::new("/workspace/missing/Cargo.toml"),
+                &metadata,
+                &workspace.join("missing/Cargo.toml"),
                 "demo-package"
             )
             .is_err()
