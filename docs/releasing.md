@@ -120,11 +120,11 @@ normal test suites, not duplicated in release smokes.
 
 ## Tag and publish
 
-After the candidate commit is on `main`, create and push an annotated, signed
-stable tag:
+After the candidate commit is on `main`, create and push an annotated stable
+tag:
 
 ```sh
-git tag -s v0.3.0 -m "rspyts v0.3.0"
+git tag -a v0.3.0 -m "rspyts v0.3.0"
 git push origin v0.3.0
 ```
 
@@ -132,7 +132,7 @@ The source guard rejects prerelease tags and verifies all of the following
 before credentials or package publication are possible:
 
 - the event is the exact tag push and `GITHUB_SHA` is its target commit;
-- the tag is annotated and GitHub verifies its signature;
+- the tag is annotated and targets the workflow commit;
 - the tag target is contained in `origin/main`;
 - the complete reusable validation workflow passes at that immutable commit;
 - the tag version matches the Cargo workspace version. Reusable validation

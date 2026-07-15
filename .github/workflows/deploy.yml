@@ -1,4 +1,4 @@
-# Stable releases are published by pushing an annotated, signed vMAJOR.MINOR.PATCH tag.
+# Stable releases are published by pushing an annotated vMAJOR.MINOR.PATCH tag.
 #
 #   source guard -> full validation -> exact package smokes -> crates.io -> PyPI -> npm -> GitHub
 
@@ -33,10 +33,8 @@ jobs:
           ref: ${{ github.sha }}
           fetch-depth: 0
           persist-credentials: false
-      - name: Verify event ref, commit, tag signature, and main ancestry
+      - name: Verify event ref, commit, tag, and main ancestry
         id: source
-        env:
-          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
 
@@ -58,33 +56,11 @@ jobs:
 
           tag_object=$(git rev-parse "$expected_ref")
           if [[ "$(git cat-file -t "$tag_object")" != tag ]]; then
-            echo "$expected_ref must be an annotated, signed tag" >&2
+            echo "$expected_ref must be an annotated tag" >&2
             exit 1
           fi
           if [[ "$(git rev-parse "${expected_ref}^{commit}")" != "$event_commit" ]]; then
             echo "$expected_ref does not target the workflow commit $event_commit" >&2
-            exit 1
-          fi
-
-          verification=$(curl \
-            --fail-with-body \
-            --silent \
-            --show-error \
-            --header "Accept: application/vnd.github+json" \
-            --header "Authorization: Bearer $GH_TOKEN" \
-            --header "X-GitHub-Api-Version: 2022-11-28" \
-            "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/git/tags/$tag_object")
-          if ! jq -e \
-            --arg tag "$tag" \
-            --arg commit "$event_commit" \
-            '.tag == $tag and .object.type == "commit" and .object.sha == $commit' \
-            <<<"$verification" >/dev/null; then
-            echo "GitHub's tag object does not target $event_commit" >&2
-            exit 1
-          fi
-          if [[ "$(jq -r '.verification.verified' <<<"$verification")" != true ]]; then
-            reason=$(jq -r '.verification.reason // "unknown"' <<<"$verification")
-            echo "$expected_ref does not have a GitHub-verified signature ($reason)" >&2
             exit 1
           fi
 
