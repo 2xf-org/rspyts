@@ -6,7 +6,7 @@ Rust `cdylib` built with [rspyts](https://crates.io/crates/rspyts).
 ## Install
 
 ```sh
-cargo install rspyts-cli --version 0.3.1 --locked
+cargo install rspyts-cli --version 0.3.2 --locked
 ```
 
 ## Commands

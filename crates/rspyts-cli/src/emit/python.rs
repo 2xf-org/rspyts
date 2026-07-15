@@ -7,7 +7,7 @@
 //! models.
 
 use super::util::{
-    collect_refs, doc_lines, find_type, int_bounds, py_alias_roundtrips, py_docstring,
+    Provenance, collect_refs, doc_lines, find_type, int_bounds, py_alias_roundtrips, py_docstring,
     py_error_registry_name, py_header, py_name, py_type,
 };
 use rspyts_core::ir::{
@@ -23,23 +23,23 @@ const MAX_LINE_LENGTH: usize = 120;
 /// Emit one wholly-owned generated Python package.
 pub fn emit(
     manifest: &Manifest,
-    fingerprint: &str,
+    provenance: &Provenance<'_>,
     library_search: &[String],
     imports: &BTreeMap<String, String>,
 ) -> Vec<(&'static str, String)> {
     let codecs = CodecPlan::new(manifest);
     vec![
-        ("__init__.py", init_py(manifest, fingerprint)),
-        ("codecs.py", codecs_py(manifest, fingerprint, &codecs)),
-        ("classes.py", classes_py(manifest, fingerprint, &codecs)),
-        ("constants.py", constants_py(manifest, fingerprint)),
-        ("errors.py", errors_py(manifest, fingerprint, imports)),
-        ("functions.py", functions_py(manifest, fingerprint, &codecs)),
+        ("__init__.py", init_py(manifest, provenance)),
+        ("codecs.py", codecs_py(manifest, provenance, &codecs)),
+        ("classes.py", classes_py(manifest, provenance, &codecs)),
+        ("constants.py", constants_py(manifest, provenance)),
+        ("errors.py", errors_py(manifest, provenance, imports)),
+        ("functions.py", functions_py(manifest, provenance, &codecs)),
         (
             "library.py",
-            library_py(manifest, fingerprint, library_search),
+            library_py(manifest, provenance, library_search),
         ),
-        ("models.py", models_py(manifest, fingerprint, imports)),
+        ("models.py", models_py(manifest, provenance, imports)),
     ]
 }
 
@@ -71,7 +71,11 @@ fn projected_names(decl: &TypeDecl) -> Vec<String> {
 
 // ---------------------------------------------------------------- models.py
 
-fn models_py(manifest: &Manifest, fingerprint: &str, imports: &BTreeMap<String, String>) -> String {
+fn models_py(
+    manifest: &Manifest,
+    provenance: &Provenance<'_>,
+    imports: &BTreeMap<String, String>,
+) -> String {
     let mut body = String::new();
     let mut defined = BTreeSet::new();
     for decl in &manifest.types {
@@ -154,7 +158,7 @@ fn models_py(manifest: &Manifest, fingerprint: &str, imports: &BTreeMap<String, 
         defined.insert(decl.name().to_string());
     }
 
-    let mut out = py_header(fingerprint);
+    let mut out = py_header(provenance);
     out.push_str(&format!(
         "\"\"\"\nHost data models bridged from `{}`.\n\"\"\"\n",
         manifest.crate_name
@@ -682,7 +686,7 @@ fn raise_line(indent: &str, error: &str, argument: &str) -> String {
     format!("{indent}raise {error}(\n{indent}    {argument}\n{indent})\n")
 }
 
-fn codecs_py(manifest: &Manifest, fingerprint: &str, plan: &CodecPlan) -> String {
+fn codecs_py(manifest: &Manifest, provenance: &Provenance<'_>, plan: &CodecPlan) -> String {
     let mut body = String::new();
     for (name, ty) in plan.encode_boundaries.values() {
         body.push_str("\n\n");
@@ -713,7 +717,7 @@ fn codecs_py(manifest: &Manifest, fingerprint: &str, plan: &CodecPlan) -> String
         }
     }
 
-    let mut out = py_header(fingerprint);
+    let mut out = py_header(provenance);
     out.push_str("\"\"\"Schema-directed ABI 3 codecs for the generated client.\"\"\"\n");
     out.push_str("\nimport typing\n\nimport rspyts.internal\n");
     if body.contains("models.") {
@@ -1240,7 +1244,11 @@ fn error_codec_name(error_name: &str, variant_name: &str) -> String {
 
 // ---------------------------------------------------------------- errors.py
 
-fn errors_py(manifest: &Manifest, fingerprint: &str, imports: &BTreeMap<String, String>) -> String {
+fn errors_py(
+    manifest: &Manifest,
+    provenance: &Provenance<'_>,
+    imports: &BTreeMap<String, String>,
+) -> String {
     let mut local = Vec::new();
     let mut foreign: BTreeMap<&str, BTreeSet<String>> = BTreeMap::new();
     for decl in &manifest.types {
@@ -1265,7 +1273,7 @@ fn errors_py(manifest: &Manifest, fingerprint: &str, imports: &BTreeMap<String, 
         }
     }
 
-    let mut out = py_header(fingerprint);
+    let mut out = py_header(provenance);
     out.push_str(&format!(
         "\"\"\"\nException classes bridged from `{}`.\n\"\"\"\n",
         manifest.crate_name
@@ -1355,8 +1363,12 @@ fn error_class(name: &str, base: &str, docs: &str, codec: Option<String>) -> Str
 
 // ---------------------------------------------------------------- library.py
 
-fn library_py(manifest: &Manifest, fingerprint: &str, library_search: &[String]) -> String {
-    let mut out = py_header(fingerprint);
+fn library_py(
+    manifest: &Manifest,
+    provenance: &Provenance<'_>,
+    library_search: &[String],
+) -> String {
+    let mut out = py_header(provenance);
     out.push_str(&format!(
         "\"\"\"\nLoader for the compiled `{}` bridge library.\n\"\"\"\n",
         manifest.crate_name
@@ -1376,7 +1388,7 @@ fn library_py(manifest: &Manifest, fingerprint: &str, library_search: &[String])
     out.push_str("    anchor=pathlib.Path(__file__).parent,\n");
     out.push_str(&format!(
         "    expected_contract_fingerprint={},\n",
-        py_string(fingerprint)
+        py_string(provenance.manifest_hash)
     ));
     out.push_str(")\n");
     out
@@ -1384,7 +1396,7 @@ fn library_py(manifest: &Manifest, fingerprint: &str, library_search: &[String])
 
 // -------------------------------------------------------------- constants.py
 
-fn constants_py(manifest: &Manifest, fingerprint: &str) -> String {
+fn constants_py(manifest: &Manifest, provenance: &Provenance<'_>) -> String {
     let mut body = String::new();
     let mut model_imports = BTreeSet::new();
     for constant in &manifest.constants {
@@ -1399,7 +1411,7 @@ fn constants_py(manifest: &Manifest, fingerprint: &str) -> String {
         record_model_uses(manifest, &constant.ty, &mut model_imports);
         body.push_str(&constant_decl(manifest, constant));
     }
-    let mut out = py_header(fingerprint);
+    let mut out = py_header(provenance);
     out.push_str("\"\"\"\nConstants bridged from Rust.\n\"\"\"\n");
     if !manifest.constants.is_empty() {
         out.push_str("\nimport typing\n");
@@ -1728,7 +1740,7 @@ fn multiline_items(open: &str, close: &str, items: Vec<String>, indent: usize) -
 
 // -------------------------------------------------------------- functions.py
 
-fn functions_py(manifest: &Manifest, fingerprint: &str, codecs: &CodecPlan) -> String {
+fn functions_py(manifest: &Manifest, provenance: &Provenance<'_>, codecs: &CodecPlan) -> String {
     let functions: Vec<&FnDecl> = manifest
         .functions
         .iter()
@@ -1747,7 +1759,7 @@ fn functions_py(manifest: &Manifest, fingerprint: &str, codecs: &CodecPlan) -> S
             &mut uses_numpy,
         ));
     }
-    let mut out = py_header(fingerprint);
+    let mut out = py_header(provenance);
     out.push_str("\"\"\"\nTyped wrappers for bridged free functions.\n\"\"\"\n");
     if !functions.is_empty() {
         if body.contains("typing.") {
@@ -1800,7 +1812,7 @@ fn function_def(
 
 // ---------------------------------------------------------------- classes.py
 
-fn classes_py(manifest: &Manifest, fingerprint: &str, codecs: &CodecPlan) -> String {
+fn classes_py(manifest: &Manifest, provenance: &Provenance<'_>, codecs: &CodecPlan) -> String {
     let mut body = String::new();
     let mut model_imports = BTreeSet::new();
     let mut uses_numpy = false;
@@ -1814,7 +1826,7 @@ fn classes_py(manifest: &Manifest, fingerprint: &str, codecs: &CodecPlan) -> Str
             &mut uses_numpy,
         ));
     }
-    let mut out = py_header(fingerprint);
+    let mut out = py_header(provenance);
     out.push_str("\"\"\"\nHandle classes for bridged Rust objects.\n\"\"\"\n");
     if !manifest.classes.is_empty() {
         out.push_str("\nimport typing\n\n");
@@ -2152,7 +2164,7 @@ fn py_param_name(name: &str) -> String {
 
 // ---------------------------------------------------------------- __init__.py
 
-fn init_py(manifest: &Manifest, fingerprint: &str) -> String {
+fn init_py(manifest: &Manifest, provenance: &Provenance<'_>) -> String {
     let mut models = Vec::new();
     let mut errors = Vec::new();
     for decl in &manifest.types {
@@ -2192,7 +2204,7 @@ fn init_py(manifest: &Manifest, fingerprint: &str) -> String {
         ),
         (".models", models),
     ];
-    let mut out = py_header(fingerprint);
+    let mut out = py_header(provenance);
     out.push_str(&format!(
         "\"\"\"\nGenerated bridge surface for `{}`.\n\"\"\"\n",
         manifest.crate_name
@@ -2266,9 +2278,14 @@ mod tests {
     use super::*;
 
     fn emitted(manifest: &Manifest) -> Vec<(&'static str, String)> {
+        let hash = manifest_hash(manifest);
+        let provenance = Provenance {
+            manifest_hash: &hash,
+            rust_source: "../rust/src",
+        };
         emit(
             manifest,
-            &manifest_hash(manifest),
+            &provenance,
             &["lib".to_string()],
             &BTreeMap::new(),
         )
@@ -2337,7 +2354,16 @@ mod tests {
     fn loader_pins_emitter_api_and_contract_fingerprint() {
         let manifest = manifest();
         let hash = manifest_hash(&manifest);
-        let files = emit(&manifest, &hash, &["lib".to_string()], &BTreeMap::new());
+        let provenance = Provenance {
+            manifest_hash: &hash,
+            rust_source: "../rust/src",
+        };
+        let files = emit(
+            &manifest,
+            &provenance,
+            &["lib".to_string()],
+            &BTreeMap::new(),
+        );
         let library = file(&files, "library.py");
         assert!(library.contains("rspyts.internal.require_emitter_api(4)"));
         assert!(library.contains(&format!("expected_contract_fingerprint={hash:?}")));

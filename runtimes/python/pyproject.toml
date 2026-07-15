@@ -1,6 +1,6 @@
 [project]
 name = "rspyts"
-version = "0.3.1"
+version = "0.3.2"
 description = "Python runtime for rspyts: pydantic contracts and a ctypes loader for Rust cdylibs bridged with the rspyts ABI."
 readme = "README.md"
 license = "MIT"

@@ -9,8 +9,8 @@
 //! re-emitted (codegen.md §9).
 
 use super::util::{
-    collect_refs, int_bounds, pascal, ts_doc, ts_doc_from_lines, ts_error_registry_name, ts_header,
-    ts_type, ts_typed_array,
+    Provenance, collect_refs, int_bounds, pascal, ts_doc, ts_doc_from_lines,
+    ts_error_registry_name, ts_header, ts_type, ts_typed_array,
 };
 use heck::ToLowerCamelCase;
 use rspyts_core::ir::{
@@ -21,16 +21,16 @@ use std::collections::{BTreeMap, BTreeSet};
 /// Emit all five files: `(file name, content)` pairs, name-sorted.
 pub fn emit(
     m: &Manifest,
-    hash: &str,
+    provenance: &Provenance<'_>,
     imports: &BTreeMap<String, String>,
 ) -> Vec<(&'static str, String)> {
     vec![
-        ("client.ts", client_ts(m, hash)),
-        ("codecs.ts", codecs_ts(m, hash)),
-        ("constants.ts", constants_ts(m, hash)),
-        ("errors.ts", errors_ts(m, hash, imports)),
-        ("index.ts", index_ts(hash)),
-        ("types.ts", types_ts(m, hash, imports)),
+        ("client.ts", client_ts(m, provenance)),
+        ("codecs.ts", codecs_ts(m, provenance)),
+        ("constants.ts", constants_ts(m, provenance)),
+        ("errors.ts", errors_ts(m, provenance, imports)),
+        ("index.ts", index_ts(provenance)),
+        ("types.ts", types_ts(m, provenance, imports)),
     ]
 }
 
@@ -47,8 +47,12 @@ fn on_ts(targets: &[Target]) -> bool {
 
 // ----------------------------------------------------------------- types.ts
 
-fn types_ts(m: &Manifest, hash: &str, imports: &BTreeMap<String, String>) -> String {
-    let mut out = ts_header(hash);
+fn types_ts(
+    m: &Manifest,
+    provenance: &Provenance<'_>,
+    imports: &BTreeMap<String, String>,
+) -> String {
+    let mut out = ts_header(provenance);
     let mut any = false;
 
     // Imported foreign data types: import for local use, re-export so
@@ -220,8 +224,8 @@ fn is_ts_ident(name: &str) -> bool {
 
 // -------------------------------------------------------------- constants.ts
 
-fn constants_ts(m: &Manifest, hash: &str) -> String {
-    let mut out = ts_header(hash);
+fn constants_ts(m: &Manifest, provenance: &Provenance<'_>) -> String {
+    let mut out = ts_header(provenance);
     if m.constants.is_empty() {
         out.push_str("\nexport {};\n");
         return wrap_ts_source(&out, 120);
@@ -373,7 +377,11 @@ fn ts_json(value: &serde_json::Value) -> String {
 
 // ---------------------------------------------------------------- errors.ts
 
-fn errors_ts(m: &Manifest, hash: &str, imports: &BTreeMap<String, String>) -> String {
+fn errors_ts(
+    m: &Manifest,
+    provenance: &Provenance<'_>,
+    imports: &BTreeMap<String, String>,
+) -> String {
     let mut local: Vec<(&String, &String, &Vec<rspyts_core::ir::ErrorVariantDecl>)> = Vec::new();
     let mut foreign: BTreeMap<&str, Vec<String>> = BTreeMap::new();
     for t in &m.types {
@@ -396,7 +404,7 @@ fn errors_ts(m: &Manifest, hash: &str, imports: &BTreeMap<String, String>) -> St
         }
     }
 
-    let mut out = ts_header(hash);
+    let mut out = ts_header(provenance);
     if local.is_empty() && foreign.is_empty() {
         out.push_str("\nexport {};\n");
         return wrap_ts_source(&out, 120);
@@ -494,7 +502,7 @@ fn ts_error_data_expr(error: &str, variant: &str, fields: &[FieldDecl]) -> Strin
 
 /// Generator/runtime plumbing. This module is imported by `client.ts` and
 /// `errors.ts`, but deliberately never re-exported by `index.ts`.
-fn codecs_ts(m: &Manifest, hash: &str) -> String {
+fn codecs_ts(m: &Manifest, provenance: &Provenance<'_>) -> String {
     let (encode_names, decode_names) = codec_type_requirements(m);
     let mut body = String::new();
 
@@ -562,7 +570,7 @@ fn codecs_ts(m: &Manifest, hash: &str) -> String {
         }
     }
 
-    let mut out = ts_header(hash);
+    let mut out = ts_header(provenance);
     if body.is_empty() {
         out.push_str("\nexport {};\n");
         return wrap_ts_source(&out, 120);
@@ -867,7 +875,7 @@ fn static_result_codec(class: &ClassDecl, method: &str) -> String {
 
 // ---------------------------------------------------------------- client.ts
 
-fn client_ts(m: &Manifest, hash: &str) -> String {
+fn client_ts(m: &Manifest, provenance: &Provenance<'_>) -> String {
     let client_name = format!("{}Client", pascal(&m.crate_name));
     let fns: Vec<&FnDecl> = m.functions.iter().filter(|f| on_ts(&f.targets)).collect();
     let has_errors = fns.iter().any(|function| function.err.is_some())
@@ -925,7 +933,7 @@ fn client_ts(m: &Manifest, hash: &str) -> String {
         collect_refs(r, &mut type_imports);
     }
 
-    let mut out = ts_header(hash);
+    let mut out = ts_header(provenance);
     out.push('\n');
     let mut rspyts_names = vec![
         "type BridgeModule".to_string(),
@@ -1052,7 +1060,7 @@ fn client_ts(m: &Manifest, hash: &str) -> String {
     ));
     out.push_str(&format!(
         "  verifyModuleContract(mod, {});\n",
-        ts_string(hash)
+        ts_string(provenance.manifest_hash)
     ));
     if fns.is_empty() && m.classes.is_empty() {
         out.push_str("  return {};\n}\n");
@@ -1733,8 +1741,8 @@ fn surrounded_by_spaces(bytes: &[u8], index: usize) -> bool {
 
 // ----------------------------------------------------------------- index.ts
 
-fn index_ts(hash: &str) -> String {
-    let mut out = ts_header(hash);
+fn index_ts(provenance: &Provenance<'_>) -> String {
+    let mut out = ts_header(provenance);
     out.push('\n');
     out.push_str("export * from \"./client.js\";\n");
     out.push_str("export * from \"./constants.js\";\n");
@@ -1751,7 +1759,12 @@ mod tests {
     use super::*;
 
     fn rendered(manifest: &Manifest) -> Vec<(&'static str, String)> {
-        emit(manifest, &manifest_hash(manifest), &BTreeMap::new())
+        let hash = manifest_hash(manifest);
+        let provenance = Provenance {
+            manifest_hash: &hash,
+            rust_source: "../rust/src",
+        };
+        emit(manifest, &provenance, &BTreeMap::new())
     }
 
     fn file<'a>(files: &'a [(&str, String)], name: &str) -> &'a str {
@@ -1884,7 +1897,12 @@ mod tests {
             FOREIGN_ORIGIN.to_string(),
             "shared-types-example".to_string(),
         )]);
-        let files = emit(&manifest, &manifest_hash(&manifest), &imports);
+        let hash = manifest_hash(&manifest);
+        let provenance = Provenance {
+            manifest_hash: &hash,
+            rust_source: "../rust/src",
+        };
+        let files = emit(&manifest, &provenance, &imports);
         assert!(
             file(&files, "types.ts").contains("from \"shared-types-example\""),
             "{}",
