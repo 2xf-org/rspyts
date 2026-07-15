@@ -51,9 +51,10 @@ use proc_macro::TokenStream;
 /// deserialize. Override the casing per struct with
 /// `#[bridge(rename_all = "snake_case")]`. Doc comments propagate to
 /// Python docstrings, TypeScript doc comments, and JSON Schema
-/// descriptions. `Option<T>` fields are marked optional in the generated
-/// surfaces (null default). Rejected: generics, lifetimes, tuple structs,
-/// unit structs, non-`pub` fields.
+/// descriptions. Direct `Option<T>` fields are omittable in generated
+/// surfaces; add `#[bridge(required)]` to require the key while still
+/// accepting null. All other fields are required. Rejected: generics,
+/// lifetimes, tuple structs, unit structs, non-`pub` fields.
 ///
 /// A type that already derives Serde can instead use adoption mode:
 ///
@@ -70,8 +71,8 @@ use proc_macro::TokenStream;
 /// Serde's `rename`, `rename_all`, `tag`, `transparent`, and
 /// `deny_unknown_fields` subset into the manifest and rejects every
 /// unmodeled shape-changing key at its definition site. Both derives are
-/// required syntactically and by trait bound. Use `rspyts::Json` for an
-/// intentionally schemaless custom codec.
+/// required syntactically and by trait bound. Use `serde_json::Value` for
+/// intentionally schemaless data.
 ///
 /// # Enums
 ///
@@ -132,7 +133,8 @@ use proc_macro::TokenStream;
 ///
 /// Accepted const types — exactly these:
 ///
-/// - **scalars**: `bool`, `u8`/`u16`/`u32`, `i8`/`i16`/`i32`, `f32`/`f64`;
+/// - **scalars**: `bool`, `u8`/`u16`/`u32`/`u64`,
+///   `i8`/`i16`/`i32`/`i64`, `f32`/`f64`;
 /// - **`&'static str`** (a `String` on the wire — `const String` is
 ///   impossible in Rust, so the borrowed form is special-cased);
 /// - **arrays and slices of supported types**: `[T; N]`,
@@ -159,7 +161,7 @@ use proc_macro::TokenStream;
 /// Emits `extern "C" fn rspyts_fn__process_values(args_ptr, args_len,
 /// s0_ptr, s0_len) -> *mut u8` (ABI §3.1). Parameters written as slices of
 /// any supported numeric dtype cross as raw `(ptr, len)`
-/// pairs; everything else travels in one ABI-2 request envelope keyed by the
+/// pairs; everything else travels in one ABI-3 request envelope keyed by the
 /// camelCase parameter name. Owned `Buf<T>` and `Bytes` values use binary
 /// attachments in that envelope. `&T` and `&str` parameters deserialize to
 /// owned values and are re-borrowed for the call. Return `T`, `()`, or —
@@ -264,6 +266,7 @@ use proc_macro::TokenStream;
 /// | `serde` | struct, data enum | adopt existing Serde derives and reflected naming metadata |
 /// | `tag = "…"` | data enum | discriminator key (default `"type"`) |
 /// | `rename_all = "…"` | struct | wire casing: `"camelCase"` (default) or `"snake_case"` |
+/// | `required` | direct `Option<T>` field | require the object key while retaining nullable values |
 /// | `constructor` | method in a bridged impl | marks the constructor |
 /// | `static` | method in a bridged impl | handle-less static; factory when returning `Self` |
 /// | `target = "…"` | fn, method, static, impl | emit only for `"python"` or `"typescript"`; on an impl it is the default for all members |

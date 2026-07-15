@@ -8,9 +8,8 @@ worthwhile: both packages hand out the *same* classes, so instances flow
 between them without conversion.
 
 Notes:
-    Requires the native library: ``cargo build -p multi-crate-app`` (the
-    generated ``library.py`` searches ``target/{debug,release}``; override
-    with the ``RSPYTS_LIBRARY`` env var, which CI sets explicitly).
+    Requires ``rspyts build --config examples/multi-crate/app/rspyts.toml``;
+    the native library is staged beside the generated package.
 """
 
 import shared_types

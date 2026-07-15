@@ -1,0 +1,17 @@
+error: bridged member `prototype` projects to `prototype`, which collides with reserved JavaScript class static `prototype`; rename it or scope it to Python with `#[bridge(target = "python")]`
+  --> tests/ui/static_named_prototype.rs:13:12
+   |
+13 |     pub fn prototype() -> u32 {
+   |            ^^^^^^^^^
+
+error: `constructor` does not apply to this item; it marks the constructor method inside a #[bridge] impl block
+ --> tests/ui/static_named_prototype.rs:7:14
+  |
+7 |     #[bridge(constructor)]
+  |              ^^^^^^^^^^^
+
+error: `static` does not apply to free functions; `static` marks a method inside a #[bridge] impl block
+  --> tests/ui/static_named_prototype.rs:12:14
+   |
+12 |     #[bridge(static)]
+   |              ^^^^^^

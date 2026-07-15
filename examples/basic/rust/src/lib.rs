@@ -1,21 +1,23 @@
 //! basic-example — the rspyts end-to-end example.
 //!
-//! A deliberately plain little library that nonetheless exercises every
-//! feature of the portable type system: structs, string enums, tagged data
+//! A deliberately plain little library that exercises a broad representative
+//! slice of the portable type system: structs, string enums, tagged data
 //! enums, error enums with data, optional values, borrowed slice
 //! parameters, owned `Buf` inputs and returns, plain and fallible functions, bridged
-//! constants, schemaless [`Json`] passthrough, binary values, nested owned
+//! constants, schemaless [`serde_json::Value`] passthrough, binary values, nested owned
 //! buffers, transparent newtypes, target-scoped functions, and a stateful
-//! handle class with statics and a factory.
+//! handle class with statics and a factory. The example uses native Rust
+//! `i64`, `u64`, `Option`, unit, and `serde_json::Value` throughout; rspyts
+//! changes only their schema-directed FFI representation.
 //!
-//! Build the cdylib (`cargo build -p basic-example`), run
-//! `rspyts generate --config examples/basic/rspyts.toml`, and the Python
-//! and TypeScript packages next door gain fully typed access to everything
-//! below.
+//! Run `rspyts generate --config examples/basic/rspyts.toml` for the clients
+//! and `rspyts build --config examples/basic/rspyts.toml` for the runnable
+//! native and WebAssembly artifacts. The Python and TypeScript packages next
+//! door then gain fully typed access to everything below.
 
 use std::collections::BTreeMap;
 
-use rspyts::{Buf, Bytes, I64, Json, U64, bridge};
+use rspyts::{Buf, Bytes, bridge};
 
 /// The largest number of values [`summarize`] accepts in one call.
 #[bridge]
@@ -27,11 +29,11 @@ pub const ROUNDING_MODES: &[&str] = &["up", "down", "nearest", "halfEven"];
 
 /// Largest unsigned value that can cross the bridge exactly.
 #[bridge]
-pub const MAX_EXACT_U64: U64 = U64::new(u64::MAX);
+pub const MAX_EXACT_U64: u64 = u64::MAX;
 
 /// Signed and unsigned exact-integer bounds.
 #[bridge]
-pub const EXACT_BOUNDS: (I64, U64) = (I64::new(i64::MIN), U64::new(u64::MAX));
+pub const EXACT_BOUNDS: (i64, u64) = (i64::MIN, u64::MAX);
 
 /// Rounding strategy for [`round_value`].
 #[bridge]
@@ -52,6 +54,9 @@ pub struct Summary {
     pub average: f64,
     /// Optional label passed through untouched.
     pub label: Option<String>,
+    /// Required on the wire even though null is an accepted value.
+    #[bridge(required)]
+    pub source: Option<String>,
 }
 
 /// Stable identifier for a binary packet.
@@ -60,6 +65,10 @@ pub struct Summary {
 /// using the inner integer directly at runtime.
 #[bridge]
 pub struct PacketId(pub u32);
+
+/// An exact integer identifier using the ordinary native Rust type.
+#[bridge]
+pub struct TransferId(pub u64);
 
 /// Binary values and owned numeric buffers nested in ordinary data.
 #[bridge]
@@ -78,17 +87,23 @@ pub struct BinaryPacket {
 /// Exact integers in plain, tuple, optional, and list positions.
 #[bridge]
 pub struct ExactNumbers {
-    pub signed: I64,
-    pub unsigned: U64,
-    pub pair: (I64, U64),
-    pub history: Option<Vec<U64>>,
+    pub signed: i64,
+    pub unsigned: u64,
+    pub transfer_id: TransferId,
+    pub pair: (i64, u64),
+    pub history: Option<Vec<u64>>,
+    pub by_name: BTreeMap<String, i64>,
 }
 
 /// A state that can be either tag-only or carry exact data.
 #[bridge]
 pub enum TransferState {
     Pending,
-    Complete { sequence: U64 },
+    Complete {
+        sequence: u64,
+        #[bridge(required)]
+        receipt: Option<u64>,
+    },
 }
 
 /// A number parsed from text.
@@ -115,7 +130,7 @@ pub enum BasicError {
     /// The file could not be read.
     UnreadableFile { path: String },
     /// An exact sequence exceeded the caller's exact limit.
-    SequenceTooLarge { value: U64, maximum: U64 },
+    SequenceTooLarge { value: u64, maximum: u64 },
 }
 
 impl std::fmt::Display for BasicError {
@@ -154,6 +169,7 @@ pub fn summarize(values: &[f64], label: Option<String>) -> Result<Summary, Basic
         total,
         average: total / values.len() as f64,
         label,
+        source: None,
     })
 }
 
@@ -192,7 +208,7 @@ pub fn echo_exact_numbers(value: ExactNumbers) -> ExactNumbers {
 
 /// Return an exact pair unchanged.
 #[bridge]
-pub fn echo_exact_pair(value: (I64, U64)) -> (I64, U64) {
+pub fn echo_exact_pair(value: (i64, u64)) -> (i64, u64) {
     value
 }
 
@@ -204,7 +220,7 @@ pub fn echo_transfer_state(value: TransferState) -> TransferState {
 
 /// Validate one exact sequence against another.
 #[bridge]
-pub fn validate_sequence(value: U64, maximum: U64) -> Result<U64, BasicError> {
+pub fn validate_sequence(value: u64, maximum: u64) -> Result<u64, BasicError> {
     if value > maximum {
         return Err(BasicError::SequenceTooLarge { value, maximum });
     }
@@ -229,8 +245,8 @@ pub fn round_value(value: f64, mode: Rounding) -> f64 {
 /// back exactly as rich as it went in. Non-object metadata is wrapped
 /// under an `"input"` key first.
 #[bridge]
-pub fn annotate(value: f64, metadata: Json) -> Json {
-    let mut object = match metadata.into_inner() {
+pub fn annotate(value: f64, metadata: serde_json::Value) -> serde_json::Value {
+    let mut object = match metadata {
         serde_json::Value::Object(map) => map,
         other => {
             let mut map = serde_json::Map::new();
@@ -239,7 +255,7 @@ pub fn annotate(value: f64, metadata: Json) -> Json {
         }
     };
     object.insert("value".to_string(), serde_json::Value::from(value));
-    Json::new(serde_json::Value::Object(object))
+    serde_json::Value::Object(object)
 }
 
 /// Read one number per line from the text file at `path`, skipping blank
@@ -374,6 +390,7 @@ mod tests {
         assert_eq!(summary.total, 12.0);
         assert_eq!(summary.average, 4.0);
         assert_eq!(summary.label.as_deref(), Some("demo"));
+        assert_eq!(summary.source, None);
     }
 
     #[test]
@@ -423,32 +440,88 @@ mod tests {
     #[test]
     fn exact_numbers_preserve_all_boundaries_and_nesting() {
         let value = ExactNumbers {
-            signed: I64::new(i64::MIN),
-            unsigned: U64::new(u64::MAX),
-            pair: (I64::new(9_007_199_254_740_993), U64::new(u64::MAX)),
-            history: Some(vec![U64::new(0), U64::new(u64::MAX)]),
+            signed: i64::MIN,
+            unsigned: u64::MAX,
+            transfer_id: TransferId(u64::MAX),
+            pair: (9_007_199_254_740_993, u64::MAX),
+            history: Some(vec![0, u64::MAX]),
+            by_name: BTreeMap::from([("minimum".to_string(), i64::MIN)]),
         };
         let out = echo_exact_numbers(value);
-        assert_eq!(out.signed.get(), i64::MIN);
-        assert_eq!(out.unsigned.get(), u64::MAX);
-        assert_eq!(out.pair.0.get(), 9_007_199_254_740_993);
-        assert_eq!(out.history.unwrap()[1].get(), u64::MAX);
-        assert_eq!(MAX_EXACT_U64.get(), u64::MAX);
-        assert_eq!(EXACT_BOUNDS.0.get(), i64::MIN);
+        assert_eq!(out.signed, i64::MIN);
+        assert_eq!(out.unsigned, u64::MAX);
+        assert_eq!(out.transfer_id.0, u64::MAX);
+        assert_eq!(out.pair.0, 9_007_199_254_740_993);
+        assert_eq!(out.history.unwrap()[1], u64::MAX);
+        assert_eq!(out.by_name["minimum"], i64::MIN);
+        assert_eq!(MAX_EXACT_U64, u64::MAX);
+        assert_eq!(EXACT_BOUNDS.0, i64::MIN);
+    }
+
+    #[test]
+    fn exact_integers_and_json_keep_normal_serde_outside_ffi() {
+        let exact = ExactNumbers {
+            signed: i64::MIN,
+            unsigned: u64::MAX,
+            transfer_id: TransferId(u64::MAX),
+            pair: (9_007_199_254_740_993, u64::MAX),
+            history: Some(vec![u64::MAX]),
+            by_name: BTreeMap::from([("largest".to_string(), i64::MAX)]),
+        };
+        let value = serde_json::to_value(exact).unwrap();
+        assert_eq!(value["signed"], serde_json::json!(i64::MIN));
+        assert_eq!(value["unsigned"], serde_json::json!(u64::MAX));
+        assert_eq!(value["transferId"], serde_json::json!(u64::MAX));
+        assert_eq!(
+            value["pair"][0],
+            serde_json::json!(9_007_199_254_740_993_i64)
+        );
+
+        let marker_shaped = serde_json::json!({
+            "__rspyts_buf__": {"off": "ordinary data"},
+            "__rspyts_json__": [u64::MAX],
+        });
+        assert_eq!(
+            annotate(1.0, marker_shaped),
+            serde_json::json!({
+                "__rspyts_buf__": {"off": "ordinary data"},
+                "__rspyts_json__": [u64::MAX],
+                "value": 1.0,
+            })
+        );
+    }
+
+    #[test]
+    fn required_option_keeps_ordinary_option_serde_outside_ffi() {
+        let explicit: Summary = serde_json::from_value(serde_json::json!({
+            "itemCount": 1,
+            "total": 2.0,
+            "average": 2.0,
+            "source": null,
+        }))
+        .unwrap();
+        assert_eq!(explicit.label, None);
+        assert_eq!(explicit.source, None);
+
+        let omitted: Summary = serde_json::from_value(serde_json::json!({
+            "itemCount": 1,
+            "total": 2.0,
+            "average": 2.0,
+        }))
+        .unwrap();
+        assert_eq!(omitted.source, None);
     }
 
     #[test]
     fn exact_sequence_validation_keeps_typed_error_data() {
         assert_eq!(
-            validate_sequence(U64::new(9_007_199_254_740_993), U64::new(u64::MAX))
-                .unwrap()
-                .get(),
+            validate_sequence(9_007_199_254_740_993, u64::MAX).unwrap(),
             9_007_199_254_740_993
         );
         assert!(matches!(
-            validate_sequence(U64::new(u64::MAX), U64::new(9_007_199_254_740_993)),
+            validate_sequence(u64::MAX, 9_007_199_254_740_993),
             Err(BasicError::SequenceTooLarge { value, maximum })
-                if value.get() == u64::MAX && maximum.get() == 9_007_199_254_740_993
+                if value == u64::MAX && maximum == 9_007_199_254_740_993
         ));
     }
 
@@ -460,14 +533,12 @@ mod tests {
         ));
         assert!(matches!(
             echo_transfer_state(TransferState::Complete {
-                sequence: U64::new(u64::MAX),
+                sequence: u64::MAX,
+                receipt: None,
             }),
-            TransferState::Complete { sequence } if sequence.get() == u64::MAX
+            TransferState::Complete { sequence, receipt: None } if sequence == u64::MAX
         ));
-        assert_eq!(
-            echo_exact_pair((I64::new(i64::MIN), U64::new(u64::MAX))),
-            (I64::new(i64::MIN), U64::new(u64::MAX))
-        );
+        assert_eq!(echo_exact_pair((i64::MIN, u64::MAX)), (i64::MIN, u64::MAX));
     }
 
     #[test]
@@ -504,13 +575,13 @@ mod tests {
 
     #[test]
     fn annotate_merges_value_into_objects() {
-        let out = annotate(2.5, Json::new(serde_json::json!({"source": "demo"}))).into_inner();
+        let out = annotate(2.5, serde_json::json!({"source": "demo"}));
         assert_eq!(out, serde_json::json!({"source": "demo", "value": 2.5}));
     }
 
     #[test]
     fn annotate_wraps_non_objects() {
-        let out = annotate(1.0, Json::new(serde_json::json!([1, 2]))).into_inner();
+        let out = annotate(1.0, serde_json::json!([1, 2]));
         assert_eq!(out, serde_json::json!({"input": [1, 2], "value": 1.0}));
     }
 

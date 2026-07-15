@@ -1,6 +1,6 @@
 # ABI
 
-This document defines ABI 2.0. It is the contract between a bridged Rust
+This document defines ABI 3.0. It is the contract between a bridged Rust
 module and every rspyts runtime.
 
 The ABI is deliberately small. A host allocates one request, calls one symbol,
@@ -15,10 +15,15 @@ Every module exports:
 uint32_t rspyts_abi_version(void);
 ```
 
-ABI 2 modules return `2`. The manifest records the full string `"2.0"`.
-Runtimes reject a different major before calling any generated symbol. A
-change that alters symbol signatures, ownership, or envelope interpretation
-requires a new major.
+ABI 3 modules return `3`. The manifest records the exact string `"3.0"`.
+The CLI and runtimes accept that exact contract and reject every other major
+or minor. There is no ABI-2 compatibility path in the 0.3 runtime.
+
+Runtimes reject a different C ABI major before calling any generated symbol.
+A change that alters symbol signatures, ownership, or envelope interpretation
+requires a new major. A backwards-compatible manifest vocabulary extension
+increments the minor, and each CLI must explicitly declare the contiguous
+minor range it understands.
 
 Only `wasm32-unknown-unknown` is supported for WebAssembly. Its pointers and
 lengths are unsigned 32-bit values. Native pointer and length values use the
@@ -26,17 +31,23 @@ platform's `usize` width.
 
 ## Module exports
 
-`rspyts::export!()` adds four module-level symbols:
+`rspyts::export!()` adds five module-level symbols:
 
 ```c
 uint32_t rspyts_abi_version(void);
 uint8_t *rspyts_manifest(void);
+uint8_t *rspyts_contract_fingerprint(void);
 uint8_t *rspyts_alloc(size_t len);
 void rspyts_free(uint8_t *ptr, size_t len);
 ```
 
 `rspyts_manifest` returns a normal success envelope. Its JSON value is the
 compiled manifest and its tail is empty.
+
+`rspyts_contract_fingerprint` returns a success envelope containing the
+lowercase SHA-256 digest of the exact compact manifest JSON. Generated clients
+embed the fingerprint seen during generation and verify it when loading a
+module, before any user symbol is called.
 
 Free functions use their Rust name:
 
@@ -86,8 +97,10 @@ uint8_t *method(
 Drop takes only the handle and returns nothing. It is idempotent.
 
 The request JSON is an object containing every non-slice argument under its
-wire name. A zero request length is accepted as an empty object for no-argument
-calls. Every non-empty request uses the envelope below.
+wire name. Every such key is required, including a parameter whose value type
+is `Option<T>`; it may be present with null. A zero request length is accepted
+as an empty object for no-argument calls. Every non-empty request uses the
+envelope below.
 
 ## Ownership
 
@@ -160,6 +173,12 @@ the tail, and `off` must satisfy the element type's natural alignment. Numeric
 elements are little-endian. Padding between attachments is zero-filled and is
 not part of an attachment.
 
+The object is protocol metadata only where the declared Rust type is `Bytes`
+or `Buf<T>`. Envelope decoding by itself does not scan arbitrary JSON objects
+for this key. In particular, `Map<String, T>` permits every string key,
+including `__rspyts_buf__` and `__rspyts_json__`; generated clients interpret
+placeholders only while decoding a schema position declared as an attachment.
+
 Opaque bytes use the `bytes` dtype. `Buf<u8>` uses `u8`; the distinction is
 preserved by the declared type even though TypeScript exposes both as
 `Uint8Array`.
@@ -168,21 +187,28 @@ Top-level `&[T]` parameters do not use placeholders. They use the separate
 pointer and element-count pairs in the call signature. The host runtime keeps
 a private copy alive for the call so concurrent mutation cannot race Rust.
 
-## Reserved JSON wrappers
+## Schema-directed values
 
-`rspyts::Json` is schemaless, but arbitrary user JSON must not collide with a
-buffer placeholder. Its wire value is therefore wrapped exactly once:
+`serde_json::Value` is schemaless and crosses transparently, without a JSON
+sentinel. The typed decoder stops traversal at a schema position declared as
+`Json`, so objects inside it are ordinary user data even when they exactly
+resemble an attachment placeholder. The same keys in a declared map are also
+ordinary map data. Attachment objects gain protocol meaning only at a schema
+position declared as `Bytes` or `Buf<T>`.
 
-```json
-{"__rspyts_json__": <value>}
-```
+Exact `i64` and `u64` values are canonical decimal strings on the wire. They
+have no plus sign or leading zeroes; signed zero is `"0"`. Native Rust Serde
+still sees ordinary numeric values outside the bridge. Structured `f32` and
+`f64` values must be finite. Schemaless JSON additionally restricts integral
+numbers to JavaScript's exact safe range; typed exact integers are the path for
+larger values. Schemaless JSON also canonicalizes signed zero to positive zero.
+Binary float attachments preserve their IEEE bytes.
 
-The wrapper has no sibling fields. Generated clients add and remove it at the
-typed boundary.
-
-Exact `I64` and `U64` values are canonical decimal strings. They have no plus
-sign or leading zeroes; signed zero is `"0"`. Structured `f32` and `f64`
-values must be finite. Binary float attachments preserve their IEEE bytes.
+The Rust shim performs this conversion from the declared IR, recursively
+through structs, newtypes, tagged enums, options, lists, maps, and tuples. It
+does not scan arbitrary object shapes and it does not rebuild the manifest
+during a call. Constants and typed application-error data use the same
+normalizer.
 
 ## Errors and panics
 
@@ -231,9 +257,10 @@ The manifest is canonical JSON containing:
 - sorted functions;
 - sorted classes, constructors, methods, and statics.
 
-Declarations contain docs, exact wire names, portable types, origin crate,
-target projection, and error association. Unknown manifest fields are
-rejected. The CLI validates the complete surface before writing any output.
+Declarations contain docs, exact wire names, portable types, field-presence
+requirements, origin crate, target projection, and error association. Unknown
+manifest fields are rejected. The CLI validates the complete surface before
+writing any output.
 
 ## Required invariants
 
@@ -245,3 +272,5 @@ rejected. The CLI validates the complete surface before writing any output.
 - A trapped WebAssembly instance is never called again.
 - Handles are nonzero, bounded, and never reused.
 - Generated output is derived from the compiled manifest, not source parsing.
+- Generated clients verify the compiled module's contract fingerprint before
+  calling user symbols.

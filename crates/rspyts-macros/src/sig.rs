@@ -52,10 +52,10 @@ pub fn validate_param_wire_names(params: &[BridgedParam]) -> syn::Result<()> {
             &param.ident.to_string(),
             crate::casing::RenameRule::Camel,
         );
-        if ["__rspyts_buf__", "__rspyts_json__"].contains(&wire.as_str()) {
+        if wire == "__proto__" {
             return Err(syn::Error::new_spanned(
                 &param.ident,
-                format!("parameter wire name `{wire}` is reserved by the ABI envelope"),
+                format!("parameter wire name `{wire}` is unsafe for JavaScript object projection"),
             ));
         }
         if !seen.insert(wire.clone()) {
@@ -77,9 +77,9 @@ pub enum RetKind {
     /// Written literally as `Result<T, E>`.
     Result {
         ok: syn::Type,
-        /// Last path segment of `E` when `E` is a plain path — recorded in
-        /// the manifest as the error enum name.
-        err_name: Option<String>,
+        /// Concrete error type. Its `BridgeErr::inventory_name()` carries
+        /// exact origin identity for macro-generated error enums.
+        err: Box<syn::Type>,
     },
 }
 
@@ -180,17 +180,9 @@ pub fn classify_ret(output: &syn::ReturnType) -> RetKind {
         }
     }
     if let Some((ok, err)) = result_parts(ty) {
-        let err_name = match err {
-            syn::Type::Path(path) if path.qself.is_none() => path
-                .path
-                .segments
-                .last()
-                .map(|segment| segment.ident.to_string()),
-            _ => None,
-        };
         return RetKind::Result {
             ok: ok.clone(),
-            err_name,
+            err: Box::new(err.clone()),
         };
     }
     RetKind::Plain(ty.clone())
@@ -226,8 +218,8 @@ pub fn result_parts(ty: &syn::Type) -> Option<(&syn::Type, &syn::Type)> {
     }
 }
 
-/// True iff `ty` is written syntactically as `Option<…>` (type-system §2:
-/// optional fields get a null default in the generated surfaces).
+/// True iff `ty` is written syntactically as a direct `Option<…>`.
+/// Such object fields are omittable unless marked `#[bridge(required)]`.
 pub fn is_option(ty: &syn::Type) -> bool {
     let syn::Type::Path(path) = ty else {
         return false;
@@ -235,37 +227,15 @@ pub fn is_option(ty: &syn::Type) -> bool {
     if path.qself.is_some() {
         return false;
     }
-    match path.path.segments.last() {
-        Some(segment) => {
-            segment.ident == "Option"
-                && matches!(segment.arguments, syn::PathArguments::AngleBracketed(_))
-        }
-        None => false,
-    }
-}
-
-/// Reject bare 64-bit integers in JSON-carried positions with actionable
-/// guidance. Raw `&[i64]`/`&[u64]` slices are a separate binary ABI path and
-/// never call this helper.
-pub fn reject_bare_exact_integer(ty: &syn::Type) -> syn::Result<()> {
-    let syn::Type::Path(path) = ty else {
-        return Ok(());
+    let Some(segment) = path.path.segments.last() else {
+        return false;
     };
-    if path.qself.is_some() || path.path.segments.len() != 1 {
-        return Ok(());
-    }
-    let ident = &path.path.segments[0].ident;
-    let wrapper = match ident.to_string().as_str() {
-        "i64" => "I64",
-        "u64" => "U64",
-        _ => return Ok(()),
+    let syn::PathArguments::AngleBracketed(args) = &segment.arguments else {
+        return false;
     };
-    Err(syn::Error::new_spanned(
-        ty,
-        format!(
-            "bare `{ident}` is not bridgeable because JSON numbers cannot preserve every 64-bit value; use `rspyts::{wrapper}` for canonical decimal-string transport"
-        ),
-    ))
+    segment.ident == "Option"
+        && args.args.len() == 1
+        && matches!(args.args.first(), Some(syn::GenericArgument::Type(_)))
 }
 
 /// Reject values that require an envelope attachment in positions whose
@@ -346,8 +316,8 @@ pub fn ensure_plain_signature(sig: &syn::Signature, what: &str) -> syn::Result<(
     if let Some(token) = &sig.asyncness {
         return Err(syn::Error::new_spanned(
             token,
-            "`async fn` cannot be bridged — ABI 2 has no async support \
-             (docs/design/abi.md §11)",
+            "`async fn` cannot be bridged — ABI 3 has no async support \
+             (docs/design/abi.md)",
         ));
     }
     if let Some(token) = &sig.unsafety {
@@ -487,13 +457,13 @@ mod tests {
         ));
 
         match classify_ret(&parse_quote!(-> Result<ProcessingReport, QueryError>)) {
-            RetKind::Result { err_name, .. } => {
-                assert_eq!(err_name.as_deref(), Some("QueryError"));
-            }
+            RetKind::Result { err, .. } => assert_eq!(err.as_ref(), &parse_quote!(QueryError)),
             _ => panic!("expected result"),
         }
         match classify_ret(&parse_quote!(-> std::result::Result<u32, errors::MyError>)) {
-            RetKind::Result { err_name, .. } => assert_eq!(err_name.as_deref(), Some("MyError")),
+            RetKind::Result { err, .. } => {
+                assert_eq!(err.as_ref(), &parse_quote!(errors::MyError))
+            }
             _ => panic!("expected result"),
         }
         // A one-argument `Result` alias is not the literal form.
@@ -507,6 +477,7 @@ mod tests {
     fn option_detection_is_syntactic() {
         assert!(is_option(&parse_quote!(Option<f64>)));
         assert!(is_option(&parse_quote!(std::option::Option<f64>)));
+        assert!(!is_option(&parse_quote!(Option<f64, f32>)));
         assert!(!is_option(&parse_quote!(Vec<Option<f64>>)));
         assert!(!is_option(&parse_quote!(f64)));
     }

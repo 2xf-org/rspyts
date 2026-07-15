@@ -1,7 +1,7 @@
 //! Expansion of `#[bridge]` on data structs, data enums, string enums,
 //! and `#[bridge(error)]` error enums (type-system §3, §4, §8).
 
-use crate::attrs::{BridgeArgs, deny_bridge_attrs};
+use crate::attrs::{BridgeArgs, deny_bridge_attrs, take_field_required};
 use crate::casing::{RenameRule, field_wire_name, variant_wire_name};
 use crate::docs::extract_docs;
 use crate::emit;
@@ -12,7 +12,7 @@ use quote::quote;
 use std::collections::BTreeSet;
 use syn::parse_quote;
 
-const RESERVED_WIRE_KEYS: [&str; 2] = ["__rspyts_buf__", "__rspyts_json__"];
+const RESERVED_WIRE_KEYS: [&str; 1] = ["__proto__"];
 
 fn deny_fn_only_args(args: &BridgeArgs, what: &str) -> syn::Result<()> {
     args.deny_constructor()?;
@@ -141,8 +141,8 @@ pub fn expand_struct(args: BridgeArgs, mut item: syn::ItemStruct) -> syn::Result
     }
 
     let name_str = item.ident.to_string();
-    let fields = match &item.fields {
-        syn::Fields::Named(fields) => &fields.named,
+    let fields = match &mut item.fields {
+        syn::Fields::Named(fields) => &mut fields.named,
         syn::Fields::Unnamed(_) => {
             return Err(syn::Error::new_spanned(
                 &item.ident,
@@ -175,15 +175,14 @@ pub fn expand_struct(args: BridgeArgs, mut item: syn::ItemStruct) -> syn::Result
                 "every field of a bridged struct must be `pub` — the whole shape crosses the boundary (docs/design/type-system.md §3)",
             ));
         }
-        deny_bridge_attrs(&field.attrs, "struct fields")?;
-        sig::reject_bare_exact_integer(&field.ty)?;
+        let is_option = sig::is_option(&field.ty);
+        let required = take_field_required(&mut field.attrs, is_option, "struct fields")?;
         let field_model = serde_reflect::parse_field(&field.attrs)?;
         let name = field.ident.as_ref().expect("named field").to_string();
         let wire = member_wire(&name, &field_model, rule, false);
         check_object_key(field, &wire, &mut wire_names, "struct field")?;
         let docs = extract_docs(&field.attrs);
-        let optional = sig::is_option(&field.ty);
-        field_decls.push(emit::field_decl(&name, &wire, &docs, &field.ty, optional));
+        field_decls.push(emit::field_decl(&name, &wire, &docs, &field.ty, required));
     }
     if mode == SerdeMode::Adopted && serde_model.deny_unknown_fields.is_none() {
         return Err(syn::Error::new_spanned(
@@ -274,7 +273,6 @@ fn expand_newtype(
         ));
     }
     deny_bridge_attrs(&field.attrs, "newtype fields")?;
-    sig::reject_bare_exact_integer(&field.ty)?;
     let field_model = serde_reflect::parse_field(&field.attrs)?;
     if let Some(rename) = field_model.rename {
         return Err(syn::Error::new(
@@ -306,7 +304,7 @@ fn expand_newtype(
             name: ::std::string::String::from(#name),
             docs: ::std::string::String::from(#docs),
             origin: #origin,
-            inner: <#inner as ::rspyts::__private::Bridged>::ty(),
+            inner: <#inner as ::rspyts::__private::Bridged>::inventory_ty(),
         }
     });
 
@@ -465,7 +463,7 @@ fn expand_data_enum(args: BridgeArgs, mut item: syn::ItemEnum) -> syn::Result<To
     if RESERVED_WIRE_KEYS.contains(&tag.as_str()) {
         return Err(syn::Error::new_spanned(
             &item.ident,
-            format!("enum discriminator `{tag}` is reserved by the ABI envelope"),
+            format!("enum discriminator `{tag}` is unsafe for JavaScript object projection"),
         ));
     }
 
@@ -474,8 +472,8 @@ fn expand_data_enum(args: BridgeArgs, mut item: syn::ItemEnum) -> syn::Result<To
     for variant in &mut item.variants {
         deny_bridge_attrs(&variant.attrs, "enum variants")?;
         let variant_model = serde_reflect::parse_variant(&variant.attrs)?;
-        let fields = match &variant.fields {
-            syn::Fields::Named(fields) => Some(&fields.named),
+        let fields = match &mut variant.fields {
+            syn::Fields::Named(fields) => Some(&mut fields.named),
             syn::Fields::Unit => None,
             syn::Fields::Unnamed(_) => {
                 return Err(syn::Error::new_spanned(
@@ -484,7 +482,8 @@ fn expand_data_enum(args: BridgeArgs, mut item: syn::ItemEnum) -> syn::Result<To
                 ));
             }
         };
-        if fields.is_none() {
+        let has_fields = fields.is_some();
+        if !has_fields {
             if let Some(rename_all) = &variant_model.rename_all {
                 return Err(syn::Error::new(
                     rename_all.span,
@@ -503,8 +502,8 @@ fn expand_data_enum(args: BridgeArgs, mut item: syn::ItemEnum) -> syn::Result<To
         let mut field_decls = Vec::new();
         let mut field_wires = BTreeSet::new();
         for field in fields.into_iter().flatten() {
-            deny_bridge_attrs(&field.attrs, "variant fields")?;
-            sig::reject_bare_exact_integer(&field.ty)?;
+            let is_option = sig::is_option(&field.ty);
+            let required = take_field_required(&mut field.attrs, is_option, "variant fields")?;
             let field_model = serde_reflect::parse_field(&field.attrs)?;
             let name = field.ident.as_ref().expect("named field").to_string();
             let wire = member_wire(&name, &field_model, field_rule, false);
@@ -516,8 +515,7 @@ fn expand_data_enum(args: BridgeArgs, mut item: syn::ItemEnum) -> syn::Result<To
                 ));
             }
             let docs = extract_docs(&field.attrs);
-            let optional = sig::is_option(&field.ty);
-            field_decls.push(emit::field_decl(&name, &wire, &docs, &field.ty, optional));
+            field_decls.push(emit::field_decl(&name, &wire, &docs, &field.ty, required));
         }
         let name = variant.ident.to_string();
         let wire = member_wire(&name, &variant_model, variant_rule, true);
@@ -536,7 +534,7 @@ fn expand_data_enum(args: BridgeArgs, mut item: syn::ItemEnum) -> syn::Result<To
                 fields: ::std::vec![#(#field_decls),*],
             }
         });
-        if mode == SerdeMode::Owning && fields.is_some() && variant_model.rename_all.is_none() {
+        if mode == SerdeMode::Owning && has_fields && variant_model.rename_all.is_none() {
             let serde_rule = field_rule
                 .serde_value()
                 .expect("owning mode always has a rule");
@@ -592,7 +590,7 @@ fn expand_data_enum(args: BridgeArgs, mut item: syn::ItemEnum) -> syn::Result<To
     Ok(quote! { #item #assertion #bridged_impl #registration })
 }
 
-fn expand_error_enum(args: BridgeArgs, item: syn::ItemEnum) -> syn::Result<TokenStream> {
+fn expand_error_enum(args: BridgeArgs, mut item: syn::ItemEnum) -> syn::Result<TokenStream> {
     args.deny_serde("error enums; error envelopes are not Serde data contracts")?;
     args.deny_tag("error enums; errors carry their code in the envelope, not a tag")?;
     args.deny_rename_all("error enums; codes are always camelCase")?;
@@ -604,7 +602,7 @@ fn expand_error_enum(args: BridgeArgs, item: syn::ItemEnum) -> syn::Result<Token
     let mut arms = Vec::new();
     let mut variant_decls = Vec::new();
     let mut error_codes = BTreeSet::new();
-    for variant in &item.variants {
+    for variant in &mut item.variants {
         deny_bridge_attrs(&variant.attrs, "enum variants")?;
         let variant_ident = variant.ident.clone();
         let name = variant_ident.to_string();
@@ -616,7 +614,7 @@ fn expand_error_enum(args: BridgeArgs, item: syn::ItemEnum) -> syn::Result<Token
             ));
         }
         let docs = extract_docs(&variant.attrs);
-        match &variant.fields {
+        match &mut variant.fields {
             syn::Fields::Unit => {
                 arms.push(
                     quote! { #ident::#variant_ident => (#code, ::std::option::Option::None), },
@@ -628,22 +626,22 @@ fn expand_error_enum(args: BridgeArgs, item: syn::ItemEnum) -> syn::Result<Token
                 let mut keys = Vec::new();
                 let mut field_decls = Vec::new();
                 let mut field_wires = BTreeSet::new();
-                for field in &fields.named {
-                    deny_bridge_attrs(&field.attrs, "variant fields")?;
-                    sig::reject_bare_exact_integer(&field.ty)?;
+                for field in &mut fields.named {
+                    let is_option = sig::is_option(&field.ty);
+                    let required =
+                        take_field_required(&mut field.attrs, is_option, "variant fields")?;
                     sig::reject_attachment_type(&field.ty, "an application-error field")?;
                     let field_ident = field.ident.clone().expect("named field");
                     let field_name = field_ident.to_string();
                     let wire = field_wire_name(&field_name, RenameRule::Camel);
                     check_object_key(field, &wire, &mut field_wires, "application-error field")?;
                     let field_docs = extract_docs(&field.attrs);
-                    let optional = sig::is_option(&field.ty);
                     field_decls.push(emit::field_decl(
                         &field_name,
                         &wire,
                         &field_docs,
                         &field.ty,
-                        optional,
+                        required,
                     ));
                     idents.push(field_ident);
                     keys.push(wire);
@@ -683,11 +681,31 @@ fn expand_error_enum(args: BridgeArgs, item: syn::ItemEnum) -> syn::Result<Token
                     &'static str,
                     ::std::option::Option<::rspyts::__private::serde_json::Value>,
                 ) = match self { #(#arms)* };
+                let __rspyts_data = __rspyts_data.map(|data| {
+                    ::rspyts::__private::wire::normalize_error_data(
+                        data,
+                        &::rspyts::__private::ir::Ty::qualified_ref_name(
+                            ::core::env!("CARGO_PKG_NAME"),
+                            #name_str,
+                        ),
+                        __rspyts_code,
+                    )
+                    .expect("rspyts: bridged error data failed wire normalization")
+                });
                 ::rspyts::BridgeError {
                     code: ::std::string::String::from(__rspyts_code),
                     message: __rspyts_message,
                     data: __rspyts_data,
                 }
+            }
+
+            fn inventory_name() -> ::std::option::Option<::std::string::String> {
+                ::std::option::Option::Some(
+                    ::rspyts::__private::ir::Ty::qualified_ref_name(
+                        ::core::env!("CARGO_PKG_NAME"),
+                        #name_str,
+                    ),
+                )
             }
         }
     };
@@ -724,7 +742,7 @@ fn check_object_key<T: quote::ToTokens>(
     if RESERVED_WIRE_KEYS.contains(&wire) {
         return Err(syn::Error::new_spanned(
             node,
-            format!("{kind} wire name `{wire}` is reserved by the ABI envelope"),
+            format!("{kind} wire name `{wire}` is unsafe for JavaScript object projection"),
         ));
     }
     if !seen.insert(wire.to_string()) {
@@ -752,4 +770,32 @@ fn ensure_variants(item: &syn::ItemEnum) -> syn::Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use quote::ToTokens;
+    use syn::parse_quote;
+
+    #[test]
+    fn struct_fields_emit_required_polarity_and_strip_the_marker() {
+        let item: syn::ItemStruct = parse_quote! {
+            pub struct Presence {
+                pub omittable: Option<String>,
+                #[bridge(required)]
+                pub nullable_but_required: Option<String>,
+                pub always_required: String,
+            }
+        };
+        let tokens = expand_struct(BridgeArgs::default(), item)
+            .unwrap()
+            .to_token_stream()
+            .to_string()
+            .replace(' ', "");
+
+        assert_eq!(tokens.matches("required:false").count(), 1, "{tokens}");
+        assert_eq!(tokens.matches("required:true").count(), 2, "{tokens}");
+        assert!(!tokens.contains("bridge(required)"), "{tokens}");
+    }
 }

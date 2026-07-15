@@ -13,15 +13,17 @@ from typing import Any
 import numpy as np
 import pytest
 
-from rspyts import BridgeError, Library, RspytsPanicError, StaleHandleError, envelope, library
+from rspyts import BridgeError, Library, RspytsPanicError, StaleHandleError, _internal, envelope, library
+
+FINGERPRINT = "a" * 64
 
 
 @pytest.fixture(autouse=True)
 def clean_env(monkeypatch):
     """
-    Keep the developer's real RSPYTS_LIBRARY out of the tests.
+    Keep the developer's real library overrides out of the tests.
     """
-    monkeypatch.delenv("RSPYTS_LIBRARY", raising=False)
+    monkeypatch.delenv("RSPYTS_LIBRARY_DEMO", raising=False)
 
 
 @pytest.mark.parametrize(
@@ -39,18 +41,40 @@ def test_platform_filename(monkeypatch, platform, expected):
     assert library.platform_filename("demo_crate") == expected
 
 
+@pytest.mark.parametrize(
+    ("name", "expected"),
+    [
+        ("example_catalog", "RSPYTS_LIBRARY_EXAMPLE_CATALOG"),
+        ("demo-crate", "RSPYTS_LIBRARY_DEMO_CRATE"),
+        ("demo.crate", "RSPYTS_LIBRARY_DEMO_CRATE"),
+    ],
+)
+def test_library_env_var(name, expected):
+    assert library.library_env_var(name) == expected
+
+
 def touch(path: Path) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_bytes(b"")
     return path
 
 
-def test_env_var_wins_over_everything(monkeypatch, tmp_path):
+def test_scoped_env_var_wins_over_everything(monkeypatch, tmp_path):
     env_path = tmp_path / "from_env.dylib"
-    monkeypatch.setenv("RSPYTS_LIBRARY", str(env_path))
+    monkeypatch.setenv("RSPYTS_LIBRARY_DEMO", str(env_path))
     lib = Library("demo", search=[str(tmp_path)])
     lib.set_path(tmp_path / "explicit.dylib")
     assert lib.resolve_path() == env_path
+
+
+def test_library_specific_env_vars_allow_multiple_libraries(monkeypatch, tmp_path):
+    catalog_path = tmp_path / "catalog.dylib"
+    reports_path = tmp_path / "reports.dylib"
+    monkeypatch.setenv("RSPYTS_LIBRARY_EXAMPLE_CATALOG", str(catalog_path))
+    monkeypatch.setenv("RSPYTS_LIBRARY_EXAMPLE_REPORTS", str(reports_path))
+
+    assert Library("example_catalog").resolve_path() == catalog_path
+    assert Library("example_reports").resolve_path() == reports_path
 
 
 @pytest.mark.parametrize(
@@ -67,7 +91,7 @@ def test_resolution_precedence_matrix(monkeypatch, tmp_path, use_env, use_set_pa
     env_path = tmp_path / "env.dylib"
     explicit = tmp_path / "explicit.dylib"
     if use_env:
-        monkeypatch.setenv("RSPYTS_LIBRARY", str(env_path))
+        monkeypatch.setenv("RSPYTS_LIBRARY_DEMO", str(env_path))
     lib = Library("demo", search=["dist"], anchor=tmp_path)
     if use_set_path:
         lib.set_path(explicit)
@@ -76,10 +100,16 @@ def test_resolution_precedence_matrix(monkeypatch, tmp_path, use_env, use_set_pa
 
 
 def test_empty_env_var_is_ignored(monkeypatch, tmp_path):
-    monkeypatch.setenv("RSPYTS_LIBRARY", "")
+    monkeypatch.setenv("RSPYTS_LIBRARY_DEMO", "")
     expected = touch(tmp_path / library.platform_filename("demo"))
     lib = Library("demo", search=[str(tmp_path)])
     assert lib.resolve_path() == expected
+
+
+def test_empty_library_specific_env_var_falls_back_to_search(monkeypatch, tmp_path):
+    monkeypatch.setenv("RSPYTS_LIBRARY_DEMO", "")
+    expected = touch(tmp_path / library.platform_filename("demo"))
+    assert Library("demo", search=[str(tmp_path)]).resolve_path() == expected
 
 
 def test_set_path_wins_over_search(tmp_path):
@@ -92,7 +122,7 @@ def test_set_path_wins_over_search(tmp_path):
 
 def test_set_path_after_load_is_an_error(tmp_path):
     lib = Library("demo")
-    lib.cdll = object()  # simulate a completed load
+    lib.cdll = object()  # ty: ignore[invalid-assignment]  # simulate a completed load
     with pytest.raises(RuntimeError, match="already loaded"):
         lib.set_path(tmp_path / "late.dylib")
 
@@ -135,7 +165,7 @@ def test_missing_library_error_lists_candidates(tmp_path):
         lib.resolve_path()
     message = str(exc_info.value)
     assert str(tmp_path / "target" / "debug" / library.platform_filename("demo")) in message
-    assert "RSPYTS_LIBRARY" in message
+    assert "RSPYTS_LIBRARY_DEMO" in message
 
 
 def test_no_search_dirs_error_is_still_helpful():
@@ -209,12 +239,13 @@ class FakeCdll:
         frees the request before returning.
     """
 
-    def __init__(self, abi_version: int = 2) -> None:
+    def __init__(self, abi_version: int = 3, fingerprint: str = FINGERPRINT) -> None:
         self.live: dict[int, Any] = {}
         self.freed: list[tuple[int, int]] = []
         self.rspyts_abi_version = FakeExport(lambda: abi_version)
         self.rspyts_alloc = FakeExport(self.alloc)
         self.rspyts_free = FakeExport(self.free)
+        self.rspyts_contract_fingerprint = FakeExport(lambda: self.response(0, fingerprint))
 
     def alloc(self, size: Any) -> int:
         n = int(cvalue(size))
@@ -226,6 +257,13 @@ class FakeCdll:
     def free(self, ptr: Any, size: Any) -> None:
         self.freed.append((int(cvalue(ptr)), int(cvalue(size))))
         self.live.pop(int(cvalue(ptr)), None)
+
+    def response(self, status: int, payload: Any, tail: bytes = b"") -> int:
+        body = json.dumps(payload, separators=(",", ":")).encode()
+        raw = bytes([status, 0, 0, 0]) + struct.pack("<II", len(body), len(tail)) + body + tail
+        addr = self.alloc(len(raw))
+        ctypes.memmove(addr, raw, len(raw))
+        return addr
 
     def install(
         self,
@@ -264,11 +302,7 @@ class FakeCdll:
                 for dt, (ptr, count) in zip(slice_dts, pairs, strict=True)
             ]
             calls.append(Call(handle=handle, request=request, slices=snapshots))
-            body = json.dumps(payload, separators=(",", ":")).encode()
-            raw = bytes([status, 0, 0, 0]) + struct.pack("<II", len(body), len(tail)) + body + tail
-            addr = self.alloc(len(raw))
-            ctypes.memmove(addr, raw, len(raw))
-            return addr
+            return self.response(status, payload, tail)
 
         setattr(self, symbol, FakeExport(impl))
         return calls
@@ -285,13 +319,12 @@ def bridged(fake: FakeCdll) -> Library:
         A Library ready for call / call_drop without touching the disk.
     """
     lib = Library("demo")
-    lib.cdll = fake
+    lib.cdll = fake  # ty: ignore[invalid-assignment]
     return lib
 
 
 def request_payload(call: Call) -> Any:
-    payload, _tail = envelope.decode_request(call.request)
-    return payload
+    return envelope.decode_request(call.request).value
 
 
 # ---------------------------------------------------------------------------
@@ -299,8 +332,8 @@ def request_payload(call: Call) -> Any:
 # ---------------------------------------------------------------------------
 
 
-def test_load_checks_abi_version_and_caches(monkeypatch, tmp_path):
-    fake = FakeCdll(abi_version=2)
+def test_load_checks_abi_version_fingerprint_and_caches(monkeypatch, tmp_path):
+    fake = FakeCdll(abi_version=3)
     opened: list[str] = []
 
     def fake_cdll(path):
@@ -308,8 +341,8 @@ def test_load_checks_abi_version_and_caches(monkeypatch, tmp_path):
         return fake
 
     monkeypatch.setattr(ctypes, "CDLL", fake_cdll)
-    monkeypatch.setenv("RSPYTS_LIBRARY", str(tmp_path / "demo.dylib"))
-    lib = Library("demo")
+    monkeypatch.setenv("RSPYTS_LIBRARY_DEMO", str(tmp_path / "demo.dylib"))
+    lib = Library("demo", expected_contract_fingerprint=FINGERPRINT)
 
     assert lib.load() is fake
     assert lib.load() is fake  # second load hits the cache
@@ -318,16 +351,90 @@ def test_load_checks_abi_version_and_caches(monkeypatch, tmp_path):
     assert fake.rspyts_alloc.restype is ctypes.c_void_p
     assert fake.rspyts_alloc.argtypes == (ctypes.c_size_t,)
     assert fake.rspyts_free.restype is None
+    assert fake.rspyts_contract_fingerprint.restype is ctypes.c_void_p
+    assert fake.rspyts_contract_fingerprint.argtypes == ()
+    assert lib.contract_fingerprint == FINGERPRINT
+    assert fake.live == {}
 
 
 def test_load_rejects_abi_version_mismatch(monkeypatch, tmp_path):
     monkeypatch.setattr(ctypes, "CDLL", lambda path: FakeCdll(abi_version=7))
-    monkeypatch.setenv("RSPYTS_LIBRARY", str(tmp_path / "demo.dylib"))
+    monkeypatch.setenv("RSPYTS_LIBRARY_DEMO", str(tmp_path / "demo.dylib"))
     lib = Library("demo")
     with pytest.raises(RuntimeError, match="ABI version 7") as exc_info:
         lib.load()
-    assert "version 2" in str(exc_info.value)
+    assert "version 3" in str(exc_info.value)
     assert lib.cdll is None  # a failed handshake caches nothing
+
+
+def test_load_rejects_missing_abi_version_export(monkeypatch, tmp_path):
+    fake = FakeCdll()
+    del fake.rspyts_abi_version
+    monkeypatch.setattr(ctypes, "CDLL", lambda path: fake)
+    monkeypatch.setenv("RSPYTS_LIBRARY_DEMO", str(tmp_path / "demo.dylib"))
+    with pytest.raises(RuntimeError, match="does not export rspyts_abi_version"):
+        Library("demo").load()
+
+
+def test_constructor_rejects_malformed_expected_fingerprint():
+    for fingerprint in ["", "sha256:" + FINGERPRINT, "A" * 64, "a" * 63, "g" * 64]:
+        with pytest.raises(RuntimeError, match="lowercase 64-character"):
+            Library("demo", expected_contract_fingerprint=fingerprint)
+
+
+def test_load_rejects_contract_fingerprint_mismatch_without_caching(monkeypatch, tmp_path):
+    fake = FakeCdll(fingerprint="b" * 64)
+    monkeypatch.setattr(ctypes, "CDLL", lambda path: fake)
+    monkeypatch.setenv("RSPYTS_LIBRARY_DEMO", str(tmp_path / "demo.dylib"))
+    lib = Library("demo", expected_contract_fingerprint=FINGERPRINT)
+    with pytest.raises(RuntimeError, match="contract fingerprint mismatch"):
+        lib.load()
+    assert lib.cdll is None
+    assert lib.contract_fingerprint is None
+    assert fake.live == {}
+
+
+@pytest.mark.parametrize("payload", [None, "A" * 64, "short", 7])
+def test_load_rejects_malformed_module_fingerprint(monkeypatch, tmp_path, payload):
+    fake = FakeCdll()
+    fake.rspyts_contract_fingerprint = FakeExport(lambda: fake.response(0, payload))
+    monkeypatch.setattr(ctypes, "CDLL", lambda path: fake)
+    monkeypatch.setenv("RSPYTS_LIBRARY_DEMO", str(tmp_path / "demo.dylib"))
+    with pytest.raises(RuntimeError, match="module contract fingerprint"):
+        Library("demo").load()
+    assert fake.live == {}
+
+
+def test_load_rejects_missing_or_failed_fingerprint_export(monkeypatch, tmp_path):
+    fake = FakeCdll()
+    del fake.rspyts_contract_fingerprint
+    monkeypatch.setattr(ctypes, "CDLL", lambda path: fake)
+    monkeypatch.setenv("RSPYTS_LIBRARY_DEMO", str(tmp_path / "demo.dylib"))
+    with pytest.raises(RuntimeError, match="required ABI 3 export"):
+        Library("demo").load()
+
+    fake = FakeCdll()
+    fake.rspyts_contract_fingerprint = FakeExport(lambda: fake.response(1, {"message": "no"}))
+    monkeypatch.setattr(ctypes, "CDLL", lambda path: fake)
+    with pytest.raises(RuntimeError, match="failed with status 1"):
+        Library("demo").load()
+    assert fake.live == {}
+
+
+def test_load_rejects_null_or_tailed_fingerprint_envelope(monkeypatch, tmp_path):
+    fake = FakeCdll()
+    fake.rspyts_contract_fingerprint = FakeExport(lambda: None)
+    monkeypatch.setattr(ctypes, "CDLL", lambda path: fake)
+    monkeypatch.setenv("RSPYTS_LIBRARY_DEMO", str(tmp_path / "demo.dylib"))
+    with pytest.raises(RuntimeError, match="null envelope"):
+        Library("demo").load()
+
+    fake = FakeCdll()
+    fake.rspyts_contract_fingerprint = FakeExport(lambda: fake.response(0, FINGERPRINT, b"x"))
+    monkeypatch.setattr(ctypes, "CDLL", lambda path: fake)
+    with pytest.raises(RuntimeError, match="attachment bytes"):
+        Library("demo").load()
+    assert fake.live == {}
 
 
 # ---------------------------------------------------------------------------
@@ -341,7 +448,8 @@ def test_call_sends_compact_json_and_decodes_payload():
 
     result = bridged(fake).call("demo__add", {"a": 1, "minimumValue": 1.5})
 
-    assert result == {"sum": 3}
+    assert result.value == {"sum": 3}
+    assert result.tail == b""
     assert request_payload(calls[0]) == {"a": 1, "minimumValue": 1.5}
     assert calls[0].handle is None
 
@@ -353,10 +461,13 @@ def test_call_sends_nested_numpy_buffers_in_the_request_envelope():
 
     bridged(fake).call("demo__buffered", {"nested": [{"values": values}]})
 
-    payload, tail = envelope.decode_request(calls[0].request)
-    decoded = envelope.substitute_buffers(payload, tail)
-    assert decoded["nested"][0]["values"].dtype == np.int32
-    np.testing.assert_array_equal(decoded["nested"][0]["values"], values)
+    request = envelope.decode_request(calls[0].request)
+    decoded = _internal.buffer_from_wire(
+        request.child(request.value["nested"][0]["values"]),
+        dtype="i32",
+    )
+    assert decoded.dtype == np.int32
+    np.testing.assert_array_equal(decoded, values)
     assert fake.live == {}
     assert fake.freed[0][1] == len(calls[0].request)
 
@@ -365,7 +476,7 @@ def test_call_with_no_args_sends_empty_object():
     fake = FakeCdll()
     calls = fake.install("demo__ping", payload=None)
 
-    assert bridged(fake).call("demo__ping", None) is None
+    assert bridged(fake).call("demo__ping", None).value is None
     assert request_payload(calls[0]) == {}
 
 
@@ -377,6 +488,27 @@ def test_call_passes_handle_as_leading_u64():
 
     assert calls[0].handle == 42
     assert request_payload(calls[0]) == {}
+
+
+@pytest.mark.parametrize("handle", [True, 1.0, "1", None])
+def test_calls_reject_non_integer_handles(handle):
+    fake = FakeCdll()
+    fake.install("demo__method", payload=None)
+    kwargs = {} if handle is None else {"handle": handle}
+    if handle is None:
+        # None denotes a free function and is intentionally valid.
+        assert bridged(fake).call("demo__method", {}, **kwargs).value is None
+    else:
+        with pytest.raises(TypeError, match="exact integer"):
+            bridged(fake).call("demo__method", {}, **kwargs)
+
+
+@pytest.mark.parametrize("handle", [0, -1, 2**53])
+def test_calls_reject_out_of_range_handles(handle):
+    fake = FakeCdll()
+    fake.install("demo__method", payload=None)
+    with pytest.raises(ValueError, match="handle must be in"):
+        bridged(fake).call("demo__method", {}, handle=handle)
 
 
 def test_call_passes_slices_as_contiguous_pointer_count_pairs():
@@ -393,6 +525,14 @@ def test_call_passes_slices_as_contiguous_pointer_count_pairs():
     np.testing.assert_array_equal(second, [0, 2, 4, 6])
 
 
+def test_call_rejects_unknown_slice_dtype_before_native_allocation():
+    fake = FakeCdll()
+    fake.install("demo__analyze", payload=None)
+    with pytest.raises(ValueError, match="unsupported slice dtype"):
+        bridged(fake).call("demo__analyze", {}, slices=[([1], "f16")])
+    assert fake.live == {}
+
+
 def test_call_borrows_only_runtime_owned_slice_copies():
     fake = FakeCdll()
     source = np.array([1.0, 2.0], dtype=np.float64)
@@ -406,13 +546,13 @@ def test_call_borrows_only_runtime_owned_slice_copies():
         ctypes.memmove(addr, raw, len(raw))
         return addr
 
-    fake.demo__inspect = FakeExport(inspect)
+    fake.demo__inspect = FakeExport(inspect)  # ty: ignore[unresolved-attribute]
     bridged(fake).call("demo__inspect", {}, slices=[(source, "f64")])
 
     assert seen_pointer[0] != source.ctypes.data
 
 
-def test_call_substitutes_buffers_from_the_tail():
+def test_call_returns_explicit_attachment_context_for_schema_decoder():
     values = np.array([1.0, 2.0, 4.0], dtype=np.float32)
     fake = FakeCdll()
     fake.install(
@@ -423,7 +563,19 @@ def test_call_substitutes_buffers_from_the_tail():
 
     result = bridged(fake).call("demo__spectrum", {})
 
-    np.testing.assert_array_equal(result["bins"], values)
+    bins = _internal.map_from_wire(result)["bins"]
+    np.testing.assert_array_equal(_internal.buffer_from_wire(bins, dtype="f32"), values)
+
+
+def test_call_preserves_wrapper_shaped_maps_until_schema_conversion():
+    value = {"__rspyts_buf__": {"off": 0, "len": 1, "dt": "u8"}}
+    fake = FakeCdll()
+    fake.install("demo__map", payload=value, tail=b"\x07")
+
+    result = bridged(fake).call("demo__map", {})
+    assert result.value == value
+    assert _internal.json_from_wire(result) == value
+    np.testing.assert_array_equal(_internal.buffer_from_wire(result, dtype="u8"), [7])
 
 
 def test_call_status_1_raises_registered_error():
@@ -460,9 +612,21 @@ def test_call_unknown_error_code_raises_bridge_error():
 
 def test_call_null_envelope_is_a_runtime_error():
     fake = FakeCdll()
-    fake.demo__null = FakeExport(lambda *args: None)
+    fake.demo__null = FakeExport(lambda *args: None)  # ty: ignore[unresolved-attribute]
     with pytest.raises(RuntimeError, match="null envelope"):
         bridged(fake).call("demo__null", {})
+
+
+def test_call_rejects_missing_export_and_null_request_allocation():
+    fake = FakeCdll()
+    with pytest.raises(RuntimeError, match="module has no export"):
+        bridged(fake).call("demo__missing", {})
+
+    fake = FakeCdll()
+    fake.install("demo__call", payload=None)
+    fake.rspyts_alloc = FakeExport(lambda size: None)
+    with pytest.raises(MemoryError, match="rspyts_alloc returned null"):
+        bridged(fake).call("demo__call", {})
 
 
 def test_call_frees_request_and_envelope():
@@ -483,7 +647,7 @@ def test_call_frees_request_even_when_the_export_raises():
     def explode(*args: Any) -> int:
         raise OSError("segv, politely")
 
-    fake.demo__bad = FakeExport(explode)
+    fake.demo__bad = FakeExport(explode)  # ty: ignore[unresolved-attribute]
     with pytest.raises(OSError, match="politely"):
         bridged(fake).call("demo__bad", {})
     assert fake.live == {}
@@ -519,10 +683,20 @@ def test_call_rejects_non_finite_floats_in_json_position(bad):
 def test_call_drop_fires_without_an_envelope():
     fake = FakeCdll()
     calls: list[tuple[Any, ...]] = []
-    fake.demo__drop = FakeExport(lambda *args: calls.append(args))
+    fake.demo__drop = FakeExport(lambda *args: calls.append(args))  # ty: ignore[unresolved-attribute]
 
     assert bridged(fake).call_drop("demo__drop", 9) is None
 
-    assert fake.demo__drop.restype is None
+    assert fake.demo__drop.restype is None  # ty: ignore[unresolved-attribute]
     assert isinstance(calls[0][0], ctypes.c_uint64)
     assert calls[0][0].value == 9
+
+
+def test_call_drop_validates_export_and_handle():
+    fake = FakeCdll()
+    with pytest.raises(RuntimeError, match="module has no export"):
+        bridged(fake).call_drop("demo__missing", 1)
+
+    fake.demo__drop = FakeExport(lambda *args: None)  # ty: ignore[unresolved-attribute]
+    with pytest.raises(ValueError, match="handle must be in"):
+        bridged(fake).call_drop("demo__drop", 0)

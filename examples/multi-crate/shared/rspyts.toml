@@ -3,29 +3,17 @@
 #   rspyts generate --config examples/multi-crate/shared/rspyts.toml
 
 [crate]
-# The leaf crate that adds `rspyts::export!()` on top of shared-types;
-# see module/src/lib.rs for why the types crate cannot export itself.
-path = "module"
-
-[build]
-features = []
-no-default-features = false
-profile = "dev"
-targets = ["wasm32-unknown-unknown"]
-locked = true
+# Build the real shared-types crate as its own module. The feature adds the
+# exporter only for this standalone build; app dependencies leave it disabled.
+path = "rust"
+features = ["standalone-module"]
+no-default-features = true
 
 [python]
-enabled = true
 out = "python/src/shared_types/generated"
-# Relative entries resolve against the generated package directory at
-# import time; these reach the workspace target/ dir seven levels up.
-# (Nothing here calls the library — the package is types only — but the
-# loader is generated uniformly.)
-library_search = [
-    "../../../../../../../target/debug",
-    "../../../../../../../target/release",
-]
+# `rspyts build` stages the host library in `generated/lib` by default.
+# Nothing here calls it — this package is types only — but the loader and
+# artifact layout are generated uniformly.
 
 [typescript]
-enabled = true
 out = "typescript/src/generated"

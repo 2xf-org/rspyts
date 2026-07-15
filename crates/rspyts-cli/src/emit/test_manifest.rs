@@ -12,13 +12,13 @@ use rspyts_core::ir::{
 };
 use serde_json::json;
 
-fn field(name: &str, wire: &str, docs: &str, ty: Ty, optional: bool) -> FieldDecl {
+fn field(name: &str, wire: &str, docs: &str, ty: Ty, required: bool) -> FieldDecl {
     FieldDecl {
         name: name.to_string(),
         wire_name: wire.to_string(),
         docs: docs.to_string(),
         ty,
-        optional,
+        required,
     }
 }
 
@@ -37,7 +37,7 @@ pub const FOREIGN_ORIGIN: &str = "shared-types";
 /// Build the fixture. Sections are name-sorted, mirroring ABI §7.
 pub fn manifest() -> Manifest {
     Manifest {
-        abi: "2.0".to_string(),
+        abi: rspyts_core::ABI_VERSION_STR.to_string(),
         crate_name: "demo-crate".to_string(),
         crate_version: "0.1.0".to_string(),
         types: vec![
@@ -56,7 +56,7 @@ pub fn manifest() -> Manifest {
                         name: "BatchTooLarge".to_string(),
                         wire_code: "batchTooLarge".to_string(),
                         docs: String::new(),
-                        fields: vec![field("max", "max", "", Ty::U32, false)],
+                        fields: vec![field("max", "max", "", Ty::U32, true)],
                     },
                 ],
             },
@@ -70,7 +70,7 @@ pub fn manifest() -> Manifest {
                         "minimumValue",
                         "Minimum value to include.",
                         Ty::F64,
-                        false,
+                        true,
                     ),
                     field(
                         "tolerance",
@@ -79,9 +79,9 @@ pub fn manifest() -> Manifest {
                         Ty::Option {
                             inner: Box::new(Ty::F64),
                         },
-                        true,
+                        false,
                     ),
-                    field("metadata", "metadata", "", Ty::Json, false),
+                    field("metadata", "metadata", "", Ty::Json, true),
                 ],
             },
             TypeDecl::Struct {
@@ -89,8 +89,8 @@ pub fn manifest() -> Manifest {
                 docs: "Description of an input source.".to_string(),
                 origin: FOREIGN_ORIGIN.to_string(),
                 fields: vec![
-                    field("name", "name", "", Ty::String, false),
-                    field("field_count", "fieldCount", "", Ty::U16, false),
+                    field("name", "name", "", Ty::String, true),
+                    field("field_count", "fieldCount", "", Ty::U16, true),
                 ],
             },
             TypeDecl::StringEnum {
@@ -117,15 +117,15 @@ pub fn manifest() -> Manifest {
                         wire_name: "accepted".to_string(),
                         docs: String::new(),
                         fields: vec![
-                            field("index", "index", "", Ty::U32, false),
-                            field("value", "value", "", Ty::F64, false),
+                            field("index", "index", "", Ty::U32, true),
+                            field("value", "value", "", Ty::F64, true),
                         ],
                     },
                     VariantDecl {
                         name: "Rejected".to_string(),
                         wire_name: "rejected".to_string(),
                         docs: String::new(),
-                        fields: vec![field("index", "index", "", Ty::U32, false)],
+                        fields: vec![field("index", "index", "", Ty::U32, true)],
                     },
                 ],
             },
@@ -327,10 +327,10 @@ pub fn binary_manifest() -> Manifest {
                 Ty::Ref {
                     name: "PacketId".to_string(),
                 },
-                false,
+                true,
             ),
-            field("payload", "payload", "", Ty::Bytes, false),
-            field("samples", "samples", "", Ty::Buf { dt: Dtype::F64 }, false),
+            field("payload", "payload", "", Ty::Bytes, true),
+            field("samples", "samples", "", Ty::Buf { dt: Dtype::F64 }, true),
             field(
                 "chunks",
                 "chunks",
@@ -338,7 +338,7 @@ pub fn binary_manifest() -> Manifest {
                 Ty::List {
                     inner: Box::new(Ty::Buf { dt: Dtype::I16 }),
                 },
-                false,
+                true,
             ),
             field(
                 "channels",
@@ -347,7 +347,7 @@ pub fn binary_manifest() -> Manifest {
                 Ty::Map {
                     value: Box::new(Ty::Buf { dt: Dtype::U8 }),
                 },
-                false,
+                true,
             ),
         ],
     });
@@ -409,9 +409,9 @@ pub fn exact_manifest() -> Manifest {
                 Ty::Ref {
                     name: "SequenceId".into(),
                 },
-                false,
+                true,
             ),
-            field("delta", "delta", "", Ty::I64, false),
+            field("delta", "delta", "", Ty::I64, true),
             field(
                 "pair",
                 "pair",
@@ -419,7 +419,7 @@ pub fn exact_manifest() -> Manifest {
                 Ty::Tuple {
                     items: vec![Ty::I64, Ty::U64],
                 },
-                false,
+                true,
             ),
             field(
                 "nested",
@@ -432,7 +432,7 @@ pub fn exact_manifest() -> Manifest {
                         }),
                     }),
                 },
-                false,
+                true,
             ),
         ],
     });
@@ -452,14 +452,14 @@ pub fn exact_manifest() -> Manifest {
                 name: "Ready".to_string(),
                 wire_name: "ready".to_string(),
                 docs: String::new(),
-                fields: vec![field("total", "total", "", Ty::U64, false)],
+                fields: vec![field("total", "total", "", Ty::U64, true)],
             },
         ],
     });
     if let TypeDecl::ErrorEnum { variants, .. } = &mut m.types[0] {
         variants[1]
             .fields
-            .push(field("exact_limit", "exactLimit", "", Ty::U64, false));
+            .push(field("exact_limit", "exactLimit", "", Ty::U64, true));
     }
     m.constants.push(ConstDecl {
         name: "MAX_SEQUENCE".to_string(),
@@ -530,9 +530,7 @@ pub fn exact_manifest() -> Manifest {
     m
 }
 
-/// The manifest-hash the emitters would receive for this fixture: the
-/// SHA-256 of its serialized JSON, exactly as in the real pipeline.
+/// The canonical manifest hash the emitters receive for this fixture.
 pub fn manifest_hash(m: &Manifest) -> String {
-    let json = serde_json::to_vec(m).expect("manifest serializes");
-    super::util::manifest_hash_hex(&json)
+    super::util::manifest_hash_hex(m)
 }

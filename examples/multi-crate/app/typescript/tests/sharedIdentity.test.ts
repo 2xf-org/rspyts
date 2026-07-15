@@ -1,10 +1,11 @@
 /**
- * Smoke tests proving shared type identity across bridged crates.
+ * Smoke tests for shared declaration provenance across bridged crates.
  *
  * The app's generated code imports `Point` and `Axis` from the
  * shared-types package (via `[typescript.imports]`) instead of re-emitting
- * them, so the type this suite pulls from "shared-types-example" is —
- * not just resembles — the type the app client accepts and returns.
+ * them. The assertions below prove mutual structural assignability and the
+ * live calls prove round-trips; TypeScript does not provide nominal identity
+ * for interfaces, so assignability alone cannot prove an import's origin.
  *
  * Requires the WASM build:
  *   rspyts build --config examples/multi-crate/app/rspyts.toml
@@ -25,13 +26,20 @@ const WASM_PATH = fileURLToPath(
   ),
 );
 
-// Compile-time proof of identity: the app's parameter and return types are
-// mutually assignable with the shared package's exports. `AssertSame`
-// resolves to `true` only for identical (mutually assignable) types.
-type AssertSame<A, B> = A extends B ? (B extends A ? true : never) : never;
-type _PointIdentity = AssertSame<Point, ReturnType<MultiCrateAppClient["translate"]>>;
-type _AxisIdentity = AssertSame<Axis, Parameters<MultiCrateAppClient["mirror"]>[1]>;
-const identityHolds: _PointIdentity & _AxisIdentity = true;
+// Compile-time compatibility guard: the app's parameter and return types are
+// mutually assignable with the shared package's exports. This would also hold
+// for independently emitted lookalikes, so the generated import itself is the
+// declaration-provenance guarantee.
+type MutuallyAssignable<A, B> = A extends B ? (B extends A ? true : never) : never;
+type _PointCompatibility = MutuallyAssignable<
+  Point,
+  ReturnType<MultiCrateAppClient["translate"]>
+>;
+type _AxisCompatibility = MutuallyAssignable<
+  Axis,
+  Parameters<MultiCrateAppClient["mirror"]>[1]
+>;
+const importsAreAssignable: _PointCompatibility & _AxisCompatibility = true;
 
 let client: MultiCrateAppClient;
 
@@ -40,9 +48,9 @@ beforeAll(async () => {
   client = createClient(await instantiate(await readFile(WASM_PATH)));
 });
 
-describe("shared identity", () => {
-  it("type-level identity holds", () => {
-    expect(identityHolds).toBe(true);
+describe("shared declaration provenance", () => {
+  it("imported declarations remain mutually assignable", () => {
+    expect(importsAreAssignable).toBe(true);
   });
 
   it("translate accepts and returns the shared Point", () => {

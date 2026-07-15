@@ -96,8 +96,10 @@ describe("exact integers", () => {
     const value: ExactNumbers = {
       signed: -(1n << 63n),
       unsigned: (1n << 64n) - 1n,
+      transferId: (1n << 53n) + 7n,
       pair: [(1n << 53n) + 1n, (1n << 64n) - 1n],
       history: [0n, (1n << 53n) + 1n, (1n << 64n) - 1n],
+      byName: { primary: (1n << 63n) - 1n },
     };
     expect(client.echoExactNumbers(value)).toEqual(value);
     expect(client.echoExactPair([(1n << 63n) - 1n, (1n << 64n) - 1n])).toEqual([
@@ -136,14 +138,27 @@ describe("mixed enums", () => {
   it("round-trips unit and data variants", () => {
     expect(client.echoTransferState({ type: "pending" })).toEqual({ type: "pending" });
     expect(
-      client.echoTransferState({ type: "complete", sequence: (1n << 64n) - 1n }),
-    ).toEqual({ type: "complete", sequence: (1n << 64n) - 1n });
+      client.echoTransferState({
+        type: "complete",
+        sequence: (1n << 64n) - 1n,
+        receipt: null,
+      }),
+    ).toEqual({ type: "complete", sequence: (1n << 64n) - 1n, receipt: null });
   });
 });
 
 describe("annotate", () => {
   it("round-trips schemaless JSON objects untouched", () => {
-    const metadata = { source: "fixture", nested: { tags: ["a", "b"], rev: 2 }, empty: null };
+    const marker = { __rspyts_buf__: { off: 0, len: 1, dt: "u8" } };
+    const metadata = {
+      source: "fixture",
+      nested: { tags: ["a", "b"], rev: 2 },
+      markerShapes: {
+        buffer: marker,
+        json: { __rspyts_json__: marker },
+      },
+      empty: null,
+    };
     expect(client.annotate(2.5, metadata)).toEqual({ ...metadata, value: 2.5 });
   });
 
@@ -204,6 +219,8 @@ describe("binary attachments", () => {
       channels: {
         red: new Uint8Array([0, 127, 255]),
         empty: new Uint8Array(0),
+        __rspyts_buf__: new Uint8Array([7, 8]),
+        __rspyts_json__: new Uint8Array([9]),
       },
     };
 
@@ -219,10 +236,14 @@ describe("binary attachments", () => {
     expect(out.channels.red).toBeInstanceOf(Uint8Array);
     expect(out.channels.red).toEqual(new Uint8Array([0, 127, 255]));
     expect(out.channels.empty).toEqual(new Uint8Array(0));
+    expect(out.channels.__rspyts_buf__).toEqual(new Uint8Array([7, 8]));
+    expect(out.channels.__rspyts_json__).toEqual(new Uint8Array([9]));
 
     expect(out.samples).not.toBe(packet.samples);
     expect(out.chunks[0]).not.toBe(packet.chunks[0]);
     expect(out.channels.red).not.toBe(packet.channels.red);
+    expect(out.channels.__rspyts_buf__).not.toBe(packet.channels.__rspyts_buf__);
+    expect(out.channels.__rspyts_json__).not.toBe(packet.channels.__rspyts_json__);
     packet.samples[0] = 99;
     packet.chunks[0][0] = 99;
     packet.channels.red[0] = 99;

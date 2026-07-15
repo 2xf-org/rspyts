@@ -2,12 +2,9 @@
 //! the [`Buf`] zero-JSON-copy numeric buffer.
 //!
 //! A Rust type can cross the bridge if and only if it implements
-//! [`Bridged`]. Deliberately **not** implemented (see
-//! `docs/design/type-system.md` §1): `u64`, `i64`, `u128`, `i128`,
-//! `usize`, `isize`, `char`, and tuples outside arities 2 through 12. If
-//! you hit a "trait bound not satisfied" error on one of these, that is
-//! the type system saying no — use [`I64`]/[`U64`] for exact 64-bit
-//! integers, or a supported portable shape.
+//! [`Bridged`]. Domain code keeps ordinary Serde representations: `i64` and
+//! `u64` are JSON numbers in Rust and become canonical decimal strings only
+//! at the FFI boundary; `serde_json::Value` stays transparent JSON.
 
 use crate::ir::{Dtype, Ty};
 use serde::de::{MapAccess, SeqAccess, Visitor};
@@ -22,6 +19,27 @@ use std::collections::{BTreeMap, HashMap};
 /// [`Ty::Ref`]; everything else is structural.
 pub trait Bridged {
     fn ty() -> Ty;
+
+    /// IR shape used only while assembling inventory registrations.
+    ///
+    /// Named macro-generated types override this to retain their defining
+    /// crate identity until registry reachability has been resolved. Public
+    /// callers should use [`Bridged::ty`], which always returns the stable
+    /// manifest shape.
+    #[doc(hidden)]
+    fn inventory_ty() -> Ty {
+        Self::ty()
+    }
+
+    /// IR shape when this type is the top-level function return.
+    ///
+    /// Data `()` is JSON null, while a top-level `()` return projects to
+    /// host-language void. All other types use their ordinary inventory
+    /// shape, including aliases of `()` through Rust's trait resolution.
+    #[doc(hidden)]
+    fn inventory_return_ty() -> Ty {
+        Self::inventory_ty()
+    }
 }
 
 macro_rules! impl_bridged_scalar {
@@ -40,16 +58,39 @@ impl_bridged_scalar! {
     i8 => I8,
     i16 => I16,
     i32 => I32,
+    i64 => I64,
+    u64 => U64,
     f32 => F32,
     f64 => F64,
     String => String,
-    () => Unit,
+}
+
+impl Bridged for () {
+    fn ty() -> Ty {
+        Ty::Null
+    }
+
+    fn inventory_return_ty() -> Ty {
+        Ty::Unit
+    }
+}
+
+impl Bridged for serde_json::Value {
+    fn ty() -> Ty {
+        Ty::Json
+    }
 }
 
 impl<T: Bridged> Bridged for Option<T> {
     fn ty() -> Ty {
         Ty::Option {
             inner: Box::new(T::ty()),
+        }
+    }
+
+    fn inventory_ty() -> Ty {
+        Ty::Option {
+            inner: Box::new(T::inventory_ty()),
         }
     }
 }
@@ -60,6 +101,12 @@ impl<T: Bridged> Bridged for Vec<T> {
             inner: Box::new(T::ty()),
         }
     }
+
+    fn inventory_ty() -> Ty {
+        Ty::List {
+            inner: Box::new(T::inventory_ty()),
+        }
+    }
 }
 
 impl<T: Bridged> Bridged for HashMap<String, T> {
@@ -68,12 +115,24 @@ impl<T: Bridged> Bridged for HashMap<String, T> {
             value: Box::new(T::ty()),
         }
     }
+
+    fn inventory_ty() -> Ty {
+        Ty::Map {
+            value: Box::new(T::inventory_ty()),
+        }
+    }
 }
 
 impl<T: Bridged> Bridged for BTreeMap<String, T> {
     fn ty() -> Ty {
         Ty::Map {
             value: Box::new(T::ty()),
+        }
+    }
+
+    fn inventory_ty() -> Ty {
+        Ty::Map {
+            value: Box::new(T::inventory_ty()),
         }
     }
 }
@@ -85,6 +144,12 @@ macro_rules! impl_bridged_tuple {
                 fn ty() -> Ty {
                     Ty::Tuple {
                         items: vec![$($ty::ty()),+],
+                    }
+                }
+
+                fn inventory_ty() -> Ty {
+                    Ty::Tuple {
+                        items: vec![$($ty::inventory_ty()),+],
                     }
                 }
             }
@@ -104,148 +169,6 @@ impl_bridged_tuple! {
     (A, B, C, D, E, F, G, H, I, J),
     (A, B, C, D, E, F, G, H, I, J, K),
     (A, B, C, D, E, F, G, H, I, J, K, L),
-}
-
-/// Exact signed 64-bit integer transported as a canonical decimal string.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct I64(pub i64);
-
-impl I64 {
-    pub const fn new(value: i64) -> Self {
-        Self(value)
-    }
-
-    pub const fn get(self) -> i64 {
-        self.0
-    }
-
-    pub const fn into_inner(self) -> i64 {
-        self.0
-    }
-}
-
-impl From<i64> for I64 {
-    fn from(value: i64) -> Self {
-        Self(value)
-    }
-}
-
-impl From<I64> for i64 {
-    fn from(value: I64) -> Self {
-        value.0
-    }
-}
-
-impl std::fmt::Display for I64 {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        self.0.fmt(f)
-    }
-}
-
-impl std::str::FromStr for I64 {
-    type Err = std::num::ParseIntError;
-
-    fn from_str(value: &str) -> Result<Self, Self::Err> {
-        value.parse::<i64>().map(Self)
-    }
-}
-
-impl Bridged for I64 {
-    fn ty() -> Ty {
-        Ty::I64
-    }
-}
-
-impl Serialize for I64 {
-    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        serializer.collect_str(&self.0)
-    }
-}
-
-impl<'de> Deserialize<'de> for I64 {
-    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let value = String::deserialize(deserializer)?;
-        let parsed = value.parse::<i64>().map_err(|_| {
-            serde::de::Error::custom("expected a canonical signed 64-bit decimal string")
-        })?;
-        if parsed.to_string() != value {
-            return Err(serde::de::Error::custom(
-                "expected a canonical signed 64-bit decimal string",
-            ));
-        }
-        Ok(Self(parsed))
-    }
-}
-
-/// Exact unsigned 64-bit integer transported as a canonical decimal string.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct U64(pub u64);
-
-impl U64 {
-    pub const fn new(value: u64) -> Self {
-        Self(value)
-    }
-
-    pub const fn get(self) -> u64 {
-        self.0
-    }
-
-    pub const fn into_inner(self) -> u64 {
-        self.0
-    }
-}
-
-impl From<u64> for U64 {
-    fn from(value: u64) -> Self {
-        Self(value)
-    }
-}
-
-impl From<U64> for u64 {
-    fn from(value: U64) -> Self {
-        value.0
-    }
-}
-
-impl std::fmt::Display for U64 {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        self.0.fmt(f)
-    }
-}
-
-impl std::str::FromStr for U64 {
-    type Err = std::num::ParseIntError;
-
-    fn from_str(value: &str) -> Result<Self, Self::Err> {
-        value.parse::<u64>().map(Self)
-    }
-}
-
-impl Bridged for U64 {
-    fn ty() -> Ty {
-        Ty::U64
-    }
-}
-
-impl Serialize for U64 {
-    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        serializer.collect_str(&self.0)
-    }
-}
-
-impl<'de> Deserialize<'de> for U64 {
-    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let value = String::deserialize(deserializer)?;
-        let parsed = value.parse::<u64>().map_err(|_| {
-            serde::de::Error::custom("expected a canonical unsigned 64-bit decimal string")
-        })?;
-        if parsed.to_string() != value {
-            return Err(serde::de::Error::custom(
-                "expected a canonical unsigned 64-bit decimal string",
-            ));
-        }
-        Ok(Self(parsed))
-    }
 }
 
 /// Element types allowed in `&[T]` slice parameters (ABI §6).
@@ -390,65 +313,6 @@ impl AsRef<[u8]> for Bytes {
 impl Bridged for Bytes {
     fn ty() -> Ty {
         Ty::Bytes
-    }
-}
-
-/// Schemaless JSON passthrough — the deliberate escape hatch for payloads
-/// whose shape is decided at runtime (plugin parameters, free-form
-/// attributes). Projects as `Any` in Python, `unknown` in TypeScript, and
-/// `{}` in JSON Schema. Prefer real bridged types wherever the shape is
-/// actually known.
-#[derive(Clone, Debug, Default, PartialEq)]
-pub struct Json(pub serde_json::Value);
-
-impl Json {
-    pub fn new(value: serde_json::Value) -> Self {
-        Self(value)
-    }
-    pub fn into_inner(self) -> serde_json::Value {
-        self.0
-    }
-}
-
-impl From<serde_json::Value> for Json {
-    fn from(value: serde_json::Value) -> Self {
-        Self(value)
-    }
-}
-
-impl Bridged for Json {
-    fn ty() -> Ty {
-        Ty::Json
-    }
-}
-
-/// The exact single-key wrapper used to keep schemaless JSON opaque to the
-/// attachment scanner. The wrapper is removed by host runtimes, so `Json`
-/// remains an ordinary JSON value in generated APIs.
-pub const JSON_WRAPPER_KEY: &str = "__rspyts_json__";
-
-impl Serialize for Json {
-    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        use serde::ser::SerializeMap;
-        let mut map = serializer.serialize_map(Some(1))?;
-        map.serialize_entry(JSON_WRAPPER_KEY, &self.0)?;
-        map.end()
-    }
-}
-
-impl<'de> Deserialize<'de> for Json {
-    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let mut map = BTreeMap::<String, serde_json::Value>::deserialize(deserializer)?;
-        if map.len() != 1 {
-            return Err(serde::de::Error::custom(
-                "schemaless JSON wrapper must contain exactly one field",
-            ));
-        }
-        map.remove(JSON_WRAPPER_KEY).map(Self).ok_or_else(|| {
-            serde::de::Error::custom(format!(
-                "schemaless JSON wrapper must use {JSON_WRAPPER_KEY:?}"
-            ))
-        })
     }
 }
 
@@ -620,27 +484,31 @@ mod tests {
     }
 
     #[test]
-    fn json_uses_an_exact_wrapper_and_preserves_attachment_shaped_content() {
+    fn json_is_transparent_and_preserves_attachment_shaped_content() {
         let inner = serde_json::json!({
             BUF_PLACEHOLDER_KEY: {"off": 0, "len": 1, "dt": "u8"}
         });
-        let wrapped = Json::new(inner.clone());
-        let encoded = serde_json::to_value(&wrapped).unwrap();
-        assert_eq!(encoded, serde_json::json!({JSON_WRAPPER_KEY: inner}));
+        let encoded = serde_json::to_value(&inner).unwrap();
+        assert_eq!(encoded, inner);
         assert_eq!(
-            serde_json::from_value::<Json>(encoded)
-                .unwrap()
-                .into_inner(),
+            serde_json::from_value::<serde_json::Value>(encoded).unwrap(),
             inner
         );
-        assert!(serde_json::from_value::<Json>(serde_json::json!({})).is_err());
-        assert!(
-            serde_json::from_value::<Json>(serde_json::json!({
-                JSON_WRAPPER_KEY: null,
-                "sibling": true
-            }))
-            .is_err()
+
+        let ptr = envelope::encode_ok(&inner);
+        let (status, json, tail) = envelope::decode_owned(ptr);
+        assert_eq!(status, envelope::STATUS_OK);
+        assert!(tail.is_empty());
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&json).unwrap(),
+            inner
         );
+
+        let request_tail = [99_u8];
+        let decoded = envelope::with_request_tail(&request_tail, || {
+            serde_json::from_value::<serde_json::Value>(inner.clone()).unwrap()
+        });
+        assert_eq!(decoded, inner);
     }
 
     #[test]
@@ -711,12 +579,14 @@ mod tests {
         assert_eq!(i8::ty(), Ty::I8);
         assert_eq!(i16::ty(), Ty::I16);
         assert_eq!(i32::ty(), Ty::I32);
-        assert_eq!(I64::ty(), Ty::I64);
-        assert_eq!(U64::ty(), Ty::U64);
+        assert_eq!(i64::ty(), Ty::I64);
+        assert_eq!(u64::ty(), Ty::U64);
         assert_eq!(f32::ty(), Ty::F32);
         assert_eq!(f64::ty(), Ty::F64);
         assert_eq!(String::ty(), Ty::String);
-        assert_eq!(<()>::ty(), Ty::Unit);
+        assert_eq!(<()>::ty(), Ty::Null);
+        assert_eq!(<()>::inventory_return_ty(), Ty::Unit);
+        assert_eq!(serde_json::Value::ty(), Ty::Json);
     }
 
     #[test]
@@ -770,7 +640,7 @@ mod tests {
             },
         );
         assert_eq!(
-            <(u8, String, Option<I64>)>::ty(),
+            <(u8, String, Option<i64>)>::ty(),
             Ty::Tuple {
                 items: vec![
                     Ty::U8,
@@ -781,37 +651,6 @@ mod tests {
                 ],
             }
         );
-    }
-
-    #[test]
-    fn exact_integer_wrappers_use_canonical_decimal_strings() {
-        for value in [i64::MIN, -9_007_199_254_740_993, -1, 0, 1, i64::MAX] {
-            let wrapped = I64::new(value);
-            let json = serde_json::to_string(&wrapped).unwrap();
-            assert_eq!(json, format!("\"{value}\""));
-            assert_eq!(serde_json::from_str::<I64>(&json).unwrap().get(), value);
-            assert_eq!(i64::from(wrapped), value);
-        }
-        for value in [0, 1, 9_007_199_254_740_993, u64::MAX] {
-            let wrapped = U64::new(value);
-            let json = serde_json::to_string(&wrapped).unwrap();
-            assert_eq!(json, format!("\"{value}\""));
-            assert_eq!(serde_json::from_str::<U64>(&json).unwrap().get(), value);
-            assert_eq!(u64::from(wrapped), value);
-        }
-
-        for invalid in ["\"01\"", "\"-0\"", "\"+1\"", "\"9223372036854775808\"", "1"] {
-            assert!(serde_json::from_str::<I64>(invalid).is_err(), "{invalid}");
-        }
-        for invalid in [
-            "\"01\"",
-            "\"-1\"",
-            "\"+1\"",
-            "\"18446744073709551616\"",
-            "1",
-        ] {
-            assert!(serde_json::from_str::<U64>(invalid).is_err(), "{invalid}");
-        }
     }
 
     #[test]

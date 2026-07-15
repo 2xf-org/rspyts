@@ -40,12 +40,13 @@
 //! `docs/design/type-system.md` (what can cross), `docs/design/abi.md`
 //! (how it crosses), and `docs/design/codegen.md` (what gets generated).
 
-pub use rspyts_core::{BridgeErr, BridgeError, Bridged, Buf, Bytes, I64, Json, U64};
+pub use rspyts_core::{BridgeErr, BridgeError, Bridged, Buf, Bytes};
 pub use rspyts_macros::bridge;
 
 /// Export the module-level rspyts symbols (`rspyts_abi_version`,
-/// `rspyts_manifest`, `rspyts_alloc`, `rspyts_free`). Invoke exactly once
-/// at the root of every bridged cdylib crate.
+/// `rspyts_manifest`, `rspyts_contract_fingerprint`, `rspyts_alloc`, and
+/// `rspyts_free`). Invoke exactly once at the root of every bridged cdylib
+/// crate.
 #[macro_export]
 macro_rules! export {
     () => {
@@ -61,6 +62,17 @@ macro_rules! export {
                     env!("CARGO_PKG_NAME"),
                     env!("CARGO_PKG_VERSION"),
                 ))
+            })
+        }
+
+        #[unsafe(no_mangle)]
+        pub extern "C" fn rspyts_contract_fingerprint() -> *mut u8 {
+            $crate::__private::shim::run(|| {
+                let manifest = $crate::__private::registry::build_manifest(
+                    env!("CARGO_PKG_NAME"),
+                    env!("CARGO_PKG_VERSION"),
+                );
+                ::core::result::Result::Ok($crate::__private::manifest_fingerprint(&manifest))
             })
         }
 
@@ -89,8 +101,10 @@ pub mod __private {
     pub use rspyts_core::envelope;
     pub use rspyts_core::handles::Slab;
     pub use rspyts_core::ir;
+    pub use rspyts_core::manifest_fingerprint;
     pub use rspyts_core::registry;
     pub use rspyts_core::shim;
+    pub use rspyts_core::wire;
     pub use serde;
     pub use serde_json;
 }

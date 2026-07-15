@@ -360,7 +360,7 @@ wheels = [
 
 [[package]]
 name = "rspyts"
-version = "0.2.0"
+version = "0.3.0"
 source = { editable = "../../../../runtimes/python" }
 dependencies = [
     { name = "numpy", version = "2.4.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.12'" },
@@ -370,9 +370,14 @@ dependencies = [
 
 [package.metadata]
 requires-dist = [
+    { name = "hatchling", marker = "extra == 'hatch'", specifier = ">=1.27,<2.0" },
     { name = "numpy", specifier = ">=1.24" },
+    { name = "packaging", marker = "extra == 'hatch'", specifier = ">=24" },
+    { name = "pefile", marker = "sys_platform == 'win32' and extra == 'hatch'", specifier = ">=2023.2.7" },
     { name = "pydantic", specifier = ">=2.7" },
+    { name = "pyelftools", marker = "sys_platform == 'linux' and extra == 'hatch'", specifier = ">=0.31" },
 ]
+provides-extras = ["hatch"]
 
 [package.metadata.requires-dev]
 dev = [

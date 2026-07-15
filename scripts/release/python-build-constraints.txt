@@ -1,0 +1,2 @@
+# Keep release artifact construction and sdist smoke builds reproducible.
+uv_build==0.11.28

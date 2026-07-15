@@ -75,7 +75,7 @@ def test_unknown_wire_fields_are_rejected():
 
 def test_unknown_constructor_fields_are_rejected():
     with pytest.raises(ValidationError):
-        QueryOptions(minimum_value=1.0, unknown_field=2)
+        QueryOptions(minimum_value=1.0, unknown_field=2)  # ty: ignore[unknown-argument]
 
 
 def test_numpy_fields_are_allowed():

@@ -1,45 +1,55 @@
 import { describe, expect, it } from "vitest";
 
+import * as internal from "../src/internal/abi3.js";
 import * as rspyts from "../src/index.js";
 import { RspytsError } from "../src/errors.js";
 
-describe("public surface", () => {
-  it("exposes exactly the names generated code imports", () => {
-    // codegen.md §5.1: generated modules import exactly these names and
-    // nothing else. Type-only exports have no runtime presence.
+describe("package surfaces", () => {
+  it("keeps the package root application-facing and small", () => {
     expect(Object.keys(rspyts).sort()).toEqual([
+      "ABI_VERSION",
+      "ContractFingerprintMismatchError",
       "InstancePoisonedError",
       "RspytsError",
       "RspytsPanicError",
       "StaleHandleError",
+      "instantiate",
+    ]);
+    expect(rspyts.ABI_VERSION).toBe(3);
+    expect(rspyts.RspytsError).toBe(RspytsError);
+    expect(rspyts.instantiate).toBeTypeOf("function");
+  });
+
+  it("exposes the exact ABI-3 emitter runtime from the versioned internal subpath", () => {
+    expect(Object.keys(internal).sort()).toEqual([
+      "RspytsError",
+      "boolFromWire",
+      "boundedIntFromWire",
+      "bufferFromWire",
+      "bytesFromWire",
       "callDrop",
       "callFn",
+      "enumFromWire",
+      "f32FromWire",
       "floatFromWire",
       "i64FromWire",
       "i64ToWire",
-      "instantiate",
       "jsonFromWire",
-      "registerError",
+      "jsonToWire",
+      "listFromWire",
+      "mapFromWire",
+      "nullFromWire",
+      "objectFromWire",
+      "stringEnumFromWire",
+      "stringFromWire",
+      "tupleFromWire",
       "u64FromWire",
       "u64ToWire",
+      "verifyModuleContract",
       "wireBuffer",
+      "wireResponse",
     ]);
-  });
-
-  it("re-exports the same bindings the submodules define", () => {
-    expect(rspyts.RspytsError).toBe(RspytsError);
-    expect(new rspyts.InstancePoisonedError()).toBeInstanceOf(Error);
-    expect(new rspyts.RspytsPanicError("boom")).toBeInstanceOf(RspytsError);
-    expect(rspyts.instantiate).toBeTypeOf("function");
-    expect(rspyts.callFn).toBeTypeOf("function");
-    expect(rspyts.callDrop).toBeTypeOf("function");
-    expect(rspyts.floatFromWire).toBeTypeOf("function");
-    expect(rspyts.i64FromWire).toBeTypeOf("function");
-    expect(rspyts.i64ToWire).toBeTypeOf("function");
-    expect(rspyts.jsonFromWire).toBeTypeOf("function");
-    expect(rspyts.registerError).toBeTypeOf("function");
-    expect(rspyts.wireBuffer).toBeTypeOf("function");
-    expect(rspyts.u64FromWire).toBeTypeOf("function");
-    expect(rspyts.u64ToWire).toBeTypeOf("function");
+    expect(internal.callFn).toBeTypeOf("function");
+    expect(internal.verifyModuleContract).toBeTypeOf("function");
   });
 });

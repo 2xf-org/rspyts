@@ -41,9 +41,13 @@ wrappers, handle classes, and a lazy native-library loader.
 TypeScript gets interfaces, literal unions, typed errors, a client bound to one
 WebAssembly instance, and disposable handle classes.
 
-Both runtimes speak the same ABI and validate the same manifest. Unsupported
-local shapes fail in the macro. Conflicts that require the whole manifest,
-such as duplicate projected names, fail during `generate` and `check`.
+Both runtimes speak the same ABI, and their clients are generated from the same
+compiled manifest. At load time the runtimes validate the exported ABI major,
+not the generated manifest hash; generated wrappers then validate successful
+return shapes. `rspyts check` is the build-time guard that recompiles the
+manifest and detects stale generated source. Unsupported local shapes fail in
+the macro. Conflicts that require the whole manifest, such as duplicate
+projected names, fail during `generate` and `check`.
 
 ## Why this shape
 

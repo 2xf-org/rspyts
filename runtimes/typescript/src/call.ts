@@ -18,23 +18,65 @@
 
 import {
   DTYPE,
-  HEADER_LEN,
   STATUS_OK,
+  bufferFromEnvelope,
   buildRequest,
+  checkedJsonValue,
   decodeEnvelope,
   type BufTypedArray,
   type Dtype,
 } from "./envelope.js";
 import {
   type BridgeErrorRegistry,
-  InstancePoisonedError,
   throwBridgeError,
 } from "./errors.js";
-import { isPoisoned, markPoisoned, type BridgeModule } from "./module.js";
+import {
+  allocRaw,
+  ensureHealthy,
+  ensureMemoryRange,
+  exportFn,
+  freeRaw,
+  invokeWasm,
+  isPoisoned,
+  takeOwnedEnvelope,
+  type BridgeModule,
+} from "./module.js";
 
 const I64_MIN = -(1n << 63n);
 const I64_MAX = (1n << 63n) - 1n;
 const U64_MAX = (1n << 64n) - 1n;
+const MAX_HANDLE = BigInt(Number.MAX_SAFE_INTEGER);
+
+function checkedHandle(handle: unknown): bigint {
+  if (typeof handle !== "bigint") {
+    throw new TypeError("rspyts: class handle must be a bigint");
+  }
+  if (handle < 1n || handle > MAX_HANDLE) {
+    throw new RangeError("rspyts: class handle must be between 1 and Number.MAX_SAFE_INTEGER");
+  }
+  return handle;
+}
+
+/**
+ * One successful ABI-3 response position. `tail` is explicit and owned host
+ * memory; generated schema decoders preserve it while selecting child values.
+ */
+export interface WireResponse<Value = unknown> {
+  readonly value: Value;
+  readonly tail: Uint8Array;
+}
+
+/** Create an explicit response context, primarily for attachment-free error data. */
+export function wireResponse<Value>(
+  value: Value,
+  tail: Uint8Array = new Uint8Array(),
+): WireResponse<Value> {
+  return { value, tail };
+}
+
+function childResponse<Value>(parent: WireResponse, value: Value): WireResponse<Value> {
+  return { value, tail: parent.tail };
+}
 
 function exactWireInteger(value: unknown, signed: boolean): bigint {
   const label = signed ? "signed" : "unsigned";
@@ -77,34 +119,185 @@ export function u64ToWire(value: bigint): string {
 }
 
 /** Validate a canonical signed 64-bit wire string and return a bigint. */
-export function i64FromWire(value: unknown): bigint {
-  return exactWireInteger(value, true);
+export function i64FromWire(response: WireResponse): bigint {
+  return exactWireInteger(response.value, true);
 }
 
 /** Validate a canonical unsigned 64-bit wire string and return a bigint. */
-export function u64FromWire(value: unknown): bigint {
-  return exactWireInteger(value, false);
+export function u64FromWire(response: WireResponse): bigint {
+  return exactWireInteger(response.value, false);
 }
 
 /** Validate a finite structured float and canonicalize signed zero. */
-export function floatFromWire(value: unknown): number {
+export function floatFromWire(response: WireResponse): number {
+  const value = response.value;
   if (typeof value !== "number" || !Number.isFinite(value)) {
     throw new TypeError("rspyts: expected a finite JSON number");
   }
   return Object.is(value, -0) ? 0 : value;
 }
 
-/** Unwrap a schemaless JSON field from an opaque application-error payload. */
-export function jsonFromWire(value: unknown): unknown {
-  if (
-    value === null ||
-    typeof value !== "object" ||
-    Object.keys(value).length !== 1 ||
-    !Object.prototype.hasOwnProperty.call(value, "__rspyts_json__")
-  ) {
-    throw new TypeError("rspyts: expected an rspyts Json wrapper");
+/** Validate a finite structured f32 without accepting values Rust cannot represent. */
+export function f32FromWire(response: WireResponse): number {
+  const parsed = floatFromWire(response);
+  if (!Number.isFinite(Math.fround(parsed))) {
+    throw new RangeError(`rspyts: f32 value out of range: ${parsed}`);
   }
-  return (value as Record<string, unknown>)["__rspyts_json__"];
+  return parsed;
+}
+
+/** Validate an exact JSON boolean. */
+export function boolFromWire(response: WireResponse): boolean {
+  const value = response.value;
+  if (typeof value !== "boolean") {
+    throw new TypeError("rspyts: expected a JSON boolean");
+  }
+  return value;
+}
+
+/** Validate an exact, bounded JSON integer. */
+export function boundedIntFromWire(
+  response: WireResponse,
+  minimum: number,
+  maximum: number,
+): number {
+  const value = response.value;
+  if (typeof value !== "number" || !Number.isInteger(value)) {
+    throw new TypeError("rspyts: expected a JSON integer");
+  }
+  if (value < minimum || value > maximum) {
+    throw new RangeError(`rspyts: integer value out of range ${minimum}..=${maximum}: ${value}`);
+  }
+  return value;
+}
+
+/** Validate an exact JSON string. */
+export function stringFromWire(response: WireResponse): string {
+  const value = response.value;
+  if (typeof value !== "string") {
+    throw new TypeError("rspyts: expected a JSON string");
+  }
+  return value;
+}
+
+/** Validate a materialized opaque-bytes attachment. */
+export function bytesFromWire(response: WireResponse): Uint8Array {
+  return bufferFromEnvelope(response.value, response.tail, "bytes") as Uint8Array;
+}
+
+/** Validate a materialized numeric-buffer attachment and its declared dtype. */
+export function bufferFromWire(response: WireResponse, dtype: Dtype): BufTypedArray {
+  return bufferFromEnvelope(response.value, response.tail, dtype);
+}
+
+/** Validate an exact JSON array. */
+export function listFromWire(response: WireResponse): WireResponse[] {
+  const value = response.value;
+  if (!Array.isArray(value)) {
+    throw new TypeError("rspyts: expected a JSON array");
+  }
+  return value.map((item) => childResponse(response, item));
+}
+
+/** Validate an exact JSON object. */
+export function mapFromWire(response: WireResponse): Record<string, WireResponse> {
+  const value = response.value;
+  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+    throw new TypeError("rspyts: expected a JSON object");
+  }
+  const prototype = Object.getPrototypeOf(value);
+  if (prototype !== Object.prototype && prototype !== null) {
+    throw new TypeError("rspyts: expected a plain JSON object");
+  }
+  const result = Object.create(null) as Record<string, WireResponse>;
+  for (const [key, item] of Object.entries(value)) {
+    result[key] = childResponse(response, item);
+  }
+  return result;
+}
+
+/** Validate the exact field set of one generated struct or enum variant. */
+export function objectFromWire(
+  response: WireResponse,
+  required: readonly string[],
+  optional: readonly string[] = [],
+): Record<string, WireResponse> {
+  const object = mapFromWire(response);
+  const requiredSet = new Set(required);
+  const allowed = new Set([...required, ...optional]);
+  for (const key of requiredSet) {
+    if (!Object.prototype.hasOwnProperty.call(object, key)) {
+      throw new TypeError(`rspyts: expected required wire field ${JSON.stringify(key)}`);
+    }
+  }
+  for (const key of Object.keys(object)) {
+    if (!allowed.has(key)) {
+      throw new TypeError(`rspyts: unexpected wire field ${JSON.stringify(key)}`);
+    }
+  }
+  return object;
+}
+
+/** Validate the JSON-array representation of a fixed-length tuple. */
+export function tupleFromWire(response: WireResponse, length: number): WireResponse[] {
+  const items = listFromWire(response);
+  if (items.length !== length) {
+    throw new RangeError(`rspyts: expected a JSON array of length ${length}, got ${items.length}`);
+  }
+  return items;
+}
+
+/** Validate one generated string-enum wire value. */
+export function stringEnumFromWire<const Value extends string>(
+  response: WireResponse,
+  variants: readonly Value[],
+): Value {
+  const string = stringFromWire(response);
+  if (!(variants as readonly string[]).includes(string)) {
+    throw new TypeError(`rspyts: unknown string-enum wire value ${JSON.stringify(string)}`);
+  }
+  return string as Value;
+}
+
+/** Field requirements for one internally tagged data-enum variant. */
+export interface WireVariantShape {
+  readonly required: readonly string[];
+  readonly optional?: readonly string[];
+}
+
+/** Validate and dispatch one internally tagged data-enum wire object. */
+export function enumFromWire(
+  response: WireResponse,
+  tag: string,
+  variants: Readonly<Record<string, WireVariantShape>>,
+): Record<string, WireResponse> {
+  const candidate = mapFromWire(response);
+  if (!Object.prototype.hasOwnProperty.call(candidate, tag)) {
+    throw new TypeError(`rspyts: expected required enum tag ${JSON.stringify(tag)}`);
+  }
+  const discriminator = stringFromWire(candidate[tag]!);
+  if (!Object.prototype.hasOwnProperty.call(variants, discriminator)) {
+    throw new TypeError(
+      `rspyts: unknown ${JSON.stringify(tag)} discriminator ${JSON.stringify(discriminator)}`,
+    );
+  }
+  const shape = variants[discriminator];
+  // The own-property check above proves this generated table entry exists.
+  if (shape === undefined) throw new TypeError("rspyts: invalid enum variant table");
+  return objectFromWire(response, [tag, ...shape.required], shape.optional ?? []);
+}
+
+/** Validate the one-value null data type. */
+export function nullFromWire(response: WireResponse): null {
+  if (response.value !== null) {
+    throw new TypeError("rspyts: expected null");
+  }
+  return null;
+}
+
+/** Validate and copy a transparent value at a schema-declared `Json` position. */
+export function jsonFromWire(response: WireResponse): unknown {
+  return checkedJsonValue(response.value);
 }
 
 /**
@@ -129,64 +322,6 @@ interface SliceAllocation extends Allocation {
   aligned: number;
   /** Element count (not bytes) — the `len` half of the C (ptr, len) pair. */
   count: number;
-}
-
-function exportFn(mod: BridgeModule, name: string): Function {
-  const fn = mod.exports[name];
-  if (typeof fn !== "function") {
-    throw new Error(`rspyts: module has no export "${name}"`);
-  }
-  return fn;
-}
-
-function ensureHealthy(mod: BridgeModule): void {
-  if (isPoisoned(mod)) {
-    throw new InstancePoisonedError();
-  }
-}
-
-function invokeWasm(mod: BridgeModule, fn: Function, args: Array<number | bigint>): unknown {
-  try {
-    return fn(...args);
-  } catch (error) {
-    if (error instanceof WebAssembly.RuntimeError) {
-      markPoisoned(mod);
-    }
-    throw error;
-  }
-}
-
-function allocRaw(mod: BridgeModule, len: number): number {
-  const raw = invokeWasm(mod, exportFn(mod, "rspyts_alloc"), [len]);
-  if (typeof raw !== "number") {
-    throw new Error("rspyts: rspyts_alloc returned a non-numeric pointer");
-  }
-  return wasm32Pointer(raw, "rspyts_alloc");
-}
-
-function freeRaw(mod: BridgeModule, ptr: number, len: number): void {
-  invokeWasm(mod, exportFn(mod, "rspyts_free"), [ptr, len]);
-}
-
-function wasm32Pointer(value: number, source: string): number {
-  if (!Number.isInteger(value)) {
-    throw new Error(`rspyts: ${source} returned a non-integer pointer`);
-  }
-  const ptr = value >>> 0;
-  if (ptr === 0) {
-    throw new Error(`rspyts: ${source} returned a null pointer`);
-  }
-  return ptr;
-}
-
-function ensureMemoryRange(mod: BridgeModule, ptr: number, len: number, label: string): void {
-  const end = ptr + len;
-  if (!Number.isSafeInteger(len) || len < 0 || end > mod.memory.buffer.byteLength) {
-    throw new RangeError(
-      `rspyts: ${label} range ${ptr}..${end} exceeds WebAssembly memory ` +
-        `${mod.memory.buffer.byteLength}`,
-    );
-  }
 }
 
 /**
@@ -248,20 +383,9 @@ export function writeSlice(mod: BridgeModule, slice: SliceArg): SliceAllocation 
 }
 
 /**
- * Call a bridged export and return its decoded result.
- *
- * @param mod    The instantiated module.
- * @param symbol Export name, e.g. `"rspyts_fn__process_values"`.
- * @param args   Plain parameters as a wire-cased JSON object (`{}` when
- *               there are none — the pair is always passed, ABI §3.1).
- * @param slices `&[T]` parameters, in declaration order.
- * @param handle Leading `u64` handle for method calls. WASM `u64`
- *               parameters surface as JS `bigint`; pointers and lengths
- *               are `usize` (wasm32 `i32`) and cross as `number`s.
- * @returns The JSON payload with every `__rspyts_buf__` placeholder
- *          replaced by a typed array copied out of linear memory.
- * @throws A registered {@link RspytsError} subclass on status 1,
- *         {@link RspytsPanicError} on status 2.
+ * Invoke one ABI-3 generated export. This is the sole function-call path.
+ * Successful calls return explicit `{ value, tail }` context for the
+ * generated schema decoder; application errors and panics throw.
  */
 export function callFn(
   mod: BridgeModule,
@@ -270,17 +394,17 @@ export function callFn(
   slices: SliceArg[] = [],
   handle?: bigint,
   errorTypes?: BridgeErrorRegistry,
-): unknown {
+): WireResponse {
   ensureHealthy(mod);
+  const methodHandle = handle === undefined ? undefined : checkedHandle(handle);
   const fn = exportFn(mod, symbol);
   const allocations: Allocation[] = [];
-  let response: Allocation | undefined;
   let envelope: Uint8Array;
   try {
     const argsAlloc = writeBytes(mod, buildRequest(args ?? {}));
     allocations.push(argsAlloc);
 
-    const callArgs: Array<number | bigint> = handle === undefined ? [] : [handle];
+    const callArgs: Array<number | bigint> = methodHandle === undefined ? [] : [methodHandle];
     callArgs.push(argsAlloc.ptr, argsAlloc.len);
     for (const slice of slices) {
       const sliceAlloc = writeSlice(mod, slice);
@@ -288,38 +412,8 @@ export function callFn(
       callArgs.push(sliceAlloc.aligned, sliceAlloc.count);
     }
 
-    const rawRetPtr = invokeWasm(mod, fn, callArgs);
-    if (typeof rawRetPtr !== "number") {
-      throw new Error(`rspyts: export "${symbol}" returned a non-pointer`);
-    }
-    const retPtr = wasm32Pointer(rawRetPtr, `export "${symbol}"`);
-
-    // Fresh view: the call itself may have grown linear memory while
-    // allocating the envelope.
-    try {
-      ensureMemoryRange(mod, retPtr, HEADER_LEN, "response header");
-    } catch (error) {
-      markPoisoned(mod);
-      throw error;
-    }
-    const view = new DataView(mod.memory.buffer);
-    const jsonLen = view.getUint32(retPtr + 4, true);
-    const tailLen = view.getUint32(retPtr + 8, true);
-    const total = HEADER_LEN + jsonLen + tailLen;
-    response = { ptr: retPtr, len: total };
-    try {
-      ensureMemoryRange(mod, retPtr, total, "response envelope");
-    } catch (error) {
-      markPoisoned(mod);
-      throw error;
-    }
-    // Copy the whole envelope out before freeing; nothing may reference
-    // linear memory after this point.
-    envelope = new Uint8Array(mod.memory.buffer, retPtr, total).slice();
+    envelope = takeOwnedEnvelope(mod, symbol, invokeWasm(mod, fn, callArgs));
   } finally {
-    if (response !== undefined && !isPoisoned(mod)) {
-      freeRaw(mod, response.ptr, response.len);
-    }
     // Request buffers stay alive for the duration of the call (the callee
     // borrows, never frees — ABI §2) and are released even when the call
     // traps.
@@ -331,11 +425,11 @@ export function callFn(
     }
   }
 
-  const { status, payload } = decodeEnvelope(envelope);
+  const { status, value, tail } = decodeEnvelope(envelope);
   if (status === STATUS_OK) {
-    return payload;
+    return { value, tail };
   }
-  throwBridgeError(status, payload, errorTypes);
+  throwBridgeError(status, value, errorTypes);
 }
 
 /**
@@ -346,12 +440,13 @@ export function callFn(
  * swallowed. A missing export (a codegen bug) still throws.
  */
 export function callDrop(mod: BridgeModule, symbol: string, handle: bigint): void {
+  const classHandle = checkedHandle(handle);
   if (isPoisoned(mod)) {
     return;
   }
   const fn = exportFn(mod, symbol);
   try {
-    invokeWasm(mod, fn, [handle]);
+    invokeWasm(mod, fn, [classHandle]);
   } catch {
     // Deliberately ignored; see doc comment.
   }

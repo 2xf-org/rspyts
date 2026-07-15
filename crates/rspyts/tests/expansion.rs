@@ -12,7 +12,7 @@
 
 #![recursion_limit = "512"]
 
-use rspyts::{Buf, I64, Json, U64, bridge};
+use rspyts::{Buf, Bytes, bridge};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, HashMap};
 
@@ -92,18 +92,48 @@ pub enum Event {
 /// Exact integers and fixed-length tuple shapes.
 #[bridge]
 pub struct ExactRecord {
-    pub signed: I64,
-    pub unsigned: U64,
-    pub pair: (I64, U64),
+    pub signed: i64,
+    pub unsigned: u64,
+    pub id: ExactId,
+    pub pair: (i64, u64),
+    pub signed_list: Vec<i64>,
+    pub by_name: BTreeMap<String, u64>,
+    pub optional: Option<u64>,
     pub dozen: (u8, u8, u8, u8, u8, u8, u8, u8, u8, u8, u8, u8),
 }
+
+/// A named exact-integer newtype.
+#[bridge]
+pub struct ExactId(pub u64);
 
 /// A mixed unit-and-data state.
 #[bridge]
 pub enum MixedState {
     Pending,
-    Ready { sequence: U64 },
+    Ready {
+        sequence: u64,
+        #[bridge(required)]
+        receipt: Option<ExactId>,
+    },
 }
+
+/// Owned attachments nested through ordinary data containers.
+#[bridge]
+pub struct AttachmentTree {
+    pub payloads: Vec<Bytes>,
+    pub channels: BTreeMap<String, Vec<Option<Buf<i64>>>>,
+}
+
+/// Unit is an ordinary data value. It is spelled `null` on the wire.
+#[bridge]
+pub struct UnitRecord {
+    pub direct: (),
+    pub optional: Option<()>,
+    #[bridge(required)]
+    pub required: Option<()>,
+}
+
+pub type UnitAlias = ();
 
 /// An owning contract whose Serde attributes are reflected by rspyts.
 #[bridge]
@@ -183,7 +213,12 @@ pub enum FixtureError {
     /// The counter would exceed its limit.
     OverLimit { max_allowed: i32, attempted: i32 },
     /// An exact unsigned limit was rejected.
-    ExactLimit { limit: U64 },
+    ExactLimit { limit: u64 },
+    /// An explicitly nullable error detail.
+    MissingContext {
+        #[bridge(required)]
+        context: Option<String>,
+    },
 }
 
 impl std::fmt::Display for FixtureError {
@@ -197,6 +232,9 @@ impl std::fmt::Display for FixtureError {
                 write!(f, "adding {attempted} exceeds the limit {max_allowed}")
             }
             FixtureError::ExactLimit { limit } => write!(f, "exact limit {limit} was rejected"),
+            FixtureError::MissingContext { context } => {
+                write!(f, "context is missing: {context:?}")
+            }
         }
     }
 }
@@ -288,8 +326,54 @@ pub fn echo_mixed(value: MixedState) -> MixedState {
 
 /// Round-trip a pair without changing its positions.
 #[bridge]
-pub fn echo_tuple(value: (I64, U64)) -> (I64, U64) {
+pub fn echo_tuple(value: (i64, u64)) -> (i64, u64) {
     value
+}
+
+/// Round-trip exact integers in a string-keyed map.
+#[bridge]
+pub fn echo_exact_map(value: BTreeMap<String, u64>) -> BTreeMap<String, u64> {
+    value
+}
+
+/// Round-trip nested owned binary attachments.
+#[bridge]
+pub fn echo_attachment_tree(value: AttachmentTree) -> AttachmentTree {
+    value
+}
+
+/// Round-trip unit in data position.
+#[bridge]
+pub fn echo_unit_record(value: UnitRecord) -> UnitRecord {
+    value
+}
+
+/// Exercise a Rust alias whose underlying bridge type is unit.
+#[bridge]
+pub fn echo_unit_alias(value: UnitAlias) -> UnitAlias {
+    value
+}
+
+/// Exercise optional unit directly.
+#[bridge]
+pub fn echo_optional_unit(value: Option<()>) -> Option<()> {
+    value
+}
+
+/// Exercise unit as the success value of a fallible operation.
+#[bridge]
+pub fn fallible_unit(succeed: bool) -> Result<(), FixtureError> {
+    if succeed {
+        Ok(())
+    } else {
+        Err(FixtureError::Empty)
+    }
+}
+
+/// Return an exact-integer error payload through the bridge.
+#[bridge]
+pub fn reject_exact(limit: u64) -> Result<(), FixtureError> {
+    Err(FixtureError::ExactLimit { limit })
 }
 
 /// Echo `label`, or a placeholder when absent.
@@ -330,15 +414,15 @@ pub const DEFAULT_GAIN: f64 = 1.25;
 
 /// Largest exact sequence value.
 #[bridge]
-pub const MAX_EXACT: U64 = U64::new(u64::MAX);
+pub const MAX_EXACT: u64 = u64::MAX;
 
 /// Exact signed and unsigned bounds.
 #[bridge]
-pub const EXACT_PAIR: (I64, U64) = (I64::new(i64::MIN), U64::new(u64::MAX));
+pub const EXACT_PAIR: (i64, u64) = (i64::MIN, u64::MAX);
 
 /// Echo arbitrary JSON.
 #[bridge]
-pub fn echo_json(value: Json) -> Json {
+pub fn echo_json(value: serde_json::Value) -> serde_json::Value {
     value
 }
 
@@ -491,10 +575,15 @@ fn grab(ptr: *mut u8) -> Env {
     env
 }
 
-/// Encode an ABI-2 request envelope for a direct shim call.
+/// Encode an ABI-3 request envelope for a direct shim call.
 fn args(value: &Value) -> Vec<u8> {
     let json = serde_json::to_vec(value).expect("args JSON encode");
     rspyts_core::envelope::encode_request(&json, &[]).expect("args envelope encode")
+}
+
+fn args_with_tail(value: &Value, tail: &[u8]) -> Vec<u8> {
+    let json = serde_json::to_vec(value).expect("args JSON encode");
+    rspyts_core::envelope::encode_request(&json, tail).expect("args envelope encode")
 }
 
 fn expect_ok(env: &Env) -> &Value {
@@ -523,8 +612,8 @@ fn expect_err<'a>(env: &'a Env, code: &str) -> &'a Value {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn abi_version_is_two() {
-    assert_eq!(rspyts_abi_version(), 2);
+fn abi_version_is_three() {
+    assert_eq!(rspyts_abi_version(), 3);
 }
 
 #[test]
@@ -549,6 +638,39 @@ fn manifest_export_matches_registry_build() {
     assert!(env.tail.is_empty());
 }
 
+#[test]
+fn public_bridged_shape_does_not_expose_inventory_origin_encoding() {
+    assert_eq!(
+        <Everything as rspyts::Bridged>::ty(),
+        rspyts_core::ir::Ty::Ref {
+            name: "Everything".to_string()
+        }
+    );
+
+    use rspyts_core::ir::Ty;
+    assert_eq!(<i64 as rspyts::Bridged>::ty(), Ty::I64);
+    assert_eq!(<u64 as rspyts::Bridged>::ty(), Ty::U64);
+    assert_eq!(<Value as rspyts::Bridged>::ty(), Ty::Json);
+    assert_eq!(
+        <Option<String> as rspyts::Bridged>::ty(),
+        Ty::Option {
+            inner: Box::new(Ty::String),
+        }
+    );
+    assert_eq!(<() as rspyts::Bridged>::ty(), Ty::Null);
+}
+
+#[test]
+fn contract_fingerprint_export_matches_the_exact_manifest() {
+    let env = grab(rspyts_contract_fingerprint());
+    let manifest = rspyts_core::registry::build_manifest("rspyts", env!("CARGO_PKG_VERSION"));
+    assert_eq!(
+        *expect_ok(&env),
+        json!(rspyts_core::manifest_fingerprint(&manifest))
+    );
+    assert!(env.tail.is_empty());
+}
+
 // ---------------------------------------------------------------------------
 // Free-function shims
 // ---------------------------------------------------------------------------
@@ -570,6 +692,65 @@ fn unit_return_serializes_as_null() {
     let env = grab(unsafe { rspyts_fn__no_return(body.as_ptr(), body.len()) });
     assert_eq!(*expect_ok(&env), Value::Null);
     assert!(env.tail.is_empty());
+}
+
+#[test]
+fn unit_works_as_data_result_alias_and_option() {
+    let value = json!({"direct": null, "optional": null, "required": null});
+    let body = args(&json!({"value": value}));
+    let env = grab(unsafe { rspyts_fn__echo_unit_record(body.as_ptr(), body.len()) });
+    assert_eq!(*expect_ok(&env), value);
+
+    // An ordinary Option field may be omitted, but #[bridge(required)]
+    // separates presence from nullability.
+    let body = args(&json!({"value": {"direct": null, "required": null}}));
+    let env = grab(unsafe { rspyts_fn__echo_unit_record(body.as_ptr(), body.len()) });
+    assert_eq!(
+        *expect_ok(&env),
+        json!({"direct": null, "optional": null, "required": null})
+    );
+    let body = args(&json!({"value": {"direct": null}}));
+    let env = grab(unsafe { rspyts_fn__echo_unit_record(body.as_ptr(), body.len()) });
+    expect_err(&env, "invalidArgs");
+
+    let body = args(&json!({"value": null}));
+    let env = grab(unsafe { rspyts_fn__echo_unit_alias(body.as_ptr(), body.len()) });
+    assert_eq!(*expect_ok(&env), Value::Null);
+    let env = grab(unsafe { rspyts_fn__echo_optional_unit(body.as_ptr(), body.len()) });
+    assert_eq!(*expect_ok(&env), Value::Null);
+
+    let body = args(&json!({"succeed": true}));
+    let env = grab(unsafe { rspyts_fn__fallible_unit(body.as_ptr(), body.len()) });
+    assert_eq!(*expect_ok(&env), Value::Null);
+
+    let body = args(&json!({"succeed": false}));
+    let env = grab(unsafe { rspyts_fn__fallible_unit(body.as_ptr(), body.len()) });
+    expect_err(&env, "empty");
+}
+
+#[test]
+fn nested_buf_and_bytes_inputs_and_returns_use_the_attachment_tail() {
+    let mut tail = vec![0_u8, 0x7f, 0xff];
+    tail.resize(8, 0);
+    tail.extend_from_slice(&i64::MIN.to_le_bytes());
+    tail.extend_from_slice(&9_007_199_254_740_993_i64.to_le_bytes());
+
+    let value = json!({
+        "payloads": [
+            {"__rspyts_buf__": {"off": 0, "len": 3, "dt": "bytes"}},
+            {"__rspyts_buf__": {"off": 3, "len": 0, "dt": "bytes"}},
+        ],
+        "channels": {
+            "lead": [
+                {"__rspyts_buf__": {"off": 8, "len": 2, "dt": "i64"}},
+                null,
+            ],
+        },
+    });
+    let request = args_with_tail(&json!({"value": value}), &tail);
+    let env = grab(unsafe { rspyts_fn__echo_attachment_tree(request.as_ptr(), request.len()) });
+    assert_eq!(*expect_ok(&env), value);
+    assert_eq!(env.tail, tail);
 }
 
 #[test]
@@ -717,7 +898,7 @@ fn deny_unknown_fields_rejects_extras_as_invalid_args() {
 }
 
 #[test]
-fn optional_string_param_present_null_and_omitted() {
+fn optional_string_param_key_is_required_but_its_value_may_be_null() {
     let body = args(&json!({"label": "tagged"}));
     let env = grab(unsafe { rspyts_fn__maybe_label(body.as_ptr(), body.len()) });
     assert_eq!(*expect_ok(&env), json!("tagged"));
@@ -728,7 +909,7 @@ fn optional_string_param_present_null_and_omitted() {
 
     let body = args(&json!({}));
     let env = grab(unsafe { rspyts_fn__maybe_label(body.as_ptr(), body.len()) });
-    assert_eq!(*expect_ok(&env), json!("<none>"));
+    expect_err(&env, "invalidArgs");
 }
 
 #[test]
@@ -756,7 +937,11 @@ fn exact_integer_boundaries_and_tuples_round_trip_through_shims() {
     let value = json!({
         "signed": i64::MIN.to_string(),
         "unsigned": u64::MAX.to_string(),
+        "id": u64::MAX.to_string(),
         "pair": ["9007199254740993", "9007199254740993"],
+        "signedList": [i64::MIN.to_string(), "9007199254740993"],
+        "byName": {"largest": u64::MAX.to_string()},
+        "optional": u64::MAX.to_string(),
         "dozen": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11],
     });
     let body = args(&json!({"value": value}));
@@ -767,6 +952,55 @@ fn exact_integer_boundaries_and_tuples_round_trip_through_shims() {
     let body = args(&json!({"value": pair}));
     let env = grab(unsafe { rspyts_fn__echo_tuple(body.as_ptr(), body.len()) });
     assert_eq!(*expect_ok(&env), pair);
+}
+
+#[test]
+fn exact_integer_newtypes_lists_maps_tuples_and_options_are_schema_directed() {
+    let rust_value = ExactRecord {
+        signed: i64::MIN,
+        unsigned: u64::MAX,
+        id: ExactId(u64::MAX),
+        pair: (9_007_199_254_740_993, u64::MAX),
+        signed_list: vec![i64::MIN, 9_007_199_254_740_993],
+        by_name: BTreeMap::from([("largest".to_string(), u64::MAX)]),
+        optional: Some(u64::MAX),
+        dozen: (0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11),
+    };
+
+    // Ordinary Rust Serde remains ordinary: native integers are JSON numbers.
+    let serde_value = serde_json::to_value(&rust_value).unwrap();
+    assert_eq!(serde_value["signed"], json!(i64::MIN));
+    assert_eq!(serde_value["unsigned"], json!(u64::MAX));
+    assert_eq!(serde_value["id"], json!(u64::MAX));
+    assert_eq!(
+        serde_value["signedList"][1],
+        json!(9_007_199_254_740_993_i64)
+    );
+    assert_eq!(serde_value["byName"]["largest"], json!(u64::MAX));
+    assert_eq!(serde_value["optional"], json!(u64::MAX));
+
+    // The FFI wire uses canonical decimal strings at the exact declared paths.
+    let wire = json!({
+        "signed": i64::MIN.to_string(),
+        "unsigned": u64::MAX.to_string(),
+        "id": u64::MAX.to_string(),
+        "pair": ["9007199254740993", u64::MAX.to_string()],
+        "signedList": [i64::MIN.to_string(), "9007199254740993"],
+        "byName": {"largest": u64::MAX.to_string()},
+        "optional": u64::MAX.to_string(),
+        "dozen": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11],
+    });
+    let body = args(&json!({"value": wire}));
+    let env = grab(unsafe { rspyts_fn__echo_exact(body.as_ptr(), body.len()) });
+    assert_eq!(*expect_ok(&env), wire);
+
+    let marker_map = json!({
+        "__rspyts_buf__": u64::MAX.to_string(),
+        "__rspyts_json__": "9007199254740993",
+    });
+    let body = args(&json!({"value": marker_map}));
+    let env = grab(unsafe { rspyts_fn__echo_exact_map(body.as_ptr(), body.len()) });
+    assert_eq!(*expect_ok(&env), marker_map);
 }
 
 #[test]
@@ -790,12 +1024,28 @@ fn exact_integer_wire_values_are_strict_and_range_checked() {
 fn mixed_unit_and_data_enum_round_trips_through_the_shim() {
     for value in [
         json!({"type": "pending"}),
-        json!({"type": "ready", "sequence": u64::MAX.to_string()}),
+        json!({"type": "ready", "sequence": u64::MAX.to_string(), "receipt": null}),
+        json!({
+            "type": "ready",
+            "sequence": "9007199254740993",
+            "receipt": u64::MAX.to_string(),
+        }),
     ] {
         let body = args(&json!({"value": value}));
         let env = grab(unsafe { rspyts_fn__echo_mixed(body.as_ptr(), body.len()) });
         assert_eq!(*expect_ok(&env), value);
     }
+
+    let body = args(&json!({"value": {
+        "type": "ready",
+        "sequence": u64::MAX.to_string(),
+    }}));
+    let env = grab(unsafe { rspyts_fn__echo_mixed(body.as_ptr(), body.len()) });
+    expect_err(&env, "invalidArgs");
+
+    let body = args(&json!({"value": {"type": "unknown"}}));
+    let env = grab(unsafe { rspyts_fn__echo_mixed(body.as_ptr(), body.len()) });
+    expect_err(&env, "invalidArgs");
 }
 
 // ---------------------------------------------------------------------------
@@ -858,10 +1108,15 @@ fn mixed_enum_serde_shape_matches_its_registered_contract() {
     );
     assert_eq!(
         serde_json::to_value(MixedState::Ready {
-            sequence: U64::new(u64::MAX),
+            sequence: u64::MAX,
+            receipt: Some(ExactId(9_007_199_254_740_993)),
         })
         .unwrap(),
-        json!({"type": "ready", "sequence": u64::MAX.to_string()})
+        json!({
+            "type": "ready",
+            "sequence": u64::MAX,
+            "receipt": 9_007_199_254_740_993_u64,
+        })
     );
 }
 
@@ -919,7 +1174,7 @@ fn struct_serde_round_trips_and_rejects_unknown_fields() {
 fn reflected_serde_names_match_the_registered_manifest_mechanically() {
     use rspyts_core::ir::TypeDecl;
 
-    let manifest = rspyts_core::registry::build_manifest("expansion-fixture", "0.0.0");
+    let manifest = rspyts_core::registry::build_manifest("rspyts", "0.0.0");
     let type_decl = |name: &str| {
         manifest
             .types
@@ -1043,6 +1298,52 @@ fn reflected_serde_names_match_the_registered_manifest_mechanically() {
     }
 }
 
+#[test]
+fn manifest_records_required_option_polarity_for_struct_enum_and_error_fields() {
+    use rspyts_core::ir::{Ty, TypeDecl};
+
+    let manifest = rspyts_core::registry::build_manifest("rspyts", "0.0.0");
+    let declaration = |name: &str| {
+        manifest
+            .types
+            .iter()
+            .find(|declaration| declaration.name() == name)
+            .unwrap_or_else(|| panic!("missing {name}"))
+    };
+
+    let TypeDecl::Struct { fields, .. } = declaration("UnitRecord") else {
+        panic!("UnitRecord should be a struct");
+    };
+    assert!(fields[0].required);
+    assert_eq!(fields[0].ty, Ty::Null);
+    assert!(!fields[1].required);
+    assert!(matches!(fields[1].ty, Ty::Option { .. }));
+    assert!(fields[2].required);
+    assert!(matches!(fields[2].ty, Ty::Option { .. }));
+
+    let TypeDecl::Enum { variants, .. } = declaration("MixedState") else {
+        panic!("MixedState should be an enum");
+    };
+    let receipt = variants
+        .iter()
+        .find(|variant| variant.name == "Ready")
+        .and_then(|variant| variant.fields.iter().find(|field| field.name == "receipt"))
+        .expect("Ready.receipt");
+    assert!(receipt.required);
+    assert!(matches!(receipt.ty, Ty::Option { .. }));
+
+    let TypeDecl::ErrorEnum { variants, .. } = declaration("FixtureError") else {
+        panic!("FixtureError should be an error enum");
+    };
+    let context = variants
+        .iter()
+        .find(|variant| variant.name == "MissingContext")
+        .and_then(|variant| variant.fields.iter().find(|field| field.name == "context"))
+        .expect("MissingContext.context");
+    assert!(context.required);
+    assert!(matches!(context.ty, Ty::Option { .. }));
+}
+
 // ---------------------------------------------------------------------------
 // Error enums
 // ---------------------------------------------------------------------------
@@ -1070,15 +1371,28 @@ fn error_enum_maps_variants_to_code_message_and_data() {
         })
     );
 
-    let err = rspyts::BridgeErr::into_bridge_error(FixtureError::ExactLimit {
-        limit: U64::new(u64::MAX),
-    });
+    let err = rspyts::BridgeErr::into_bridge_error(FixtureError::ExactLimit { limit: u64::MAX });
     assert_eq!(
         serde_json::to_value(&err).unwrap(),
         json!({
             "code": "exactLimit",
             "message": format!("exact limit {} was rejected", u64::MAX),
             "data": {"limit": u64::MAX.to_string()},
+        })
+    );
+
+    let body = args(&json!({"limit": u64::MAX.to_string()}));
+    let env = grab(unsafe { rspyts_fn__reject_exact(body.as_ptr(), body.len()) });
+    let err = expect_err(&env, "exactLimit");
+    assert_eq!(err["data"], json!({"limit": u64::MAX.to_string()}));
+
+    let err = rspyts::BridgeErr::into_bridge_error(FixtureError::MissingContext { context: None });
+    assert_eq!(
+        serde_json::to_value(err).unwrap(),
+        json!({
+            "code": "missingContext",
+            "message": "context is missing: None",
+            "data": {"context": null},
         })
     );
 }
@@ -1182,7 +1496,7 @@ fn string_enum_round_trips_through_the_shim_as_camel_case() {
 #[test]
 fn const_decls_capture_name_ty_and_serialized_value() {
     use rspyts_core::ir::Ty;
-    let manifest = rspyts_core::registry::build_manifest("expansion-fixture", "0.0.0");
+    let manifest = rspyts_core::registry::build_manifest("rspyts", "0.0.0");
     let find = |name: &str| {
         manifest
             .constants
@@ -1233,7 +1547,7 @@ fn const_decls_capture_name_ty_and_serialized_value() {
 #[test]
 fn target_scoping_lands_in_the_manifest() {
     use rspyts_core::ir::Target;
-    let manifest = rspyts_core::registry::build_manifest("expansion-fixture", "0.0.0");
+    let manifest = rspyts_core::registry::build_manifest("rspyts", "0.0.0");
 
     let scoped = manifest
         .functions
@@ -1260,7 +1574,7 @@ fn target_scoping_lands_in_the_manifest() {
 #[test]
 fn impl_level_target_is_inherited_and_overridable() {
     use rspyts_core::ir::Target;
-    let manifest = rspyts_core::registry::build_manifest("expansion-fixture", "0.0.0");
+    let manifest = rspyts_core::registry::build_manifest("rspyts", "0.0.0");
     let telemetry = manifest
         .classes
         .iter()
@@ -1289,15 +1603,22 @@ fn impl_level_target_is_inherited_and_overridable() {
 #[test]
 fn json_passthrough_round_trips_arbitrary_shapes() {
     let payload = json!({"nested": [1, "two", {"three": null}], "flag": true});
-    let body = args(&json!({"value": {"__rspyts_json__": payload}}));
+    assert_eq!(serde_json::to_value(&payload).unwrap(), payload);
+    let body = args(&json!({"value": payload}));
     let env = grab(unsafe { rspyts_fn__echo_json(body.as_ptr(), body.len()) });
-    assert_eq!(expect_ok(&env)["__rspyts_json__"], payload);
+    assert_eq!(*expect_ok(&env), payload);
 
-    // Marker-shaped user data stays opaque inside the outer Json wrapper.
-    let collision = json!({"__rspyts_buf__": {"off": "user data"}});
-    let body = args(&json!({"value": {"__rspyts_json__": collision}}));
+    // Marker-shaped user data stays opaque because only generated,
+    // schema-directed attachment decoders interpret the shape.
+    let collision = json!({
+        "__rspyts_buf__": {"off": "user data"},
+        "__rspyts_json__": {
+            "__rspyts_buf__": {"off": 0, "len": 1, "dt": "u8"},
+        },
+    });
+    let body = args(&json!({"value": collision}));
     let env = grab(unsafe { rspyts_fn__echo_json(body.as_ptr(), body.len()) });
-    assert_eq!(expect_ok(&env)["__rspyts_json__"], collision);
+    assert_eq!(*expect_ok(&env), collision);
 
     // The shim (target-scoped functions always keep their shim) still works.
     let body = args(&json!({"x": 21}));
@@ -1357,11 +1678,11 @@ fn factory_only_class_lifecycle_and_stale_handles() {
 
 #[test]
 fn manifest_snapshot_covers_every_registered_item() {
-    let manifest = rspyts_core::registry::build_manifest("expansion-fixture", "0.0.0");
+    let manifest = rspyts_core::registry::build_manifest("rspyts", "0.0.0");
     let actual = serde_json::to_value(&manifest).unwrap();
     let expected = json!({
-        "abi": "2.0",
-        "crateName": "expansion-fixture",
+        "abi": "3.0",
+        "crateName": "rspyts",
         "crateVersion": "0.0.0",
         "types": [
             {
@@ -1370,7 +1691,7 @@ fn manifest_snapshot_covers_every_registered_item() {
                 "docs": "Adoption without rename metadata follows Serde's ordinary field names.",
                 "origin": "rspyts",
                 "fields": [
-                    {"name": "item_count", "wireName": "item_count", "docs": "", "ty": {"kind": "u32"}, "optional": false},
+                    {"name": "item_count", "wireName": "item_count", "docs": "", "ty": {"kind": "u32"}, "required": true},
                 ],
             },
             {
@@ -1392,8 +1713,8 @@ fn manifest_snapshot_covers_every_registered_item() {
                         "wireName": "h_t_t_p2_ready",
                         "docs": "",
                         "fields": [
-                            {"name": "request_id", "wireName": "request-id", "docs": "", "ty": {"kind": "u32"}, "optional": false},
-                            {"name": "url_value", "wireName": "URL", "docs": "", "ty": {"kind": "string"}, "optional": false},
+                            {"name": "request_id", "wireName": "request-id", "docs": "", "ty": {"kind": "u32"}, "required": true},
+                            {"name": "url_value", "wireName": "URL", "docs": "", "ty": {"kind": "string"}, "required": true},
                         ],
                     },
                     {
@@ -1401,7 +1722,7 @@ fn manifest_snapshot_covers_every_registered_item() {
                         "wireName": "closed",
                         "docs": "",
                         "fields": [
-                            {"name": "reason_code", "wireName": "reason_code", "docs": "", "ty": {"kind": "u32"}, "optional": false},
+                            {"name": "reason_code", "wireName": "reason_code", "docs": "", "ty": {"kind": "u32"}, "required": true},
                         ],
                     },
                 ],
@@ -1422,8 +1743,33 @@ fn manifest_snapshot_covers_every_registered_item() {
                 "docs": "An existing Serde struct adopted without duplicate derives.",
                 "origin": "rspyts",
                 "fields": [
-                    {"name": "http2_id", "wireName": "http2-id", "docs": "", "ty": {"kind": "u32"}, "optional": false},
-                    {"name": "display_name", "wireName": "display", "docs": "", "ty": {"kind": "string"}, "optional": false},
+                    {"name": "http2_id", "wireName": "http2-id", "docs": "", "ty": {"kind": "u32"}, "required": true},
+                    {"name": "display_name", "wireName": "display", "docs": "", "ty": {"kind": "string"}, "required": true},
+                ],
+            },
+            {
+                "kind": "struct",
+                "name": "AttachmentTree",
+                "docs": "Owned attachments nested through ordinary data containers.",
+                "origin": "rspyts",
+                "fields": [
+                    {
+                        "name": "payloads", "wireName": "payloads", "docs": "", "required": true,
+                        "ty": {"kind": "list", "inner": {"kind": "bytes"}},
+                    },
+                    {
+                        "name": "channels", "wireName": "channels", "docs": "", "required": true,
+                        "ty": {
+                            "kind": "map",
+                            "value": {
+                                "kind": "list",
+                                "inner": {
+                                    "kind": "option",
+                                    "inner": {"kind": "buf", "dt": "i64"},
+                                },
+                            },
+                        },
+                    },
                 ],
             },
             {
@@ -1442,8 +1788,8 @@ fn manifest_snapshot_covers_every_registered_item() {
                 "docs": "A labeled chunk of samples.",
                 "origin": "rspyts",
                 "fields": [
-                    {"name": "label", "wireName": "label", "docs": "", "ty": {"kind": "string"}, "optional": false},
-                    {"name": "samples", "wireName": "samples", "docs": "Raw samples for this chunk.", "ty": {"kind": "buf", "dt": "f32"}, "optional": false},
+                    {"name": "label", "wireName": "label", "docs": "", "ty": {"kind": "string"}, "required": true},
+                    {"name": "samples", "wireName": "samples", "docs": "Raw samples for this chunk.", "ty": {"kind": "buf", "dt": "f32"}, "required": true},
                 ],
             },
             {
@@ -1458,7 +1804,7 @@ fn manifest_snapshot_covers_every_registered_item() {
                         "wireName": "started",
                         "docs": "",
                         "fields": [
-                            {"name": "at_ms", "wireName": "atMs", "docs": "", "ty": {"kind": "u32"}, "optional": false},
+                            {"name": "at_ms", "wireName": "atMs", "docs": "", "ty": {"kind": "u32"}, "required": true},
                         ],
                     },
                     {
@@ -1466,8 +1812,8 @@ fn manifest_snapshot_covers_every_registered_item() {
                         "wireName": "stopped",
                         "docs": "",
                         "fields": [
-                            {"name": "at_ms", "wireName": "atMs", "docs": "", "ty": {"kind": "u32"}, "optional": false},
-                            {"name": "reason", "wireName": "reason", "docs": "", "ty": {"kind": "option", "inner": {"kind": "string"}}, "optional": true},
+                            {"name": "at_ms", "wireName": "atMs", "docs": "", "ty": {"kind": "u32"}, "required": true},
+                            {"name": "reason", "wireName": "reason", "docs": "", "ty": {"kind": "option", "inner": {"kind": "string"}}, "required": false},
                         ],
                     },
                 ],
@@ -1478,22 +1824,29 @@ fn manifest_snapshot_covers_every_registered_item() {
                 "docs": "Every scalar and container in one shape.\n\nSecond doc paragraph.",
                 "origin": "rspyts",
                 "fields": [
-                    {"name": "flag", "wireName": "flag", "docs": "", "ty": {"kind": "bool"}, "optional": false},
-                    {"name": "tiny_u", "wireName": "tinyU", "docs": "", "ty": {"kind": "u8"}, "optional": false},
-                    {"name": "small_u", "wireName": "smallU", "docs": "", "ty": {"kind": "u16"}, "optional": false},
-                    {"name": "medium_u", "wireName": "mediumU", "docs": "", "ty": {"kind": "u32"}, "optional": false},
-                    {"name": "tiny_i", "wireName": "tinyI", "docs": "", "ty": {"kind": "i8"}, "optional": false},
-                    {"name": "small_i", "wireName": "smallI", "docs": "", "ty": {"kind": "i16"}, "optional": false},
-                    {"name": "medium_i", "wireName": "mediumI", "docs": "", "ty": {"kind": "i32"}, "optional": false},
-                    {"name": "single", "wireName": "single", "docs": "", "ty": {"kind": "f32"}, "optional": false},
-                    {"name": "double", "wireName": "double", "docs": "", "ty": {"kind": "f64"}, "optional": false},
-                    {"name": "text", "wireName": "text", "docs": "", "ty": {"kind": "string"}, "optional": false},
-                    {"name": "maybe_text", "wireName": "maybeText", "docs": "Present only sometimes.", "ty": {"kind": "option", "inner": {"kind": "string"}}, "optional": true},
-                    {"name": "numbers", "wireName": "numbers", "docs": "", "ty": {"kind": "list", "inner": {"kind": "i32"}}, "optional": false},
-                    {"name": "lookup", "wireName": "lookup", "docs": "", "ty": {"kind": "map", "value": {"kind": "f64"}}, "optional": false},
-                    {"name": "ordered", "wireName": "ordered", "docs": "", "ty": {"kind": "map", "value": {"kind": "u32"}}, "optional": false},
-                    {"name": "nested", "wireName": "nested", "docs": "", "ty": {"kind": "ref", "name": "NestedInfo"}, "optional": false},
+                    {"name": "flag", "wireName": "flag", "docs": "", "ty": {"kind": "bool"}, "required": true},
+                    {"name": "tiny_u", "wireName": "tinyU", "docs": "", "ty": {"kind": "u8"}, "required": true},
+                    {"name": "small_u", "wireName": "smallU", "docs": "", "ty": {"kind": "u16"}, "required": true},
+                    {"name": "medium_u", "wireName": "mediumU", "docs": "", "ty": {"kind": "u32"}, "required": true},
+                    {"name": "tiny_i", "wireName": "tinyI", "docs": "", "ty": {"kind": "i8"}, "required": true},
+                    {"name": "small_i", "wireName": "smallI", "docs": "", "ty": {"kind": "i16"}, "required": true},
+                    {"name": "medium_i", "wireName": "mediumI", "docs": "", "ty": {"kind": "i32"}, "required": true},
+                    {"name": "single", "wireName": "single", "docs": "", "ty": {"kind": "f32"}, "required": true},
+                    {"name": "double", "wireName": "double", "docs": "", "ty": {"kind": "f64"}, "required": true},
+                    {"name": "text", "wireName": "text", "docs": "", "ty": {"kind": "string"}, "required": true},
+                    {"name": "maybe_text", "wireName": "maybeText", "docs": "Present only sometimes.", "ty": {"kind": "option", "inner": {"kind": "string"}}, "required": false},
+                    {"name": "numbers", "wireName": "numbers", "docs": "", "ty": {"kind": "list", "inner": {"kind": "i32"}}, "required": true},
+                    {"name": "lookup", "wireName": "lookup", "docs": "", "ty": {"kind": "map", "value": {"kind": "f64"}}, "required": true},
+                    {"name": "ordered", "wireName": "ordered", "docs": "", "ty": {"kind": "map", "value": {"kind": "u32"}}, "required": true},
+                    {"name": "nested", "wireName": "nested", "docs": "", "ty": {"kind": "ref", "name": "NestedInfo"}, "required": true},
                 ],
+            },
+            {
+                "kind": "newtype",
+                "name": "ExactId",
+                "docs": "A named exact-integer newtype.",
+                "origin": "rspyts",
+                "inner": {"kind": "u64"},
             },
             {
                 "kind": "struct",
@@ -1501,11 +1854,15 @@ fn manifest_snapshot_covers_every_registered_item() {
                 "docs": "Exact integers and fixed-length tuple shapes.",
                 "origin": "rspyts",
                 "fields": [
-                    {"name": "signed", "wireName": "signed", "docs": "", "ty": {"kind": "i64"}, "optional": false},
-                    {"name": "unsigned", "wireName": "unsigned", "docs": "", "ty": {"kind": "u64"}, "optional": false},
-                    {"name": "pair", "wireName": "pair", "docs": "", "ty": {"kind": "tuple", "items": [{"kind": "i64"}, {"kind": "u64"}]}, "optional": false},
+                    {"name": "signed", "wireName": "signed", "docs": "", "ty": {"kind": "i64"}, "required": true},
+                    {"name": "unsigned", "wireName": "unsigned", "docs": "", "ty": {"kind": "u64"}, "required": true},
+                    {"name": "id", "wireName": "id", "docs": "", "ty": {"kind": "ref", "name": "ExactId"}, "required": true},
+                    {"name": "pair", "wireName": "pair", "docs": "", "ty": {"kind": "tuple", "items": [{"kind": "i64"}, {"kind": "u64"}]}, "required": true},
+                    {"name": "signed_list", "wireName": "signedList", "docs": "", "ty": {"kind": "list", "inner": {"kind": "i64"}}, "required": true},
+                    {"name": "by_name", "wireName": "byName", "docs": "", "ty": {"kind": "map", "value": {"kind": "u64"}}, "required": true},
+                    {"name": "optional", "wireName": "optional", "docs": "", "ty": {"kind": "option", "inner": {"kind": "u64"}}, "required": false},
                     {
-                        "name": "dozen", "wireName": "dozen", "docs": "", "optional": false,
+                        "name": "dozen", "wireName": "dozen", "docs": "", "required": true,
                         "ty": {
                             "kind": "tuple",
                             "items": [
@@ -1530,8 +1887,8 @@ fn manifest_snapshot_covers_every_registered_item() {
                         "wireCode": "overLimit",
                         "docs": "The counter would exceed its limit.",
                         "fields": [
-                            {"name": "max_allowed", "wireName": "maxAllowed", "docs": "", "ty": {"kind": "i32"}, "optional": false},
-                            {"name": "attempted", "wireName": "attempted", "docs": "", "ty": {"kind": "i32"}, "optional": false},
+                            {"name": "max_allowed", "wireName": "maxAllowed", "docs": "", "ty": {"kind": "i32"}, "required": true},
+                            {"name": "attempted", "wireName": "attempted", "docs": "", "ty": {"kind": "i32"}, "required": true},
                         ],
                     },
                     {
@@ -1539,7 +1896,15 @@ fn manifest_snapshot_covers_every_registered_item() {
                         "wireCode": "exactLimit",
                         "docs": "An exact unsigned limit was rejected.",
                         "fields": [
-                            {"name": "limit", "wireName": "limit", "docs": "", "ty": {"kind": "u64"}, "optional": false},
+                            {"name": "limit", "wireName": "limit", "docs": "", "ty": {"kind": "u64"}, "required": true},
+                        ],
+                    },
+                    {
+                        "name": "MissingContext",
+                        "wireCode": "missingContext",
+                        "docs": "An explicitly nullable error detail.",
+                        "fields": [
+                            {"name": "context", "wireName": "context", "docs": "", "ty": {"kind": "option", "inner": {"kind": "string"}}, "required": true},
                         ],
                     },
                 ],
@@ -1568,7 +1933,8 @@ fn manifest_snapshot_covers_every_registered_item() {
                         "wireName": "ready",
                         "docs": "",
                         "fields": [
-                            {"name": "sequence", "wireName": "sequence", "docs": "", "ty": {"kind": "u64"}, "optional": false},
+                            {"name": "sequence", "wireName": "sequence", "docs": "", "ty": {"kind": "u64"}, "required": true},
+                            {"name": "receipt", "wireName": "receipt", "docs": "", "ty": {"kind": "option", "inner": {"kind": "ref", "name": "ExactId"}}, "required": true},
                         ],
                     },
                 ],
@@ -1586,7 +1952,7 @@ fn manifest_snapshot_covers_every_registered_item() {
                 "docs": "A nested payload.",
                 "origin": "rspyts",
                 "fields": [
-                    {"name": "note", "wireName": "note", "docs": "Free-form note.", "ty": {"kind": "string"}, "optional": false},
+                    {"name": "note", "wireName": "note", "docs": "Free-form note.", "ty": {"kind": "string"}, "required": true},
                 ],
             },
             {
@@ -1595,8 +1961,8 @@ fn manifest_snapshot_covers_every_registered_item() {
                 "docs": "An owning contract whose Serde attributes are reflected by rspyts.",
                 "origin": "rspyts",
                 "fields": [
-                    {"name": "http2_id", "wireName": "HTTP2_ID", "docs": "", "ty": {"kind": "u32"}, "optional": false},
-                    {"name": "display_code", "wireName": "display-code", "docs": "", "ty": {"kind": "string"}, "optional": false},
+                    {"name": "http2_id", "wireName": "HTTP2_ID", "docs": "", "ty": {"kind": "u32"}, "required": true},
+                    {"name": "display_code", "wireName": "display-code", "docs": "", "ty": {"kind": "string"}, "required": true},
                 ],
             },
             {
@@ -1618,7 +1984,7 @@ fn manifest_snapshot_covers_every_registered_item() {
                         "wireName": "circle",
                         "docs": "A circle.",
                         "fields": [
-                            {"name": "radius_len", "wireName": "radiusLen", "docs": "", "ty": {"kind": "f64"}, "optional": false},
+                            {"name": "radius_len", "wireName": "radiusLen", "docs": "", "ty": {"kind": "f64"}, "required": true},
                         ],
                     },
                     {
@@ -1626,8 +1992,8 @@ fn manifest_snapshot_covers_every_registered_item() {
                         "wireName": "rect",
                         "docs": "",
                         "fields": [
-                            {"name": "width", "wireName": "width", "docs": "", "ty": {"kind": "f64"}, "optional": false},
-                            {"name": "height", "wireName": "height", "docs": "", "ty": {"kind": "f64"}, "optional": false},
+                            {"name": "width", "wireName": "width", "docs": "", "ty": {"kind": "f64"}, "required": true},
+                            {"name": "height", "wireName": "height", "docs": "", "ty": {"kind": "f64"}, "required": true},
                         ],
                     },
                 ],
@@ -1638,8 +2004,19 @@ fn manifest_snapshot_covers_every_registered_item() {
                 "docs": "Snake-cased wire shape.",
                 "origin": "rspyts",
                 "fields": [
-                    {"name": "item_count", "wireName": "item_count", "docs": "", "ty": {"kind": "u32"}, "optional": false},
-                    {"name": "max_value", "wireName": "max_value", "docs": "Optional maximum.", "ty": {"kind": "option", "inner": {"kind": "f64"}}, "optional": true},
+                    {"name": "item_count", "wireName": "item_count", "docs": "", "ty": {"kind": "u32"}, "required": true},
+                    {"name": "max_value", "wireName": "max_value", "docs": "Optional maximum.", "ty": {"kind": "option", "inner": {"kind": "f64"}}, "required": false},
+                ],
+            },
+            {
+                "kind": "struct",
+                "name": "UnitRecord",
+                "docs": "Unit is an ordinary data value. It is spelled `null` on the wire.",
+                "origin": "rspyts",
+                "fields": [
+                    {"name": "direct", "wireName": "direct", "docs": "", "ty": {"kind": "null"}, "required": true},
+                    {"name": "optional", "wireName": "optional", "docs": "", "ty": {"kind": "option", "inner": {"kind": "null"}}, "required": false},
+                    {"name": "required", "wireName": "required", "docs": "", "ty": {"kind": "option", "inner": {"kind": "null"}}, "required": true},
                 ],
             },
         ],
@@ -1702,6 +2079,16 @@ fn manifest_snapshot_covers_every_registered_item() {
                 "targets": ["python", "typescript"],
             },
             {
+                "name": "echo_attachment_tree",
+                "docs": "Round-trip nested owned binary attachments.",
+                "params": [
+                    {"name": "value", "wireName": "value", "ty": {"kind": "ref", "name": "AttachmentTree"}},
+                ],
+                "ret": {"kind": "ref", "name": "AttachmentTree"},
+                "err": null,
+                "targets": ["python", "typescript"],
+            },
+            {
                 "name": "echo_channel",
                 "docs": "Echo a channel.",
                 "params": [
@@ -1718,6 +2105,16 @@ fn manifest_snapshot_covers_every_registered_item() {
                     {"name": "value", "wireName": "value", "ty": {"kind": "ref", "name": "ExactRecord"}},
                 ],
                 "ret": {"kind": "ref", "name": "ExactRecord"},
+                "err": null,
+                "targets": ["python", "typescript"],
+            },
+            {
+                "name": "echo_exact_map",
+                "docs": "Round-trip exact integers in a string-keyed map.",
+                "params": [
+                    {"name": "value", "wireName": "value", "ty": {"kind": "map", "value": {"kind": "u64"}}},
+                ],
+                "ret": {"kind": "map", "value": {"kind": "u64"}},
                 "err": null,
                 "targets": ["python", "typescript"],
             },
@@ -1742,6 +2139,16 @@ fn manifest_snapshot_covers_every_registered_item() {
                 "targets": ["python", "typescript"],
             },
             {
+                "name": "echo_optional_unit",
+                "docs": "Exercise optional unit directly.",
+                "params": [
+                    {"name": "value", "wireName": "value", "ty": {"kind": "option", "inner": {"kind": "null"}}},
+                ],
+                "ret": {"kind": "option", "inner": {"kind": "null"}},
+                "err": null,
+                "targets": ["python", "typescript"],
+            },
+            {
                 "name": "echo_snake",
                 "docs": "Round-trip a snake-cased struct.",
                 "params": [
@@ -1759,6 +2166,36 @@ fn manifest_snapshot_covers_every_registered_item() {
                 ],
                 "ret": {"kind": "tuple", "items": [{"kind": "i64"}, {"kind": "u64"}]},
                 "err": null,
+                "targets": ["python", "typescript"],
+            },
+            {
+                "name": "echo_unit_alias",
+                "docs": "Exercise a Rust alias whose underlying bridge type is unit.",
+                "params": [
+                    {"name": "value", "wireName": "value", "ty": {"kind": "null"}},
+                ],
+                "ret": {"kind": "unit"},
+                "err": null,
+                "targets": ["python", "typescript"],
+            },
+            {
+                "name": "echo_unit_record",
+                "docs": "Round-trip unit in data position.",
+                "params": [
+                    {"name": "value", "wireName": "value", "ty": {"kind": "ref", "name": "UnitRecord"}},
+                ],
+                "ret": {"kind": "ref", "name": "UnitRecord"},
+                "err": null,
+                "targets": ["python", "typescript"],
+            },
+            {
+                "name": "fallible_unit",
+                "docs": "Exercise unit as the success value of a fallible operation.",
+                "params": [
+                    {"name": "succeed", "wireName": "succeed", "ty": {"kind": "bool"}},
+                ],
+                "ret": {"kind": "unit"},
+                "err": "FixtureError",
                 "targets": ["python", "typescript"],
             },
             {
@@ -1815,6 +2252,16 @@ fn manifest_snapshot_covers_every_registered_item() {
                 "ret": {"kind": "u32"},
                 "err": null,
                 "targets": ["python"],
+            },
+            {
+                "name": "reject_exact",
+                "docs": "Return an exact-integer error payload through the bridge.",
+                "params": [
+                    {"name": "limit", "wireName": "limit", "ty": {"kind": "u64"}},
+                ],
+                "ret": {"kind": "unit"},
+                "err": "FixtureError",
+                "targets": ["python", "typescript"],
             },
             {
                 "name": "zero_params",
