@@ -51,7 +51,7 @@ instead of maintaining a project-specific packaging script:
 
 ```toml
 [build-system]
-requires = ["hatchling", "rspyts[hatch]==0.3.1"]
+requires = ["hatchling", "rspyts[hatch]==0.3.2"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.hooks.rspyts]
