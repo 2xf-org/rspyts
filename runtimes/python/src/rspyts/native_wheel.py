@@ -387,17 +387,20 @@ def read_windows_dependencies(artifact: pathlib.Path) -> set[str]:
         raise RuntimeError("Cannot audit Windows dependencies; install the `rspyts[hatch]` extra") from error
     try:
         image = pefile.PE(str(artifact), fast_load=True)
-        image.parse_data_directories(
-            directories=[
-                pefile.DIRECTORY_ENTRY["IMAGE_DIRECTORY_ENTRY_IMPORT"],
-                pefile.DIRECTORY_ENTRY["IMAGE_DIRECTORY_ENTRY_DELAY_IMPORT"],
+        try:
+            image.parse_data_directories(
+                directories=[
+                    pefile.DIRECTORY_ENTRY["IMAGE_DIRECTORY_ENTRY_IMPORT"],
+                    pefile.DIRECTORY_ENTRY["IMAGE_DIRECTORY_ENTRY_DELAY_IMPORT"],
+                ]
+            )
+            entries = [
+                *getattr(image, "DIRECTORY_ENTRY_IMPORT", []),
+                *getattr(image, "DIRECTORY_ENTRY_DELAY_IMPORT", []),
             ]
-        )
-        entries = [
-            *getattr(image, "DIRECTORY_ENTRY_IMPORT", []),
-            *getattr(image, "DIRECTORY_ENTRY_DELAY_IMPORT", []),
-        ]
-        return {entry.dll.decode("ascii").lower() for entry in entries}
+            return {entry.dll.decode("ascii").lower() for entry in entries}
+        finally:
+            image.close()
     except Exception as error:
         raise RuntimeError(f"Cannot inspect Windows dependencies for {artifact}: {error}") from error
 
