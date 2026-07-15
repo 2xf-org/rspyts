@@ -1,7 +1,7 @@
 //! Compact Python source generation for the ABI 3 runtime.
 //!
 //! Public modules contain only host declarations and typed wrappers. All
-//! schema-directed wire work lives in the private `_codecs.py` module. Named
+//! schema-directed wire work lives in the generated `codecs.py` module. Named
 //! references always cross one named codec boundary, which keeps wrapper size
 //! proportional to the number of functions instead of the depth of their
 //! models.
@@ -30,7 +30,7 @@ pub fn emit(
     let codecs = CodecPlan::new(manifest);
     vec![
         ("__init__.py", init_py(manifest, fingerprint)),
-        ("_codecs.py", codecs_py(manifest, fingerprint, &codecs)),
+        ("codecs.py", codecs_py(manifest, fingerprint, &codecs)),
         ("classes.py", classes_py(manifest, fingerprint, &codecs)),
         ("constants.py", constants_py(manifest, fingerprint)),
         ("errors.py", errors_py(manifest, fingerprint, imports)),
@@ -494,8 +494,8 @@ impl CodecPlan {
         };
         target.entry(key).or_insert_with(|| {
             let prefix = match direction {
-                Direction::Encode => "_encode_",
-                Direction::Decode => "_decode_",
+                Direction::Encode => "encode_",
+                Direction::Decode => "decode_",
             };
             (format!("{prefix}{}", ty_slug(ty)), ty.clone())
         });
@@ -609,10 +609,10 @@ fn type_codec_name(direction: Direction, name: &str) -> String {
         Direction::Encode => "encode",
         Direction::Decode => "decode",
     };
-    format!("_{action}_type_{}", py_name(name))
+    format!("{action}_type_{}", py_name(name))
 }
 
-// --------------------------------------------------------------- _codecs.py
+// ---------------------------------------------------------------- codecs.py
 
 fn codec_def_line(name: &str, param: &str, ret: &str) -> String {
     let one = format!("def {name}({param}) -> {ret}:");
@@ -714,14 +714,14 @@ fn codecs_py(manifest: &Manifest, fingerprint: &str, plan: &CodecPlan) -> String
     }
 
     let mut out = py_header(fingerprint);
-    out.push_str("\"\"\"Private schema-directed ABI 3 codecs.\"\"\"\n");
-    out.push_str("\nimport typing\n\nimport rspyts._internal as _rspyts\n");
+    out.push_str("\"\"\"Schema-directed ABI 3 codecs for the generated client.\"\"\"\n");
+    out.push_str("\nimport typing\n\nimport rspyts.internal\n");
     if body.contains("models.") {
         out.push_str("\nfrom . import models\n");
     }
-    out.push_str("\n_rspyts.require_emitter_api(3)\n");
+    out.push_str("\nrspyts.internal.require_emitter_api(4)\n");
     out.push_str(
-        "\n\ndef _host_list(value: object) -> list[typing.Any]:\n    if type(value) is not list:\n        raise TypeError(f\"rspyts: expected a list, got {type(value).__name__}\")\n    return value\n\n\ndef _host_map(value: object) -> dict[str, typing.Any]:\n    if type(value) is not dict or any(type(key) is not str for key in value):\n        raise TypeError(\"rspyts: expected a string-keyed dict\")\n    return typing.cast(dict[str, typing.Any], value)\n\n\ndef _host_tuple(value: object, length: int) -> tuple[typing.Any, ...]:\n    if type(value) is not tuple or len(value) != length:\n        raise TypeError(f\"rspyts: expected a tuple of length {length}\")\n    return value\n",
+        "\n\ndef host_list(value: object) -> list[typing.Any]:\n    if type(value) is not list:\n        raise TypeError(f\"rspyts: expected a list, got {type(value).__name__}\")\n    return value\n\n\ndef host_map(value: object) -> dict[str, typing.Any]:\n    if type(value) is not dict or any(type(key) is not str for key in value):\n        raise TypeError(\"rspyts: expected a string-keyed dict\")\n    return typing.cast(dict[str, typing.Any], value)\n\n\ndef host_tuple(value: object, length: int) -> tuple[typing.Any, ...]:\n    if type(value) is not tuple or len(value) != length:\n        raise TypeError(f\"rspyts: expected a tuple of length {length}\")\n    return value\n",
     );
     out.push_str(&body);
     out
@@ -730,7 +730,9 @@ fn codecs_py(manifest: &Manifest, fingerprint: &str, plan: &CodecPlan) -> String
 fn codec_function(name: &str, ty: &Ty, direction: Direction) -> String {
     let mut out = match direction {
         Direction::Encode => codec_def_line(name, "value: object", "object"),
-        Direction::Decode => codec_def_line(name, "response: _rspyts.Response", "typing.Any"),
+        Direction::Decode => {
+            codec_def_line(name, "response: rspyts.internal.Response", "typing.Any")
+        }
     };
     match (direction, ty) {
         (Direction::Encode, Ty::Option { inner }) => {
@@ -743,33 +745,30 @@ fn codec_function(name: &str, ty: &Ty, direction: Direction) -> String {
         }
         (Direction::Encode, Ty::List { inner }) => {
             out.push_str(&format!(
-                "    return [\n        {}\n        for item in _host_list(value)\n    ]\n",
+                "    return [\n        {}\n        for item in host_list(value)\n    ]\n",
                 encode_expr("item", inner)
             ));
         }
         (Direction::Decode, Ty::List { inner }) => {
             out.push_str(&format!(
-                "    return [\n        {}\n        for item in _rspyts.list_from_wire(response)\n    ]\n",
+                "    return [\n        {}\n        for item in rspyts.internal.list_from_wire(response)\n    ]\n",
                 decode_expr("item", inner)
             ));
         }
         (Direction::Encode, Ty::Map { value }) => {
             out.push_str(&format!(
-                "    return {{\n        key: {}\n        for key, item in _host_map(value).items()\n    }}\n",
+                "    return {{\n        key: {}\n        for key, item in host_map(value).items()\n    }}\n",
                 encode_expr("item", value)
             ));
         }
         (Direction::Decode, Ty::Map { value }) => {
             out.push_str(&format!(
-                "    return {{\n        key: {}\n        for key, item in _rspyts.map_from_wire(response).items()\n    }}\n",
+                "    return {{\n        key: {}\n        for key, item in rspyts.internal.map_from_wire(response).items()\n    }}\n",
                 decode_expr("item", value)
             ));
         }
         (Direction::Encode, Ty::Tuple { items }) => {
-            out.push_str(&format!(
-                "    items = _host_tuple(value, {})\n",
-                items.len()
-            ));
+            out.push_str(&format!("    items = host_tuple(value, {})\n", items.len()));
             out.push_str("    return (\n");
             for (index, item) in items.iter().enumerate() {
                 out.push_str(&format!(
@@ -781,7 +780,7 @@ fn codec_function(name: &str, ty: &Ty, direction: Direction) -> String {
         }
         (Direction::Decode, Ty::Tuple { items }) => {
             out.push_str(&format!(
-                "    items = _rspyts.tuple_from_wire(response, length={})\n",
+                "    items = rspyts.internal.tuple_from_wire(response, length={})\n",
                 items.len()
             ));
             out.push_str("    return (\n");
@@ -812,7 +811,11 @@ fn named_codec(decl: &TypeDecl, direction: Direction) -> String {
             out
         }
         (Direction::Decode, TypeDecl::Newtype { inner, .. }) => {
-            let mut out = codec_def_line(&function, "response: _rspyts.Response", "typing.Any");
+            let mut out = codec_def_line(
+                &function,
+                "response: rspyts.internal.Response",
+                "typing.Any",
+            );
             out.push_str(&return_line("    ", &decode_expr("response", inner)));
             out
         }
@@ -836,12 +839,12 @@ fn named_codec(decl: &TypeDecl, direction: Direction) -> String {
         (Direction::Decode, TypeDecl::StringEnum { name, .. }) => {
             let mut out = codec_def_line(
                 &function,
-                "response: _rspyts.Response",
+                "response: rspyts.internal.Response",
                 &format!("models.{name}"),
             );
             out.push_str(&return_line(
                 "    ",
-                &format!("models.{name}(_rspyts.string_from_wire(response))"),
+                &format!("models.{name}(rspyts.internal.string_from_wire(response))"),
             ));
             out
         }
@@ -892,11 +895,11 @@ fn named_codec(decl: &TypeDecl, direction: Direction) -> String {
         ) => {
             let mut out = codec_def_line(
                 &function,
-                "response: _rspyts.Response",
+                "response: rspyts.internal.Response",
                 &format!("models.{name}"),
             );
             out.push_str(&format!(
-                "    return _rspyts.enum_from_wire(\n        response,\n        tag={},\n        variants={{\n",
+                "    return rspyts.internal.enum_from_wire(\n        response,\n        tag={},\n        variants={{\n",
                 py_string(tag)
             ));
             for variant in variants {
@@ -989,10 +992,10 @@ fn decode_model(
     }
     let mut out = codec_def_line(
         &function,
-        "response: _rspyts.Response",
+        "response: rspyts.internal.Response",
         &format!("models.{name}"),
     );
-    out.push_str("    obj = _rspyts.map_from_wire(response)\n");
+    out.push_str("    obj = rspyts.internal.map_from_wire(response)\n");
     out.push_str(&set_operation_line(
         "    ",
         "unknown",
@@ -1023,7 +1026,7 @@ fn decode_model(
         out.push_str(&if_line(
             "    ",
             &format!(
-                "_rspyts.string_from_wire(obj[{}]) != {}",
+                "rspyts.internal.string_from_wire(obj[{}]) != {}",
                 py_string(tag_name),
                 py_string(tag_value)
             ),
@@ -1077,7 +1080,7 @@ fn set_literal(values: &[String]) -> String {
 
 fn enum_variant_decoder_name(enum_name: &str, variant_name: &str) -> String {
     format!(
-        "_decode_variant_{}_{}",
+        "decode_variant_{}_{}",
         py_name(enum_name),
         py_name(variant_name)
     )
@@ -1086,7 +1089,7 @@ fn enum_variant_decoder_name(enum_name: &str, variant_name: &str) -> String {
 fn encode_expr(expr: &str, ty: &Ty) -> String {
     let function = match ty {
         Ty::Ref { name } => type_codec_name(Direction::Encode, name),
-        _ => format!("_encode_{}", ty_slug(ty)),
+        _ => format!("encode_{}", ty_slug(ty)),
     };
     format!("{function}({expr})")
 }
@@ -1094,28 +1097,32 @@ fn encode_expr(expr: &str, ty: &Ty) -> String {
 fn decode_expr(expr: &str, ty: &Ty) -> String {
     let function = match ty {
         Ty::Ref { name } => type_codec_name(Direction::Decode, name),
-        _ => format!("_decode_{}", ty_slug(ty)),
+        _ => format!("decode_{}", ty_slug(ty)),
     };
     format!("{function}({expr})")
 }
 
 fn encode_leaf_expr(expr: &str, ty: &Ty) -> String {
     match ty {
-        Ty::Bool => format!("_rspyts.bool_from_wire(_rspyts.Response({expr}))"),
+        Ty::Bool => format!("rspyts.internal.bool_from_wire(rspyts.internal.Response({expr}))"),
         Ty::U8 | Ty::U16 | Ty::U32 | Ty::I8 | Ty::I16 | Ty::I32 => {
             let (minimum, maximum) = int_bounds(ty).expect("integer kind");
             format!(
-                "_rspyts.bounded_int_from_wire(_rspyts.Response({expr}), minimum={minimum}, maximum={maximum})"
+                "rspyts.internal.bounded_int_from_wire(rspyts.internal.Response({expr}), minimum={minimum}, maximum={maximum})"
             )
         }
-        Ty::I64 => format!("_rspyts.i64_to_wire({expr})"),
-        Ty::U64 => format!("_rspyts.u64_to_wire({expr})"),
-        Ty::F32 => format!("_rspyts.float_from_wire(_rspyts.Response({expr}), f32=True)"),
-        Ty::F64 => format!("_rspyts.float_from_wire(_rspyts.Response({expr}))"),
-        Ty::String => format!("_rspyts.string_from_wire(_rspyts.Response({expr}))"),
+        Ty::I64 => format!("rspyts.internal.i64_to_wire({expr})"),
+        Ty::U64 => format!("rspyts.internal.u64_to_wire({expr})"),
+        Ty::F32 => {
+            format!("rspyts.internal.float_from_wire(rspyts.internal.Response({expr}), f32=True)")
+        }
+        Ty::F64 => format!("rspyts.internal.float_from_wire(rspyts.internal.Response({expr}))"),
+        Ty::String => format!("rspyts.internal.string_from_wire(rspyts.internal.Response({expr}))"),
         Ty::Bytes | Ty::Buf { .. } | Ty::Slice { .. } => expr.to_string(),
-        Ty::Unit | Ty::Null => format!("_rspyts.null_from_wire(_rspyts.Response({expr}))"),
-        Ty::Json => format!("_rspyts.json_to_wire({expr})"),
+        Ty::Unit | Ty::Null => {
+            format!("rspyts.internal.null_from_wire(rspyts.internal.Response({expr}))")
+        }
+        Ty::Json => format!("rspyts.internal.json_to_wire({expr})"),
         Ty::Ref { .. }
         | Ty::Option { .. }
         | Ty::List { .. }
@@ -1126,23 +1133,25 @@ fn encode_leaf_expr(expr: &str, ty: &Ty) -> String {
 
 fn decode_leaf_expr(expr: &str, ty: &Ty) -> String {
     match ty {
-        Ty::Bool => format!("_rspyts.bool_from_wire({expr})"),
+        Ty::Bool => format!("rspyts.internal.bool_from_wire({expr})"),
         Ty::U8 | Ty::U16 | Ty::U32 | Ty::I8 | Ty::I16 | Ty::I32 => {
             let (minimum, maximum) = int_bounds(ty).expect("integer kind");
-            format!("_rspyts.bounded_int_from_wire({expr}, minimum={minimum}, maximum={maximum})")
+            format!(
+                "rspyts.internal.bounded_int_from_wire({expr}, minimum={minimum}, maximum={maximum})"
+            )
         }
-        Ty::I64 => format!("_rspyts.i64_from_wire({expr})"),
-        Ty::U64 => format!("_rspyts.u64_from_wire({expr})"),
-        Ty::F32 => format!("_rspyts.float_from_wire({expr}, f32=True)"),
-        Ty::F64 => format!("_rspyts.float_from_wire({expr})"),
-        Ty::String => format!("_rspyts.string_from_wire({expr})"),
-        Ty::Bytes => format!("_rspyts.bytes_from_wire({expr})"),
+        Ty::I64 => format!("rspyts.internal.i64_from_wire({expr})"),
+        Ty::U64 => format!("rspyts.internal.u64_from_wire({expr})"),
+        Ty::F32 => format!("rspyts.internal.float_from_wire({expr}, f32=True)"),
+        Ty::F64 => format!("rspyts.internal.float_from_wire({expr})"),
+        Ty::String => format!("rspyts.internal.string_from_wire({expr})"),
+        Ty::Bytes => format!("rspyts.internal.bytes_from_wire({expr})"),
         Ty::Buf { dt } => format!(
-            "_rspyts.buffer_from_wire({expr}, dtype={})",
+            "rspyts.internal.buffer_from_wire({expr}, dtype={})",
             py_string(dt.wire_name())
         ),
-        Ty::Unit | Ty::Null => format!("_rspyts.null_from_wire({expr})"),
-        Ty::Json => format!("_rspyts.json_from_wire({expr})"),
+        Ty::Unit | Ty::Null => format!("rspyts.internal.null_from_wire({expr})"),
+        Ty::Json => format!("rspyts.internal.json_from_wire({expr})"),
         Ty::Ref { .. }
         | Ty::Option { .. }
         | Ty::List { .. }
@@ -1170,8 +1179,12 @@ fn error_data_codec(error_name: &str, variant: &rspyts_core::ir::ErrorVariantDec
         .filter(|field| field.required)
         .map(|field| py_string(&field.wire_name))
         .collect();
-    let mut out = codec_def_line(&function, "response: _rspyts.Response", "dict[str, object]");
-    out.push_str("    obj = _rspyts.map_from_wire(response)\n");
+    let mut out = codec_def_line(
+        &function,
+        "response: rspyts.internal.Response",
+        "dict[str, object]",
+    );
+    out.push_str("    obj = rspyts.internal.map_from_wire(response)\n");
     out.push_str(&set_operation_line(
         "    ",
         "unknown",
@@ -1219,7 +1232,7 @@ fn error_data_codec(error_name: &str, variant: &rspyts_core::ir::ErrorVariantDec
 
 fn error_codec_name(error_name: &str, variant_name: &str) -> String {
     format!(
-        "_decode_error_{}_{}",
+        "decode_error_{}_{}",
         py_name(error_name),
         py_name(variant_name)
     )
@@ -1267,9 +1280,9 @@ fn errors_py(manifest: &Manifest, fingerprint: &str, imports: &BTreeMap<String, 
         if has_data {
             out.push_str("\nimport typing\n");
         }
-        out.push_str("\nimport rspyts\nimport rspyts._internal as _rspyts\n");
+        out.push_str("\nimport rspyts\nimport rspyts.internal\n");
         if has_data {
-            out.push_str("\nfrom . import _codecs\n");
+            out.push_str("\nfrom . import codecs\n");
         }
     }
     for (module, names) in foreign {
@@ -1297,7 +1310,7 @@ fn errors_py(manifest: &Manifest, fingerprint: &str, imports: &BTreeMap<String, 
     for (name, _, variants) in &local {
         out.push_str("\n\n");
         out.push_str(&format!(
-            "{}: _rspyts.BridgeErrorRegistry = {{\n",
+            "{}: rspyts.internal.BridgeErrorRegistry = {{\n",
             py_error_registry_name(name)
         ));
         for variant in *variants {
@@ -1334,7 +1347,7 @@ fn error_class(name: &str, base: &str, docs: &str, codec: Option<String>) -> Str
         "    def __init__(self, message: str, *, code: str, data: typing.Any | None = None) -> None:\n",
     );
     out.push_str(&format!(
-        "        if data is not None:\n            data = _codecs.{codec}(_rspyts.Response(data))\n"
+        "        if data is not None:\n            data = codecs.{codec}(rspyts.internal.Response(data))\n"
     ));
     out.push_str("        super().__init__(message, code=code, data=data)\n");
     out
@@ -1348,8 +1361,8 @@ fn library_py(manifest: &Manifest, fingerprint: &str, library_search: &[String])
         "\"\"\"\nLoader for the compiled `{}` bridge library.\n\"\"\"\n",
         manifest.crate_name
     ));
-    out.push_str("\nimport pathlib\n\nimport rspyts\nimport rspyts._internal as _rspyts\n\n");
-    out.push_str("_rspyts.require_emitter_api(3)\n\n");
+    out.push_str("\nimport pathlib\n\nimport rspyts\nimport rspyts.internal\n\n");
+    out.push_str("rspyts.internal.require_emitter_api(4)\n\n");
     out.push_str("LIB = rspyts.Library(\n");
     out.push_str(&format!(
         "    name={},\n",
@@ -1744,9 +1757,9 @@ fn functions_py(manifest: &Manifest, fingerprint: &str, codecs: &CodecPlan) -> S
             out.push_str("\nimport numpy as np\n");
         }
         if body.contains("errors.") {
-            out.push_str("\nfrom . import _codecs, errors, library\n");
+            out.push_str("\nfrom . import codecs, errors, library\n");
         } else {
-            out.push_str("\nfrom . import _codecs, library\n");
+            out.push_str("\nfrom . import codecs, library\n");
         }
         if !model_imports.is_empty() {
             out.push_str(&wrap_from_import(
@@ -1779,7 +1792,7 @@ fn function_def(
         function.err.as_deref(),
     ));
     out.push_str(&format!(
-        "    return _codecs.{}(response)\n",
+        "    return codecs.{}(response)\n",
         codecs.decoder(&function.ret)
     ));
     out
@@ -1808,11 +1821,11 @@ fn classes_py(manifest: &Manifest, fingerprint: &str, codecs: &CodecPlan) -> Str
         if uses_numpy {
             out.push_str("import numpy as np\n");
         }
-        out.push_str("import rspyts._internal as _rspyts\n");
+        out.push_str("import rspyts.internal\n");
         if body.contains("errors.") {
-            out.push_str("\nfrom . import _codecs, errors, library\n");
+            out.push_str("\nfrom . import codecs, errors, library\n");
         } else {
-            out.push_str("\nfrom . import _codecs, library\n");
+            out.push_str("\nfrom . import codecs, library\n");
         }
         if !model_imports.is_empty() {
             out.push_str(&wrap_from_import(
@@ -1864,7 +1877,7 @@ fn class_def(
             false,
             constructor.err.as_deref(),
         ));
-        out.push_str("        self.handle = _rspyts.bounded_int_from_wire(\n            response, minimum=1, maximum=9007199254740991\n        )\n");
+        out.push_str("        self.handle = rspyts.internal.bounded_int_from_wire(\n            response, minimum=1, maximum=9007199254740991\n        )\n");
     } else {
         let hint = if factories.is_empty() {
             String::new()
@@ -1911,7 +1924,7 @@ fn class_def(
                 false,
                 static_decl.err.as_deref(),
             ));
-            out.push_str("        obj = cls.__new__(cls)\n        obj.handle = _rspyts.bounded_int_from_wire(\n            response, minimum=1, maximum=9007199254740991\n        )\n        return obj\n");
+            out.push_str("        obj = cls.__new__(cls)\n        obj.handle = rspyts.internal.bounded_int_from_wire(\n            response, minimum=1, maximum=9007199254740991\n        )\n        return obj\n");
         } else {
             out.push_str("    @staticmethod\n");
             let params = py_params(manifest, &static_decl.params, model_imports, uses_numpy);
@@ -1927,7 +1940,7 @@ fn class_def(
                 static_decl.err.as_deref(),
             ));
             out.push_str(&format!(
-                "        return _codecs.{}(response)\n",
+                "        return codecs.{}(response)\n",
                 codecs.decoder(&static_decl.ret)
             ));
         }
@@ -1958,7 +1971,7 @@ fn class_def(
             method.err.as_deref(),
         ));
         out.push_str(&format!(
-            "        return _codecs.{}(response)\n",
+            "        return codecs.{}(response)\n",
             codecs.decoder(&method.ret)
         ));
     }
@@ -2040,7 +2053,7 @@ fn call_block(
         .filter(|param| !matches!(param.ty, Ty::Slice { .. }))
         .map(|param| {
             format!(
-                "{}: _codecs.{}({})",
+                "{}: codecs.{}({})",
                 py_string(&param.wire_name),
                 codecs.encoder(&param.ty),
                 py_param_name(&param.name)
@@ -2266,24 +2279,24 @@ mod tests {
     }
 
     #[test]
-    fn emits_private_compact_codecs_and_one_call_path() {
+    fn emits_compact_codecs_and_one_call_path() {
         let files = emitted(&manifest());
-        let codecs = file(&files, "_codecs.py");
+        let codecs = file(&files, "codecs.py");
         let functions = file(&files, "functions.py");
         let init = file(&files, "__init__.py");
-        assert!(codecs.contains("import rspyts._internal as _rspyts"));
-        assert!(codecs.contains("def _encode_type_query_options"));
-        assert!(codecs.contains("def _decode_type_query_options"));
+        assert!(codecs.contains("import rspyts.internal"));
+        assert!(codecs.contains("def encode_type_query_options"));
+        assert!(codecs.contains("def decode_type_query_options"));
         assert!(functions.contains("library.LIB.call("));
         assert!(!functions.contains("call_raw"));
-        assert!(!init.contains("_codecs"));
+        assert!(!init.contains("codecs"));
     }
 
     #[test]
     fn named_refs_are_called_not_expanded_in_wrappers() {
         let files = emitted(&manifest());
         let functions = file(&files, "functions.py");
-        assert!(functions.contains("_codecs._encode_type_query_options(options)"));
+        assert!(functions.contains("codecs.encode_type_query_options(options)"));
         assert!(!functions.contains("model_dump"));
         assert!(!functions.contains("minimumValue"));
     }
@@ -2293,7 +2306,7 @@ mod tests {
         let files = emitted(&manifest());
         let models = file(&files, "models.py");
         assert!(!models.contains("_from_wire"));
-        assert!(!models.contains("_codecs"));
+        assert!(!models.contains("codecs"));
         assert!(models.contains("metadata: typing.Any"));
     }
 
@@ -2301,11 +2314,11 @@ mod tests {
     fn explicit_response_context_reaches_nested_attachments() {
         let manifest = binary_manifest();
         let files = emitted(&manifest);
-        let codecs = file(&files, "_codecs.py");
-        assert!(codecs.contains("_rspyts.bytes_from_wire"));
-        assert!(codecs.contains("_rspyts.buffer_from_wire"));
-        assert!(codecs.contains("_rspyts.list_from_wire"));
-        assert!(codecs.contains("_rspyts.map_from_wire"));
+        let codecs = file(&files, "codecs.py");
+        assert!(codecs.contains("rspyts.internal.bytes_from_wire"));
+        assert!(codecs.contains("rspyts.internal.buffer_from_wire"));
+        assert!(codecs.contains("rspyts.internal.list_from_wire"));
+        assert!(codecs.contains("rspyts.internal.map_from_wire"));
     }
 
     #[test]
@@ -2313,11 +2326,11 @@ mod tests {
         let manifest = exact_manifest();
         let files = emitted(&manifest);
         let models = file(&files, "models.py");
-        let codecs = file(&files, "_codecs.py");
+        let codecs = file(&files, "codecs.py");
         assert!(models.contains("delta: int"));
         assert!(!models.contains("rspyts.I64"));
-        assert!(codecs.contains("_rspyts.i64_to_wire"));
-        assert!(codecs.contains("_rspyts.u64_from_wire"));
+        assert!(codecs.contains("rspyts.internal.i64_to_wire"));
+        assert!(codecs.contains("rspyts.internal.u64_from_wire"));
     }
 
     #[test]
@@ -2326,7 +2339,7 @@ mod tests {
         let hash = manifest_hash(&manifest);
         let files = emit(&manifest, &hash, &["lib".to_string()], &BTreeMap::new());
         let library = file(&files, "library.py");
-        assert!(library.contains("_rspyts.require_emitter_api(3)"));
+        assert!(library.contains("rspyts.internal.require_emitter_api(4)"));
         assert!(library.contains(&format!("expected_contract_fingerprint={hash:?}")));
     }
 
@@ -2334,7 +2347,7 @@ mod tests {
     fn codecs_are_readable_instead_of_single_giant_lines() {
         let manifest = binary_manifest();
         let files = emitted(&manifest);
-        let codecs = file(&files, "_codecs.py");
+        let codecs = file(&files, "codecs.py");
         assert!(codecs.lines().all(|line| line.len() <= MAX_LINE_LENGTH));
         assert!(codecs.lines().count() > 40);
     }
@@ -2348,6 +2361,27 @@ mod tests {
                     longest <= MAX_LINE_LENGTH,
                     "{path} contains a {longest}-column generated line"
                 );
+            }
+        }
+    }
+
+    #[test]
+    fn generated_python_has_no_single_underscore_prefixes() {
+        for manifest in [manifest(), binary_manifest(), exact_manifest()] {
+            for (path, source) in emitted(&manifest) {
+                assert!(
+                    !path.starts_with('_') || path == "__init__.py",
+                    "generated Python filename {path:?} has a single-underscore prefix"
+                );
+                for identifier in source
+                    .split(|character: char| !character.is_ascii_alphanumeric() && character != '_')
+                {
+                    let is_dunder = identifier.starts_with("__") && identifier.ends_with("__");
+                    assert!(
+                        !identifier.starts_with('_') || is_dunder,
+                        "{path} contains the single-underscore identifier {identifier:?}"
+                    );
+                }
             }
         }
     }

@@ -1,6 +1,6 @@
 {
   "name": "rspyts",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "TypeScript/WebAssembly runtime for rspyts: define it in Rust, call it in Python and TypeScript.",
   "license": "MIT",
   "repository": {

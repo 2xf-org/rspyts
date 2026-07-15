@@ -44,7 +44,7 @@ import importlib.metadata
 import os
 
 import rspyts
-import rspyts._internal as internal
+from rspyts import internal
 
 expected = os.environ["RSPYTS_EXPECTED_VERSION"]
 assert importlib.metadata.version("rspyts") == expected

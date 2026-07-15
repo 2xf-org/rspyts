@@ -292,7 +292,7 @@ dependencies = [
 
 [[package]]
 name = "rspyts"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "inventory",
  "rspyts-core",
@@ -303,7 +303,7 @@ dependencies = [
 
 [[package]]
 name = "rspyts-cli"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "anyhow",
  "clap",
@@ -318,7 +318,7 @@ dependencies = [
 
 [[package]]
 name = "rspyts-core"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "inventory",
  "serde",
@@ -328,7 +328,7 @@ dependencies = [
 
 [[package]]
 name = "rspyts-macros"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "heck",
  "proc-macro2",

@@ -7,7 +7,7 @@ from typing import Any
 import numpy as np
 import pytest
 
-from rspyts import _internal, envelope
+from rspyts import envelope, internal
 
 
 def make_envelope(status: int, payload: Any, tail: bytes = b"") -> bytes:
@@ -23,13 +23,13 @@ def test_response_is_explicit_owned_value_and_tail_context():
     raw = make_envelope(0, {"value": [1, 2]}, b"tail")
     status, response = envelope.parse_envelope(raw)
     assert status == 0
-    assert type(response) is _internal.Response
+    assert type(response) is internal.Response
     assert response.value == {"value": [1, 2]}
     assert response.tail == b"tail"
     assert type(response.tail) is bytes
 
-    child = _internal.map_from_wire(response)["value"]
-    assert [item.value for item in _internal.list_from_wire(child)] == [1, 2]
+    child = internal.map_from_wire(response)["value"]
+    assert [item.value for item in internal.list_from_wire(child)] == [1, 2]
     assert child.tail is response.tail
 
 
@@ -53,22 +53,22 @@ def test_transparent_json_does_not_interpret_exact_attachment_shaped_objects():
     marker = placeholder(0, 8, "f64")
     status, response = envelope.parse_envelope(make_envelope(0, marker, b"not-a-valid-f64-tail"))
     assert status == 0
-    assert _internal.json_from_wire(response) == marker
+    assert internal.json_from_wire(response) == marker
 
-    payload = _internal.json_to_wire({"marker": marker, "__rspyts_json__": marker})
+    payload = internal.json_to_wire({"marker": marker, "__rspyts_json__": marker})
     request = envelope.decode_request(envelope.build_request({"value": payload}))
     assert request.value == {"value": payload}
     assert request.tail == b""
 
 
 def test_declared_buffer_still_validates_bounds_and_alignment():
-    aligned = _internal.Response(placeholder(0, 1, "f64"), np.array([1.5], dtype="<f8").tobytes())
-    np.testing.assert_array_equal(_internal.buffer_from_wire(aligned, dtype="f64"), [1.5])
+    aligned = internal.Response(placeholder(0, 1, "f64"), np.array([1.5], dtype="<f8").tobytes())
+    np.testing.assert_array_equal(internal.buffer_from_wire(aligned, dtype="f64"), [1.5])
 
     with pytest.raises(ValueError, match="not aligned"):
-        _internal.buffer_from_wire(_internal.Response(placeholder(1, 1, "f64"), b"\0" * 9), dtype="f64")
+        internal.buffer_from_wire(internal.Response(placeholder(1, 1, "f64"), b"\0" * 9), dtype="f64")
     with pytest.raises(ValueError, match="exceeds tail length"):
-        _internal.buffer_from_wire(_internal.Response(placeholder(0, 2, "f64"), b"\0" * 8), dtype="f64")
+        internal.buffer_from_wire(internal.Response(placeholder(0, 2, "f64"), b"\0" * 8), dtype="f64")
 
 
 @pytest.mark.parametrize(
@@ -88,11 +88,11 @@ def test_declared_buffer_still_validates_bounds_and_alignment():
 )
 def test_every_numeric_attachment_dtype_is_little_endian_and_owned(dt, np_dtype, items):
     values = np.array(items, dtype=np_dtype)
-    response = _internal.Response(
+    response = internal.Response(
         placeholder(0, len(items), dt),
         values.astype(values.dtype.newbyteorder("<")).tobytes(),
     )
-    decoded = _internal.buffer_from_wire(response, dtype=dt)
+    decoded = internal.buffer_from_wire(response, dtype=dt)
     assert decoded.dtype == np.dtype(np_dtype)
     assert decoded.flags.writeable
     assert decoded.flags.owndata
@@ -105,9 +105,9 @@ def test_bytes_and_u8_attachments_remain_distinct():
     )
     assert request.value["bytes"]["__rspyts_buf__"]["dt"] == "bytes"
     assert request.value["numeric"]["__rspyts_buf__"]["dt"] == "u8"
-    assert _internal.bytes_from_wire(request.child(request.value["bytes"])) == b"\x00\xff"
+    assert internal.bytes_from_wire(request.child(request.value["bytes"])) == b"\x00\xff"
     np.testing.assert_array_equal(
-        _internal.buffer_from_wire(request.child(request.value["numeric"]), dtype="u8"),
+        internal.buffer_from_wire(request.child(request.value["numeric"]), dtype="u8"),
         [3, 4],
     )
 
@@ -123,18 +123,18 @@ def test_bytes_and_u8_attachments_remain_distinct():
     ],
 )
 def test_malformed_declared_attachments_are_rejected(body, match):
-    response = _internal.Response({"__rspyts_buf__": body}, b"\0")
+    response = internal.Response({"__rspyts_buf__": body}, b"\0")
     with pytest.raises(ValueError, match=match):
-        _internal.buffer_from_wire(response, dtype="u8")
+        internal.buffer_from_wire(response, dtype="u8")
 
 
 def test_attachment_requires_exact_wrapper_and_expected_dtype():
     with pytest.raises(TypeError, match="attachment wrapper"):
-        _internal.buffer_from_wire(_internal.Response({"other": 1}, b""), dtype="u8")
+        internal.buffer_from_wire(internal.Response({"other": 1}, b""), dtype="u8")
     with pytest.raises(TypeError, match="expected a u8"):
-        _internal.buffer_from_wire(_internal.Response(placeholder(0, 1, "i8"), b"\0"), dtype="u8")
+        internal.buffer_from_wire(internal.Response(placeholder(0, 1, "i8"), b"\0"), dtype="u8")
     with pytest.raises(ValueError, match="unsupported buffer dtype"):
-        _internal.buffer_from_wire(_internal.Response(placeholder(0, 1, "u8"), b"\0"), dtype="f16")
+        internal.buffer_from_wire(internal.Response(placeholder(0, 1, "u8"), b"\0"), dtype="f16")
 
 
 def test_request_encoding_aligns_nested_attachments_and_rejects_coercion():
@@ -204,4 +204,4 @@ def test_envelope_status_reserved_lengths_and_json_are_strict():
 
 def test_response_rejects_borrowed_or_mutable_tail_context():
     with pytest.raises(TypeError, match="owned bytes"):
-        _internal.Response(None, bytearray())  # ty: ignore[invalid-argument-type]
+        internal.Response(None, bytearray())  # ty: ignore[invalid-argument-type]
