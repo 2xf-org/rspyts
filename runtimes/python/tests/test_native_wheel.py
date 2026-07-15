@@ -461,6 +461,45 @@ def test_windows_dependency_audit_uses_system_resolution(
         native_wheel.validate_system_dependencies(artifact, "x86_64-pc-windows-msvc")
 
 
+def test_windows_dependency_reader_closes_pe_image(monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path) -> None:
+    class Entry:
+        dll = b"KERNEL32.dll"
+
+    class Image:
+        def __init__(self) -> None:
+            self.DIRECTORY_ENTRY_IMPORT = [Entry()]
+            self.DIRECTORY_ENTRY_DELAY_IMPORT: list[Entry] = []
+            self.closed = False
+
+        def parse_data_directories(self, *, directories: list[int]) -> None:
+            assert directories == [1, 2]
+
+        def close(self) -> None:
+            self.closed = True
+
+    class Pefile:
+        def __init__(self, image: Image) -> None:
+            self.DIRECTORY_ENTRY = {
+                "IMAGE_DIRECTORY_ENTRY_IMPORT": 1,
+                "IMAGE_DIRECTORY_ENTRY_DELAY_IMPORT": 2,
+            }
+            self.image = image
+
+        def PE(self, path: str, *, fast_load: bool) -> Image:  # noqa: N802 - matches pefile's API
+            assert pathlib.Path(path) == artifact
+            assert fast_load is True
+            return self.image
+
+    artifact = tmp_path / "demo.dll"
+    artifact.write_bytes(b"native")
+    image = Image()
+    pefile = Pefile(image)
+    monkeypatch.setattr(native_wheel.importlib, "import_module", lambda name: pefile)
+
+    assert native_wheel.read_windows_dependencies(artifact) == {"kernel32.dll"}
+    assert image.closed is True
+
+
 def test_stage_cleanup_is_narrow(tmp_path: pathlib.Path) -> None:
     project = tmp_path / "project"
     stage = native_wheel.wheel_stage_dir(project, pathlib.Path("dist"))
