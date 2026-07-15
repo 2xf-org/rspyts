@@ -11,6 +11,7 @@ __pycache__/
 .ruff_cache/
 dist/
 *.egg-info/
+/examples/**/python/src/**/generated/lib/
 
 # Node
 node_modules/

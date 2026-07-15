@@ -2,14 +2,19 @@
 End-to-end tests: Python → ctypes → Rust cdylib → envelope → pydantic.
 
 Notes:
-    Requires the native library: ``cargo build -p basic-example`` (the
-    generated ``library.py`` searches ``target/{debug,release}``; override
-    with the ``RSPYTS_LIBRARY`` env var, which CI sets explicitly).
+    Requires ``rspyts build --config examples/basic/rspyts.toml``. The host
+    library is staged beside the generated package and loads without an
+    ``RSPYTS_LIBRARY_BASIC_EXAMPLE`` override.
 """
 
 import concurrent.futures
+import copy
 import json
+import os
+import pickle
 import re
+import subprocess
+import sys
 import threading
 from pathlib import Path
 
@@ -21,6 +26,26 @@ import rspyts
 import basic_example as bx
 
 SCHEMA_PATH = Path(__file__).parents[2] / "schema" / "schema.json"
+
+
+def test_source_package_loads_staged_library_without_environment_override():
+    env = os.environ.copy()
+    env.pop("RSPYTS_LIBRARY_BASIC_EXAMPLE", None)
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import numpy as np; import basic_example as bx; "
+                "assert bx.summarize(np.array([2.0, 4.0]), None).average == 3.0"
+            ),
+        ],
+        check=False,
+        capture_output=True,
+        env=env,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr
 
 
 class TestSummarize:
@@ -78,7 +103,7 @@ class TestScale:
     def test_non_finite_scalars_fail_fast_client_side(self):
         # JSON has no Infinity/NaN; the bridge rejects them before the call
         # (raw slice and Buf payloads carry non-finite values just fine).
-        with pytest.raises(ValueError, match="non-finite"):
+        with pytest.raises(ValueError, match="finite"):
             bx.scale(np.array([1.0]), float("inf"))
 
 
@@ -99,6 +124,8 @@ class TestBinaryAttachments:
             channels={
                 "red": np.array([0, 127, 255], dtype=np.uint8),
                 "empty": np.array([], dtype=np.uint8),
+                "__rspyts_buf__": np.array([7, 8], dtype=np.uint8),
+                "__rspyts_json__": np.array([9], dtype=np.uint8),
             },
         )
 
@@ -114,10 +141,14 @@ class TestBinaryAttachments:
         assert out.channels["red"].dtype == np.uint8
         np.testing.assert_array_equal(out.channels["red"], [0, 127, 255])
         assert out.channels["empty"].size == 0
+        np.testing.assert_array_equal(out.channels["__rspyts_buf__"], [7, 8])
+        np.testing.assert_array_equal(out.channels["__rspyts_json__"], [9])
 
         assert out.samples is not packet.samples
         assert out.chunks[0] is not packet.chunks[0]
         assert out.channels["red"] is not packet.channels["red"]
+        assert out.channels["__rspyts_buf__"] is not packet.channels["__rspyts_buf__"]
+        assert out.channels["__rspyts_json__"] is not packet.channels["__rspyts_json__"]
         packet.samples[0] = 99.0
         packet.chunks[0][0] = 99
         packet.channels["red"][0] = 99
@@ -159,12 +190,16 @@ class TestExactIntegers:
         value = bx.ExactNumbers(
             signed=-(2**63),
             unsigned=2**64 - 1,
+            transfer_id=2**64 - 1,
             pair=(2**53 + 1, 2**64 - 1),
             history=[0, 2**53 + 1, 2**64 - 1],
+            by_name={"minimum": -(2**63)},
         )
         out = bx.echo_exact_numbers(value)
         assert out == value
+        assert out.transfer_id == 2**64 - 1
         assert out.pair == (2**53 + 1, 2**64 - 1)
+        assert out.by_name == {"minimum": -(2**63)}
         assert bx.echo_exact_pair((2**63 - 1, 2**64 - 1)) == (2**63 - 1, 2**64 - 1)
 
     def test_out_of_range_values_fail_before_the_native_call(self):
@@ -195,14 +230,27 @@ class TestMixedEnums:
         assert isinstance(pending, bx.TransferStatePending)
         assert pending.model_dump(by_alias=True) == {"type": "pending"}
 
-        complete = bx.echo_transfer_state(bx.TransferStateComplete(sequence=2**64 - 1))
+        complete = bx.echo_transfer_state(bx.TransferStateComplete(sequence=2**64 - 1, receipt=None))
         assert isinstance(complete, bx.TransferStateComplete)
         assert complete.sequence == 2**64 - 1
+
+    def test_required_nullable_variant_field_rejects_omission(self):
+        with pytest.raises(pydantic.ValidationError):
+            bx.TransferStateComplete(sequence=1)
 
 
 class TestAnnotate:
     def test_json_dict_round_trips_untouched(self):
-        metadata = {"source": "fixture", "nested": {"tags": ["a", "b"], "rev": 2}, "empty": None}
+        marker = {"__rspyts_buf__": {"off": 0, "len": 1, "dt": "u8"}}
+        metadata = {
+            "source": "fixture",
+            "nested": {"tags": ["a", "b"], "rev": 2},
+            "markerShapes": {
+                "buffer": marker,
+                "json": {"__rspyts_json__": marker},
+            },
+            "empty": None,
+        }
         out = bx.annotate(2.5, metadata)
         assert out == {**metadata, "value": 2.5}
 
@@ -297,6 +345,17 @@ class TestCounter:
         counter.close()
         counter.close()
 
+    def test_handle_ownership_rejects_copying_and_pickling(self):
+        counter = bx.Counter(0, "owned")
+        try:
+            for operation in [copy.copy, copy.deepcopy, pickle.dumps]:
+                with pytest.raises(TypeError, match="owns a Rust handle"):
+                    operation(counter)
+            with pytest.raises(TypeError, match="owns a Rust handle"):
+                counter.__reduce__()
+        finally:
+            counter.close()
+
     def test_instances_are_independent(self):
         a = bx.Counter(0, "a")
         b = bx.Counter(100, "b")
@@ -321,7 +380,9 @@ class TestPanics:
 
 class TestContractValidation:
     def test_camel_case_aliases(self):
-        summary = bx.Summary.model_validate({"itemCount": 3, "total": 12.0, "average": 4.0, "label": None})
+        summary = bx.Summary.model_validate(
+            {"itemCount": 3, "total": 12.0, "average": 4.0, "label": None, "source": None}
+        )
         assert summary.item_count == 3
 
     def test_unknown_fields_rejected(self):

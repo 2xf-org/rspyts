@@ -106,8 +106,7 @@ fn object_schema(def: &mut Map<String, Value>, tag: Option<(&str, &str)>, fields
         add_description(&mut prop, &f.docs);
         extend_with(&mut prop, ty_schema(&f.ty));
         properties.insert(f.wire_name.clone(), Value::Object(prop));
-        // Optional fields may be omitted on input (they default to null).
-        if !(f.optional || matches!(f.ty, Ty::Option { .. })) {
+        if f.required {
             required.push(json!(f.wire_name.clone()));
         }
     }
@@ -164,7 +163,10 @@ fn ty_schema(ty: &Ty) -> Value {
         Ty::String => json!({"type": "string"}),
         Ty::Bytes => attachment_schema("bytes"),
         Ty::Unit => json!({"type": "null"}),
-        Ty::Option { inner } => json!({"anyOf": [ty_schema(inner), {"type": "null"}]}),
+        Ty::Null => json!({"type": "null"}),
+        Ty::Option { inner } => {
+            json!({"anyOf": [ty_schema(inner), {"type": "null"}]})
+        }
         Ty::List { inner } => {
             let mut map = Map::new();
             map.insert("type".to_string(), json!("array"));
@@ -411,6 +413,50 @@ mod tests {
         let v = ty_schema(&Ty::I16);
         assert_eq!(v["minimum"], -32768);
         assert_eq!(v["maximum"], 32767);
+    }
+
+    #[test]
+    fn nullable_property_allows_null_but_remains_required() {
+        let fields = vec![
+            FieldDecl {
+                name: "omittable".to_string(),
+                wire_name: "omittable".to_string(),
+                docs: String::new(),
+                ty: Ty::Option {
+                    inner: Box::new(Ty::String),
+                },
+                required: false,
+            },
+            FieldDecl {
+                name: "required_nullable".to_string(),
+                wire_name: "requiredNullable".to_string(),
+                docs: String::new(),
+                ty: Ty::Option {
+                    inner: Box::new(Ty::U64),
+                },
+                required: true,
+            },
+            FieldDecl {
+                name: "unavailable".to_string(),
+                wire_name: "unavailable".to_string(),
+                docs: String::new(),
+                ty: Ty::Null,
+                required: true,
+            },
+        ];
+        let mut definition = Map::new();
+        object_schema(&mut definition, None, &fields);
+        let schema = Value::Object(definition);
+
+        assert_eq!(
+            schema["required"],
+            json!(["requiredNullable", "unavailable"])
+        );
+        assert_eq!(
+            schema["properties"]["requiredNullable"]["anyOf"][1],
+            json!({"type": "null"})
+        );
+        assert_eq!(schema["properties"]["unavailable"], json!({"type": "null"}));
     }
 
     #[test]

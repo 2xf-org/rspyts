@@ -1,0 +1,11 @@
+error: bridged instance methods `read_value` and `read__value` both project to TypeScript member `readValue`; rename one or give them disjoint target scopes
+  --> tests/ui/typescript_member_projection_collision.rs:14:12
+   |
+14 |     pub fn read__value(&self) {}
+   |            ^^^^^^^^^^^
+
+error: `constructor` does not apply to this item; it marks the constructor method inside a #[bridge] impl block
+ --> tests/ui/typescript_member_projection_collision.rs:7:14
+  |
+7 |     #[bridge(constructor)]
+  |              ^^^^^^^^^^^

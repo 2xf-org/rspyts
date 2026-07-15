@@ -3,9 +3,8 @@
 //! ```text
 //! rspyts generate [build options]   build host → dlopen → emit
 //! rspyts check    [build options]   same, but diff (CI gate)
-//! rspyts build    [build options]   stage host + configured targets
+//! rspyts build    [build options]   build and stage selected artifacts
 //! rspyts manifest [build options]   print the canonical manifest JSON
-//! rspyts diff <old> <new>           classify manifest compatibility
 //! rspyts init                       write a starter rspyts.toml
 //! ```
 //!
@@ -14,13 +13,12 @@
 
 mod build;
 mod config;
-mod diff;
 mod emit;
-mod exclude;
 mod load;
 mod validate;
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
+use serde::Serialize;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -38,7 +36,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Build the crate and (re)write all enabled outputs.
+    /// Build the crate and (re)write all configured outputs.
     Generate {
         /// Path to rspyts.toml (default: ./rspyts.toml).
         #[arg(long, default_value = "rspyts.toml")]
@@ -54,19 +52,22 @@ enum Command {
         #[command(flatten)]
         build: CargoOptions,
     },
-    /// Build and stage host plus configured target artifacts.
+    /// Build and stage the host or explicit Rust targets.
     Build {
         /// Path to rspyts.toml (default: ./rspyts.toml).
         #[arg(long, default_value = "rspyts.toml")]
         config: PathBuf,
         #[command(flatten)]
         build: CargoOptions,
-        /// Replace configured build targets (repeat or comma-separate).
-        #[arg(long = "target", value_delimiter = ',', conflicts_with = "no_targets")]
+        /// Artifact to build: `host` or a Rust target triple. Repeat to build several. Defaults to `host`.
+        #[arg(long = "target", value_name = "host|TRIPLE", value_delimiter = ',')]
         targets: Vec<String>,
-        /// Build only the host, overriding configured targets.
-        #[arg(long, conflicts_with = "targets")]
-        no_targets: bool,
+        /// Stage the selected artifact in this directory instead of the default package/Cargo location. Requires one target.
+        #[arg(long, value_name = "DIR")]
+        out_dir: Option<PathBuf>,
+        /// Select human-readable text or a versioned JSON report on stdout.
+        #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
+        output_format: OutputFormat,
     },
     /// Build the host module and print its complete canonical manifest JSON.
     Manifest {
@@ -75,16 +76,6 @@ enum Command {
         config: PathBuf,
         #[command(flatten)]
         build: CargoOptions,
-    },
-    /// Conservatively classify compatibility between two manifest snapshots.
-    Diff {
-        /// Previous complete manifest JSON.
-        old: PathBuf,
-        /// New complete manifest JSON.
-        new: PathBuf,
-        /// Which class of change should make the command exit 1.
-        #[arg(long, value_enum, default_value_t = FailOn::Breaking)]
-        fail_on: FailOn,
     },
     /// Write a commented starter rspyts.toml.
     Init {
@@ -95,75 +86,40 @@ enum Command {
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, ValueEnum)]
-enum FailOn {
+enum OutputFormat {
     #[default]
-    Breaking,
-    Any,
+    Text,
+    Json,
 }
 
 #[derive(Args, Clone, Debug, Default)]
 struct CargoOptions {
     /// Replace configured Cargo features (comma/space-separated).
-    #[arg(long, value_name = "FEATURES", conflicts_with = "no_features")]
+    #[arg(long, value_name = "FEATURES")]
     features: Option<String>,
-    /// Disable every configured feature.
-    #[arg(long, conflicts_with = "features")]
-    no_features: bool,
     /// Disable Cargo default features.
-    #[arg(long, conflicts_with = "default_features")]
+    #[arg(long)]
     no_default_features: bool,
-    /// Enable Cargo default features, overriding config.
-    #[arg(long, conflicts_with = "no_default_features")]
-    default_features: bool,
-    /// Replace the configured Cargo profile.
-    #[arg(long, value_name = "NAME", conflicts_with = "release")]
-    profile: Option<String>,
-    /// Shorthand for --profile release.
-    #[arg(long, conflicts_with = "profile")]
+    /// Build with Cargo's release profile.
+    #[arg(long)]
     release: bool,
     /// Pass --locked to Cargo.
-    #[arg(long, conflicts_with = "unlocked")]
+    #[arg(long)]
     locked: bool,
-    /// Do not pass --locked, overriding config.
-    #[arg(long, conflicts_with = "locked")]
-    unlocked: bool,
 }
 
 impl CargoOptions {
-    fn overrides(&self, targets: Option<Vec<String>>) -> anyhow::Result<build::BuildOverrides> {
-        let features = if self.no_features {
-            Some(Vec::new())
-        } else {
-            self.features
-                .as_deref()
-                .map(build::parse_features)
-                .transpose()?
-        };
-        let no_default_features = if self.no_default_features {
-            Some(true)
-        } else if self.default_features {
-            Some(false)
-        } else {
-            None
-        };
-        let profile = if self.release {
-            Some("release".to_string())
-        } else {
-            self.profile.clone()
-        };
-        let locked = if self.locked {
-            Some(true)
-        } else if self.unlocked {
-            Some(false)
-        } else {
-            None
-        };
+    fn overrides(&self) -> anyhow::Result<build::BuildOverrides> {
+        let features = self
+            .features
+            .as_deref()
+            .map(build::parse_features)
+            .transpose()?;
         Ok(build::BuildOverrides {
             features,
-            no_default_features,
-            profile,
-            targets,
-            locked,
+            no_default_features: self.no_default_features.then_some(true),
+            profile: self.release.then(|| "release".to_string()),
+            locked: self.locked.then_some(true),
         })
     }
 }
@@ -198,10 +154,10 @@ fn main() -> ExitCode {
             config,
             build,
             targets,
-            no_targets,
-        } => run_build(&config, &build, targets, no_targets),
+            out_dir,
+            output_format,
+        } => run_build(&config, &build, targets, out_dir.as_deref(), output_format),
         Command::Manifest { config, build } => run_manifest(&config, &build),
-        Command::Diff { old, new, fail_on } => run_diff(&old, &new, fail_on),
         Command::Init { dir } => run_init(&dir),
     };
     match result {
@@ -223,8 +179,8 @@ enum Mode {
 fn run_pipeline(config_path: &Path, cli_build: &CargoOptions, mode: Mode) -> Result<(), Failure> {
     let cfg = config::load(config_path).map_err(Failure::config)?;
     let options = cfg
-        .build
-        .with_overrides(cli_build.overrides(None).map_err(Failure::config)?)
+        .contract
+        .build_options(cli_build.overrides().map_err(Failure::config)?)
         .map_err(Failure::config)?;
     if cfg.python.is_none() && cfg.typescript.is_none() && cfg.schema.is_none() {
         return Err(Failure::config(anyhow::anyhow!(
@@ -240,15 +196,9 @@ fn run_pipeline(config_path: &Path, cli_build: &CargoOptions, mode: Mode) -> Res
         meta.version,
         options.profile_dir()
     );
-    if !options.targets.is_empty() {
-        eprintln!(
-            "warning: [build].targets is ignored by generate/check; run `rspyts build` to stage {} configured target(s)",
-            options.targets.len()
-        );
-    }
-    let artifact =
+    let host_artifact =
         build::build_host_cdylib(&cfg.crate_dir, &meta.name, &options).map_err(Failure::build)?;
-    let loaded = load::load_manifest(&artifact).map_err(Failure::build)?;
+    let loaded = load::load_manifest(&host_artifact).map_err(Failure::build)?;
     validate::validate(&loaded.manifest).map_err(Failure::build)?;
     eprintln!(
         "loaded manifest: {} type(s), {} constant(s), {} function(s), {} class(es)",
@@ -258,9 +208,8 @@ fn run_pipeline(config_path: &Path, cli_build: &CargoOptions, mode: Mode) -> Res
         loaded.manifest.classes.len()
     );
 
-    let hash = emit::util::manifest_hash_hex(&loaded.json);
-    // A bad exclude list is a config problem, hence exit code 2.
-    let plan = emit::plan(&cfg, &loaded.manifest, &hash).map_err(Failure::config)?;
+    let hash = emit::util::manifest_hash_hex(&loaded.manifest);
+    let plan = emit::plan(&cfg, &loaded.manifest, &hash);
     match mode {
         Mode::Generate => emit::write(&plan).map_err(Failure::build),
         Mode::Check => match emit::check(&plan).map_err(Failure::build)? {
@@ -277,45 +226,140 @@ fn run_build(
     config_path: &Path,
     cli_build: &CargoOptions,
     targets: Vec<String>,
-    no_targets: bool,
+    out_dir: Option<&Path>,
+    output_format: OutputFormat,
 ) -> Result<(), Failure> {
     let cfg = config::load(config_path).map_err(Failure::config)?;
-    let target_override = if no_targets {
-        Some(Vec::new())
-    } else if targets.is_empty() {
-        None
-    } else {
-        Some(targets)
-    };
     let options = cfg
-        .build
-        .with_overrides(
-            cli_build
-                .overrides(target_override)
-                .map_err(Failure::config)?,
-        )
+        .contract
+        .build_options(cli_build.overrides().map_err(Failure::config)?)
         .map_err(Failure::config)?;
+    let mut selection = build::BuildSelection::new(targets).map_err(Failure::config)?;
+    if selection.include_host && !selection.targets.is_empty() {
+        let host = build::rustc_host().map_err(Failure::build)?;
+        selection.deduplicate_included_host(&host);
+    }
+    if out_dir.is_some() && selection.artifact_count() != 1 {
+        return Err(Failure::config(anyhow::anyhow!(
+            "`--out-dir` requires exactly one selected build target"
+        )));
+    }
     let meta = build::crate_meta(&cfg.crate_dir).map_err(Failure::config)?;
     eprintln!(
-        "building and staging `{}` v{} ({}, {} additional target(s))",
+        "building and staging `{}` v{} ({}, {} artifact(s))",
         meta.name,
         meta.version,
         options.profile_dir(),
-        options.targets.len()
+        selection.artifact_count()
     );
-    let artifacts =
-        build::build_and_stage(&cfg.crate_dir, &meta.name, &options).map_err(Failure::build)?;
-    for artifact in artifacts {
-        println!("staged     {}", artifact.display());
+    let python_out = cfg.python.as_ref().map(|python| python.out.as_path());
+    let artifacts = build::build_and_stage(
+        &cfg.crate_dir,
+        &meta.name,
+        &options,
+        &selection,
+        python_out,
+        out_dir,
+    )
+    .map_err(Failure::build)?;
+    match output_format {
+        OutputFormat::Text => {
+            for artifact in artifacts {
+                println!("staged     {}", artifact.path.display());
+            }
+        }
+        OutputFormat::Json => write_build_report(&cfg, &meta, &options, &artifacts)?,
     }
+    Ok(())
+}
+
+const BUILD_REPORT_FORMAT_VERSION: u8 = 1;
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct BuildReport<'a> {
+    format_version: u8,
+    #[serde(rename = "crate")]
+    krate: CrateReport<'a>,
+    build: ResolvedBuildReport<'a>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    python: Option<PythonReport<'a>>,
+    artifacts: &'a [build::StagedArtifact],
+}
+
+#[derive(Debug, Serialize)]
+struct CrateReport<'a> {
+    name: &'a str,
+    version: &'a str,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ResolvedBuildReport<'a> {
+    features: &'a [String],
+    no_default_features: bool,
+    profile: &'a str,
+    locked: bool,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PythonReport<'a> {
+    out: &'a Path,
+}
+
+fn build_report<'a>(
+    cfg: &'a config::Config,
+    meta: &'a build::CrateMeta,
+    options: &'a build::BuildOptions,
+    artifacts: &'a [build::StagedArtifact],
+) -> BuildReport<'a> {
+    BuildReport {
+        format_version: BUILD_REPORT_FORMAT_VERSION,
+        krate: CrateReport {
+            name: &meta.name,
+            version: &meta.version,
+        },
+        build: ResolvedBuildReport {
+            features: &options.features,
+            no_default_features: options.no_default_features,
+            profile: &options.profile,
+            locked: options.locked,
+        },
+        python: cfg
+            .python
+            .as_ref()
+            .map(|python| PythonReport { out: &python.out }),
+        artifacts,
+    }
+}
+
+fn write_build_report(
+    cfg: &config::Config,
+    meta: &build::CrateMeta,
+    options: &build::BuildOptions,
+    artifacts: &[build::StagedArtifact],
+) -> Result<(), Failure> {
+    let stdout = std::io::stdout();
+    let mut output = std::io::BufWriter::new(stdout.lock());
+    serde_json::to_writer_pretty(&mut output, &build_report(cfg, meta, options, artifacts))
+        .map_err(|error| {
+            Failure::build(anyhow::Error::new(error).context("cannot serialize build report"))
+        })?;
+    writeln!(output).map_err(|error| {
+        Failure::build(anyhow::Error::new(error).context("cannot write build report to stdout"))
+    })?;
+    output.flush().map_err(|error| {
+        Failure::build(anyhow::Error::new(error).context("cannot flush build report to stdout"))
+    })?;
     Ok(())
 }
 
 fn run_manifest(config_path: &Path, cli_build: &CargoOptions) -> Result<(), Failure> {
     let cfg = config::load(config_path).map_err(Failure::config)?;
     let options = cfg
-        .build
-        .with_overrides(cli_build.overrides(None).map_err(Failure::config)?)
+        .contract
+        .build_options(cli_build.overrides().map_err(Failure::config)?)
         .map_err(Failure::config)?;
     let meta = build::crate_meta(&cfg.crate_dir).map_err(Failure::config)?;
     eprintln!(
@@ -324,14 +368,9 @@ fn run_manifest(config_path: &Path, cli_build: &CargoOptions) -> Result<(), Fail
         meta.version,
         options.profile_dir()
     );
-    if !options.targets.is_empty() {
-        eprintln!(
-            "warning: [build].targets is ignored by manifest; only the host module can be loaded"
-        );
-    }
-    let artifact =
+    let host_artifact =
         build::build_host_cdylib(&cfg.crate_dir, &meta.name, &options).map_err(Failure::build)?;
-    let loaded = load::load_manifest(&artifact).map_err(Failure::build)?;
+    let loaded = load::load_manifest(&host_artifact).map_err(Failure::build)?;
     validate::validate(&loaded.manifest).map_err(Failure::build)?;
 
     let stdout = std::io::stdout();
@@ -345,37 +384,6 @@ fn run_manifest(config_path: &Path, cli_build: &CargoOptions) -> Result<(), Fail
     Ok(())
 }
 
-fn run_diff(old_path: &Path, new_path: &Path, fail_on: FailOn) -> Result<(), Failure> {
-    let old = diff::read_manifest(old_path).map_err(Failure::build)?;
-    let new = diff::read_manifest(new_path).map_err(Failure::build)?;
-    validate::validate(&old).map_err(|error| {
-        Failure::build(error.context(format!(
-            "old input `{}` is not a valid manifest",
-            old_path.display()
-        )))
-    })?;
-    validate::validate(&new).map_err(|error| {
-        Failure::build(error.context(format!(
-            "new input `{}` is not a valid manifest",
-            new_path.display()
-        )))
-    })?;
-
-    let report = diff::compare(&old, &new);
-    print!("{}", report.render());
-    let fail_on_any = fail_on == FailOn::Any;
-    if diff::exit_code(&report, fail_on_any) == 1 {
-        return Err(Failure {
-            code: 1,
-            error: anyhow::anyhow!(
-                "manifest changes violate the selected `{}` compatibility policy",
-                if fail_on_any { "any" } else { "breaking" }
-            ),
-        });
-    }
-    Ok(())
-}
-
 fn run_init(dir: &Path) -> Result<(), Failure> {
     let path = config::init(dir).map_err(Failure::config)?;
     println!("wrote      {}", path.display());
@@ -385,33 +393,10 @@ fn run_init(dir: &Path) -> Result<(), Failure> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     #[test]
-    fn paired_cli_flags_produce_explicit_false_overrides() {
-        let cli = Cli::try_parse_from([
-            "rspyts",
-            "build",
-            "--no-features",
-            "--default-features",
-            "--unlocked",
-            "--no-targets",
-        ])
-        .unwrap();
-        let Command::Build {
-            build, no_targets, ..
-        } = cli.command
-        else {
-            panic!("expected build command")
-        };
-        let overrides = build.overrides(Some(Vec::new())).unwrap();
-        assert_eq!(overrides.features, Some(Vec::new()));
-        assert_eq!(overrides.no_default_features, Some(false));
-        assert_eq!(overrides.locked, Some(false));
-        assert!(no_targets);
-    }
-
-    #[test]
-    fn release_features_and_targets_parse_as_replacements() {
+    fn positive_build_options_and_targets_parse() {
         let cli = Cli::try_parse_from([
             "rspyts",
             "build",
@@ -426,63 +411,159 @@ mod tests {
         let Command::Build { build, targets, .. } = cli.command else {
             panic!("expected build command")
         };
-        let overrides = build.overrides(Some(targets)).unwrap();
+        let overrides = build.overrides().unwrap();
         assert_eq!(
             overrides.features,
             Some(vec!["serde".into(), "fast".into()])
         );
         assert_eq!(overrides.profile.as_deref(), Some("release"));
         assert_eq!(overrides.locked, Some(true));
-        assert_eq!(overrides.targets.as_ref().unwrap().len(), 2);
+        assert_eq!(targets.len(), 2);
     }
 
     #[test]
-    fn conflicting_cli_overrides_are_rejected_by_clap() {
-        for args in [
-            vec!["rspyts", "check", "--release", "--profile", "dev"],
-            vec!["rspyts", "check", "--locked", "--unlocked"],
-            vec![
-                "rspyts",
-                "build",
-                "--target",
-                "wasm32-unknown-unknown",
-                "--no-targets",
-            ],
-        ] {
-            assert!(Cli::try_parse_from(args).is_err());
-        }
-    }
-
-    #[test]
-    fn diff_fail_policy_parses_with_equals_or_space() {
-        for args in [
-            vec!["rspyts", "diff", "old.json", "new.json", "--fail-on=any"],
-            vec!["rspyts", "diff", "old.json", "new.json", "--fail-on", "any"],
-        ] {
-            let cli = Cli::try_parse_from(args).unwrap();
-            assert!(matches!(
-                cli.command,
-                Command::Diff {
-                    fail_on: FailOn::Any,
-                    ..
-                }
-            ));
-        }
-    }
-
-    #[test]
-    fn diff_defaults_to_breaking_and_rejects_unknown_policy() {
-        let cli = Cli::try_parse_from(["rspyts", "diff", "old.json", "new.json"]).unwrap();
+    fn build_output_format_defaults_to_text_and_accepts_json() {
+        let cli = Cli::try_parse_from(["rspyts", "build"]).unwrap();
         assert!(matches!(
             cli.command,
-            Command::Diff {
-                fail_on: FailOn::Breaking,
+            Command::Build {
+                output_format: OutputFormat::Text,
                 ..
             }
         ));
-        assert!(
-            Cli::try_parse_from(["rspyts", "diff", "old.json", "new.json", "--fail-on=minor"])
-                .is_err()
+
+        let cli = Cli::try_parse_from(["rspyts", "build", "--output-format", "json"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Build {
+                output_format: OutputFormat::Json,
+                ..
+            }
+        ));
+        assert!(Cli::try_parse_from(["rspyts", "build", "--output-format", "xml"]).is_err());
+    }
+
+    #[test]
+    fn target_and_output_selection_are_positive() {
+        let cli = Cli::try_parse_from([
+            "rspyts",
+            "build",
+            "--target",
+            "wasm32-unknown-unknown",
+            "--out-dir",
+            "dist",
+        ])
+        .unwrap();
+        let Command::Build {
+            targets, out_dir, ..
+        } = cli.command
+        else {
+            panic!("expected build command")
+        };
+        assert_eq!(targets, ["wasm32-unknown-unknown"]);
+        assert_eq!(out_dir.as_deref(), Some(Path::new("dist")));
+
+        for removed in [
+            ["rspyts", "check", "--no-python-stage"].as_slice(),
+            ["rspyts", "manifest", "--no-python-stage"].as_slice(),
+            ["rspyts", "build", "--no-host"].as_slice(),
+            ["rspyts", "build", "--no-targets"].as_slice(),
+            ["rspyts", "check", "--unlocked"].as_slice(),
+            ["rspyts", "check", "--default-features"].as_slice(),
+        ] {
+            assert!(Cli::try_parse_from(removed).is_err(), "{removed:?}");
+        }
+    }
+
+    #[test]
+    fn json_build_report_has_a_versioned_machine_readable_shape() {
+        let cfg = config::Config {
+            crate_dir: PathBuf::from("/workspace/crate"),
+            python: Some(config::PythonConfig {
+                out: PathBuf::from("/workspace/python/generated"),
+                imports: Default::default(),
+            }),
+            typescript: None,
+            schema: None,
+            contract: build::ContractOptions::default(),
+        };
+        let meta = build::CrateMeta {
+            name: "demo-crate".into(),
+            version: "1.2.3".into(),
+        };
+        let options = build::BuildOptions::new(
+            vec!["serde".into(), "fast".into()],
+            true,
+            "release".into(),
+            true,
+        )
+        .unwrap();
+        let artifacts = vec![
+            build::StagedArtifact {
+                kind: build::ArtifactKind::Native,
+                target: "aarch64-apple-darwin".into(),
+                path: PathBuf::from("/workspace/python/generated/lib/libdemo_crate.dylib"),
+            },
+            build::StagedArtifact {
+                kind: build::ArtifactKind::Target,
+                target: "wasm32-unknown-unknown".into(),
+                path: PathBuf::from(
+                    "/workspace/target/rspyts/wasm32-unknown-unknown/release/demo_crate.wasm",
+                ),
+            },
+        ];
+
+        assert_eq!(
+            serde_json::to_value(build_report(&cfg, &meta, &options, &artifacts)).unwrap(),
+            json!({
+                "formatVersion": 1,
+                "crate": {"name": "demo-crate", "version": "1.2.3"},
+                "build": {
+                    "features": ["serde", "fast"],
+                    "noDefaultFeatures": true,
+                    "profile": "release",
+                    "locked": true
+                },
+                "python": {
+                    "out": "/workspace/python/generated"
+                },
+                "artifacts": [
+                    {
+                        "kind": "native",
+                        "target": "aarch64-apple-darwin",
+                        "path": "/workspace/python/generated/lib/libdemo_crate.dylib"
+                    },
+                    {
+                        "kind": "target",
+                        "target": "wasm32-unknown-unknown",
+                        "path": "/workspace/target/rspyts/wasm32-unknown-unknown/release/demo_crate.wasm"
+                    }
+                ]
+            })
         );
+    }
+
+    #[test]
+    fn json_build_report_omits_disabled_python_output() {
+        let cfg = config::Config {
+            crate_dir: PathBuf::from("/workspace/crate"),
+            python: None,
+            typescript: None,
+            schema: None,
+            contract: build::ContractOptions::default(),
+        };
+        let meta = build::CrateMeta {
+            name: "demo".into(),
+            version: "0.1.0".into(),
+        };
+        let options = build::BuildOptions::default();
+
+        let value = serde_json::to_value(build_report(&cfg, &meta, &options, &[])).unwrap();
+        assert!(value.get("python").is_none());
+    }
+
+    #[test]
+    fn removed_diff_command_is_rejected() {
+        assert!(Cli::try_parse_from(["rspyts", "diff", "old.json", "new.json"]).is_err());
     }
 }

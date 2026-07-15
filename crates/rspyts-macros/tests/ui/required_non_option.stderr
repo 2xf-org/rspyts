@@ -1,0 +1,11 @@
+error: #[bridge(required)] applies only to a direct `Option<T>` field
+ --> tests/ui/required_non_option.rs:5:5
+  |
+5 |     #[bridge(required)]
+  |     ^^^^^^^^^^^^^^^^^^^
+
+error: expected non-macro attribute, found attribute macro `bridge`
+ --> tests/ui/required_non_option.rs:5:7
+  |
+5 |     #[bridge(required)]
+  |       ^^^^^^ not a non-macro attribute

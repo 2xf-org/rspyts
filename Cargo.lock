@@ -292,7 +292,7 @@ dependencies = [
 
 [[package]]
 name = "rspyts"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "inventory",
  "rspyts-core",
@@ -303,7 +303,7 @@ dependencies = [
 
 [[package]]
 name = "rspyts-cli"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -312,28 +312,30 @@ dependencies = [
  "rspyts-core",
  "serde",
  "serde_json",
- "sha2",
  "similar",
  "toml",
 ]
 
 [[package]]
 name = "rspyts-core"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "inventory",
  "serde",
  "serde_json",
+ "sha2",
 ]
 
 [[package]]
 name = "rspyts-macros"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
+ "heck",
  "proc-macro2",
  "quote",
  "rspyts",
  "serde",
+ "serde_json",
  "syn",
  "trybuild",
 ]
@@ -413,14 +415,6 @@ name = "shared-types"
 version = "0.1.0"
 dependencies = [
  "rspyts",
-]
-
-[[package]]
-name = "shared-types-module"
-version = "0.1.0"
-dependencies = [
- "rspyts",
- "shared-types",
 ]
 
 [[package]]

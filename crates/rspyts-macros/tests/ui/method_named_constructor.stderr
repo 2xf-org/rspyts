@@ -1,0 +1,11 @@
+error: bridged member `constructor` projects to `constructor`, which collides with generated TypeScript class lifecycle member `constructor`; rename it or scope it to Python with `#[bridge(target = "python")]`
+  --> tests/ui/method_named_constructor.rs:12:12
+   |
+12 |     pub fn constructor(&self) {}
+   |            ^^^^^^^^^^^
+
+error: `constructor` does not apply to this item; it marks the constructor method inside a #[bridge] impl block
+ --> tests/ui/method_named_constructor.rs:7:14
+  |
+7 |     #[bridge(constructor)]
+  |              ^^^^^^^^^^^

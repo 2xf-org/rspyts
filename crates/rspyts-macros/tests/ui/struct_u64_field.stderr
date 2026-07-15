@@ -1,5 +1,0 @@
-error: bare `u64` is not bridgeable because JSON numbers cannot preserve every 64-bit value; use `rspyts::U64` for canonical decimal-string transport
- --> tests/ui/struct_u64_field.rs:9:14
-  |
-9 |     pub big: u64,
-  |              ^^^

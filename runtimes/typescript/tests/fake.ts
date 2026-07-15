@@ -107,7 +107,7 @@ export function createFake(options: FakeOptions = {}): Fake {
 
   const exportsObj: Record<string, unknown> = {
     memory,
-    rspyts_abi_version: () => 2,
+    rspyts_abi_version: () => 3,
     rspyts_alloc: alloc,
     rspyts_free: free,
   };
@@ -115,6 +115,7 @@ export function createFake(options: FakeOptions = {}): Fake {
   const mod: BridgeModule = {
     exports: exportsObj as unknown as BridgeModule["exports"],
     memory,
+    contractFingerprint: "0".repeat(64),
   };
 
   return {

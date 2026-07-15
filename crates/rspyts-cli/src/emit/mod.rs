@@ -37,9 +37,8 @@ pub struct Plan {
     pub owned: Vec<OwnedDir>,
 }
 
-/// Render all enabled emitters into a [`Plan`]. Pure: no filesystem.
-/// Fails only on an invalid `exclude` list (a dangling type reference).
-pub fn plan(cfg: &Config, manifest: &Manifest, hash: &str) -> Result<Plan> {
+/// Render every configured emitter into a [`Plan`]. Pure: no filesystem.
+pub fn plan(cfg: &Config, manifest: &Manifest, hash: &str) -> Plan {
     let mut files = Vec::new();
     let mut owned = Vec::new();
     let mut add = |dir: &Path, emitted: Vec<(&'static str, String)>| {
@@ -53,22 +52,19 @@ pub fn plan(cfg: &Config, manifest: &Manifest, hash: &str) -> Result<Plan> {
         }));
     };
     if let Some(py) = &cfg.python {
-        let filtered = crate::exclude::apply(manifest, &py.exclude, "[python]")?;
+        let library_search = ["lib".to_string()];
         add(
             &py.out,
-            python::emit(&filtered, hash, &py.library_search, &py.imports),
+            python::emit(manifest, hash, &library_search, &py.imports),
         );
     }
     if let Some(ts) = &cfg.typescript {
-        let filtered = crate::exclude::apply(manifest, &ts.exclude, "[typescript]")?;
-        add(&ts.out, typescript::emit(&filtered, hash, &ts.imports));
+        add(&ts.out, typescript::emit(manifest, hash, &ts.imports));
     }
     if let Some(sc) = &cfg.schema {
-        // The schema bundle is always the whole manifest: `exclude` is a
-        // per-language projection knob, and [schema] has none.
         add(&sc.out, schema::emit(manifest, hash));
     }
-    Ok(Plan { files, owned })
+    Plan { files, owned }
 }
 
 /// `rspyts generate`: write changed files, delete no-longer-emitted
@@ -197,17 +193,14 @@ mod tests {
     fn config_for(root: &Path) -> Config {
         Config {
             crate_dir: root.join("crate"),
-            build: Default::default(),
+            contract: Default::default(),
             python: Some(PythonConfig {
                 out: root.join("py"),
-                library_search: vec![],
                 imports: Default::default(),
-                exclude: vec![],
             }),
             typescript: Some(TypescriptConfig {
                 out: root.join("ts"),
                 imports: Default::default(),
-                exclude: vec![],
             }),
             schema: Some(SchemaConfig {
                 out: root.join("schema"),
@@ -216,12 +209,12 @@ mod tests {
     }
 
     #[test]
-    fn plan_covers_all_enabled_out_dirs() {
+    fn plan_covers_all_configured_out_dirs() {
         let m = manifest();
         let hash = manifest_hash(&m);
         let root = PathBuf::from("/virtual");
-        let plan = plan(&config_for(&root), &m, &hash).unwrap();
-        assert_eq!(plan.files.len(), 7 + 5 + 1);
+        let plan = plan(&config_for(&root), &m, &hash);
+        assert_eq!(plan.files.len(), 8 + 6 + 1);
         assert_eq!(plan.owned.len(), 3);
         assert!(
             plan.files
@@ -231,13 +224,35 @@ mod tests {
         assert!(
             plan.files
                 .iter()
+                .any(|f| f.path == root.join("py/_codecs.py"))
+        );
+        assert!(
+            plan.files
+                .iter()
                 .any(|f| f.path == root.join("ts/index.ts"))
+        );
+        assert!(
+            plan.files
+                .iter()
+                .any(|f| f.path == root.join("ts/codecs.ts"))
         );
         assert!(
             plan.files
                 .iter()
                 .any(|f| f.path == root.join("schema/schema.json"))
         );
+        let python_owned = plan
+            .owned
+            .iter()
+            .find(|owned| owned.dir == root.join("py"))
+            .expect("Python output directory is owned");
+        assert!(python_owned.keep.contains(&"_codecs.py"));
+        let typescript_owned = plan
+            .owned
+            .iter()
+            .find(|owned| owned.dir == root.join("ts"))
+            .expect("TypeScript output directory is owned");
+        assert!(typescript_owned.keep.contains(&"codecs.ts"));
     }
 
     #[test]
@@ -246,7 +261,7 @@ mod tests {
         let hash = manifest_hash(&m);
         let root = temp_dir("write");
         let cfg = config_for(&root);
-        let p = plan(&cfg, &m, &hash).unwrap();
+        let p = plan(&cfg, &m, &hash);
 
         write(&p).unwrap();
         assert!(!check(&p).unwrap(), "freshly written tree must be clean");
@@ -284,7 +299,7 @@ mod tests {
         let m = manifest();
         let hash = manifest_hash(&m);
         let root = temp_dir("check");
-        let p = plan(&config_for(&root), &m, &hash).unwrap();
+        let p = plan(&config_for(&root), &m, &hash);
         assert!(check(&p).unwrap());
         assert!(!root.join("py").exists());
         std::fs::remove_dir_all(&root).unwrap();

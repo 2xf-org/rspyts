@@ -1,4 +1,4 @@
-error: `async fn` cannot be bridged — ABI 2 has no async support (docs/design/abi.md §11)
+error: `async fn` cannot be bridged — ABI 3 has no async support (docs/design/abi.md)
  --> tests/ui/async_fn.rs:4:5
   |
 4 | pub async fn fetch_answer() -> u32 {

@@ -6,13 +6,12 @@
  * status-2 (panic) envelope. This module maps that object back onto a
  * JavaScript error class:
  *
- * - status 2 always becomes a {@link RspytsPanicError}, regardless of code;
- * - status 1 consults the generated call-scoped map, then the optional
- *   process registry populated through {@link registerError}, then the
- *   {@link RspytsError} base class.
+ * - status 2 requires code `panic` and becomes a {@link RspytsPanicError};
+ * - status 1 maps bridge-owned `staleHandle` directly, then consults the
+ *   generated call-scoped registry, then falls back to {@link RspytsError}.
  */
 
-import { STATUS_PANIC } from "./envelope.js";
+import { STATUS_ERROR, STATUS_PANIC } from "./envelope.js";
 
 /**
  * Base class for every error crossing the rspyts bridge.
@@ -69,17 +68,6 @@ export class InstancePoisonedError extends Error {
 export type BridgeErrorConstructor = new (message: string, data?: unknown) => RspytsError;
 export type BridgeErrorRegistry = Readonly<Record<string, BridgeErrorConstructor>>;
 
-const registry = new Map<string, BridgeErrorConstructor>();
-
-/**
- * Register a process-wide fallback for a bridge error `code`. Generated
- * clients use call-scoped maps so packages may safely reuse codes; this
- * compatibility hook remains useful for handwritten integrations.
- */
-export function registerError(code: string, ctor: BridgeErrorConstructor): void {
-  registry.set(code, ctor);
-}
-
 /**
  * Throw the error class corresponding to a non-ok envelope: panic status
  * beats the registry; otherwise the registry maps `code` to a generated
@@ -90,22 +78,78 @@ export function throwBridgeError(
   payload: unknown,
   errorTypes?: BridgeErrorRegistry,
 ): never {
-  const body =
-    payload !== null && typeof payload === "object"
-      ? (payload as { code?: unknown; message?: unknown; data?: unknown })
-      : {};
-  const code = typeof body.code === "string" ? body.code : "unknown";
-  const message = typeof body.message === "string" ? body.message : "unknown bridge error";
+  if (status !== STATUS_ERROR && status !== STATUS_PANIC) {
+    throw new TypeError(`rspyts: bridge error status must be 1 or 2, got ${status}`);
+  }
+  const body = validateErrorPayload(payload);
+  const { code, message } = body;
   if (status === STATUS_PANIC) {
+    if (code !== "panic") {
+      throw new TypeError(`rspyts: panic envelope must use error code "panic", got ${JSON.stringify(code)}`);
+    }
     throw new RspytsPanicError(message, body.data);
   }
-  const ctor = errorTypes?.[code] ?? registry.get(code);
+  const scopedCtor =
+    errorTypes !== undefined && Object.prototype.hasOwnProperty.call(errorTypes, code)
+      ? errorTypes[code]
+      : undefined;
+  const ctor: unknown = code === "staleHandle" ? StaleHandleError : scopedCtor;
   if (ctor !== undefined) {
-    throw new ctor(message, body.data);
+    if (typeof ctor !== "function") {
+      throw new TypeError(
+        `rspyts: error registry entry for ${JSON.stringify(code)} must be an error constructor`,
+      );
+    }
+    let error: unknown;
+    try {
+      error = new (ctor as BridgeErrorConstructor)(message, body.data);
+    } catch (cause) {
+      throw new TypeError(
+        `rspyts: error registry entry for ${JSON.stringify(code)} is not a usable constructor`,
+        { cause },
+      );
+    }
+    if (!(error instanceof RspytsError)) {
+      throw new TypeError(
+        `rspyts: error registry entry for ${JSON.stringify(code)} must construct RspytsError`,
+      );
+    }
+    throw error;
   }
   throw new RspytsError(message, code, body.data);
 }
 
-// `staleHandle` is raised by the bridge itself (ABI §8), not by generated
-// error enums, so the runtime pre-registers it.
-registerError("staleHandle", StaleHandleError);
+function validateErrorPayload(
+  payload: unknown,
+): { code: string; message: string; data?: unknown } {
+  if (payload === null || typeof payload !== "object" || Array.isArray(payload)) {
+    throw new TypeError("rspyts: error envelope JSON must be an object");
+  }
+  const prototype = Object.getPrototypeOf(payload);
+  if (prototype !== Object.prototype && prototype !== null) {
+    throw new TypeError("rspyts: error envelope JSON must be a plain object");
+  }
+  const body = payload as Record<string, unknown>;
+  const keys = Object.keys(body);
+  for (const required of ["code", "message"]) {
+    if (!Object.prototype.hasOwnProperty.call(body, required)) {
+      throw new TypeError(`rspyts: error envelope is missing required field ${JSON.stringify(required)}`);
+    }
+  }
+  for (const key of keys) {
+    if (key !== "code" && key !== "message" && key !== "data") {
+      throw new TypeError(`rspyts: error envelope has unexpected field ${JSON.stringify(key)}`);
+    }
+  }
+  if (typeof body["code"] !== "string" || body["code"].length === 0) {
+    throw new TypeError("rspyts: error envelope code must be a non-empty string");
+  }
+  if (typeof body["message"] !== "string") {
+    throw new TypeError("rspyts: error envelope message must be a string");
+  }
+  return {
+    code: body["code"],
+    message: body["message"],
+    ...(Object.prototype.hasOwnProperty.call(body, "data") ? { data: body["data"] } : {}),
+  };
+}

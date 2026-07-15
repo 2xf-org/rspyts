@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Manifest {
-    /// ABI version string, e.g. `"2.0"`.
+    /// ABI version string, e.g. `"3.0"`.
     pub abi: String,
     pub crate_name: String,
     pub crate_version: String,
@@ -111,6 +111,37 @@ impl TypeDecl {
     }
 }
 
+const QUALIFIED_REF_SEPARATOR: char = '\0';
+
+impl Ty {
+    /// Construct an origin-qualified named reference for inventory assembly.
+    ///
+    /// Macro-generated [`Bridged`](crate::Bridged) implementations use this
+    /// transient representation so [`crate::registry::build_manifest`] can
+    /// distinguish identically named types from different linked crates.
+    /// The registry resolves and normalizes it before the manifest crosses
+    /// the ABI, so emitters continue to receive ordinary `Ref { name }`
+    /// values.
+    #[doc(hidden)]
+    pub fn qualified_ref(origin: &str, name: &str) -> Self {
+        Ty::Ref {
+            name: Self::qualified_ref_name(origin, name),
+        }
+    }
+
+    /// Encode an inventory-only qualified reference name.
+    #[doc(hidden)]
+    pub fn qualified_ref_name(origin: &str, name: &str) -> String {
+        debug_assert!(!origin.contains(QUALIFIED_REF_SEPARATOR));
+        debug_assert!(!name.contains(QUALIFIED_REF_SEPARATOR));
+        format!("{origin}{QUALIFIED_REF_SEPARATOR}{name}")
+    }
+
+    pub(crate) fn split_qualified_ref(name: &str) -> Option<(&str, &str)> {
+        name.split_once(QUALIFIED_REF_SEPARATOR)
+    }
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct FieldDecl {
@@ -120,8 +151,10 @@ pub struct FieldDecl {
     pub wire_name: String,
     pub docs: String,
     pub ty: Ty,
-    /// True for `Option<T>` fields: emitters give these a null default.
-    pub optional: bool,
+    /// Whether the object key must be present. A direct `Option<T>` field is
+    /// omittable by default; `#[bridge(required)]` makes the key mandatory
+    /// while retaining null as a valid value.
+    pub required: bool,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -176,6 +209,8 @@ pub enum Ty {
     Bytes,
     /// `()` — valid in return position only.
     Unit,
+    /// The one-value JSON null type (`()`) for data positions.
+    Null,
     Option {
         inner: Box<Ty>,
     },
@@ -194,8 +229,9 @@ pub enum Ty {
     Ref {
         name: String,
     },
-    /// Schemaless JSON passthrough (`rspyts::Json`): `JsonValue` in Python,
-    /// `unknown` in TypeScript, `{}` in JSON Schema.
+    /// Transparent schemaless JSON passthrough (`serde_json::Value`):
+    /// `typing.Any` in Python, `unknown` in TypeScript, and an unconstrained
+    /// value in JSON Schema.
     Json,
     /// Owned numeric buffer transported via an envelope attachment.
     Buf {
@@ -389,7 +425,7 @@ pub struct MethodDecl {
 
 #[cfg(test)]
 mod tests {
-    use super::Dtype;
+    use super::{Dtype, Ty};
 
     #[test]
     fn every_dtype_has_stable_wire_name_width_and_alignment() {
@@ -419,5 +455,13 @@ mod tests {
             );
         }
         assert_eq!(Dtype::from_wire_name("usize"), None);
+    }
+
+    #[test]
+    fn null_has_a_stable_manifest_shape() {
+        assert_eq!(
+            serde_json::to_value(Ty::Null).unwrap(),
+            serde_json::json!({"kind": "null"})
+        );
     }
 }

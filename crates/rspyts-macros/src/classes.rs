@@ -19,6 +19,7 @@ use crate::attrs::{BridgeArgs, TargetArg, is_bridge_attr};
 use crate::docs::extract_docs;
 use crate::emit;
 use crate::sig;
+use heck::ToLowerCamelCase;
 use proc_macro2::TokenStream;
 use quote::{format_ident, quote};
 
@@ -142,6 +143,7 @@ pub fn expand_impl(args: BridgeArgs, mut item: syn::ItemImpl) -> syn::Result<Tok
             }
         }
     }
+    ensure_unique_host_projections(&methods, &statics)?;
 
     let slab = format_ident!("__RSPYTS_SLAB_{}", ty_ident);
     let ctor_shim = ctor.as_ref().map(|ctor| ctor_shim(&ty_ident, &slab, ctor));
@@ -302,6 +304,7 @@ fn analyze_static(
         ));
     }
     ensure_not_reserved(&method.sig.ident)?;
+    ensure_host_member_safe(&method.sig.ident, target, MemberKind::Static)?;
     let ret = sig::classify_ret(&method.sig.output);
     let returns_self = match &ret {
         sig::RetKind::Plain(ty) => sig::is_self_ty(ty, ty_ident),
@@ -337,6 +340,7 @@ fn analyze_method(method: &syn::ImplItemFn, target: Option<TargetArg>) -> syn::R
         ));
     }
     ensure_not_reserved(&method.sig.ident)?;
+    ensure_host_member_safe(&method.sig.ident, target, MemberKind::Instance)?;
     let params = sig::bridged_params(method.sig.inputs.iter().skip(1))?;
     sig::validate_param_wire_names(&params)?;
     Ok(MethodInfo {
@@ -360,6 +364,124 @@ fn ensure_not_reserved(ident: &syn::Ident) -> syn::Result<()> {
                 format!(
                     "method name `{reserved}` collides with the generated \
                      `rspyts_cls__{{Type}}__{reserved}` symbol; rename the method"
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy)]
+enum MemberKind {
+    Instance,
+    Static,
+}
+
+fn includes_target(target: Option<TargetArg>, expected: TargetArg) -> bool {
+    target.is_none() || target == Some(expected)
+}
+
+/// Reject names that would overwrite host-side handle/lifecycle plumbing.
+/// The constructor's Rust identifier never reaches either host (it becomes
+/// `__init__` / `constructor`), so this applies only to projected methods and
+/// statics.
+fn ensure_host_member_safe(
+    ident: &syn::Ident,
+    target: Option<TargetArg>,
+    kind: MemberKind,
+) -> syn::Result<()> {
+    let rust_name = ident.to_string();
+    let python_name = rust_name.strip_prefix("r#").unwrap_or(&rust_name);
+    if includes_target(target, TargetArg::Python)
+        && [
+            "handle",
+            "__init__",
+            "__new__",
+            "__copy__",
+            "__deepcopy__",
+            "__reduce__",
+            "__reduce_ex__",
+            "close",
+            "__enter__",
+            "__exit__",
+            "__del__",
+        ]
+        .contains(&python_name)
+    {
+        let scope_hint = if target.is_none() {
+            "; rename it or scope it to TypeScript with `#[bridge(target = \"typescript\")]`"
+        } else {
+            "; rename it"
+        };
+        return Err(syn::Error::new_spanned(
+            ident,
+            format!(
+                "bridged member `{rust_name}` collides with generated Python class member \
+                 `{python_name}`{scope_hint}"
+            ),
+        ));
+    }
+
+    let typescript_name = rust_name
+        .strip_prefix("r#")
+        .unwrap_or(&rust_name)
+        .to_lower_camel_case();
+    let reserved = match kind {
+        MemberKind::Instance => {
+            ["constructor", "free", "dispose"].contains(&typescript_name.as_str())
+        }
+        MemberKind::Static => typescript_name == "prototype",
+    };
+    if includes_target(target, TargetArg::Typescript) && reserved {
+        let scope_hint = if target.is_none() {
+            "; rename it or scope it to Python with `#[bridge(target = \"python\")]`"
+        } else {
+            "; rename it"
+        };
+        let generated = match kind {
+            MemberKind::Instance => "generated TypeScript class lifecycle member",
+            MemberKind::Static => "reserved JavaScript class static",
+        };
+        return Err(syn::Error::new_spanned(
+            ident,
+            format!(
+                "bridged member `{rust_name}` projects to `{typescript_name}`, which collides \
+                 with {generated} `{typescript_name}`{scope_hint}"
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// Rust permits distinct snake-case spellings that `heck` projects to the
+/// same lower-camel TypeScript member. Instance and static sides are separate
+/// JavaScript namespaces, so validate each independently.
+fn ensure_unique_host_projections(
+    methods: &[MethodInfo],
+    statics: &[MethodInfo],
+) -> syn::Result<()> {
+    ensure_unique_typescript_names(methods, "instance methods")?;
+    ensure_unique_typescript_names(statics, "static methods")
+}
+
+fn ensure_unique_typescript_names(members: &[MethodInfo], namespace: &str) -> syn::Result<()> {
+    let mut seen = std::collections::HashMap::<String, &syn::Ident>::new();
+    for member in members {
+        if !includes_target(member.target, TargetArg::Typescript) {
+            continue;
+        }
+        let rust_name = member.ident.to_string();
+        let projected = rust_name
+            .strip_prefix("r#")
+            .unwrap_or(&rust_name)
+            .to_lower_camel_case();
+        if let Some(previous) = seen.insert(projected.clone(), &member.ident) {
+            return Err(syn::Error::new_spanned(
+                &member.ident,
+                format!(
+                    "bridged {namespace} `{previous}` and `{}` both project to TypeScript \
+                     member `{projected}`; rename one or give them disjoint target scopes",
+                    member.ident
                 ),
             ));
         }
@@ -411,7 +533,7 @@ fn static_shim(ty_ident: &syn::Ident, slab: &syn::Ident, st: &MethodInfo) -> Tok
         #[doc(hidden)]
         #[allow(non_snake_case, clippy::too_many_arguments, clippy::unit_arg)]
         pub unsafe extern "C" fn #symbol(#(#c_params),*) -> *mut u8 {
-            ::rspyts::__private::shim::run(|| {
+            ::rspyts::__private::shim::run_typed(|| {
                 #prelude
                 #mapped
             })
@@ -498,7 +620,7 @@ fn method_shim(ty_ident: &syn::Ident, slab: &syn::Ident, method: &MethodInfo) ->
         #[doc(hidden)]
         #[allow(non_snake_case, clippy::too_many_arguments, clippy::unit_arg)]
         pub unsafe extern "C" fn #symbol(__rspyts_handle: u64, #(#c_params),*) -> *mut u8 {
-            ::rspyts::__private::shim::run(|| {
+            ::rspyts::__private::shim::run_typed(|| {
                 #prelude
                 let __rspyts_ret = #slab.#with_fn(__rspyts_handle, |__rspyts_obj| {
                     __rspyts_obj.#method_ident(#(#call_args),*)

@@ -1,6 +1,4 @@
-"""
-Load and call a bridged native library.
-"""
+"""Load and call an ABI 3 bridged native library."""
 
 from __future__ import annotations
 
@@ -8,6 +6,7 @@ import collections.abc
 import ctypes
 import os
 import pathlib
+import re
 import sys
 import threading
 import typing
@@ -16,28 +15,22 @@ import numpy as np
 
 from . import envelope, errors
 
-__all__ = ["Library", "platform_filename"]
+__all__ = ["Library"]
 
-ENV_VAR = "RSPYTS_LIBRARY"
-EXPECTED_ABI_VERSION = 2
+ENV_VAR_PREFIX = "RSPYTS_LIBRARY"
+EXPECTED_ABI_VERSION = 3
+MAX_HANDLE = 2**53 - 1
+FINGERPRINT_PATTERN = re.compile(r"[0-9a-f]{64}\Z")
+
+
+def library_env_var(name: str) -> str:
+    """Return the library-specific native override variable for ``name``."""
+    suffix = "".join(character.upper() if character.isascii() and character.isalnum() else "_" for character in name)
+    return f"{ENV_VAR_PREFIX}_{suffix}"
 
 
 def platform_filename(name: str) -> str:
-    """
-    The platform-specific shared-library filename for a crate name.
-
-    Notes:
-        Hyphens are normalized to underscores (Cargo does the same when
-        naming cdylib artifacts): ``basic-example`` ->
-        ``libbasic_example.dylib`` / ``libbasic_example.so`` /
-        ``basic_example.dll``.
-
-    Args:
-        name: The crate name.
-
-    Returns:
-        The filename the current platform's dynamic loader expects.
-    """
+    """Return the platform-specific shared-library filename for a crate name."""
     stem = name.replace("-", "_")
     if sys.platform == "darwin":
         return f"lib{stem}.dylib"
@@ -46,50 +39,46 @@ def platform_filename(name: str) -> str:
     return f"lib{stem}.so"
 
 
+def _checked_fingerprint(value: object, *, source: str) -> str:
+    if type(value) is not str or FINGERPRINT_PATTERN.fullmatch(value) is None:
+        raise RuntimeError(f"rspyts: {source} must be a lowercase 64-character SHA-256 fingerprint")
+    return value
+
+
+def _checked_handle(handle: object) -> int:
+    if type(handle) is not int:
+        raise TypeError(f"rspyts: handle must be an exact integer, got {type(handle).__name__}")
+    if not 1 <= handle <= MAX_HANDLE:
+        raise ValueError(f"rspyts: handle must be in 1..={MAX_HANDLE}, got {handle}")
+    return handle
+
+
 class Library:
-    """
-    A lazily-loaded bridged cdylib and the calling convention around it.
-
-    Notes:
-        Resolution order for the library path (first hit wins):
-
-        1. the ``RSPYTS_LIBRARY`` environment variable (a full file path);
-        2. an explicit :meth:`set_path` override;
-        3. each ``search`` directory — absolute entries as-is, relative
-           entries joined onto ``anchor`` — combined with
-           :func:`platform_filename`.
-    """
+    """A lazily loaded ABI 3 cdylib with one schema-directed call path."""
 
     def __init__(
         self,
         name: str,
         search: collections.abc.Sequence[str] = (),
         anchor: str | pathlib.Path | None = None,
+        *,
+        expected_contract_fingerprint: str | None = None,
     ) -> None:
         self.name = name
         self.search = tuple(search)
         self.anchor = pathlib.Path(anchor) if anchor is not None else None
+        self.expected_contract_fingerprint = (
+            _checked_fingerprint(expected_contract_fingerprint, source="expected contract fingerprint")
+            if expected_contract_fingerprint is not None
+            else None
+        )
+        self.contract_fingerprint: str | None = None
         self.explicit_path: pathlib.Path | None = None
         self.cdll: ctypes.CDLL | None = None
-        # Guards lazy loading only. Calls themselves need no Python-side
-        # lock: ctypes releases the GIL for the duration of the C call and
-        # the Rust side is internally synchronized (ABI §10).
         self.load_lock = threading.Lock()
 
     def set_path(self, path: str | pathlib.Path) -> None:
-        """
-        Override library resolution with an explicit file path.
-
-        Notes:
-            Takes effect on the next (first) load; overriding after the
-            library has been loaded is a programming error.
-
-        Args:
-            path: The full path to the compiled library file.
-
-        Raises:
-            RuntimeError: If the library has already been loaded.
-        """
+        """Override library resolution before the first load."""
         if self.cdll is not None:
             raise RuntimeError(
                 f"rspyts: library {self.name!r} is already loaded; "
@@ -98,16 +87,9 @@ class Library:
         self.explicit_path = pathlib.Path(path)
 
     def resolve_path(self) -> pathlib.Path:
-        """
-        Resolve the on-disk path of the compiled library.
-
-        Returns:
-            The first existing candidate per the resolution order.
-
-        Raises:
-            FileNotFoundError: If no candidate exists on disk.
-        """
-        env = os.environ.get(ENV_VAR)
+        """Resolve the on-disk native library path."""
+        env_var = library_env_var(self.name)
+        env = os.environ.get(env_var)
         if env:
             return pathlib.Path(env)
         if self.explicit_path is not None:
@@ -124,45 +106,63 @@ class Library:
                 return candidate
         raise FileNotFoundError(
             f"rspyts: cannot locate the compiled library for {self.name!r}. "
-            f"Tried: {', '.join(str(c) for c in candidates) or '(no search directories)'}. "
-            f"Build the crate (cargo build), or point the {ENV_VAR} environment "
-            "variable at the library file."
+            f"Tried: {', '.join(str(candidate) for candidate in candidates) or '(no search directories)'}. "
+            f"Build the crate, or point {env_var} at the library file."
         )
 
     def load(self) -> ctypes.CDLL:
-        """
-        Load the cdylib once, check its ABI version, and cache it.
-
-        Returns:
-            The loaded ``ctypes.CDLL`` with the allocator symbols typed.
-
-        Raises:
-            RuntimeError: If the library reports an unexpected ABI version.
-            FileNotFoundError: If the library cannot be located.
-        """
+        """Load, ABI-check, fingerprint-check, and cache the cdylib."""
         cdll = self.cdll
         if cdll is not None:
             return cdll
         with self.load_lock:
-            if self.cdll is None:
-                path = self.resolve_path()
-                cdll = ctypes.CDLL(str(path))
+            if self.cdll is not None:
+                return self.cdll
+            path = self.resolve_path()
+            cdll = ctypes.CDLL(str(path))
+            try:
                 cdll.rspyts_abi_version.restype = ctypes.c_uint32
                 cdll.rspyts_abi_version.argtypes = ()
                 version = cdll.rspyts_abi_version()
-                if version != EXPECTED_ABI_VERSION:
-                    raise RuntimeError(
-                        f"rspyts: {path} reports ABI version {version}, but this "
-                        f"runtime speaks version {EXPECTED_ABI_VERSION}. Rebuild the "
-                        "crate and regenerate the bindings (rspyts generate), or "
-                        "install the matching rspyts package version."
-                    )
+            except AttributeError as exc:
+                raise RuntimeError(f"rspyts: {path} does not export rspyts_abi_version") from exc
+            if version != EXPECTED_ABI_VERSION:
+                raise RuntimeError(
+                    f"rspyts: {path} reports ABI version {version}, but this runtime speaks version "
+                    f"{EXPECTED_ABI_VERSION}. Rebuild the crate and regenerate the bindings, or install "
+                    "the matching rspyts package version."
+                )
+
+            try:
                 cdll.rspyts_alloc.restype = ctypes.c_void_p
                 cdll.rspyts_alloc.argtypes = (ctypes.c_size_t,)
                 cdll.rspyts_free.restype = None
                 cdll.rspyts_free.argtypes = (ctypes.c_void_p, ctypes.c_size_t)
-                self.cdll = cdll
-            return self.cdll
+                cdll.rspyts_contract_fingerprint.restype = ctypes.c_void_p
+                cdll.rspyts_contract_fingerprint.argtypes = ()
+            except AttributeError as exc:
+                raise RuntimeError(f"rspyts: {path} is missing a required ABI 3 export: {exc}") from exc
+
+            ret = cdll.rspyts_contract_fingerprint()
+            if ret is None:
+                raise RuntimeError("rspyts: rspyts_contract_fingerprint returned a null envelope")
+            raw = self._copy_and_free_response(cdll, int(ret))
+            status, response = envelope.parse_envelope(raw)
+            if status != 0:
+                raise RuntimeError(f"rspyts: rspyts_contract_fingerprint failed with status {status}")
+            if response.tail:
+                raise RuntimeError("rspyts: rspyts_contract_fingerprint returned attachment bytes")
+            fingerprint = _checked_fingerprint(response.value, source="module contract fingerprint")
+            expected = self.expected_contract_fingerprint
+            if expected is not None and fingerprint != expected:
+                raise RuntimeError(
+                    f"rspyts: contract fingerprint mismatch for {path}: module reports {fingerprint}, "
+                    f"generated client expects {expected}; rebuild the crate and regenerate the bindings"
+                )
+
+            self.contract_fingerprint = fingerprint
+            self.cdll = cdll
+            return cdll
 
     def call(
         self,
@@ -171,104 +171,71 @@ class Library:
         slices: collections.abc.Sequence[tuple[typing.Any, str]] = (),
         handle: int | None = None,
         error_types: errors.BridgeErrorRegistry | None = None,
-    ) -> typing.Any:
-        """
-        Invoke a bridged function and decode its envelope.
-
-        Notes:
-            The envelope and the request buffer are always freed.
-
-        Args:
-            symbol: The exported C symbol to call.
-            args_obj: The wire-cased plain-parameter object (or ``None`` /
-                ``{}`` when there are none).
-            slices: ``(array_like, dtype_str)`` pairs in declaration order;
-                each is made C-contiguous with the exact dtype and passed
-                as ``(ptr, element_count)``.
-            handle: For methods; passed as the leading ``u64``.
-
-        Returns:
-            The decoded JSON payload with every ``__rspyts_buf__``
-            placeholder replaced by a numpy array (status 0).
-
-        Raises:
-            BridgeError: The registered subclass for the error code
-                (status 1), or :class:`~rspyts.errors.RspytsPanicError`
-                (status 2).
-            ValueError: If a plain argument carries a non-finite float.
-        """
+    ) -> envelope.Response:
+        """Invoke one bridge and return its explicit value-plus-tail response."""
         cdll = self.load()
         encoded = envelope.build_request(args_obj)
 
-        # Rust receives shared slices while ctypes releases the GIL. Always
-        # copy into runtime-owned, naturally aligned storage so another
-        # Python or native thread cannot mutate an aliased writable ndarray
-        # during the call. The list keeps those private arrays alive until
-        # the foreign function returns.
-        arrays = [
-            np.require(data, dtype=envelope.DTYPES[dt], requirements=("C", "A", "O")).copy(order="C")
-            for data, dt in slices
-        ]
+        arrays: list[np.ndarray] = []
+        for data, dt in slices:
+            dtype = envelope.DTYPES.get(dt)
+            if dtype is None:
+                raise ValueError(f"rspyts: unsupported slice dtype {dt!r}")
+            arrays.append(np.require(data, dtype=dtype, requirements=("C", "A", "O")).copy(order="C"))
 
-        # Per-symbol C signatures vary (handle presence, slice count), so
-        # arguments are wrapped in exact ctypes values per call instead of
-        # declaring static argtypes on the shared function object.
-        fn = getattr(cdll, symbol)
+        try:
+            fn = getattr(cdll, symbol)
+        except AttributeError as exc:
+            raise RuntimeError(f"rspyts: module has no export {symbol!r}") from exc
         fn.restype = ctypes.c_void_p
 
         c_args: list[typing.Any] = []
         if handle is not None:
-            c_args.append(ctypes.c_uint64(handle))
+            c_args.append(ctypes.c_uint64(_checked_handle(handle)))
 
         request_len = len(encoded)
-        request_ptr = None
-        if request_len:
-            request_ptr = cdll.rspyts_alloc(request_len)
-            ctypes.memmove(request_ptr, encoded, request_len)
-        # A null pointer with len 0 is valid: the shim reads len == 0 as "{}".
+        request_ptr = cdll.rspyts_alloc(request_len)
+        if request_ptr is None:
+            raise MemoryError(f"rspyts: rspyts_alloc returned null for a {request_len}-byte request")
+        ctypes.memmove(request_ptr, encoded, request_len)
         c_args.append(ctypes.c_void_p(request_ptr))
         c_args.append(ctypes.c_size_t(request_len))
 
-        for arr in arrays:
-            c_args.append(ctypes.c_void_p(arr.ctypes.data))
-            c_args.append(ctypes.c_size_t(arr.size))
+        for array in arrays:
+            c_args.append(ctypes.c_void_p(array.ctypes.data))
+            c_args.append(ctypes.c_size_t(array.size))
 
         try:
             ret = fn(*c_args)
         finally:
-            if request_ptr is not None:
-                cdll.rspyts_free(ctypes.c_void_p(request_ptr), ctypes.c_size_t(request_len))
+            cdll.rspyts_free(ctypes.c_void_p(request_ptr), ctypes.c_size_t(request_len))
         if ret is None:
             raise RuntimeError(f"rspyts: {symbol} returned a null envelope")
 
-        # Read the fixed-size header in place first. This does not allocate a
-        # Python bytes object, so once `ret` is accepted we can always derive
-        # the exact length required by rspyts_free.
+        raw = self._copy_and_free_response(cdll, int(ret))
+        status, response = envelope.parse_envelope(raw)
+        if status == 0:
+            return response
+        errors.raise_bridge_error(status, response.value, error_types)
+
+    def call_drop(self, symbol: str, handle: int) -> None:
+        """Invoke an idempotent ``__drop`` export, which returns no envelope."""
+        cdll = self.load()
+        try:
+            fn = getattr(cdll, symbol)
+        except AttributeError as exc:
+            raise RuntimeError(f"rspyts: module has no export {symbol!r}") from exc
+        fn.restype = None
+        fn(ctypes.c_uint64(_checked_handle(handle)))
+
+    @staticmethod
+    def _copy_and_free_response(cdll: ctypes.CDLL, ret: int) -> bytes:
+        """Copy one owned native response and free it with its exact header-derived length."""
         header = (ctypes.c_ubyte * envelope.HEADER_LEN).from_address(ret)
         json_len = sum(int(header[4 + index]) << (8 * index) for index in range(4))
         tail_len = sum(int(header[8 + index]) << (8 * index) for index in range(4))
         total = envelope.HEADER_LEN + json_len + tail_len
         try:
-            raw = ctypes.string_at(ret, total)
+            return ctypes.string_at(ret, total)
         finally:
-            # Even malformed content or a host-side allocation failure must
-            # release the response with the header-derived exact length.
             cdll.rspyts_free(ctypes.c_void_p(ret), ctypes.c_size_t(total))
-
-        status, payload = envelope.parse_envelope(raw)
-        if status == 0:
-            return payload
-        errors.raise_bridge_error(status, payload, error_types)
-
-    def call_drop(self, symbol: str, handle: int) -> None:
-        """
-        Invoke a ``__drop`` export: fire-and-forget, no envelope (ABI §8).
-
-        Args:
-            symbol: The exported drop symbol.
-            handle: The handle to release.
-        """
-        cdll = self.load()
-        fn = getattr(cdll, symbol)
-        fn.restype = None
-        fn(ctypes.c_uint64(handle))

@@ -3,7 +3,7 @@
   "x-rspyts": {
     "version": "0.1.0",
     "crate": "basic-example",
-    "manifestHash": "sha256:bcb4295a5648b6010d7a1b2f4328fa31fcdd4b96af7993bce8a914cb74a4d3d2"
+    "manifestHash": "sha256:9afd7526528dd6aaa6e61069145dcecf91869613de17ecbacdced9138e551485"
   },
   "$defs": {
     "BinaryPacket": {
@@ -175,6 +175,9 @@
           "x-rspyts-minimum": "0",
           "x-rspyts-maximum": "18446744073709551615"
         },
+        "transferId": {
+          "$ref": "#/$defs/TransferId"
+        },
         "pair": {
           "type": "array",
           "prefixItems": [
@@ -212,12 +215,24 @@
               "type": "null"
             }
           ]
+        },
+        "byName": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string",
+            "format": "int64",
+            "pattern": "^(?:0|-?[1-9][0-9]*)$",
+            "x-rspyts-minimum": "-9223372036854775808",
+            "x-rspyts-maximum": "9223372036854775807"
+          }
         }
       },
       "required": [
         "signed",
         "unsigned",
-        "pair"
+        "transferId",
+        "pair",
+        "byName"
       ],
       "additionalProperties": false
     },
@@ -302,14 +317,34 @@
               "type": "null"
             }
           ]
+        },
+        "source": {
+          "description": "Required on the wire even though null is an accepted value.",
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
         }
       },
       "required": [
         "itemCount",
         "total",
-        "average"
+        "average",
+        "source"
       ],
       "additionalProperties": false
+    },
+    "TransferId": {
+      "description": "An exact integer identifier using the ordinary native Rust type.",
+      "type": "string",
+      "format": "uint64",
+      "pattern": "^(?:0|[1-9][0-9]*)$",
+      "x-rspyts-minimum": "0",
+      "x-rspyts-maximum": "18446744073709551615"
     },
     "TransferState": {
       "description": "A state that can be either tag-only or carry exact data.",
@@ -338,11 +373,26 @@
               "pattern": "^(?:0|[1-9][0-9]*)$",
               "x-rspyts-minimum": "0",
               "x-rspyts-maximum": "18446744073709551615"
+            },
+            "receipt": {
+              "anyOf": [
+                {
+                  "type": "string",
+                  "format": "uint64",
+                  "pattern": "^(?:0|[1-9][0-9]*)$",
+                  "x-rspyts-minimum": "0",
+                  "x-rspyts-maximum": "18446744073709551615"
+                },
+                {
+                  "type": "null"
+                }
+              ]
             }
           },
           "required": [
             "type",
-            "sequence"
+            "sequence",
+            "receipt"
           ],
           "additionalProperties": false
         }

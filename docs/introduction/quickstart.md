@@ -28,11 +28,10 @@ edition = "2024"
 rust-version = "1.85"
 
 [lib]
-crate-type = ["rlib", "cdylib"]
+crate-type = ["cdylib"]
 
 [dependencies]
-rspyts = "0.2"
-serde = { version = "1", features = ["derive"] }
+rspyts = "0.3"
 ```
 
 Create `rust/src/lib.rs`:
@@ -66,8 +65,10 @@ pub fn summarize(values: &[f64]) -> Summary {
 rspyts::export!();
 ```
 
-`cdylib` produces the native library and WebAssembly module. `rlib` keeps the
-crate usable by Rust tests and dependencies.
+`cdylib` produces the native library and WebAssembly module. Add `rlib` only
+when another Rust crate must link this crate. The default `#[bridge]` mode does
+not require a direct Serde dependency; add one when your code names Serde,
+including when adopting an existing contract with `#[bridge(serde)]`.
 
 ## 2. Configure generation
 
@@ -76,15 +77,11 @@ Create `rspyts.toml` beside the `rust` directory:
 ```toml
 [crate]
 path = "rust"
-
-[build]
-profile = "dev"
-targets = ["wasm32-unknown-unknown"]
-locked = false
+features = []
+no-default-features = false
 
 [python]
 out = "python/src/demo/generated"
-library_search = ["../../../../rust/target/debug"]
 
 [typescript]
 out = "typescript/generated"
@@ -93,21 +90,28 @@ out = "typescript/generated"
 out = "schema"
 ```
 
+Crate and output paths are relative to `rspyts.toml`. The native library is
+staged by `rspyts build` in `python/src/demo/generated/lib`, which generated
+Python searches automatically.
+
 Generate the host code and stage native/WASM artifacts:
 
 ```sh
 rspyts generate
 rspyts build
+rspyts build --target wasm32-unknown-unknown
 ```
 
-Generation reads the manifest from the compiled native library. Build stages
-stable target paths under Cargo's target directory. You should now have:
+Generation reads the manifest from the compiled native library and writes
+source only. The first build stages the host beside generated Python; the
+explicit target build stages WASM under Cargo's target directory. You should
+now have:
 
 ```text
 python/src/demo/generated/             generated Python package
 typescript/generated/                  generated TypeScript client
 schema/schema.json                     generated JSON Schema
-rust/target/rspyts/<host>/debug/       staged native library
+python/src/demo/generated/lib/         staged native library
 rust/target/rspyts/wasm32-unknown-unknown/debug/demo_bridge.wasm
 ```
 
@@ -131,8 +135,9 @@ print(summary.average)  # 4.0
 ```
 
 The generated package loads the native library on the first call. It checks
-`RSPYTS_LIBRARY` first, then an explicit `Library.set_path()` override, then
-the generated `library_search` entries.
+its library-specific override first (for example,
+`RSPYTS_LIBRARY_DEMO_CRATE`), then an explicit `Library.set_path()` override,
+and finally the generated package's fixed `lib` directory.
 
 ## 4. Call it from TypeScript
 
@@ -162,7 +167,8 @@ For a browser, pass `fetch(wasmUrl)` to `instantiate` instead.
 
 ## 5. Keep generated code current
 
-Commit the generated files and run this in CI:
+Commit the generated Python/TypeScript sources and schema, but ignore the
+platform-specific library under `generated/lib`. Run this in CI:
 
 ```sh
 rspyts check

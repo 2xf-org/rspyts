@@ -95,9 +95,17 @@ pub fn shim_bindings(args_struct: &syn::Ident, params: &[BridgedParam]) -> ShimB
         }
     }
 
+    let param_decls = params
+        .iter()
+        .filter(|param| matches!(param.kind, ParamKind::Plain { .. }))
+        .map(param_decl);
     let prelude = quote! {
         let __rspyts_args: #args_struct = unsafe {
-            ::rspyts::__private::shim::decode_args(#args_ptr, #args_len)
+            ::rspyts::__private::shim::decode_typed_args(
+                #args_ptr,
+                #args_len,
+                &[#(#param_decls),*],
+            )
         }?;
         #(#slice_lets)*
     };
@@ -116,7 +124,9 @@ pub fn param_decl(param: &BridgedParam) -> TokenStream {
         ParamKind::Slice { dtype, .. } => quote! {
             ::rspyts::__private::ir::Ty::Slice { dt: ::rspyts::__private::ir::Dtype::#dtype }
         },
-        ParamKind::Plain { owned, .. } => quote!(<#owned as ::rspyts::__private::Bridged>::ty()),
+        ParamKind::Plain { owned, .. } => {
+            quote!(<#owned as ::rspyts::__private::Bridged>::inventory_ty())
+        }
     };
     quote! {
         ::rspyts::__private::ir::ParamDecl {
@@ -130,20 +140,21 @@ pub fn param_decl(param: &BridgedParam) -> TokenStream {
 /// An `ir::Ty` expression for a return type.
 pub fn ret_ty(ret: &RetKind) -> TokenStream {
     match ret {
-        RetKind::Unit => quote!(<() as ::rspyts::__private::Bridged>::ty()),
-        RetKind::Plain(ty) => quote!(<#ty as ::rspyts::__private::Bridged>::ty()),
-        RetKind::Result { ok, .. } => quote!(<#ok as ::rspyts::__private::Bridged>::ty()),
+        RetKind::Unit => quote!(<() as ::rspyts::__private::Bridged>::inventory_return_ty()),
+        RetKind::Plain(ty) => {
+            quote!(<#ty as ::rspyts::__private::Bridged>::inventory_return_ty())
+        }
+        RetKind::Result { ok, .. } => {
+            quote!(<#ok as ::rspyts::__private::Bridged>::inventory_return_ty())
+        }
     }
 }
 
 /// The `Option<String>` error-enum name expression for a return type.
 pub fn err_name(ret: &RetKind) -> TokenStream {
     match ret {
-        RetKind::Result {
-            err_name: Some(name),
-            ..
-        } => {
-            quote!(::std::option::Option::Some(::std::string::String::from(#name)))
+        RetKind::Result { err, .. } => {
+            quote!(<#err as ::rspyts::BridgeErr>::inventory_name())
         }
         _ => quote!(::std::option::Option::None),
     }
@@ -155,26 +166,38 @@ pub fn field_decl(
     wire_name: &str,
     docs: &str,
     ty: &syn::Type,
-    optional: bool,
+    required: bool,
 ) -> TokenStream {
     quote! {
         ::rspyts::__private::ir::FieldDecl {
             name: ::std::string::String::from(#name),
             wire_name: ::std::string::String::from(#wire_name),
             docs: ::std::string::String::from(#docs),
-            ty: <#ty as ::rspyts::__private::Bridged>::ty(),
-            optional: #optional,
+            ty: <#ty as ::rspyts::__private::Bridged>::inventory_ty(),
+            required: #required,
         }
     }
 }
 
-/// `impl Bridged` returning `Ty::Ref { name }` for a named data type.
+/// `impl Bridged` returning an inventory-time origin-qualified named ref.
+///
+/// `build_manifest` resolves the qualified identity and normalizes it to the
+/// stable public `Ty::Ref { name }` shape before serialization.
 pub fn bridged_ref_impl(ident: &syn::Ident, name: &str) -> TokenStream {
     quote! {
         #[automatically_derived]
         impl ::rspyts::__private::Bridged for #ident {
             fn ty() -> ::rspyts::__private::ir::Ty {
-                ::rspyts::__private::ir::Ty::Ref { name: ::std::string::String::from(#name) }
+                ::rspyts::__private::ir::Ty::Ref {
+                    name: ::std::string::String::from(#name),
+                }
+            }
+
+            fn inventory_ty() -> ::rspyts::__private::ir::Ty {
+                ::rspyts::__private::ir::Ty::qualified_ref(
+                    ::core::env!("CARGO_PKG_NAME"),
+                    #name,
+                )
             }
         }
     }
@@ -189,7 +212,10 @@ pub fn register_type(decl: TokenStream) -> TokenStream {
         const _: () = {
             fn __rspyts_type_decl() -> ::rspyts::__private::ir::TypeDecl { #decl }
             ::rspyts::__private::inventory::submit! {
-                ::rspyts::__private::registry::RegisteredType { build: __rspyts_type_decl }
+                ::rspyts::__private::registry::RegisteredType {
+                    origin: ::core::env!("CARGO_PKG_NAME"),
+                    build: __rspyts_type_decl,
+                }
             }
         };
     }
@@ -201,7 +227,10 @@ pub fn register_const(decl: TokenStream) -> TokenStream {
         const _: () = {
             fn __rspyts_const_decl() -> ::rspyts::__private::ir::ConstDecl { #decl }
             ::rspyts::__private::inventory::submit! {
-                ::rspyts::__private::registry::RegisteredConst { build: __rspyts_const_decl }
+                ::rspyts::__private::registry::RegisteredConst {
+                    origin: ::core::env!("CARGO_PKG_NAME"),
+                    build: __rspyts_const_decl,
+                }
             }
         };
     }
@@ -213,7 +242,10 @@ pub fn register_fn(decl: TokenStream) -> TokenStream {
         const _: () = {
             fn __rspyts_fn_decl() -> ::rspyts::__private::ir::FnDecl { #decl }
             ::rspyts::__private::inventory::submit! {
-                ::rspyts::__private::registry::RegisteredFn { build: __rspyts_fn_decl }
+                ::rspyts::__private::registry::RegisteredFn {
+                    origin: ::core::env!("CARGO_PKG_NAME"),
+                    build: __rspyts_fn_decl,
+                }
             }
         };
     }
@@ -225,8 +257,80 @@ pub fn register_class(decl: TokenStream) -> TokenStream {
         const _: () = {
             fn __rspyts_class_decl() -> ::rspyts::__private::ir::ClassDecl { #decl }
             ::rspyts::__private::inventory::submit! {
-                ::rspyts::__private::registry::RegisteredClass { build: __rspyts_class_decl }
+                ::rspyts::__private::registry::RegisteredClass {
+                    origin: ::core::env!("CARGO_PKG_NAME"),
+                    build: __rspyts_class_decl,
+                }
             }
         };
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use syn::parse_quote;
+
+    fn compact(tokens: TokenStream) -> String {
+        tokens.to_string().replace(' ', "")
+    }
+
+    #[test]
+    fn returns_use_the_contextual_inventory_type() {
+        assert_eq!(
+            compact(ret_ty(&RetKind::Unit)),
+            "<()as::rspyts::__private::Bridged>::inventory_return_ty()"
+        );
+        assert_eq!(
+            compact(ret_ty(&RetKind::Plain(parse_quote!(ReturnAlias)))),
+            "<ReturnAliasas::rspyts::__private::Bridged>::inventory_return_ty()"
+        );
+        assert_eq!(
+            compact(ret_ty(&RetKind::Result {
+                ok: parse_quote!(Payload),
+                err: Box::new(parse_quote!(BridgeFailure)),
+            })),
+            "<Payloadas::rspyts::__private::Bridged>::inventory_return_ty()"
+        );
+    }
+
+    #[test]
+    fn fields_use_data_inventory_types_and_required_polarity() {
+        let tokens = compact(field_decl(
+            "value",
+            "value",
+            "",
+            &parse_quote!(Option<Payload>),
+            false,
+        ));
+        assert!(tokens.contains("Bridged>::inventory_ty()"), "{tokens}");
+        assert!(tokens.contains("required:false"), "{tokens}");
+        assert!(!tokens.contains("optional:"), "{tokens}");
+    }
+
+    #[test]
+    fn argument_prelude_uses_typed_plain_declarations_only() {
+        let params = vec![
+            BridgedParam {
+                ident: parse_quote!(value),
+                kind: ParamKind::Plain {
+                    owned: parse_quote!(i64),
+                    borrow: Borrow::Owned,
+                },
+            },
+            BridgedParam {
+                ident: parse_quote!(samples),
+                kind: ParamKind::Slice {
+                    elem: parse_quote!(f32),
+                    dtype: parse_quote!(F32),
+                },
+            },
+        ];
+        let bindings = shim_bindings(&parse_quote!(__Args), &params);
+        let prelude = compact(bindings.prelude);
+
+        assert!(prelude.contains("shim::decode_typed_args"), "{prelude}");
+        assert_eq!(prelude.matches("ir::ParamDecl").count(), 1, "{prelude}");
+        assert!(!prelude.contains("ir::Ty::Slice"), "{prelude}");
     }
 }
