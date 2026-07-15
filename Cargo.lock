@@ -273,6 +273,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "384b8ab6d37215f3c5301a95a4accb5d64aa607f1fcb26a11b5303878451b4fe"
 
 [[package]]
+name = "pathdiff"
+version = "0.2.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "df94ce210e5bc13cb6651479fa48d14f601d9858cfe0467f43ae157023b938d3"
+
+[[package]]
 name = "proc-macro2"
 version = "1.0.106"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -292,7 +298,7 @@ dependencies = [
 
 [[package]]
 name = "rspyts"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "inventory",
  "rspyts-core",
@@ -303,12 +309,13 @@ dependencies = [
 
 [[package]]
 name = "rspyts-cli"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "anyhow",
  "clap",
  "heck",
  "libloading",
+ "pathdiff",
  "rspyts-core",
  "serde",
  "serde_json",
@@ -318,7 +325,7 @@ dependencies = [
 
 [[package]]
 name = "rspyts-core"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "inventory",
  "serde",
@@ -328,7 +335,7 @@ dependencies = [
 
 [[package]]
 name = "rspyts-macros"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "heck",
  "proc-macro2",

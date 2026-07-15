@@ -17,7 +17,7 @@ default-members = [
 ]
 
 [workspace.package]
-version = "0.3.1"
+version = "0.3.2"
 edition = "2024"
 rust-version = "1.85"
 license = "MIT"
@@ -28,15 +28,16 @@ keywords = ["ffi", "codegen", "python", "typescript", "wasm"]
 categories = ["development-tools::ffi", "wasm"]
 
 [workspace.dependencies]
-rspyts-core = { version = "0.3.1", path = "crates/rspyts-core" }
-rspyts-macros = { version = "0.3.1", path = "crates/rspyts-macros" }
-rspyts = { version = "0.3.1", path = "crates/rspyts" }
+rspyts-core = { version = "0.3.2", path = "crates/rspyts-core" }
+rspyts-macros = { version = "0.3.2", path = "crates/rspyts-macros" }
+rspyts = { version = "0.3.2", path = "crates/rspyts" }
 
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 heck = "0.5"
 inventory = "0.3"
 libloading = "0.8"
+pathdiff = "0.2"
 proc-macro2 = "1"
 quote = "1"
 serde = { version = "1", features = ["derive"] }

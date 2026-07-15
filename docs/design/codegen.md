@@ -223,17 +223,21 @@ module whose manifest it loaded.
 
 ## Determinism
 
-Every generated Python and TypeScript source file contains the rspyts generator
-version and a hash of the canonical manifest. `schema.json` records the bridged
-crate name and crate version under `x-rspyts`, plus the same manifest hash; its
-`x-rspyts.version` is not the generator version. These hashes record provenance
-and let `rspyts check` detect drift. Every compiled module exports the same
-contract fingerprint, and generated Python and TypeScript clients require an
-exact match when loading it. A stale client therefore fails before its first
-bridge call rather than silently diverging.
+Every generated Python and TypeScript source file opens with a prominent
+do-not-edit header containing the rspyts generator version, a portable path to
+the bridged Rust source tree relative to the generated file, and a hash of the
+canonical manifest. `schema.json` carries the same warning in `$comment` and
+records the generator version, relative Rust source, bridged crate name, crate
+version, and manifest hash under `x-rspyts`; `x-rspyts.version` remains the
+bridged crate version. These hashes record provenance and let `rspyts check`
+detect drift. Every compiled module exports the same contract fingerprint, and
+generated Python and TypeScript clients require an exact match when loading it.
+A stale client therefore fails before its first bridge call rather than
+silently diverging.
 
-Declarations and imports are stably sorted. There are no timestamps, machine
-paths, or random identifiers. Files are written only when their bytes change.
+Declarations and imports are stably sorted. There are no timestamps, absolute
+machine paths, or random identifiers. Files are written only when their bytes
+change.
 
 Generated Python/TypeScript source and `schema.json` should be committed.
 Native libraries staged under `<python.out>/lib` and WASM files under
