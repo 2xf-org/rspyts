@@ -18,8 +18,8 @@
 //! caller free them with `rspyts_free(ptr, 12 + json_len + tail_len)`.
 
 use crate::error::BridgeError;
+use crate::ir::Ty;
 use serde::Serialize;
-use serde_json::Value;
 use std::cell::RefCell;
 use std::fmt;
 use std::marker::PhantomData;
@@ -289,6 +289,35 @@ pub fn encode_ok<T: Serialize>(value: &T) -> *mut u8 {
     }
 }
 
+/// Encode a successful bridge return after schema-directed wire conversion.
+///
+/// The response-tail scope remains active while both ordinary Serde
+/// serialization and native-to-wire normalization run. If either fails or
+/// unwinds, its RAII guard restores prior thread-local state and no partial
+/// attachment tail escapes.
+pub fn encode_typed_ok<T: Serialize>(value: &T, ty: &Ty) -> *mut u8 {
+    let tail_scope = ResponseTailGuard::enter();
+    let json = crate::wire::serialize(value, ty).and_then(|value| {
+        serde_json::to_vec(&value)
+            .map_err(|error| crate::wire::WireError::from_serialization_error(error.to_string()))
+    });
+    let tail = tail_scope.finish();
+    match json {
+        Ok(json) => {
+            if json.len() > u32::MAX as usize || tail.len() > u32::MAX as usize {
+                return encode_err(&BridgeError::new(
+                    "payloadTooLarge",
+                    "return value exceeds the 4 GiB envelope limit",
+                ));
+            }
+            seal(STATUS_OK, &json, &tail)
+        }
+        Err(error) => encode_panic(&format!(
+            "rspyts internal: typed result serialization failed: {error}"
+        )),
+    }
+}
+
 /// Encode an application error (status 1).
 pub fn encode_err(err: &BridgeError) -> *mut u8 {
     let json = serde_json::to_vec(err)
@@ -313,7 +342,7 @@ pub struct Decoded<'a> {
     pub tail: &'a [u8],
 }
 
-/// Construct a strict ABI-2 request envelope from JSON and an optional raw
+/// Construct a strict ABI-3 request envelope from JSON and an optional raw
 /// attachment tail.
 ///
 /// This helper is primarily useful to native callers and conformance tests;
@@ -324,7 +353,7 @@ pub fn encode_request(json: &[u8], tail: &[u8]) -> Result<Vec<u8>, EnvelopeError
     Ok(bytes)
 }
 
-/// Decode and validate an ABI-2 request envelope.
+/// Decode and validate an ABI-3 request envelope.
 ///
 /// Unlike [`decode_response`], byte zero is a request marker and must be
 /// exactly zero.
@@ -336,13 +365,12 @@ pub fn decode_request(bytes: &[u8]) -> Result<Decoded<'_>, EnvelopeError> {
             decoded.status
         )));
     }
-    let value: Value = serde_json::from_slice(decoded.json)
+    serde_json::from_slice::<serde_json::Value>(decoded.json)
         .map_err(|error| EnvelopeError::new(format!("malformed envelope JSON: {error}")))?;
-    validate_placeholders(&value, decoded.tail)?;
     Ok(decoded)
 }
 
-/// Decode and validate an ABI-2 response envelope.
+/// Decode and validate an ABI-3 response envelope.
 ///
 /// Response status is closed: only success (0), application error (1), and
 /// caught panic (2) are valid.
@@ -354,11 +382,9 @@ pub fn decode_response(bytes: &[u8]) -> Result<Decoded<'_>, EnvelopeError> {
             decoded.status
         )));
     }
-    let value: Value = serde_json::from_slice(decoded.json)
+    serde_json::from_slice::<serde_json::Value>(decoded.json)
         .map_err(|error| EnvelopeError::new(format!("malformed envelope JSON: {error}")))?;
-    if decoded.status == STATUS_OK {
-        validate_placeholders(&value, decoded.tail)?;
-    } else if !decoded.tail.is_empty() {
+    if decoded.status != STATUS_OK && !decoded.tail.is_empty() {
         return Err(EnvelopeError::new(
             "error and panic envelopes must not contain attachment bytes",
         ));
@@ -411,94 +437,6 @@ fn decode_layout(bytes: &[u8]) -> Result<Decoded<'_>, EnvelopeError> {
         status: bytes[0],
         json,
         tail,
-    })
-}
-
-fn validate_placeholders(value: &Value, tail: &[u8]) -> Result<(), EnvelopeError> {
-    match value {
-        Value::Array(values) => {
-            for value in values {
-                validate_placeholders(value, tail)?;
-            }
-        }
-        Value::Object(map) => {
-            if map.len() == 1 && map.contains_key(crate::bridged::JSON_WRAPPER_KEY) {
-                // Json is deliberately opaque: marker-shaped user data inside
-                // this wrapper must never be interpreted as an attachment.
-            } else if let Some(body) = map.get(crate::bridged::BUF_PLACEHOLDER_KEY) {
-                if map.len() != 1 {
-                    return Err(EnvelopeError::new(
-                        "buffer placeholder object must contain no sibling fields",
-                    ));
-                }
-                validate_placeholder_body(body, tail)?;
-            } else {
-                for value in map.values() {
-                    validate_placeholders(value, tail)?;
-                }
-            }
-        }
-        _ => {}
-    }
-    Ok(())
-}
-
-fn validate_placeholder_body(body: &Value, tail: &[u8]) -> Result<(), EnvelopeError> {
-    let body = body
-        .as_object()
-        .ok_or_else(|| EnvelopeError::new("buffer placeholder body must be an object"))?;
-    if body.len() != 3
-        || !body.contains_key("off")
-        || !body.contains_key("len")
-        || !body.contains_key("dt")
-    {
-        return Err(EnvelopeError::new(
-            "buffer placeholder body must contain exactly off, len, and dt",
-        ));
-    }
-    let off = json_usize(body.get("off").unwrap(), "off")?;
-    let len = json_usize(body.get("len").unwrap(), "len")?;
-    let dt = body
-        .get("dt")
-        .and_then(Value::as_str)
-        .ok_or_else(|| EnvelopeError::new("buffer placeholder dt must be a string"))?;
-    let (size, align) = if dt == "bytes" {
-        (1, 1)
-    } else {
-        let dtype = crate::ir::Dtype::from_wire_name(dt)
-            .ok_or_else(|| EnvelopeError::new(format!("unknown buffer dtype {dt:?}")))?;
-        (dtype.byte_width(), dtype.alignment())
-    };
-    if off % align != 0 {
-        return Err(EnvelopeError::new(format!(
-            "buffer offset {off} is not aligned to {align} bytes for {dt}"
-        )));
-    }
-    let byte_len = len
-        .checked_mul(size)
-        .ok_or_else(|| EnvelopeError::new("buffer attachment length overflows this platform"))?;
-    let end = off
-        .checked_add(byte_len)
-        .ok_or_else(|| EnvelopeError::new("buffer attachment end overflows this platform"))?;
-    if end > tail.len() {
-        return Err(EnvelopeError::new(format!(
-            "buffer attachment range {off}..{end} exceeds tail length {}",
-            tail.len()
-        )));
-    }
-    Ok(())
-}
-
-fn json_usize(value: &Value, field: &str) -> Result<usize, EnvelopeError> {
-    let value = value.as_u64().ok_or_else(|| {
-        EnvelopeError::new(format!(
-            "buffer placeholder {field} must be an unsigned integer"
-        ))
-    })?;
-    usize::try_from(value).map_err(|_| {
-        EnvelopeError::new(format!(
-            "buffer placeholder {field} does not fit this platform"
-        ))
     })
 }
 
@@ -637,62 +575,16 @@ mod tests {
     }
 
     #[test]
-    fn strict_decoder_validates_nested_buffer_placeholders() {
-        let json = br#"{"outer":[{"values":{"__rspyts_buf__":{"off":4,"len":2,"dt":"i16"}}}]}"#;
-        let request = encode_request(json, &[0, 0, 0, 0, 1, 0, 2, 0]).unwrap();
-        let decoded = decode_request(&request).unwrap();
-        assert_eq!(decoded.tail, [0, 0, 0, 0, 1, 0, 2, 0]);
-
-        let out_of_bounds = frame(
-            REQUEST_MARKER,
-            br#"{"values":{"__rspyts_buf__":{"off":4,"len":3,"dt":"i16"}}}"#,
-            &[0; 8],
-        )
-        .unwrap();
-        assert!(
-            decode_request(&out_of_bounds)
-                .unwrap_err()
-                .to_string()
-                .contains("exceeds tail length")
-        );
-
-        let unaligned = frame(
-            REQUEST_MARKER,
-            br#"{"values":{"__rspyts_buf__":{"off":1,"len":1,"dt":"f64"}}}"#,
-            &[0; 9],
-        )
-        .unwrap();
-        assert!(
-            decode_request(&unaligned)
-                .unwrap_err()
-                .to_string()
-                .contains("not aligned")
-        );
-
-        let invalid_dtype = frame(
-            REQUEST_MARKER,
-            br#"{"values":{"__rspyts_buf__":{"off":0,"len":1,"dt":"usize"}}}"#,
-            &[0; 8],
-        )
-        .unwrap();
-        assert!(
-            decode_request(&invalid_dtype)
-                .unwrap_err()
-                .to_string()
-                .contains("unknown buffer dtype")
-        );
-    }
-
-    #[test]
-    fn strict_decoder_rejects_malformed_buffer_placeholders() {
+    fn strict_decoder_leaves_reserved_key_maps_for_schema_directed_decoding() {
         for json in [
+            br#"{"__rspyts_buf__":{"off":0,"len":1,"dt":"u8"}}"#.as_slice(),
             br#"{"__rspyts_buf__":null}"#.as_slice(),
             br#"{"__rspyts_buf__":{"off":0,"len":1}}"#.as_slice(),
             br#"{"__rspyts_buf__":{"off":-1,"len":1,"dt":"u8"}}"#.as_slice(),
             br#"{"__rspyts_buf__":{"off":0,"len":1,"dt":"u8"},"extra":true}"#.as_slice(),
         ] {
             let bytes = frame(REQUEST_MARKER, json, &[0]).unwrap();
-            assert!(decode_request(&bytes).is_err());
+            assert_eq!(decode_request(&bytes).unwrap().json, json);
         }
     }
 

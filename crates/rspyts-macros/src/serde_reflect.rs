@@ -188,7 +188,7 @@ fn unsupported(meta: &ParseNestedMeta<'_>, scope: Scope) -> syn::Error {
         Scope::Variant => "`rename` and `rename_all`",
     };
     meta.error(format!(
-        "unsupported Serde attribute `{key}` on this {}; rspyts can reflect only {supported}. Use `rspyts::Json` for a deliberately schemaless custom wire contract",
+        "unsupported Serde attribute `{key}` on this {}; rspyts can reflect only {supported}. Use `serde_json::Value` for deliberately schemaless data",
         match scope {
             Scope::Container => "type",
             Scope::Field => "field",

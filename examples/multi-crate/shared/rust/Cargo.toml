@@ -7,8 +7,14 @@ rust-version.workspace = true
 license.workspace = true
 publish = false
 
-# rlib only, and no `rspyts::export!()`: this crate is linked into other
-# bridged modules, and each compiled module has exactly one exporter. The
-# `module/` crate next door adds the export for standalone codegen.
+[lib]
+crate-type = ["rlib", "cdylib"]
+
+[features]
+default = []
+# Standalone code generation needs module exports. Downstream Rust crates do
+# not enable this feature, so their cdylibs still contain exactly one exporter.
+standalone-module = []
+
 [dependencies]
 rspyts = { workspace = true }

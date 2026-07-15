@@ -1,16 +1,16 @@
 //! Expansion of `#[bridge]` on `const` items.
 //!
 //! The const is re-emitted untouched, followed by an inventory
-//! registration whose builder serializes the value with
-//! `serde_json::to_value(&NAME)` at manifest-build time — the manifest
-//! carries the fully serialized wire value, and the emitters project it as
-//! a real importable constant in each language.
+//! registration whose builder schema-normalizes the value with
+//! `wire::serialize(&NAME, &ty)` at manifest-build time — the manifest
+//! carries the exact ABI wire value, and the emitters project it as a real
+//! importable constant in each language.
 //!
 //! Because `&str` (and friends) are not `Bridged`, the IR type of the
 //! const is resolved *syntactically* here: `&'static str` maps to
 //! `Ty::String`, references to slices and plain arrays map to `Ty::List`
 //! of the recursively mapped element, and every other path type falls back
-//! to `<T as Bridged>::ty()` — so an owned bridged type works and a
+//! to `<T as Bridged>::inventory_ty()` — so an owned bridged type works and a
 //! non-bridgeable one fails with the usual trait-bound error.
 
 use crate::attrs::BridgeArgs;
@@ -43,10 +43,8 @@ pub fn expand_const(args: BridgeArgs, item: syn::ItemConst) -> syn::Result<Token
             docs: ::std::string::String::from(#docs),
             origin: #origin,
             ty: #ty_expr,
-            // `&str`, slices, and arrays serialize as their wire shapes
-            // (string / array), so the captured value matches `ty`.
-            value: ::rspyts::__private::serde_json::to_value(&#ident)
-                .expect("rspyts: bridged const failed to serialize"),
+            value: ::rspyts::__private::wire::serialize(&#ident, &#ty_expr)
+                .expect("rspyts: bridged const failed wire normalization"),
         }
     });
 
@@ -77,7 +75,7 @@ fn const_ir_ty(ty: &syn::Type) -> syn::Result<TokenStream> {
         syn::Type::Path(_) | syn::Type::Tuple(_) => {
             // Owned types: membership is enforced semantically by `Bridged`
             // (`()` only ever satisfies it for the empty tuple).
-            Ok(quote!(<#ty as ::rspyts::__private::Bridged>::ty()))
+            Ok(quote!(<#ty as ::rspyts::__private::Bridged>::inventory_ty()))
         }
         _ => Err(unsupported(ty)),
     }
@@ -132,18 +130,18 @@ mod tests {
              (::rspyts::__private::ir::Ty::String)}"
         );
         assert!(ty_tokens(parse_quote!([f64; 3])).starts_with("::rspyts::__private::ir::Ty::List"));
-        assert!(ty_tokens(parse_quote!(&[u8])).contains("Bridged>::ty()"));
+        assert!(ty_tokens(parse_quote!(&[u8])).contains("Bridged>::inventory_ty()"));
     }
 
     #[test]
     fn owned_path_types_fall_back_to_bridged() {
         assert_eq!(
             ty_tokens(parse_quote!(f64)),
-            "<f64as::rspyts::__private::Bridged>::ty()"
+            "<f64as::rspyts::__private::Bridged>::inventory_ty()"
         );
         assert_eq!(
             ty_tokens(parse_quote!(Option<u32>)),
-            "<Option<u32>as::rspyts::__private::Bridged>::ty()"
+            "<Option<u32>as::rspyts::__private::Bridged>::inventory_ty()"
         );
     }
 

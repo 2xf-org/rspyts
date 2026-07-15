@@ -5,11 +5,10 @@
 //! on this one. That origin is what lets downstream configs map them to
 //! this crate's own generated packages instead of re-emitting them.
 //!
-//! Note what is *not* here: `rspyts::export!()`. A compiled module has
-//! exactly one exporter, and this crate is linked into other bridged
-//! cdylibs (see `examples/multi-crate/app`). The tiny `module/` crate
-//! next door re-exports everything and adds the export so this crate can
-//! also be generated standalone.
+//! A compiled module must have exactly one exporter. The
+//! `standalone-module` feature adds this crate's exporter for its own codegen
+//! build; downstream crates link the default rlib without that feature and
+//! provide their own exporter.
 
 use rspyts::bridge;
 
@@ -26,3 +25,20 @@ pub enum Axis {
     Horizontal,
     Vertical,
 }
+
+/// Exact integer data defined in one crate and bridged by another.
+#[bridge]
+pub struct SharedExact {
+    pub id: u64,
+    pub signed: i64,
+    pub history: Vec<u64>,
+    #[bridge(required)]
+    pub note: Option<String>,
+}
+
+/// A named exact identifier whose origin remains the shared crate.
+#[bridge]
+pub struct SharedId(pub u64);
+
+#[cfg(feature = "standalone-module")]
+rspyts::export!();

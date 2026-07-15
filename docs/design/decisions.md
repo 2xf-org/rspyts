@@ -24,16 +24,19 @@ The tradeoff is deliberate: rspyts optimizes bulk data, not every scalar call.
 Generated clients are source artifacts. They belong in review, type checking,
 package builds, and downstream diffs.
 
+This decision covers generated Python/TypeScript source and any configured
+schema output, not staged native libraries or WebAssembly modules. Those are
+platform build artifacts and should be packaged as needed rather than committed.
+
 `rspyts check` makes drift mechanical. Consumers never need Rust or the
 generator merely to install a Python or npm package.
 
-## ADR-4: No implicit 64-bit integers
+## ADR-4: Native exact 64-bit integers
 
 JavaScript numbers cannot represent every signed or unsigned 64-bit integer.
-Bare `i64` and `u64` are therefore rejected.
-
-`I64` and `U64` make exactness visible in Rust and project to Python `int` and
-TypeScript `bigint`. Canonical decimal strings carry them on the wire.
+Domain contracts therefore use ordinary Rust `i64` and `u64`, which project to
+Python `int` and TypeScript `bigint`. Schema-directed boundary codecs carry
+them as canonical decimal strings without changing ordinary Rust Serde behavior.
 
 ## ADR-5: ctypes, not the CPython C API
 
@@ -44,7 +47,7 @@ internal ABI.
 This makes the runtime small and portable. It also means rspyts does not try to
 make Rust objects subclassable Python objects.
 
-## ADR-6: Synchronous calls through v0.2
+## ADR-6: Calls remain synchronous
 
 Every shim begins and ends in one host call. Async runtimes would need a
 separate lifetime, cancellation, wakeup, and error protocol.
@@ -63,7 +66,9 @@ nonzero, never reused, and explicitly disposable.
 ## ADR-8: Types compose across crates; symbols do not
 
 A manifest records each type's origin. Generated packages may import a type
-from another crate's generated package, preserving one host-language identity.
+from another crate's generated package. Python then reuses the same runtime
+model class. TypeScript reuses the same declaration provenance and source of
+truth; its structural type system does not provide nominal interface identity.
 
 Calls remain bound to one loaded module. Cross-module symbol routing would need
 a linker-level contract and is not inferred by code generation.
@@ -75,9 +80,9 @@ field rejection. `#[bridge(serde)]` adopts an existing derived contract.
 
 Adoption reflects only shape-preserving attributes that the manifest can model
 exactly. `flatten`, `untagged`, aliases, defaults, skipped fields, and custom
-codecs are rejected. Schemaless data uses `Json` explicitly.
+codecs are rejected. Schemaless data uses `serde_json::Value` explicitly.
 
-## ADR-10: ABI 2 uses one envelope in both directions
+## ADR-10: ABI 3 uses one envelope in both directions
 
 Requests and responses share a strict 12-byte header, JSON payload, and binary
 tail. Direction-specific validation interprets byte zero as a request marker or
@@ -87,10 +92,11 @@ Symmetry removes the old split between raw request JSON and framed responses.
 It also allows nested owned buffers on input without adding per-function ABI
 parameters.
 
-## ADR-11: Exact 64-bit values require explicit wrappers
+## ADR-11: Exact 64-bit values are native Rust types with an exact wire form
 
-Exactness is a semantic choice, not a generator guess. The wrappers remain
-distinct even on hosts that can represent the value natively.
+Domain code uses ordinary `i64` and `u64`. The schema-directed Rust boundary
+converts them to canonical decimal strings only while crossing the ABI, so
+ordinary Serde remains ordinary and neither foreign host loses precision.
 
 This rule applies recursively to fields, collections, tuples, constants, and
 error data. Numeric buffer attachments remain raw fixed-width integers because

@@ -1,0 +1,11 @@
+error: bridged member `close` collides with generated Python class member `close`; rename it or scope it to TypeScript with `#[bridge(target = "typescript")]`
+  --> tests/ui/method_named_close.rs:12:12
+   |
+12 |     pub fn close(&self) {}
+   |            ^^^^^
+
+error: `constructor` does not apply to this item; it marks the constructor method inside a #[bridge] impl block
+ --> tests/ui/method_named_close.rs:7:14
+  |
+7 |     #[bridge(constructor)]
+  |              ^^^^^^^^^^^

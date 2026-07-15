@@ -84,6 +84,17 @@ impl std::error::Error for BridgeError {}
 /// variant fields become `data`.
 pub trait BridgeErr {
     fn into_bridge_error(self) -> BridgeError;
+
+    /// Origin-qualified generated error-enum identity used while assembling
+    /// the inventory manifest. Handwritten bridge errors remain generic and
+    /// therefore return `None`.
+    #[doc(hidden)]
+    fn inventory_name() -> Option<String>
+    where
+        Self: Sized,
+    {
+        None
+    }
 }
 
 impl BridgeErr for BridgeError {

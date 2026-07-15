@@ -19,18 +19,59 @@
 import { type BufTypedArray, type Dtype } from "./envelope.js";
 import { type BridgeErrorRegistry } from "./errors.js";
 import { type BridgeModule } from "./module.js";
+/**
+ * One successful ABI-3 response position. `tail` is explicit and owned host
+ * memory; generated schema decoders preserve it while selecting child values.
+ */
+export interface WireResponse<Value = unknown> {
+    readonly value: Value;
+    readonly tail: Uint8Array;
+}
+/** Create an explicit response context, primarily for attachment-free error data. */
+export declare function wireResponse<Value>(value: Value, tail?: Uint8Array): WireResponse<Value>;
 /** Convert a host bigint to the canonical signed 64-bit wire string. */
 export declare function i64ToWire(value: bigint): string;
 /** Convert a host bigint to the canonical unsigned 64-bit wire string. */
 export declare function u64ToWire(value: bigint): string;
 /** Validate a canonical signed 64-bit wire string and return a bigint. */
-export declare function i64FromWire(value: unknown): bigint;
+export declare function i64FromWire(response: WireResponse): bigint;
 /** Validate a canonical unsigned 64-bit wire string and return a bigint. */
-export declare function u64FromWire(value: unknown): bigint;
+export declare function u64FromWire(response: WireResponse): bigint;
 /** Validate a finite structured float and canonicalize signed zero. */
-export declare function floatFromWire(value: unknown): number;
-/** Unwrap a schemaless JSON field from an opaque application-error payload. */
-export declare function jsonFromWire(value: unknown): unknown;
+export declare function floatFromWire(response: WireResponse): number;
+/** Validate a finite structured f32 without accepting values Rust cannot represent. */
+export declare function f32FromWire(response: WireResponse): number;
+/** Validate an exact JSON boolean. */
+export declare function boolFromWire(response: WireResponse): boolean;
+/** Validate an exact, bounded JSON integer. */
+export declare function boundedIntFromWire(response: WireResponse, minimum: number, maximum: number): number;
+/** Validate an exact JSON string. */
+export declare function stringFromWire(response: WireResponse): string;
+/** Validate a materialized opaque-bytes attachment. */
+export declare function bytesFromWire(response: WireResponse): Uint8Array;
+/** Validate a materialized numeric-buffer attachment and its declared dtype. */
+export declare function bufferFromWire(response: WireResponse, dtype: Dtype): BufTypedArray;
+/** Validate an exact JSON array. */
+export declare function listFromWire(response: WireResponse): WireResponse[];
+/** Validate an exact JSON object. */
+export declare function mapFromWire(response: WireResponse): Record<string, WireResponse>;
+/** Validate the exact field set of one generated struct or enum variant. */
+export declare function objectFromWire(response: WireResponse, required: readonly string[], optional?: readonly string[]): Record<string, WireResponse>;
+/** Validate the JSON-array representation of a fixed-length tuple. */
+export declare function tupleFromWire(response: WireResponse, length: number): WireResponse[];
+/** Validate one generated string-enum wire value. */
+export declare function stringEnumFromWire<const Value extends string>(response: WireResponse, variants: readonly Value[]): Value;
+/** Field requirements for one internally tagged data-enum variant. */
+export interface WireVariantShape {
+    readonly required: readonly string[];
+    readonly optional?: readonly string[];
+}
+/** Validate and dispatch one internally tagged data-enum wire object. */
+export declare function enumFromWire(response: WireResponse, tag: string, variants: Readonly<Record<string, WireVariantShape>>): Record<string, WireResponse>;
+/** Validate the one-value null data type. */
+export declare function nullFromWire(response: WireResponse): null;
+/** Validate and copy a transparent value at a schema-declared `Json` position. */
+export declare function jsonFromWire(response: WireResponse): unknown;
 /**
  * One `&[T]` slice argument: the data to pass and its wire dtype. The
  * typed array's constructor must match `dt` (`Float64Array` for `"f64"`,
@@ -71,22 +112,11 @@ export declare function writeBytes(mod: BridgeModule, bytes: Uint8Array): Alloca
  */
 export declare function writeSlice(mod: BridgeModule, slice: SliceArg): SliceAllocation;
 /**
- * Call a bridged export and return its decoded result.
- *
- * @param mod    The instantiated module.
- * @param symbol Export name, e.g. `"rspyts_fn__process_values"`.
- * @param args   Plain parameters as a wire-cased JSON object (`{}` when
- *               there are none — the pair is always passed, ABI §3.1).
- * @param slices `&[T]` parameters, in declaration order.
- * @param handle Leading `u64` handle for method calls. WASM `u64`
- *               parameters surface as JS `bigint`; pointers and lengths
- *               are `usize` (wasm32 `i32`) and cross as `number`s.
- * @returns The JSON payload with every `__rspyts_buf__` placeholder
- *          replaced by a typed array copied out of linear memory.
- * @throws A registered {@link RspytsError} subclass on status 1,
- *         {@link RspytsPanicError} on status 2.
+ * Invoke one ABI-3 generated export. This is the sole function-call path.
+ * Successful calls return explicit `{ value, tail }` context for the
+ * generated schema decoder; application errors and panics throw.
  */
-export declare function callFn(mod: BridgeModule, symbol: string, args: unknown, slices?: SliceArg[], handle?: bigint, errorTypes?: BridgeErrorRegistry): unknown;
+export declare function callFn(mod: BridgeModule, symbol: string, args: unknown, slices?: SliceArg[], handle?: bigint, errorTypes?: BridgeErrorRegistry): WireResponse;
 /**
  * Invoke a `__drop` export (ABI §8). Fire-and-forget: `__drop` is
  * idempotent and infallible by contract, and this is called from
@@ -99,8 +129,7 @@ export {};
 
 // --- envelope.d.ts ---
 /**
- * Strict request/response envelope codecs (ABI §4) and substitution of
- * `__rspyts_buf__` tail placeholders with typed arrays (ABI §6).
+ * Strict ABI-3 request/response envelope codecs (ABI §4).
  *
  * Both directions use one 12-byte little-endian header. Byte zero is a
  * zero request marker on calls and a closed 0/1/2 status on responses:
@@ -128,6 +157,7 @@ export declare const STATUS_ERROR = 1;
 export declare const STATUS_PANIC = 2;
 /** Wire names of the supported raw-buffer element types (ABI §6). */
 export type Dtype = "u8" | "i8" | "u16" | "i16" | "u32" | "i32" | "u64" | "i64" | "f32" | "f64";
+type AttachmentDtype = Dtype | "bytes";
 /** The typed arrays that raw buffers and slices materialize as. */
 export type BufTypedArray = Uint8Array | Int8Array | Uint16Array | Int16Array | Uint32Array | Int32Array | BigUint64Array | BigInt64Array | Float32Array | Float64Array;
 interface DtypeInfo {
@@ -146,50 +176,41 @@ export declare const DTYPE: Record<Dtype, DtypeInfo>;
  * major version.
  */
 export declare const BUF_PLACEHOLDER_KEY = "__rspyts_buf__";
-export declare const JSON_WRAPPER_KEY = "__rspyts_json__";
+declare const WIRE_BUFFER_MARKER: unique symbol;
 /** Explicit marker for a numeric typed array nested in request JSON. */
 export interface WireBuffer {
-    readonly __rspytsWireBuffer: true;
+    readonly [WIRE_BUFFER_MARKER]: true;
     readonly data: BufTypedArray;
     readonly dt: Dtype;
 }
 /** Mark a typed array as a numeric `Buf<T>` request attachment. */
 export declare function wireBuffer(data: BufTypedArray, dt: Dtype): WireBuffer;
-/** Encode JSON plus aligned numeric attachments as a strict ABI-2 request. */
+/** Validate and copy a transparent schema-declared JSON request value. */
+export declare function jsonToWire(value: unknown): unknown;
+/** Encode JSON plus aligned attachments as a strict ABI-3 request. */
 export declare function buildRequest(args: unknown): Uint8Array;
-/** A decoded envelope: `payload` is the parsed JSON, with every buffer
- * placeholder already replaced by a typed array when `status` is ok. */
+/** Validate and copy one transparent, schema-declared JSON value. */
+export declare function checkedJsonValue(value: unknown): unknown;
+/** A validated response status, parsed JSON value, and owned tail bytes. */
 export interface DecodedEnvelope {
     status: number;
-    payload: unknown;
+    value: unknown;
+    tail: Uint8Array;
 }
 /** A validated request, retained in wire form for conformance diagnostics. */
 export interface DecodedRequest {
-    payload: unknown;
+    value: unknown;
     tail: Uint8Array;
 }
-/** Strictly decode an ABI-2 request envelope. */
+/** Decode ABI-3 request framing and JSON without interpreting object shapes. */
 export declare function decodeRequest(bytes: Uint8Array): DecodedRequest;
 /**
- * Decode a complete envelope. Placeholders are substituted only for
- * status-ok payloads — error payloads never carry them (their tail is
- * always empty, ABI §4/§5).
+ * Decode a complete ABI-3 response without interpreting schema-directed
+ * attachment shapes. Error and panic responses must have an empty tail.
  */
 export declare function decodeEnvelope(bytes: Uint8Array): DecodedEnvelope;
-/**
- * Recursively replace every `{"__rspyts_buf__": {off, len, dt}}`
- * placeholder in `value` with a typed array holding the corresponding
- * elements of `tail`. The placeholder key is reserved: an object that
- * contains it must contain no sibling keys.
- *
- * The result is always a copy: `tail` is a view whose `byteOffset` need
- * not be a multiple of the element size (the tail merely follows the JSON
- * bytes inside the envelope), so constructing a typed array directly over
- * `tail.buffer` could throw on alignment. Copying the bytes into a fresh
- * buffer first sidesteps alignment entirely and guarantees the returned
- * array is independent of the envelope's lifetime.
- */
-export declare function substituteBuffers(value: unknown, tail: Uint8Array): unknown;
+/** Materialize a buffer only at a generated schema-declared attachment position. */
+export declare function bufferFromEnvelope(value: unknown, tail: Uint8Array, expected: AttachmentDtype): BufTypedArray;
 export {};
 
 // --- errors.d.ts ---
@@ -201,10 +222,9 @@ export {};
  * status-2 (panic) envelope. This module maps that object back onto a
  * JavaScript error class:
  *
- * - status 2 always becomes a {@link RspytsPanicError}, regardless of code;
- * - status 1 consults the generated call-scoped map, then the optional
- *   process registry populated through {@link registerError}, then the
- *   {@link RspytsError} base class.
+ * - status 2 requires code `panic` and becomes a {@link RspytsPanicError};
+ * - status 1 maps bridge-owned `staleHandle` directly, then consults the
+ *   generated call-scoped registry, then falls back to {@link RspytsError}.
  */
 /**
  * Base class for every error crossing the rspyts bridge.
@@ -240,12 +260,6 @@ export declare class InstancePoisonedError extends Error {
 export type BridgeErrorConstructor = new (message: string, data?: unknown) => RspytsError;
 export type BridgeErrorRegistry = Readonly<Record<string, BridgeErrorConstructor>>;
 /**
- * Register a process-wide fallback for a bridge error `code`. Generated
- * clients use call-scoped maps so packages may safely reuse codes; this
- * compatibility hook remains useful for handwritten integrations.
- */
-export declare function registerError(code: string, ctor: BridgeErrorConstructor): void;
-/**
  * Throw the error class corresponding to a non-ok envelope: panic status
  * beats the registry; otherwise the registry maps `code` to a generated
  * class, with {@link RspytsError} as the fallback.
@@ -253,55 +267,81 @@ export declare function registerError(code: string, ctor: BridgeErrorConstructor
 export declare function throwBridgeError(status: number, payload: unknown, errorTypes?: BridgeErrorRegistry): never;
 
 // --- index.d.ts ---
+/** Application-facing rspyts ABI-3 runtime surface. */
+export { ABI_VERSION, ContractFingerprintMismatchError, instantiate, type BridgeModule, type InstantiateOptions, } from "./module.js";
+export { InstancePoisonedError, RspytsError, RspytsPanicError, StaleHandleError, } from "./errors.js";
+
+// --- internal/abi3.d.ts ---
 /**
- * rspyts TypeScript runtime — the support library for code generated by
- * `rspyts generate` (see `docs/design/codegen.md` §5.1 in the repository).
+ * Versioned generator-facing ABI-3 surface.
  *
- * This is the complete public surface; generated code imports exactly
- * these names and nothing else.
+ * This subpath is emitted by `rspyts generate`; application code should use
+ * generated clients and the package root instead.
  */
-export { instantiate, type BridgeModule } from "./module.js";
-export { callFn, callDrop, floatFromWire, i64FromWire, i64ToWire, jsonFromWire, u64FromWire, u64ToWire, type SliceArg, } from "./call.js";
-export { wireBuffer } from "./envelope.js";
-export { InstancePoisonedError, RspytsError, RspytsPanicError, StaleHandleError, type BridgeErrorRegistry, registerError, } from "./errors.js";
+export { boolFromWire, boundedIntFromWire, bufferFromWire, bytesFromWire, callDrop, callFn, enumFromWire, f32FromWire, floatFromWire, i64FromWire, i64ToWire, jsonFromWire, listFromWire, mapFromWire, nullFromWire, objectFromWire, stringEnumFromWire, stringFromWire, tupleFromWire, u64FromWire, u64ToWire, wireResponse, type SliceArg, type WireResponse, type WireVariantShape, } from "../call.js";
+export { jsonToWire, wireBuffer } from "../envelope.js";
+export { RspytsError, type BridgeErrorRegistry, } from "../errors.js";
+export { type BridgeModule, verifyModuleContract, } from "../module.js";
 
 // --- module.d.ts ---
+/** Loading, validating, and owning an ABI-3 bridged WebAssembly module. */
+/** The ABI major version implemented by this runtime. */
+export declare const ABI_VERSION = 3;
+/** Options accepted by {@link instantiate}. */
+export interface InstantiateOptions {
+    /** Exact lowercase SHA-256 of the deterministic manifest JSON. */
+    readonly expectedContractFingerprint?: string;
+}
 /**
- * Loading a bridged WebAssembly module (ABI §3).
- *
- * rspyts modules are self-contained `wasm32-unknown-unknown` cdylibs: they
- * import nothing and export linear memory plus the `rspyts_*` symbols.
- * {@link instantiate} accepts anything the WebAssembly JS API can
- * instantiate, verifies the module speaks ABI version 2, and returns the
- * {@link BridgeModule} that `callFn`/`callDrop` operate on.
- */
-/** The ABI major version this runtime implements (ABI §3). */
-export declare const ABI_VERSION = 2;
-/**
- * An instantiated rspyts module: the raw export object plus its linear
- * memory. `memory` is also reachable as `exports.memory`; it is hoisted
- * here so callers never touch a possibly-absent property. A WebAssembly
- * runtime trap poisons the instance permanently because its Rust-side
- * invariants and allocator state can no longer be trusted.
+ * An instantiated and ABI-validated rspyts module. The contract fingerprint
+ * is loaded from the module once during instantiation and remains explicit.
  */
 export interface BridgeModule {
-    exports: Record<string, Function> & {
+    readonly exports: Record<string, Function> & {
         memory?: WebAssembly.Memory;
     };
-    memory: WebAssembly.Memory;
+    readonly memory: WebAssembly.Memory;
+    readonly contractFingerprint: string;
+}
+/** Raised when generated bindings and the loaded binary describe different contracts. */
+export declare class ContractFingerprintMismatchError extends Error {
+    readonly expected: string;
+    readonly actual: string;
+    constructor(expected: string, actual: string);
 }
 /** @internal Whether a prior WebAssembly runtime trap poisoned this module. */
 export declare function isPoisoned(mod: BridgeModule): boolean;
 /** @internal Permanently poison a module after a WebAssembly runtime trap. */
 export declare function markPoisoned(mod: BridgeModule): void;
+/** @internal Reject calls after a WebAssembly trap. */
+export declare function ensureHealthy(mod: BridgeModule): void;
+/** @internal Resolve one required function export. */
+export declare function exportFn(mod: BridgeModule, name: string): Function;
+/** @internal Invoke WASM and poison the instance on runtime traps. */
+export declare function invokeWasm(mod: BridgeModule, fn: Function, args: Array<number | bigint>): unknown;
+/** @internal Convert a wasm32 return value into a non-null pointer. */
+export declare function wasm32Pointer(value: number, source: string): number;
+/** @internal Validate one range against the module's current memory buffer. */
+export declare function ensureMemoryRange(mod: BridgeModule, ptr: number, len: number, label: string): void;
+/** @internal Allocate exactly `len` bytes through the module allocator. */
+export declare function allocRaw(mod: BridgeModule, len: number): number;
+/** @internal Free one exact module-owned pointer/length pair. */
+export declare function freeRaw(mod: BridgeModule, ptr: number, len: number): void;
 /**
- * Instantiate a bridged module from compiled bytes, a precompiled
- * `WebAssembly.Module`, or a (promised) HTTP `Response` — the latter two
- * via `WebAssembly.instantiateStreaming`, so `instantiate(fetch(url))`
- * compiles while downloading.
- *
- * Throws if the module does not export linear memory, does not export
- * `rspyts_abi_version`, or reports an ABI version other than
- * {@link ABI_VERSION}.
+ * @internal Copy and free an envelope returned by a module export. The
+ * response is freed with the exact header-derived total length. Header/range
+ * violations poison the module because ownership can no longer be recovered
+ * safely.
  */
-export declare function instantiate(source: WebAssembly.Module | BufferSource | Response | Promise<Response>): Promise<BridgeModule>;
+export declare function takeOwnedEnvelope(mod: BridgeModule, symbol: string, rawPointer: unknown): Uint8Array;
+/**
+ * Compare a validated module with the fingerprint embedded in generated
+ * bindings. Generated `createClient` functions call this before exposing any
+ * bridged operation.
+ */
+export declare function verifyModuleContract(mod: BridgeModule, expected: string): void;
+/**
+ * Instantiate an ABI-3 module, validate all module-level exports, load its
+ * deterministic contract fingerprint, and optionally compare it immediately.
+ */
+export declare function instantiate(source: WebAssembly.Module | BufferSource | Response | Promise<Response>, options?: InstantiateOptions): Promise<BridgeModule>;

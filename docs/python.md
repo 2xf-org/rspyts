@@ -12,7 +12,8 @@ The generated directory contains:
 
 ```text
 __init__.py   public re-exports
-models.py     pydantic models and enums
+models.py     host-only pydantic models and enums
+_codecs.py    private schema-directed ABI codecs
 constants.py bridged constants
 errors.py    exception classes and scoped error maps
 functions.py free-function wrappers
@@ -40,40 +41,56 @@ Bridged structs subclass `rspyts.Contract`.
 - Wire keys use the exact manifest names, camelCase by default.
 - Supported Serde renames become explicit pydantic aliases.
 - Unknown fields are rejected.
-- `Option<T>` fields may be omitted and serialize as null.
+- `Option<T>` fields may be omitted and accept either `T` or `None`.
+- `#[bridge(required)] Option<T>` fields require the key while still accepting
+  either `T` or `None`.
+- Unit-valued data fields accept only `None`.
 - Integer ranges match Rust.
 - Structured floats must be finite and returned negative zero is normalized.
 
 `Contract` is deliberately not pydantic's global strict mode. It uses the
 normal pydantic conversion rules plus the bridge's own range, shape, alias,
-and unknown-field checks.
+and unknown-field checks when applications construct models. Generated return
+decoders take the stricter path. The generated private `_codecs.py` module
+validates the exact wire shape before constructing a model, so a Rust `f64`
+returned as a JSON string, an integer returned as a boolean, or any equivalent
+nested mismatch is rejected instead of being hidden by pydantic coercion.
+Named types use one reusable codec in each needed direction; wrappers do not
+repeat a model's conversion logic. Exact integers, string enums, tagged enums,
+tuples, and attachments are converted to their idiomatic Python host forms
+during that validation.
 
 String enums become `StrEnum` classes. Tagged Rust enums become one model per
 variant plus a discriminated union.
 
 ## Exact integers
 
-Rust `rspyts::I64` and `rspyts::U64` appear as ordinary Python `int` values.
-Generated code validates the full signed or unsigned range and uses canonical
-decimal strings on the wire.
+Ordinary Rust `i64` and `u64` appear as ordinary Python `int` values. Generated
+code validates the full signed or unsigned range and uses canonical decimal
+strings on the wire.
 
 ```python
-value = ExactNumbers(signed=-(2**63), unsigned=2**64 - 1)
+value = ExactNumbers(
+    signed=-(2**63),
+    unsigned=2**64 - 1,
+    pair=(-(2**63), 2**64 - 1),
+)
 ```
 
 The conversion is recursive through models, options, lists, maps, tuples,
-constants, and typed error data. Bare Rust `i64` and `u64` are not bridgeable.
+constants, and typed error data. No domain wrapper is required in Rust or
+Python.
 
 ## Schemaless JSON
 
-Rust `rspyts::Json` appears as `rspyts.JsonValue`. The host value remains an
-ordinary dict, list, string, number, boolean, or null. Its shape is not
-validated, but it must still be JSON-compatible and all numbers must be
-finite.
+Rust `serde_json::Value` appears as `typing.Any`. The host value remains an
+ordinary dict, list, string, number, boolean, or null. Its application-specific
+shape is opaque to rspyts, but the value must still be JSON-compatible and all
+numbers must be finite.
 
-rspyts uses an internal wrapper on the wire so a user object that looks like a
-buffer placeholder remains ordinary user data. Generated code adds and removes
-that wrapper; applications do not.
+ABI 3 transports this value transparently. The generated codec stops
+schema-directed traversal at the declared JSON position, so objects that look
+like attachment metadata remain ordinary user data without a marker wrapper.
 
 ## Errors
 
@@ -129,13 +146,20 @@ Use buffers for large data and `Vec<T>` for small structured collections.
 `Library` loads on the first generated call and caches the result. Resolution
 order is:
 
-1. `RSPYTS_LIBRARY`, containing the full library path;
+1. `RSPYTS_LIBRARY_<NAME>`, containing the full library path and with the
+   generated library name uppercased (for example,
+   `RSPYTS_LIBRARY_NEUROVIRTUAL_HARDWARE`);
 2. `Library.set_path(path)`, called before the first bridge call;
-3. the generated `library_search` directories.
+3. the generated package's fixed `lib` directory.
+
+Use the library-specific variable when a process loads more than one rspyts
+library. Non-alphanumeric characters in the generated name normalize to
+underscores.
 
 The loader normalizes Cargo crate hyphens to underscores and chooses the
 platform filename (`.dylib`, `.so`, or `.dll`). It rejects any library that
-does not report ABI version 2.
+does not report ABI version 3 or the generated client's exact contract
+fingerprint.
 
 ## Stateful classes
 
@@ -166,9 +190,9 @@ calls over a large number of tiny calls.
 ## Shipping
 
 Commit generated code and gate it with `rspyts check`. Ship the cdylib beside
-your package or set `RSPYTS_LIBRARY` at deployment time. A wheel containing the
-cdylib is platform-specific even though the `rspyts` runtime wheel itself is
-pure Python.
+your package or set its `RSPYTS_LIBRARY_<NAME>` override at deployment time. A wheel containing
+the cdylib is platform-specific even though the `rspyts` runtime wheel itself
+is pure Python.
 
 See the [quickstart](introduction/quickstart.md) and the complete
 [type system](design/type-system.md).

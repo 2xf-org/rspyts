@@ -76,7 +76,7 @@ pub fn expand_fn(args: BridgeArgs, item: syn::ItemFn) -> syn::Result<TokenStream
         #[doc(hidden)]
         #[allow(non_snake_case, clippy::too_many_arguments, clippy::unit_arg)]
         pub unsafe extern "C" fn #symbol(#(#c_params),*) -> *mut u8 {
-            ::rspyts::__private::shim::run(|| {
+            ::rspyts::__private::shim::run_typed(|| {
                 #prelude
                 #mapped
             })
