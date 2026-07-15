@@ -101,21 +101,25 @@ def build_request(args_obj: collections.abc.Mapping[str, typing.Any] | None) -> 
 
 def decode_request(raw: bytes) -> Response:
     """Strictly decode ABI 3 request framing without interpreting schema positions."""
-    status, response = _decode_frame(raw, request=True)
+    status, response = decode_frame(raw, request=True)
     assert status == 0
     return response
 
 
 def parse_envelope(raw: bytes) -> tuple[int, Response]:
     """Decode one complete response without scanning schema-dependent object shapes."""
-    status, response = _decode_frame(raw, request=False)
+    status, response = decode_frame(raw, request=False)
     if status != 0 and response.tail:
         raise ValueError("rspyts: error and panic envelopes must not contain attachment bytes")
     return status, response
 
 
-def _decode_frame(raw: bytes, *, request: bool) -> tuple[int, Response]:
+def decode_frame(raw: bytes, *, request: bool) -> tuple[int, Response]:
     """Validate and decode the shared envelope layout."""
+
+    def reject_constant(token: str) -> typing.NoReturn:
+        raise ValueError(f"non-standard JSON number {token}")
+
     if type(raw) is not bytes:
         raise TypeError(f"rspyts: envelope must be owned bytes, got {type(raw).__name__}")
     if len(raw) < HEADER_LEN:
@@ -137,7 +141,7 @@ def _decode_frame(raw: bytes, *, request: bool) -> tuple[int, Response]:
     try:
         payload = json.loads(
             raw[HEADER_LEN:json_end],
-            parse_constant=lambda token: (_ for _ in ()).throw(ValueError(f"non-standard JSON number {token}")),
+            parse_constant=reject_constant,
         )
     except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
         raise ValueError(f"rspyts: malformed envelope JSON: {exc}") from exc

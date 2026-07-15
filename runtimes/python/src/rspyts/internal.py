@@ -1,4 +1,4 @@
-"""Emitter-facing ABI 3 support; applications should not import this module."""
+"""Emitter-facing ABI 3 support for generated clients."""
 
 from __future__ import annotations
 
@@ -24,6 +24,10 @@ from .types import (
     u64_to_wire,
 )
 
+# Generated clients explicitly pin this contract. It is independent of the
+# native ABI version and changes whenever helper signatures change.
+EMITTER_API_VERSION = 4
+
 __all__ = [
     "EMITTER_API_VERSION",
     "BridgeErrorRegistry",
@@ -47,10 +51,6 @@ __all__ = [
     "u64_from_wire",
     "u64_to_wire",
 ]
-
-# Generated clients explicitly pin this contract. It is independent of the
-# native ABI version and must change whenever helper signatures change.
-EMITTER_API_VERSION = 3
 
 
 def require_emitter_api(version: int) -> None:

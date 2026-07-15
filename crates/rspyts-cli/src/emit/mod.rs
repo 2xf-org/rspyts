@@ -224,7 +224,7 @@ mod tests {
         assert!(
             plan.files
                 .iter()
-                .any(|f| f.path == root.join("py/_codecs.py"))
+                .any(|f| f.path == root.join("py/codecs.py"))
         );
         assert!(
             plan.files
@@ -246,7 +246,7 @@ mod tests {
             .iter()
             .find(|owned| owned.dir == root.join("py"))
             .expect("Python output directory is owned");
-        assert!(python_owned.keep.contains(&"_codecs.py"));
+        assert!(python_owned.keep.contains(&"codecs.py"));
         let typescript_owned = plan
             .owned
             .iter()

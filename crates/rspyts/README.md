@@ -9,10 +9,11 @@ Define a bridge once in Rust, then generate typed Python and TypeScript clients 
 crate-type = ["cdylib"]
 
 [dependencies]
-rspyts = "0.3"
+rspyts = "=0.3.1"
 ```
 
-Install the generator separately with `cargo install rspyts-cli`.
+Install the matching generator separately with
+`cargo install rspyts-cli --version 0.3.1 --locked`.
 Add `rlib` to `crate-type` only when another Rust crate must link this crate.
 The default bridge macros use the facade's Serde re-export; add Serde directly
 only when your own code names or derives it, such as with `#[bridge(serde)]`.

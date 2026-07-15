@@ -13,7 +13,7 @@ from typing import Any
 import numpy as np
 import pytest
 
-from rspyts import BridgeError, Library, RspytsPanicError, StaleHandleError, _internal, envelope, library
+from rspyts import BridgeError, Library, RspytsPanicError, StaleHandleError, envelope, internal, library
 
 FINGERPRINT = "a" * 64
 
@@ -462,7 +462,7 @@ def test_call_sends_nested_numpy_buffers_in_the_request_envelope():
     bridged(fake).call("demo__buffered", {"nested": [{"values": values}]})
 
     request = envelope.decode_request(calls[0].request)
-    decoded = _internal.buffer_from_wire(
+    decoded = internal.buffer_from_wire(
         request.child(request.value["nested"][0]["values"]),
         dtype="i32",
     )
@@ -563,8 +563,8 @@ def test_call_returns_explicit_attachment_context_for_schema_decoder():
 
     result = bridged(fake).call("demo__spectrum", {})
 
-    bins = _internal.map_from_wire(result)["bins"]
-    np.testing.assert_array_equal(_internal.buffer_from_wire(bins, dtype="f32"), values)
+    bins = internal.map_from_wire(result)["bins"]
+    np.testing.assert_array_equal(internal.buffer_from_wire(bins, dtype="f32"), values)
 
 
 def test_call_preserves_wrapper_shaped_maps_until_schema_conversion():
@@ -574,8 +574,8 @@ def test_call_preserves_wrapper_shaped_maps_until_schema_conversion():
 
     result = bridged(fake).call("demo__map", {})
     assert result.value == value
-    assert _internal.json_from_wire(result) == value
-    np.testing.assert_array_equal(_internal.buffer_from_wire(result, dtype="u8"), [7])
+    assert internal.json_from_wire(result) == value
+    np.testing.assert_array_equal(internal.buffer_from_wire(result, dtype="u8"), [7])
 
 
 def test_call_status_1_raises_registered_error():

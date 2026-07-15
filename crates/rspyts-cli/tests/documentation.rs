@@ -45,6 +45,6 @@ fn published_documentation_uses_the_current_api() {
 
     let codegen = std::fs::read_to_string(workspace.join("docs/design/codegen.md"))
         .expect("read code generation documentation");
-    assert!(codegen.contains("_codecs.py"));
+    assert!(codegen.contains("codecs.py"));
     assert!(codegen.contains("codecs.ts"));
 }

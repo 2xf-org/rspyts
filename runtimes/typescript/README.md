@@ -18,7 +18,7 @@ const summary = client.summarize(new Float64Array([2, 4, 6]), "demo");
 ## Installing
 
 ```
-npm install rspyts
+npm install rspyts@0.3.1
 ```
 
 ## Public API

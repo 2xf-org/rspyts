@@ -17,10 +17,10 @@ WebAssembly. Both use one small, documented ABI.
 Rust 1.85+, Python 3.11+, and Node.js 22.12+ are supported.
 
 ```sh
-cargo add rspyts
-cargo install rspyts-cli
-pip install rspyts
-npm install rspyts
+cargo add rspyts@=0.3.1
+cargo install rspyts-cli --version 0.3.1 --locked
+pip install rspyts==0.3.1
+npm install rspyts@0.3.1
 ```
 
 The bridged Rust crate must build as a `cdylib` and depend on `rspyts`.

@@ -114,7 +114,7 @@ artifact:
 
 ```text
 __init__.py
-_codecs.py
+codecs.py
 classes.py
 constants.py
 errors.py
@@ -126,7 +126,7 @@ models.py
 
 Models use pydantic, reject unknown input fields, and preserve exact wire
 aliases. Public model construction keeps pydantic's normal host-side
-ergonomics, while generated calls use private exact-wire constructors for
+ergonomics, while generated calls use schema-directed exact-wire codecs for
 successful returns. Those constructors validate scalar and container shapes
 recursively before strict model construction, then explicitly convert exact
 integers, enums, tuples, and attachments to their Python host forms. Each
@@ -212,7 +212,7 @@ interfaces remain mutually assignable even when emitted separately. Import
 mappings also couple the packages' generated internals. Every package in that
 imported graph must be regenerated with the same rspyts codegen release,
 dependencies before consumers. Python exact-return decoders deliberately use
-private wire helpers on imported models, while TypeScript output assumes the
+generated wire helpers on imported models, while TypeScript output assumes the
 imported generated declarations and error helpers follow the same manifest
 semantics. Mixing a newly generated consumer with a stale generated dependency
 is therefore unsupported. Run `rspyts check` for every config in the graph as

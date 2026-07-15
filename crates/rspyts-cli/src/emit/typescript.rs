@@ -1,6 +1,6 @@
 //! The TypeScript emitter (codegen.md §5, §8).
 //!
-//! Produces `client.ts`, private `codecs.ts`, `constants.ts`, `errors.ts`,
+//! Produces `client.ts`, generated `codecs.ts`, `constants.ts`, `errors.ts`,
 //! `index.ts`, and `types.ts`. Output targets ES2022, 2-space indent, semicolons,
 //! double quotes, `strict` tsc. The surface is camelCase throughout —
 //! identical to the wire names, so values need no key mapping at
@@ -1036,7 +1036,7 @@ fn client_ts(m: &Manifest, hash: &str) -> String {
         out.push('\n');
         out.push_str("// Best-effort backstop: drops handles that were never free()d.\n");
         out.push_str(
-            "const rspytsFinalizationRegistryConstructor = (\n  globalThis as unknown as {\n    FinalizationRegistry?: new (callback: (drop: () => void) => void) => {\n      register(target: object, drop: () => void, token?: object): void;\n      unregister(token: object): boolean;\n    };\n  }\n).FinalizationRegistry;\nconst finalizer =\n  rspytsFinalizationRegistryConstructor === undefined\n    ? {\n        register(_target: object, _drop: () => void, _token?: object): void {},\n        unregister(_token: object): boolean {\n          return false;\n        },\n      }\n    : new rspytsFinalizationRegistryConstructor((drop) => drop());\n",
+            "const rspytsFinalizationRegistryConstructor = (\n  globalThis as unknown as {\n    FinalizationRegistry?: new (callback: (drop: () => void) => void) => {\n      register(target: object, drop: () => void, token?: object): void;\n      unregister(token: object): boolean;\n    };\n  }\n).FinalizationRegistry;\nconst finalizer =\n  rspytsFinalizationRegistryConstructor === undefined\n    ? {\n        register(target: object, drop: () => void, token?: object): void {\n          void target;\n          void drop;\n          void token;\n        },\n        unregister(token: object): boolean {\n          void token;\n          return false;\n        },\n      }\n    : new rspytsFinalizationRegistryConstructor((drop) => drop());\n",
         );
     }
     if needs_internal {
@@ -1764,7 +1764,7 @@ mod tests {
     }
 
     #[test]
-    fn emits_private_codecs_and_only_the_abi3_runtime_path() {
+    fn emits_codecs_and_only_the_abi3_runtime_path() {
         let files = rendered(&manifest());
         assert_eq!(
             files.iter().map(|(name, _)| *name).collect::<Vec<_>>(),
@@ -1940,6 +1940,27 @@ mod tests {
                 .max()
                 .unwrap_or_default();
             assert!(longest <= 160, "{name} has a {longest}-character line");
+        }
+    }
+
+    #[test]
+    fn generated_typescript_has_no_single_underscore_prefixes() {
+        for manifest in [manifest(), binary_manifest(), exact_manifest()] {
+            for (path, source) in rendered(&manifest) {
+                assert!(
+                    !path.starts_with('_'),
+                    "generated TypeScript filename {path:?} has an underscore prefix"
+                );
+                for identifier in source
+                    .split(|character: char| !character.is_ascii_alphanumeric() && character != '_')
+                {
+                    let is_dunder = identifier.starts_with("__") && identifier.ends_with("__");
+                    assert!(
+                        !identifier.starts_with('_') || is_dunder,
+                        "{path} contains the single-underscore identifier {identifier:?}"
+                    );
+                }
+            }
         }
     }
 
