@@ -49,7 +49,7 @@ def test_standard_wheel_builds_and_configures(monkeypatch: pytest.MonkeyPatch, t
         project_root=project.resolve(),
         config_path=(tmp_path / "rspyts.toml").resolve(),
         build_directory=pathlib.Path("dist"),
-        runtime_version="0.3.1",
+        runtime_version="0.3.2",
         editable=False,
     )
     configure.assert_called_once_with(build_data, build, project.resolve())

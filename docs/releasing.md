@@ -67,7 +67,7 @@ RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
 cargo check --workspace --all-targets --locked
 
 (cd runtimes/python && \
-  uv sync --dev --locked --python 3.11 && \
+  uv sync --dev --extra hatch --locked --python 3.11 && \
   uv run ruff check . && \
   uv run ty check src && \
   uv run vulture && \
@@ -89,7 +89,7 @@ Build and smoke the exact registry candidates before tagging. `--allow-dirty`
 is for a reviewed local tree; the deploy workflow omits it.
 
 ```sh
-version=0.3.1
+version=0.3.2
 scripts/release/verify-rust-archives.sh --allow-dirty "$version"
 
 rm -rf target/release-candidate
@@ -124,8 +124,8 @@ After the candidate commit is on `main`, create and push an annotated stable
 tag:
 
 ```sh
-git tag -a v0.3.1 -m "rspyts v0.3.1"
-git push origin v0.3.1
+git tag -a v0.3.2 -m "rspyts v0.3.2"
+git push origin v0.3.2
 ```
 
 The source guard rejects prerelease tags and verifies all of the following
@@ -170,10 +170,10 @@ After the workflow completes, inspect installed artifacts rather than the
 working tree:
 
 ```sh
-cargo install rspyts-cli --version 0.3.1 --locked
+cargo install rspyts-cli --version 0.3.2 --locked
 python -m venv /tmp/rspyts-release
-/tmp/rspyts-release/bin/pip install rspyts==0.3.1
-npm view rspyts@0.3.1 version
+/tmp/rspyts-release/bin/pip install rspyts==0.3.2
+npm view rspyts@0.3.2 version
 ```
 
 Confirm that each registry page renders its README, the GitHub release points
