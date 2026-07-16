@@ -11,6 +11,10 @@ Start here:
 
 The contract is written down here:
 
+- [0.4 direct Rust API compilation](design/v0.4.md) — draft architecture for
+  the breaking next release.
+- [0.4 delivery plan](design/v0.4-delivery.md) — phased implementation and
+  Sample acceptance gates.
 - [Type system](design/type-system.md) — what may cross the boundary.
 - [ABI](design/abi.md) — symbols, memory, envelopes, attachments, and handles.
 - [Code generation](design/codegen.md) — configuration, generated files, and drift checks.
