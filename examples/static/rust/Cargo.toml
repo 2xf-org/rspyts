@@ -1,0 +1,17 @@
+[package]
+name = "rspyts-static-acceptance"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[features]
+default = []
+python = ["rspyts/python-extension"]
+wasm = ["rspyts/wasm"]
+
+[dependencies]
+rspyts = { path = "../../../crates/rspyts" }
+serde = { version = "1.0", features = ["derive"] }

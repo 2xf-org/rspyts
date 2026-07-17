@@ -1,6 +1,5 @@
-# Stable releases are published by pushing an annotated vMAJOR.MINOR.PATCH tag.
-#
-#   source guard -> full validation -> exact package smokes -> crates.io -> PyPI -> npm -> GitHub
+# Push an annotated vMAJOR.MINOR.PATCH tag to publish the three Cargo crates.
+# The tag must point to a commit already contained in origin/main.
 
 name: Deploy
 
@@ -8,7 +7,6 @@ on:
   push:
     tags: ["v*"]
 
-# Registry publication is sequential. Never interleave or cancel a release.
 concurrency:
   group: deploy
   cancel-in-progress: false
@@ -33,45 +31,60 @@ jobs:
           ref: ${{ github.sha }}
           fetch-depth: 0
           persist-credentials: false
-      - name: Verify event ref, commit, tag, and main ancestry
+      - name: Verify stable annotated tag on main
         id: source
+        shell: bash
         run: |
           set -euo pipefail
 
           tag=$GITHUB_REF_NAME
           version=${tag#v}
           if [[ ! "$version" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
-            echo "release version must be a stable x.y.z version; got $version" >&2
+            echo "release version must be stable x.y.z; got $version" >&2
+            exit 1
+          fi
+          if [[ "$GITHUB_EVENT_NAME" != push || "$GITHUB_REF" != "refs/tags/$tag" ]]; then
+            echo "release must be triggered by pushing refs/tags/$tag" >&2
             exit 1
           fi
 
-          expected_ref="refs/tags/${tag}"
-          if [[ "$GITHUB_EVENT_NAME" != push || "$GITHUB_REF" != "$expected_ref" ]]; then
-            echo "publishing requires a push event for $expected_ref" >&2
-            exit 1
-          fi
-
-          event_commit=$(git rev-parse "${GITHUB_SHA}^{commit}")
-          test "$(git rev-parse HEAD)" = "$event_commit"
-
-          tag_object=$(git rev-parse "$expected_ref")
+          git fetch --force origin "refs/tags/$tag:refs/tags/$tag"
+          tag_object=$(git rev-parse "refs/tags/$tag")
           if [[ "$(git cat-file -t "$tag_object")" != tag ]]; then
-            echo "$expected_ref must be an annotated tag" >&2
+            echo "refs/tags/$tag must be an annotated tag" >&2
             exit 1
           fi
-          if [[ "$(git rev-parse "${expected_ref}^{commit}")" != "$event_commit" ]]; then
-            echo "$expected_ref does not target the workflow commit $event_commit" >&2
+
+          release_commit=$(git rev-parse "refs/tags/$tag^{commit}")
+          event_commit=$(git rev-parse "$GITHUB_SHA^{commit}")
+          if [[ "$release_commit" != "$event_commit" || "$(git rev-parse HEAD)" != "$event_commit" ]]; then
+            echo "tag, event, and checked-out commit do not match" >&2
             exit 1
           fi
 
           git fetch --no-tags origin refs/heads/main:refs/remotes/origin/main
-          if ! git merge-base --is-ancestor "$event_commit" refs/remotes/origin/main; then
-            echo "$expected_ref does not point to a commit contained in origin/main" >&2
+          if ! git merge-base --is-ancestor "$release_commit" refs/remotes/origin/main; then
+            echo "refs/tags/$tag is not contained in origin/main" >&2
+            exit 1
+          fi
+
+          workspace_versions=$(cargo metadata --no-deps --format-version 1 | jq -r \
+            '.packages[] | select(.name == "rspyts-macros" or .name == "rspyts" or .name == "rspyts-cli") | .version' \
+            | sort -u)
+          release_crates=$(cargo metadata --no-deps --format-version 1 | jq -r \
+            '.packages[] | select(.publish != []) | .name' \
+            | LC_ALL=C sort)
+          if [[ "$release_crates" != $'rspyts\nrspyts-cli\nrspyts-macros' ]]; then
+            echo "expected exactly the rspyts-macros, rspyts, and rspyts-cli release crates" >&2
+            exit 1
+          fi
+          if [[ "$workspace_versions" != "$version" ]]; then
+            echo "all release crates must have version $version; got: $workspace_versions" >&2
             exit 1
           fi
 
           {
-            echo "sha=$event_commit"
+            echo "sha=$release_commit"
             echo "tag=$tag"
             echo "version=$version"
           } >>"$GITHUB_OUTPUT"
@@ -86,7 +99,7 @@ jobs:
       contents: read
 
   release-candidates:
-    name: Build and smoke release candidates
+    name: Build exact release candidates
     needs: [release-source, validation]
     runs-on: ubuntu-latest
     steps:
@@ -94,64 +107,39 @@ jobs:
         with:
           ref: ${{ needs.release-source.outputs.sha }}
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
-      - uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
         with:
-          enable-cache: false
-          version: "0.10.9"
-      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+          toolchain: 1.88.0
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
-          node-version: "24.18.0"
-          package-manager-cache: false
-      - name: Verify tag version
+          key: release-candidates
+      - name: Package and test exact source archives
+        env:
+          RELEASE_VERSION: ${{ needs.release-source.outputs.version }}
+        run: scripts/release/verify-crates.sh "$RELEASE_VERSION"
+      - name: Collect candidates and checksums
         env:
           RELEASE_VERSION: ${{ needs.release-source.outputs.version }}
         run: |
-          version=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "rspyts") | .version')
-          test "$RELEASE_VERSION" = "$version"
-      - name: Build and test exact Rust package archives
-        run: scripts/release/verify-rust-archives.sh "${{ needs.release-source.outputs.version }}"
-      - name: Collect exact Rust package archives
-        run: |
-          mkdir -p release-artifacts/rust
-          version=${{ needs.release-source.outputs.version }}
-          for crate in rspyts-core rspyts-macros rspyts rspyts-cli; do
-            cp "target/package/${crate}-${version}.crate" release-artifacts/rust/
+          set -euo pipefail
+          mkdir release-artifacts
+          for crate in rspyts-macros rspyts rspyts-cli; do
+            cp "target/package/${crate}-${RELEASE_VERSION}.crate" release-artifacts/
           done
-      - name: Build Python distributions
-        working-directory: runtimes/python
-        run: |
-          uv build \
-            --build-constraints ../../scripts/release/python-build-constraints.txt \
-            --out-dir ../../release-artifacts/python
-      - name: Check Python distributions
-        run: |
-          uvx --from 'twine==6.1.0' twine check --strict release-artifacts/python/*
-          sdist=$(find release-artifacts/python -maxdepth 1 -name '*.tar.gz' -print -quit)
-          scripts/release/check-python-sdist.py "$sdist" runtimes/python
-      - name: Smoke exact Python distributions
-        run: scripts/release/smoke-python-distributions.sh release-artifacts/python "${{ needs.release-source.outputs.version }}"
-      - name: Build npm tarball
-        working-directory: runtimes/typescript
-        run: |
-          mkdir -p ../../release-artifacts/npm
-          npm ci
-          npm run build
-          npm run check:surface
-          npm pack --pack-destination ../../release-artifacts/npm
-      # The isolated consumer intentionally installs the exact local tarball.
-      - name: Smoke exact npm tarball # zizmor: ignore[adhoc-packages]
-        run: scripts/release/smoke-npm-tarball.sh release-artifacts/npm "${{ needs.release-source.outputs.version }}"
+          (
+            cd release-artifacts
+            sha256sum ./*.crate | LC_ALL=C sort -k2 >SHA256SUMS
+          )
       - name: Preserve exact release candidates
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: release-packages-${{ needs.release-source.outputs.sha }}
+          name: release-crates-${{ needs.release-source.outputs.sha }}
           path: release-artifacts
           if-no-files-found: error
-          retention-days: 7
+          retention-days: 30
 
   publish-crates:
-    name: Publish to crates.io
+    name: Publish crates.io release
     needs: [release-source, release-candidates]
     runs-on: ubuntu-latest
     environment: crates-io
@@ -163,184 +151,223 @@ jobs:
         with:
           ref: ${{ needs.release-source.outputs.sha }}
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
+        with:
+          toolchain: 1.88.0
       - uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18 # v1
         id: auth
       - uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
         with:
-          name: release-packages-${{ needs.release-source.outputs.sha }}
+          name: release-crates-${{ needs.release-source.outputs.sha }}
           path: release-artifacts
-      # Publication stays inline because it is the registry mutation boundary.
-      - name: Publish crates in dependency order
+      - name: Verify preserved candidates
+        working-directory: release-artifacts
+        run: sha256sum --check SHA256SUMS
+      - name: Publish exact candidates in dependency order
+        shell: bash
         env:
-          RELEASE_VERSION: ${{ needs.release-source.outputs.version }}
           CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+          RELEASE_VERSION: ${{ needs.release-source.outputs.version }}
         run: |
           set -euo pipefail
 
-          registry_checksum() {
-            curl \
+          registry_status() {
+            local crate=$1
+            local metadata=$2
+            curl --retry 3 --retry-all-errors --silent --show-error \
               --user-agent "rspyts-release/$RELEASE_VERSION (https://github.com/2xf-org/rspyts)" \
-              --fail --silent --show-error "$1" 2>/dev/null \
-              | jq -er '.version.checksum'
+              --output "$metadata" --write-out '%{http_code}' \
+              "https://crates.io/api/v1/crates/$crate/$RELEASE_VERSION"
           }
 
-          verify_checksum() {
+          candidate_checksum() {
+            sha256sum "release-artifacts/$1-${RELEASE_VERSION}.crate" | cut -d' ' -f1
+          }
+
+          verify_remote() {
             local crate=$1
-            local remote=$2
-            local archive="release-artifacts/rust/${crate}-${RELEASE_VERSION}.crate"
-            local candidate
-            candidate=$(sha256sum "$archive" | cut -d' ' -f1)
-            if [[ "$remote" != "$candidate" ]]; then
-              echo "crates.io $crate $RELEASE_VERSION does not match the tested archive" >&2
+            local metadata=$2
+            local expected
+            local remote
+            expected=$(candidate_checksum "$crate")
+            remote=$(jq -er '.version.checksum' "$metadata")
+            if [[ "$remote" != "$expected" ]]; then
+              echo "crates.io $crate $RELEASE_VERSION differs from the tested archive" >&2
+              echo "expected $expected, received $remote" >&2
               return 1
             fi
           }
 
-          publish() {
+          publish_one() {
             local crate=$1
-            local url="https://crates.io/api/v1/crates/$crate/$RELEASE_VERSION"
-            local checksum
-
-            if checksum=$(registry_checksum "$url"); then
-              verify_checksum "$crate" "$checksum"
-              return 0
-            else
-              cargo publish --locked -p "$crate"
-            fi
-            for _ in {1..30}; do
-              if checksum=$(registry_checksum "$url"); then
-                verify_checksum "$crate" "$checksum"
+            local metadata="$RUNNER_TEMP/${crate}.json"
+            local status
+            status=$(registry_status "$crate" "$metadata")
+            case "$status" in
+              200)
+                verify_remote "$crate" "$metadata"
+                echo "$crate $RELEASE_VERSION already exists with the tested checksum"
                 return 0
+                ;;
+              404) ;;
+              *)
+                echo "crates.io lookup for $crate returned HTTP $status" >&2
+                return 1
+                ;;
+            esac
+
+            # Reproduce the archive with the same pinned Rust/Cargo toolchain
+            # before allowing Cargo to cross the registry mutation boundary.
+            cargo package --locked --no-verify -p "$crate"
+            cmp \
+              "target/package/${crate}-${RELEASE_VERSION}.crate" \
+              "release-artifacts/${crate}-${RELEASE_VERSION}.crate"
+            cargo publish --locked --no-verify -p "$crate"
+
+            for _ in {1..36}; do
+              status=$(registry_status "$crate" "$metadata")
+              if [[ "$status" == 200 ]]; then
+                verify_remote "$crate" "$metadata"
+                return 0
+              fi
+              if [[ "$status" != 404 ]]; then
+                echo "crates.io lookup for $crate returned HTTP $status" >&2
+                return 1
               fi
               sleep 10
             done
-            echo "$crate $RELEASE_VERSION did not become available on crates.io" >&2
+            echo "$crate $RELEASE_VERSION was not visible on crates.io after six minutes" >&2
             return 1
           }
 
-          publish rspyts-core
-          publish rspyts-macros
-          publish rspyts
-          publish rspyts-cli
+          publish_one rspyts-macros
+          publish_one rspyts
+          publish_one rspyts-cli
 
-  publish-pypi:
-    name: Publish to PyPI
-    needs: [release-source, release-candidates, publish-crates]
+  registry-smoke:
+    name: Install published crates
+    needs: [release-source, publish-crates]
     runs-on: ubuntu-latest
-    environment: pypi
-    permissions:
-      id-token: write
     steps:
-      - uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
         with:
-          name: release-packages-${{ needs.release-source.outputs.sha }}
-          path: release-artifacts
-      - name: Check for an equivalent existing PyPI release
-        id: existing
+          toolchain: 1.88.0
+      - name: Install CLI and compile a fresh consumer
+        shell: bash
         env:
           RELEASE_VERSION: ${{ needs.release-source.outputs.version }}
         run: |
           set -euo pipefail
 
-          metadata="$RUNNER_TEMP/pypi-release.json"
-          status=$(curl --silent --show-error --output "$metadata" --write-out '%{http_code}' \
-            "https://pypi.org/pypi/rspyts/${RELEASE_VERSION}/json")
-          if [[ "$status" == 404 ]]; then
-            echo "exists=false" >>"$GITHUB_OUTPUT"
-            exit 0
-          fi
-          if [[ "$status" != 200 ]]; then
-            echo "PyPI metadata request failed with HTTP $status" >&2
-            exit 1
-          fi
-
-          shopt -s nullglob
-          candidates=(release-artifacts/python/*)
-          test "${#candidates[@]}" -eq "$(jq '.urls | length' "$metadata")"
-          for candidate in "${candidates[@]}"; do
-            filename=$(basename "$candidate")
-            remote=$(jq -er --arg filename "$filename" \
-              '.urls[] | select(.filename == $filename) | .digests.sha256' "$metadata")
-            candidate_sha=$(sha256sum "$candidate" | cut -d' ' -f1)
-            if [[ "$remote" != "$candidate_sha" ]]; then
-              echo "PyPI $filename does not match the tested artifact" >&2
-              exit 1
+          for _ in {1..12}; do
+            if cargo install rspyts-cli \
+              --version "=$RELEASE_VERSION" \
+              --locked \
+              --root "$RUNNER_TEMP/rspyts-install"; then
+              break
             fi
+            sleep 10
           done
-          echo "exists=true" >>"$GITHUB_OUTPUT"
-      - name: Publish
-        if: steps.existing.outputs.exists != 'true'
-        uses: pypa/gh-action-pypi-publish@cef221092ed1bacb1cc03d23a2d87d1d172e277b # release/v1
-        with:
-          packages-dir: release-artifacts/python
+          test -x "$RUNNER_TEMP/rspyts-install/bin/rspyts"
+          test "$("$RUNNER_TEMP/rspyts-install/bin/rspyts" --version)" = \
+            "rspyts $RELEASE_VERSION"
 
-  publish-npm:
-    name: Publish to npm
-    needs: [release-source, release-candidates, publish-pypi]
-    runs-on: ubuntu-latest
-    environment: npm
-    permissions:
-      id-token: write
-    steps:
-      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
-        with:
-          node-version: "24.18.0"
-          package-manager-cache: false
-      - uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
-        with:
-          name: release-packages-${{ needs.release-source.outputs.sha }}
-          path: release-artifacts
-      # Publication stays inline because it is the registry mutation boundary.
-      - name: Publish
-        env:
-          RELEASE_VERSION: ${{ needs.release-source.outputs.version }}
-        run: |
-          set -euo pipefail
-          shopt -s nullglob
+          mkdir -p "$RUNNER_TEMP/consumer/src"
+          cat >"$RUNNER_TEMP/consumer/Cargo.toml" <<EOF
+          [package]
+          name = "rspyts-release-smoke"
+          version = "0.0.0"
+          edition = "2024"
 
-          tarballs=(release-artifacts/npm/*.tgz)
-          if (( ${#tarballs[@]} != 1 )); then
-            echo "expected exactly one preserved npm tarball" >&2
-            exit 1
-          fi
+          [dependencies]
+          rspyts = "=${RELEASE_VERSION}"
+          serde = { version = "1", features = ["derive"] }
+          EOF
+          cat >"$RUNNER_TEMP/consumer/src/main.rs" <<'EOF'
+          use rspyts::{ContractType, Type};
+          use serde::{Deserialize, Serialize};
 
-          metadata="$RUNNER_TEMP/npm-release.json"
-          status=$(curl --silent --show-error --output "$metadata" --write-out '%{http_code}' \
-            "https://registry.npmjs.org/rspyts/${RELEASE_VERSION}")
-          if [[ "$status" == 404 ]]; then
-            npm publish release-artifacts/npm/rspyts-*.tgz --provenance --access public
-            exit 0
-          fi
-          if [[ "$status" != 200 ]]; then
-            echo "npm metadata request failed with HTTP $status" >&2
-            exit 1
-          fi
+          #[derive(Serialize, Deserialize, Type)]
+          struct PublishedContract {
+              count: u64,
+          }
 
-          remote=$(jq -er '.dist.integrity' "$metadata")
-          candidate_integrity=$(node - "${tarballs[0]}" <<'JS'
-          import { createHash } from "node:crypto";
-          import { readFileSync } from "node:fs";
-
-          const digest = createHash("sha512").update(readFileSync(process.argv[2])).digest("base64");
-          console.log(`sha512-${digest}`);
-          JS
-          )
-          if [[ "$remote" != "$candidate_integrity" ]]; then
-            echo "npm rspyts $RELEASE_VERSION does not match the tested tarball" >&2
-            exit 1
-          fi
-          echo "rspyts ${RELEASE_VERSION} is already published with the tested tarball"
+          fn main() {
+              let _ = PublishedContract::type_ref();
+          }
+          EOF
+          for _ in {1..12}; do
+            if cargo generate-lockfile --manifest-path "$RUNNER_TEMP/consumer/Cargo.toml" && \
+              cargo check --locked --manifest-path "$RUNNER_TEMP/consumer/Cargo.toml"; then
+              exit 0
+            fi
+            rm -f "$RUNNER_TEMP/consumer/Cargo.lock"
+            sleep 10
+          done
+          echo "published crates did not resolve from a clean consumer" >&2
+          exit 1
 
   github-release:
-    name: GitHub release
-    needs: [release-source, publish-crates, publish-pypi, publish-npm]
+    name: Create GitHub release
+    needs: [release-source, release-candidates, registry-smoke]
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
-      - name: Create release
-        uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
         with:
-          tag_name: ${{ needs.release-source.outputs.tag }}
-          generate_release_notes: true
+          ref: ${{ needs.release-source.outputs.sha }}
+          persist-credentials: false
+      - uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
+        with:
+          name: release-crates-${{ needs.release-source.outputs.sha }}
+          path: release-artifacts
+      - name: Verify preserved candidates
+        working-directory: release-artifacts
+        run: sha256sum --check SHA256SUMS
+      - name: Create or verify release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_SHA: ${{ needs.release-source.outputs.sha }}
+          RELEASE_TAG: ${{ needs.release-source.outputs.tag }}
+        run: |
+          set -euo pipefail
+
+          if ! gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release create "$RELEASE_TAG" release-artifacts/* \
+              --verify-tag \
+              --target "$RELEASE_SHA" \
+              --title "rspyts $RELEASE_TAG" \
+              --generate-notes
+            exit 0
+          fi
+
+          mkdir existing-assets
+          for candidate in release-artifacts/*; do
+            name=$(basename "$candidate")
+            if gh release download "$RELEASE_TAG" \
+              --pattern "$name" \
+              --dir existing-assets \
+              --clobber; then
+              cmp "$candidate" "existing-assets/$name"
+            else
+              gh release upload "$RELEASE_TAG" "$candidate"
+            fi
+          done
+          expected_assets=$(find release-artifacts -maxdepth 1 -type f \
+            -exec basename {} \; | LC_ALL=C sort)
+          actual_assets=$(gh release view "$RELEASE_TAG" --json assets \
+            --jq '.assets[].name' | LC_ALL=C sort)
+          if [[ "$actual_assets" != "$expected_assets" ]]; then
+            echo "existing release assets do not exactly match the tested candidates" >&2
+            echo "expected:" >&2
+            printf '%s\n' "$expected_assets" >&2
+            echo "actual:" >&2
+            printf '%s\n' "$actual_assets" >&2
+            exit 1
+          fi
+          gh release edit "$RELEASE_TAG" \
+            --draft=false \
+            --prerelease=false \
+            --title "rspyts $RELEASE_TAG"

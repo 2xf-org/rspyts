@@ -1,2421 +1,2040 @@
-//! Compact Python source generation for the ABI 3 runtime.
-//!
-//! Public modules contain only host declarations and typed wrappers. All
-//! schema-directed wire work lives in the generated `codecs.py` module. Named
-//! references always cross one named codec boundary, which keeps wrapper size
-//! proportional to the number of functions instead of the depth of their
-//! models.
+use std::fs;
+use std::path::Path;
+
+use anyhow::{Context, Result};
+use rspyts::ir::{BufferElement, FieldDef, ScalarValue, Target, TypeDef, TypeRef, TypeShape};
+use serde_json::Value;
+
+use crate::config::{PythonConfig, PythonMode};
+use crate::resolve::ResolvedContract;
 
 use super::util::{
-    Provenance, collect_refs, doc_lines, find_type, int_bounds, py_alias_roundtrips, py_docstring,
-    py_error_registry_name, py_header, py_name, py_type,
+    TypeNames, error_definition, ordered_types, pascal_case, python_doc, type_definition,
+    type_names,
 };
-use rspyts_core::ir::{
-    ClassDecl, Dtype, FieldDecl, FnDecl, Manifest, ParamDecl, StaticDecl, Target, Ty, TypeDecl,
-    VariantDecl,
-};
-use std::collections::{BTreeMap, BTreeSet};
+use super::{write, write_json};
 
-const LINE_LIMIT: usize = 100;
-#[cfg(test)]
-const MAX_LINE_LENGTH: usize = 120;
-
-/// Emit one wholly-owned generated Python package.
 pub fn emit(
-    manifest: &Manifest,
-    provenance: &Provenance<'_>,
-    library_search: &[String],
-    imports: &BTreeMap<String, String>,
-) -> Vec<(&'static str, String)> {
-    let codecs = CodecPlan::new(manifest);
-    vec![
-        ("__init__.py", init_py(manifest, provenance)),
-        ("codecs.py", codecs_py(manifest, provenance, &codecs)),
-        ("classes.py", classes_py(manifest, provenance, &codecs)),
-        ("constants.py", constants_py(manifest, provenance)),
-        ("errors.py", errors_py(manifest, provenance, imports)),
-        ("functions.py", functions_py(manifest, provenance, &codecs)),
-        (
-            "library.py",
-            library_py(manifest, provenance, library_search),
-        ),
-        ("models.py", models_py(manifest, provenance, imports)),
-    ]
-}
-
-fn is_imported(manifest: &Manifest, decl: &TypeDecl, imports: &BTreeMap<String, String>) -> bool {
-    decl.origin() != manifest.crate_name && imports.contains_key(decl.origin())
-}
-
-fn projected_names(decl: &TypeDecl) -> Vec<String> {
-    match decl {
-        TypeDecl::Newtype { name, .. }
-        | TypeDecl::Struct { name, .. }
-        | TypeDecl::StringEnum { name, .. } => vec![name.clone()],
-        TypeDecl::Enum { name, variants, .. } => std::iter::once(name.clone())
-            .chain(
-                variants
-                    .iter()
-                    .map(|variant| format!("{name}{}", variant.name)),
-            )
-            .collect(),
-        TypeDecl::ErrorEnum { name, variants, .. } => std::iter::once(name.clone())
-            .chain(
-                variants
-                    .iter()
-                    .map(|variant| format!("{name}{}", variant.name)),
-            )
-            .collect(),
-    }
-}
-
-// ---------------------------------------------------------------- models.py
-
-fn models_py(
-    manifest: &Manifest,
-    provenance: &Provenance<'_>,
-    imports: &BTreeMap<String, String>,
-) -> String {
-    let mut body = String::new();
-    let mut defined = BTreeSet::new();
-    for decl in &manifest.types {
-        if is_imported(manifest, decl, imports) {
-            defined.insert(decl.name().to_string());
+    root: &Path,
+    config: &PythonConfig,
+    contract: &ResolvedContract,
+    fingerprint: &str,
+    native_library: Option<&Path>,
+) -> Result<()> {
+    let manifest = &contract.manifest;
+    let python_root = root.join("python");
+    let mut package = python_root.clone();
+    let package_parts = config.package.split('.').collect::<Vec<_>>();
+    for (index, part) in package_parts.iter().enumerate() {
+        package.push(part);
+        fs::create_dir_all(&package)?;
+        let init = package.join("__init__.py");
+        let leaf = index + 1 == package_parts.len();
+        if !leaf && config.mode == PythonMode::Standalone && !init.exists() {
+            write(&init, "")?;
         }
     }
 
-    for decl in data_types_in_dependency_order(manifest, imports) {
-        let quote = |name: &str| !defined.contains(name) && find_type(manifest, name).is_some();
-        body.push_str("\n\n");
-        match decl {
-            TypeDecl::Newtype {
-                name, docs, inner, ..
-            } => {
-                for line in doc_lines(docs) {
-                    if line.trim().is_empty() {
-                        body.push_str("#\n");
-                    } else {
-                        body.push_str(&format!("# {line}\n"));
-                    }
-                }
-                body.push_str(&format!(
-                    "{name}: typing.TypeAlias = {}\n",
-                    py_type(inner, true, &quote)
-                ));
-            }
-            TypeDecl::Struct {
-                name, docs, fields, ..
-            } => {
-                body.push_str(&format!("class {name}(rspyts.Contract):\n"));
-                body.push_str(&py_docstring(docs, "    "));
-                if !doc_lines(docs).is_empty() && !fields.is_empty() {
-                    body.push('\n');
-                }
-                for field in fields {
-                    body.push_str(&field_line(field, &quote));
-                }
-                if fields.is_empty() {
-                    body.push_str("    pass\n");
-                }
-            }
-            TypeDecl::StringEnum {
-                name,
-                docs,
-                variants,
-                ..
-            } => {
-                body.push_str(&format!("class {name}(enum.StrEnum):\n"));
-                body.push_str(&py_docstring(docs, "    "));
-                if !doc_lines(docs).is_empty() && !variants.is_empty() {
-                    body.push('\n');
-                }
-                for variant in variants {
-                    body.push_str(&format!(
-                        "    {} = {}\n",
-                        heck::ToShoutySnakeCase::to_shouty_snake_case(variant.name.as_str()),
-                        py_string(&variant.wire_name)
-                    ));
-                }
-            }
-            TypeDecl::Enum {
-                name,
-                docs,
-                tag,
-                variants,
-                ..
-            } => {
-                for variant in variants {
-                    body.push_str(&variant_class(name, tag, variant, &quote));
-                    body.push_str("\n\n");
-                }
-                body.push_str(&union_alias(name, tag, variants));
-                if !doc_lines(docs).is_empty() {
-                    body.push_str(&py_docstring(docs, ""));
-                }
-            }
-            TypeDecl::ErrorEnum { .. } => unreachable!("errors are emitted in errors.py"),
-        }
-        defined.insert(decl.name().to_string());
+    let names = type_names(contract);
+    write(&package.join("models.py"), &models(contract, &names))?;
+    write(&package.join("codecs.py"), &codecs(contract))?;
+    write(&package.join("errors.py"), &errors(contract))?;
+    write(&package.join("functions.py"), &functions(contract, &names))?;
+    write(&package.join("resources.py"), &resources(contract, &names))?;
+    write(
+        &package.join("constants.py"),
+        &constants(contract, fingerprint, &names),
+    )?;
+    write(&package.join("__init__.py"), &init_module(contract))?;
+    let typed_marker = package.join("py.typed");
+    if !typed_marker.exists() {
+        write(&typed_marker, "")?;
     }
+    write_json(
+        &package.join("contract.json"),
+        &serde_json::json!({
+            "schemaVersion": crate::LOCK_VERSION,
+            "fingerprint": fingerprint,
+            "hosts": contract.hosts,
+            "dependencies": contract.dependencies,
+            "manifest": manifest,
+        }),
+    )?;
 
-    let mut out = py_header(provenance);
-    out.push_str(&format!(
-        "\"\"\"\nHost data models bridged from `{}`.\n\"\"\"\n",
-        manifest.crate_name
-    ));
-    out.push_str(&models_imports(
-        &body,
-        &foreign_import_lines(manifest, imports),
-    ));
-    if !body.is_empty() {
-        let body = body.trim_start_matches('\n');
-        out.push('\n');
-        if !body.starts_with('#') {
-            out.push('\n');
-        }
-        out.push_str(body);
-    }
-    out
-}
-
-fn data_types_in_dependency_order<'a>(
-    manifest: &'a Manifest,
-    imports: &BTreeMap<String, String>,
-) -> Vec<&'a TypeDecl> {
-    let mut pending: BTreeMap<&str, &TypeDecl> = manifest
-        .types
-        .iter()
-        .filter(|decl| !matches!(decl, TypeDecl::ErrorEnum { .. }))
-        .filter(|decl| !is_imported(manifest, decl, imports))
-        .map(|decl| (decl.name(), decl))
-        .collect();
-    let imported: BTreeSet<&str> = manifest
-        .types
-        .iter()
-        .filter(|decl| is_imported(manifest, decl, imports))
-        .map(TypeDecl::name)
-        .collect();
-    let mut complete: BTreeSet<&str> = imported;
-    let mut result = Vec::new();
-    while !pending.is_empty() {
-        let next = pending.iter().find_map(|(name, decl)| {
-            let mut refs = BTreeSet::new();
-            collect_decl_refs(decl, &mut refs);
-            refs.iter()
-                .all(|reference| complete.contains(reference.as_str()) || reference == name)
-                .then_some(*name)
-        });
-        let name = next.unwrap_or_else(|| *pending.keys().next().expect("pending is non-empty"));
-        let decl = pending.remove(name).expect("selected declaration exists");
-        complete.insert(decl.name());
-        result.push(decl);
-    }
-    result
-}
-
-fn collect_decl_refs(decl: &TypeDecl, refs: &mut BTreeSet<String>) {
-    match decl {
-        TypeDecl::Newtype { inner, .. } => collect_refs(inner, refs),
-        TypeDecl::Struct { fields, .. } => {
-            for field in fields {
-                collect_refs(&field.ty, refs);
-            }
-        }
-        TypeDecl::Enum { variants, .. } => {
-            for field in variants.iter().flat_map(|variant| &variant.fields) {
-                collect_refs(&field.ty, refs);
-            }
-        }
-        TypeDecl::StringEnum { .. } | TypeDecl::ErrorEnum { .. } => {}
-    }
-}
-
-fn field_line(field: &FieldDecl, quote: &dyn Fn(&str) -> bool) -> String {
-    let name = py_name(&field.name);
-    let inner_bounds = match &field.ty {
-        Ty::Option { inner } => scalar_bounds(inner),
-        other => scalar_bounds(other),
-    };
-    let annotation = match (&field.ty, &inner_bounds) {
-        (Ty::Option { .. }, Some(_)) => "int | None".to_string(),
-        (_, Some(_)) => "int".to_string(),
-        (ty, None) => py_type(ty, true, quote),
-    };
-    let mut args = Vec::new();
-    if !field.required {
-        args.push("default=None".to_string());
-    }
-    if !py_alias_roundtrips(&name, &field.wire_name) {
-        args.push(format!("alias={}", py_string(&field.wire_name)));
-    }
-    if let Some((minimum, maximum)) = inner_bounds {
-        args.push("strict=True".to_string());
-        args.push(format!("ge={minimum}"));
-        args.push(format!("le={maximum}"));
-    }
-    match args.as_slice() {
-        [] => format!("    {name}: {annotation}\n"),
-        [only] if only == "default=None" => format!("    {name}: {annotation} = None\n"),
-        _ => {
-            let one = format!(
-                "    {name}: {annotation} = pydantic.Field({})",
-                args.join(", ")
+    if let Some(native_library) = native_library {
+        let extension = if cfg!(windows) { "pyd" } else { "so" };
+        let destination = package.join(format!("{}.{}", manifest.module_name, extension));
+        if destination.exists() || destination.is_symlink() {
+            anyhow::bail!(
+                "generated native extension {} collides with authored source",
+                destination.display()
             );
-            if one.len() <= LINE_LIMIT {
-                return one + "\n";
-            }
-            let mut out = format!("    {name}: {annotation} = pydantic.Field(\n");
-            for arg in args {
-                out.push_str(&format!("        {arg},\n"));
-            }
-            out.push_str("    )\n");
-            out
         }
+        fs::copy(native_library, &destination).with_context(|| {
+            format!(
+                "failed to copy native extension {} to {}",
+                native_library.display(),
+                destination.display()
+            )
+        })?;
     }
+    Ok(())
 }
 
-fn scalar_bounds(ty: &Ty) -> Option<(String, String)> {
-    if let Some((minimum, maximum)) = int_bounds(ty) {
-        return Some((minimum.to_string(), maximum.to_string()));
-    }
-    match ty {
-        Ty::I64 => Some((i64::MIN.to_string(), i64::MAX.to_string())),
-        Ty::U64 => Some(("0".to_string(), u64::MAX.to_string())),
-        _ => None,
-    }
-}
-
-fn variant_class(
-    enum_name: &str,
-    tag: &str,
-    variant: &VariantDecl,
-    quote: &dyn Fn(&str) -> bool,
-) -> String {
-    let mut out = format!("class {enum_name}{}(rspyts.Contract):\n", variant.name);
-    out.push_str(&py_docstring(&variant.docs, "    "));
-    if !doc_lines(&variant.docs).is_empty() {
-        out.push('\n');
-    }
-    let tag_attr = py_name(tag);
-    let wire = py_string(&variant.wire_name);
-    if py_alias_roundtrips(&tag_attr, tag) {
-        out.push_str(&format!(
-            "    {tag_attr}: typing.Literal[{wire}] = {wire}\n"
-        ));
-    } else {
-        out.push_str(&format!(
-            "    {tag_attr}: typing.Literal[{wire}] = pydantic.Field(default={wire}, alias={})\n",
-            py_string(tag)
-        ));
-    }
-    for field in &variant.fields {
-        out.push_str(&field_line(field, quote));
-    }
-    out
-}
-
-fn union_alias(name: &str, tag: &str, variants: &[VariantDecl]) -> String {
-    let members: Vec<String> = variants
-        .iter()
-        .map(|variant| format!("{name}{}", variant.name))
-        .collect();
-    if members.len() == 1 {
-        return format!("{name} = {}\n", members[0]);
-    }
-    let mut out = String::new();
-    out.push_str(&format!("{name} = typing.Annotated[\n"));
-    let union = members.join(" | ");
-    if union.len() + 5 <= LINE_LIMIT {
-        out.push_str(&format!("    {union},\n"));
-    } else {
-        out.push_str("    (\n");
-        for (index, member) in members.iter().enumerate() {
-            let operator = if index == 0 { "" } else { "| " };
-            out.push_str(&format!("        {operator}{member}\n"));
-        }
-        out.push_str("    ),\n");
-    }
-    out.push_str(&format!(
-        "    pydantic.Field(discriminator={}),\n]\n",
-        py_string(&py_name(tag))
-    ));
-    out
-}
-
-fn foreign_import_lines(
-    manifest: &Manifest,
-    imports: &BTreeMap<String, String>,
-) -> Vec<(String, String)> {
-    let mut by_module: BTreeMap<&str, Vec<String>> = BTreeMap::new();
-    for decl in &manifest.types {
-        if matches!(decl, TypeDecl::ErrorEnum { .. }) || !is_imported(manifest, decl, imports) {
-            continue;
-        }
-        by_module
-            .entry(imports[decl.origin()].as_str())
-            .or_default()
-            .extend(projected_names(decl));
-    }
-    by_module
-        .into_iter()
-        .map(|(module, mut names)| {
-            names.sort();
-            names.dedup();
-            (module.to_string(), wrap_reexport_import(module, &names))
-        })
-        .collect()
-}
-
-fn models_imports(body: &str, foreign: &[(String, String)]) -> String {
-    let mut standard = Vec::new();
-    if body.contains("enum.StrEnum") {
-        standard.push("import enum");
-    }
-    if body.contains("typing.") {
-        standard.push("import typing");
-    }
-    let mut third: Vec<String> = Vec::new();
-    if body.contains("np.ndarray") {
-        third.push("import numpy as np".to_string());
-    }
-    if body.contains("pydantic.Field(") {
-        third.push("import pydantic".to_string());
-    }
-    if body.contains("rspyts.Contract") {
-        third.push("import rspyts".to_string());
-    }
-    third.extend(foreign.iter().map(|(_, line)| line.clone()));
-    let mut out = String::new();
-    if !standard.is_empty() {
-        out.push('\n');
-        out.push_str(&standard.join("\n"));
-        out.push('\n');
-    }
-    if !third.is_empty() {
-        out.push('\n');
-        out.push_str(&third.join("\n"));
-        out.push('\n');
-    }
-    out
-}
-
-// -------------------------------------------------------------- codec plan
-
-#[derive(Clone, Copy)]
-enum Direction {
-    Encode,
-    Decode,
-}
-
-struct CodecPlan {
-    encode_refs: BTreeSet<String>,
-    decode_refs: BTreeSet<String>,
-    encode_boundaries: BTreeMap<String, (String, Ty)>,
-    decode_boundaries: BTreeMap<String, (String, Ty)>,
-}
-
-impl CodecPlan {
-    fn new(manifest: &Manifest) -> Self {
-        let mut plan = Self {
-            encode_refs: BTreeSet::new(),
-            decode_refs: BTreeSet::new(),
-            encode_boundaries: BTreeMap::new(),
-            decode_boundaries: BTreeMap::new(),
-        };
-        for function in manifest
-            .functions
-            .iter()
-            .filter(|function| function.targets.contains(&Target::Python))
-        {
-            for param in &function.params {
-                if !matches!(param.ty, Ty::Slice { .. }) {
-                    plan.add_root(manifest, &param.ty, Direction::Encode);
-                }
-            }
-            plan.add_root(manifest, &function.ret, Direction::Decode);
-        }
-        for class in &manifest.classes {
-            if let Some(constructor) = &class.constructor {
-                for param in &constructor.params {
-                    if !matches!(param.ty, Ty::Slice { .. }) {
-                        plan.add_root(manifest, &param.ty, Direction::Encode);
-                    }
-                }
-            }
-            for static_decl in class
-                .statics
-                .iter()
-                .filter(|item| item.targets.contains(&Target::Python))
-            {
-                for param in &static_decl.params {
-                    if !matches!(param.ty, Ty::Slice { .. }) {
-                        plan.add_root(manifest, &param.ty, Direction::Encode);
-                    }
-                }
-                if !static_decl.returns_self {
-                    plan.add_root(manifest, &static_decl.ret, Direction::Decode);
-                }
-            }
-            for method in class
-                .methods
-                .iter()
-                .filter(|item| item.targets.contains(&Target::Python))
-            {
-                for param in &method.params {
-                    if !matches!(param.ty, Ty::Slice { .. }) {
-                        plan.add_root(manifest, &param.ty, Direction::Encode);
-                    }
-                }
-                plan.add_root(manifest, &method.ret, Direction::Decode);
-            }
-        }
-        for decl in &manifest.types {
-            if let TypeDecl::ErrorEnum { variants, .. } = decl {
-                for field in variants.iter().flat_map(|variant| &variant.fields) {
-                    plan.add_type(manifest, &field.ty, Direction::Decode);
-                }
-            }
-        }
-        plan
-    }
-
-    fn add_root(&mut self, manifest: &Manifest, ty: &Ty, direction: Direction) {
-        self.add_type(manifest, ty, direction);
-    }
-
-    fn add_type(&mut self, manifest: &Manifest, ty: &Ty, direction: Direction) {
-        if let Ty::Ref { name } = ty {
-            self.mark_ref(manifest, name, direction);
-            return;
-        }
-        if matches!(ty, Ty::Slice { .. }) {
-            return;
-        }
-        let key = ty_key(ty);
-        let target = match direction {
-            Direction::Encode => &mut self.encode_boundaries,
-            Direction::Decode => &mut self.decode_boundaries,
-        };
-        target.entry(key).or_insert_with(|| {
-            let prefix = match direction {
-                Direction::Encode => "encode_",
-                Direction::Decode => "decode_",
-            };
-            (format!("{prefix}{}", ty_slug(ty)), ty.clone())
-        });
-        match ty {
-            Ty::Option { inner } | Ty::List { inner } => {
-                self.add_type(manifest, inner, direction);
-            }
-            Ty::Map { value } => self.add_type(manifest, value, direction),
-            Ty::Tuple { items } => {
-                for item in items {
-                    self.add_type(manifest, item, direction);
-                }
-            }
-            _ => {}
-        }
-    }
-
-    fn mark_ref(&mut self, manifest: &Manifest, name: &str, direction: Direction) {
-        let inserted = match direction {
-            Direction::Encode => self.encode_refs.insert(name.to_string()),
-            Direction::Decode => self.decode_refs.insert(name.to_string()),
-        };
-        if !inserted {
-            return;
-        }
-        let Some(decl) = find_type(manifest, name) else {
-            return;
-        };
-        match decl {
-            TypeDecl::Newtype { inner, .. } => self.add_type(manifest, inner, direction),
-            TypeDecl::Struct { fields, .. } => {
-                for field in fields {
-                    self.add_type(manifest, &field.ty, direction);
-                }
-            }
-            TypeDecl::Enum { variants, .. } => {
-                for field in variants.iter().flat_map(|variant| &variant.fields) {
-                    self.add_type(manifest, &field.ty, direction);
-                }
-            }
-            TypeDecl::StringEnum { .. } | TypeDecl::ErrorEnum { .. } => {}
-        }
-    }
-
-    fn encoder(&self, ty: &Ty) -> String {
-        match ty {
-            Ty::Ref { name } => type_codec_name(Direction::Encode, name),
-            _ => self.encode_boundaries[&ty_key(ty)].0.clone(),
-        }
-    }
-
-    fn decoder(&self, ty: &Ty) -> String {
-        match ty {
-            Ty::Ref { name } => type_codec_name(Direction::Decode, name),
-            _ => self.decode_boundaries[&ty_key(ty)].0.clone(),
-        }
-    }
-}
-
-fn ty_key(ty: &Ty) -> String {
-    serde_json::to_string(ty).expect("Ty is serializable")
-}
-
-fn ty_slug(ty: &Ty) -> String {
-    let raw = match ty {
-        Ty::Bool => "bool".to_string(),
-        Ty::U8 => "u8".to_string(),
-        Ty::U16 => "u16".to_string(),
-        Ty::U32 => "u32".to_string(),
-        Ty::I8 => "i8".to_string(),
-        Ty::I16 => "i16".to_string(),
-        Ty::I32 => "i32".to_string(),
-        Ty::I64 => "i64".to_string(),
-        Ty::U64 => "u64".to_string(),
-        Ty::F32 => "f32".to_string(),
-        Ty::F64 => "f64".to_string(),
-        Ty::String => "string".to_string(),
-        Ty::Bytes => "bytes".to_string(),
-        Ty::Unit => "unit".to_string(),
-        Ty::Null => "null".to_string(),
-        Ty::Json => "json".to_string(),
-        Ty::Option { inner } => format!("optional_{}", ty_slug(inner)),
-        Ty::List { inner } => format!("list_{}", ty_slug(inner)),
-        Ty::Map { value } => format!("map_{}", ty_slug(value)),
-        Ty::Tuple { items } => format!(
-            "tuple_{}",
-            items.iter().map(ty_slug).collect::<Vec<_>>().join("_")
-        ),
-        Ty::Ref { name } => format!("type_{}", py_name(name)),
-        Ty::Buf { dt } => format!("buffer_{}", dt.wire_name()),
-        Ty::Slice { dt } => format!("slice_{}", dt.wire_name()),
-    };
-    if raw.len() <= 72 {
-        raw
-    } else {
-        format!("boundary_{}", stable_name_hash(&ty_key(ty)))
-    }
-}
-
-fn stable_name_hash(value: &str) -> String {
-    let mut hash = 0xcbf29ce484222325_u64;
-    for byte in value.bytes() {
-        hash ^= u64::from(byte);
-        hash = hash.wrapping_mul(0x100000001b3);
-    }
-    format!("{hash:016x}")
-}
-
-fn type_codec_name(direction: Direction, name: &str) -> String {
-    let action = match direction {
-        Direction::Encode => "encode",
-        Direction::Decode => "decode",
-    };
-    format!("{action}_type_{}", py_name(name))
-}
-
-// ---------------------------------------------------------------- codecs.py
-
-fn codec_def_line(name: &str, param: &str, ret: &str) -> String {
-    let one = format!("def {name}({param}) -> {ret}:");
-    if one.len() <= LINE_LIMIT {
-        return one + "\n";
-    }
-    format!("def {name}(\n    {param},\n) -> {ret}:\n")
-}
-
-fn assignment_line(indent: &str, target: &str, value: &str) -> String {
-    let one = format!("{indent}{target} = {value}");
-    if one.len() <= LINE_LIMIT {
-        return one + "\n";
-    }
-    format!("{indent}{target} = (\n{indent}    {value}\n{indent})\n")
-}
-
-fn return_line(indent: &str, value: &str) -> String {
-    let one = format!("{indent}return {value}");
-    if one.len() <= LINE_LIMIT {
-        return one + "\n";
-    }
-    format!("{indent}return (\n{indent}    {value}\n{indent})\n")
-}
-
-fn mapping_entry_line(indent: &str, key: &str, value: &str) -> String {
-    let one = format!("{indent}{key}: {value},");
-    if one.len() <= LINE_LIMIT {
-        return one + "\n";
-    }
-    format!("{indent}{key}: (\n{indent}    {value}\n{indent}),\n")
-}
-
-fn if_line(indent: &str, condition: &str) -> String {
-    let one = format!("{indent}if {condition}:");
-    if one.len() <= LINE_LIMIT {
-        return one + "\n";
-    }
-    format!("{indent}if (\n{indent}    {condition}\n{indent}):\n")
-}
-
-fn set_operation_line(
-    indent: &str,
-    target: &str,
-    before: &str,
-    values: &[String],
-    after: &str,
-) -> String {
-    let literal = set_literal(values);
-    let one = format!("{indent}{target} = {before}{literal}{after}");
-    if one.len() <= LINE_LIMIT || values.len() <= 1 {
-        return one + "\n";
-    }
-    let mut out = format!("{indent}{target} = {before}{{\n");
-    for value in values {
-        out.push_str(&format!("{indent}    {value},\n"));
-    }
-    out.push_str(&format!("{indent}}}{after}\n"));
-    out
-}
-
-fn raise_line(indent: &str, error: &str, argument: &str) -> String {
-    let one = format!("{indent}raise {error}({argument})");
-    if one.len() <= LINE_LIMIT {
-        return one + "\n";
-    }
-    format!("{indent}raise {error}(\n{indent}    {argument}\n{indent})\n")
-}
-
-fn codecs_py(manifest: &Manifest, provenance: &Provenance<'_>, plan: &CodecPlan) -> String {
-    let mut body = String::new();
-    for (name, ty) in plan.encode_boundaries.values() {
-        body.push_str("\n\n");
-        body.push_str(&codec_function(name, ty, Direction::Encode));
-    }
-    for (name, ty) in plan.decode_boundaries.values() {
-        body.push_str("\n\n");
-        body.push_str(&codec_function(name, ty, Direction::Decode));
-    }
-    for name in &plan.encode_refs {
-        if let Some(decl) = find_type(manifest, name) {
-            body.push_str("\n\n");
-            body.push_str(&named_codec(decl, Direction::Encode));
-        }
-    }
-    for name in &plan.decode_refs {
-        if let Some(decl) = find_type(manifest, name) {
-            body.push_str("\n\n");
-            body.push_str(&named_codec(decl, Direction::Decode));
-        }
-    }
-    for decl in &manifest.types {
-        if let TypeDecl::ErrorEnum { name, variants, .. } = decl {
-            for variant in variants.iter().filter(|variant| !variant.fields.is_empty()) {
-                body.push_str("\n\n");
-                body.push_str(&error_data_codec(name, variant));
-            }
-        }
-    }
-
-    let mut out = py_header(provenance);
-    out.push_str("\"\"\"Schema-directed ABI 3 codecs for the generated client.\"\"\"\n");
-    out.push_str("\nimport typing\n\nimport rspyts.internal\n");
-    if body.contains("models.") {
-        out.push_str("\nfrom . import models\n");
-    }
-    out.push_str("\nrspyts.internal.require_emitter_api(4)\n");
-    out.push_str(
-        "\n\ndef host_list(value: object) -> list[typing.Any]:\n    if type(value) is not list:\n        raise TypeError(f\"rspyts: expected a list, got {type(value).__name__}\")\n    return value\n\n\ndef host_map(value: object) -> dict[str, typing.Any]:\n    if type(value) is not dict or any(type(key) is not str for key in value):\n        raise TypeError(\"rspyts: expected a string-keyed dict\")\n    return typing.cast(dict[str, typing.Any], value)\n\n\ndef host_tuple(value: object, length: int) -> tuple[typing.Any, ...]:\n    if type(value) is not tuple or len(value) != length:\n        raise TypeError(f\"rspyts: expected a tuple of length {length}\")\n    return value\n",
+fn models(contract: &ResolvedContract, names: &TypeNames) -> String {
+    let manifest = &contract.manifest;
+    let mut output = String::from(
+        "# Generated by rspyts 0.4. Do not edit.\n\
+from __future__ import annotations\n\n\
+from enum import Enum\n\
+from typing import Literal, TypeAlias\n\n\
+from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, JsonValue\n",
     );
-    out.push_str(&body);
-    out
-}
-
-fn codec_function(name: &str, ty: &Ty, direction: Direction) -> String {
-    let mut out = match direction {
-        Direction::Encode => codec_def_line(name, "value: object", "object"),
-        Direction::Decode => {
-            codec_def_line(name, "response: rspyts.internal.Response", "typing.Any")
-        }
-    };
-    match (direction, ty) {
-        (Direction::Encode, Ty::Option { inner }) => {
-            out.push_str("    if value is None:\n        return None\n");
-            out.push_str(&return_line("    ", &encode_expr("value", inner)));
-        }
-        (Direction::Decode, Ty::Option { inner }) => {
-            out.push_str("    if response.value is None:\n        return None\n");
-            out.push_str(&return_line("    ", &decode_expr("response", inner)));
-        }
-        (Direction::Encode, Ty::List { inner }) => {
-            out.push_str(&format!(
-                "    return [\n        {}\n        for item in host_list(value)\n    ]\n",
-                encode_expr("item", inner)
-            ));
-        }
-        (Direction::Decode, Ty::List { inner }) => {
-            out.push_str(&format!(
-                "    return [\n        {}\n        for item in rspyts.internal.list_from_wire(response)\n    ]\n",
-                decode_expr("item", inner)
-            ));
-        }
-        (Direction::Encode, Ty::Map { value }) => {
-            out.push_str(&format!(
-                "    return {{\n        key: {}\n        for key, item in host_map(value).items()\n    }}\n",
-                encode_expr("item", value)
-            ));
-        }
-        (Direction::Decode, Ty::Map { value }) => {
-            out.push_str(&format!(
-                "    return {{\n        key: {}\n        for key, item in rspyts.internal.map_from_wire(response).items()\n    }}\n",
-                decode_expr("item", value)
-            ));
-        }
-        (Direction::Encode, Ty::Tuple { items }) => {
-            out.push_str(&format!("    items = host_tuple(value, {})\n", items.len()));
-            out.push_str("    return (\n");
-            for (index, item) in items.iter().enumerate() {
-                out.push_str(&format!(
-                    "        {},\n",
-                    encode_expr(&format!("items[{index}]"), item)
-                ));
-            }
-            out.push_str("    )\n");
-        }
-        (Direction::Decode, Ty::Tuple { items }) => {
-            out.push_str(&format!(
-                "    items = rspyts.internal.tuple_from_wire(response, length={})\n",
-                items.len()
-            ));
-            out.push_str("    return (\n");
-            for (index, item) in items.iter().enumerate() {
-                out.push_str(&format!(
-                    "        {},\n",
-                    decode_expr(&format!("items[{index}]"), item)
-                ));
-            }
-            out.push_str("    )\n");
-        }
-        (Direction::Encode, _) => {
-            out.push_str(&return_line("    ", &encode_leaf_expr("value", ty)));
-        }
-        (Direction::Decode, _) => {
-            out.push_str(&return_line("    ", &decode_leaf_expr("response", ty)));
+    if models_use_buffer(contract) {
+        output.push_str(
+            "\nimport numpy as np\n\
+from numpy.typing import NDArray\n",
+        );
+    }
+    output.push_str(&foreign_type_imports(contract));
+    output.push('\n');
+    let mut exports = vec!["JsonValue".to_owned()];
+    exports.extend(
+        contract
+            .foreign_types
+            .values()
+            .map(|item| item.name.clone()),
+    );
+    for item in &manifest.types {
+        exports.push(item.name.clone());
+        if let TypeShape::TaggedEnum { variants, .. } = &item.shape {
+            exports.extend(
+                variants
+                    .iter()
+                    .map(|variant| format!("{}{}", item.name, pascal_case(&variant.rust_name))),
+            );
         }
     }
-    out
+    output.push_str(&all_assignment(&exports));
+    for item in ordered_types(manifest) {
+        output.push_str(&python_type(item, names, contract));
+        output.push('\n');
+    }
+    output
 }
 
-fn named_codec(decl: &TypeDecl, direction: Direction) -> String {
-    let function = type_codec_name(direction, decl.name());
-    match (direction, decl) {
-        (Direction::Encode, TypeDecl::Newtype { inner, .. }) => {
-            let mut out = codec_def_line(&function, "value: object", "object");
-            out.push_str(&return_line("    ", &encode_expr("value", inner)));
-            out
-        }
-        (Direction::Decode, TypeDecl::Newtype { inner, .. }) => {
-            let mut out = codec_def_line(
-                &function,
-                "response: rspyts.internal.Response",
-                "typing.Any",
+fn python_type(item: &TypeDef, names: &TypeNames, contract: &ResolvedContract) -> String {
+    let mut output = python_doc(item.docs.as_deref(), "");
+    match &item.shape {
+        TypeShape::Struct { fields } => {
+            output.push_str(&format!("class {}(BaseModel):\n", item.name));
+            output.push_str(
+                "    model_config = ConfigDict(populate_by_name=True, arbitrary_types_allowed=True, extra=\"forbid\", frozen=True, validate_default=True)\n",
             );
-            out.push_str(&return_line("    ", &decode_expr("response", inner)));
-            out
+            if fields.is_empty() {
+                output.push_str("    pass\n");
+            }
+            for field in fields {
+                output.push_str(&python_doc(field.docs.as_deref(), "    "));
+                output.push_str(&python_field(field, names, contract));
+                output.push('\n');
+            }
         }
-        (Direction::Encode, TypeDecl::Struct { name, fields, .. }) => {
-            encode_model(function, name, fields, None)
-        }
-        (Direction::Decode, TypeDecl::Struct { name, fields, .. }) => {
-            decode_model(function, name, fields, None)
-        }
-        (Direction::Encode, TypeDecl::StringEnum { name, .. }) => {
-            let mut out = codec_def_line(&function, "value: object", "str");
-            out.push_str(&format!("    if type(value) is not models.{name}:\n"));
-            out.push_str(&raise_line(
-                "        ",
-                "TypeError",
-                &format!("f\"rspyts: expected {name}, got {{type(value).__name__}}\""),
-            ));
-            out.push_str("    return value.value\n");
-            out
-        }
-        (Direction::Decode, TypeDecl::StringEnum { name, .. }) => {
-            let mut out = codec_def_line(
-                &function,
-                "response: rspyts.internal.Response",
-                &format!("models.{name}"),
-            );
-            out.push_str(&return_line(
-                "    ",
-                &format!("models.{name}(rspyts.internal.string_from_wire(response))"),
-            ));
-            out
-        }
-        (
-            Direction::Encode,
-            TypeDecl::Enum {
-                name,
-                tag,
-                variants,
-                ..
-            },
-        ) => {
-            let mut out = codec_def_line(&function, "value: object", "object");
+        TypeShape::StringEnum { variants } => {
+            output.push_str(&format!("class {}(str, Enum):\n", item.name));
+            if variants.is_empty() {
+                output.push_str("    pass\n");
+            }
             for variant in variants {
-                let model = format!("{name}{}", variant.name);
-                out.push_str(&format!("    if type(value) is models.{model}:\n"));
-                out.push_str(&format!(
-                    "        return {{\n            {}: {},\n",
-                    py_string(tag),
-                    py_string(&variant.wire_name)
+                output.push_str(&python_doc(variant.docs.as_deref(), "    "));
+                output.push_str(&format!(
+                    "    {} = {:?}\n",
+                    variant.rust_name, variant.wire_name
+                ));
+            }
+        }
+        TypeShape::TaggedEnum { tag, variants } => {
+            let mut variant_names = Vec::new();
+            for variant in variants {
+                let name = format!("{}{}", item.name, pascal_case(&variant.rust_name));
+                variant_names.push(name.clone());
+                output.push_str(&format!("class {name}(BaseModel):\n"));
+                output.push_str(
+                    "    model_config = ConfigDict(populate_by_name=True, arbitrary_types_allowed=True, extra=\"forbid\", frozen=True, validate_default=True)\n",
+                );
+                output.push_str(&format!(
+                    "    {}: Literal[{:?}] = {:?}\n",
+                    tag, variant.wire_name, variant.wire_name
                 ));
                 for field in &variant.fields {
-                    let attr = py_name(&field.name);
-                    let converted = encode_expr(&format!("value.{attr}"), &field.ty);
-                    out.push_str(&mapping_entry_line(
-                        "            ",
-                        &py_string(&field.wire_name),
-                        &converted,
-                    ));
+                    output.push_str(&python_field(field, names, contract));
+                    output.push('\n');
                 }
-                out.push_str("        }\n");
+                output.push('\n');
             }
-            out.push_str(&raise_line(
-                "    ",
-                "TypeError",
-                &format!("f\"rspyts: expected {name}, got {{type(value).__name__}}\""),
+            output.push_str(&format!(
+                "{}: TypeAlias = {}\n",
+                item.name,
+                variant_names.join(" | ")
             ));
-            out
         }
-        (
-            Direction::Decode,
-            TypeDecl::Enum {
+        TypeShape::Alias { target } => {
+            output.push_str(&format!(
+                "{}: TypeAlias = {}\n",
+                item.name,
+                python_ref(target, names)
+            ));
+        }
+    }
+    output
+}
+
+fn python_field(field: &FieldDef, names: &TypeNames, contract: &ResolvedContract) -> String {
+    let mut ty = match &field.constraints.literal {
+        Some(value) => {
+            let literal = python_literal(value, &field.ty, contract);
+            if matches!(field.ty, TypeRef::Option { .. }) {
+                format!("Literal[{literal}] | None")
+            } else {
+                format!("Literal[{literal}]")
+            }
+        }
+        None => python_ref(&field.ty, names),
+    };
+    if !field.required && field.default.is_none() && !matches!(field.ty, TypeRef::Option { .. }) {
+        ty = format!("{ty} | None");
+    }
+
+    let mut args = Vec::new();
+    if let Some(default) = &field.default {
+        args.push(format!("default={}", python_scalar(default, &field.ty)));
+    } else if !field.required {
+        args.push("default=None".to_owned());
+    }
+    if let Some(minimum) = field.constraints.min_length {
+        args.push(format!("min_length={minimum}"));
+    }
+    if let Some(maximum) = field.constraints.max_length {
+        args.push(format!("max_length={maximum}"));
+    }
+    if let Some(minimum) = field.constraints.ge {
+        args.push(format!("ge={minimum}"));
+    }
+    if field.rust_name != field.wire_name {
+        args.push(format!("alias={:?}", field.wire_name));
+    }
+
+    let mut output = format!("    {}: {ty}", field.rust_name);
+    if !args.is_empty() {
+        output.push_str(&format!(" = Field({})", args.join(", ")));
+    }
+    output
+}
+
+fn python_literal(value: &ScalarValue, ty: &TypeRef, contract: &ResolvedContract) -> String {
+    match ty {
+        TypeRef::Option { item } => python_literal(value, item, contract),
+        TypeRef::Named { identity } => match type_definition(contract, identity) {
+            Some(TypeDef {
                 name,
-                tag,
-                variants,
+                shape: TypeShape::StringEnum { variants },
                 ..
+            }) => match value {
+                ScalarValue::String(value) => variants
+                    .iter()
+                    .find(|variant| variant.wire_name == *value)
+                    .map(|variant| format!("{name}.{}", variant.rust_name))
+                    .unwrap_or_else(|| python_scalar(&ScalarValue::String(value.clone()), ty)),
+                _ => python_scalar(value, ty),
             },
-        ) => {
-            let mut out = codec_def_line(
-                &function,
-                "response: rspyts.internal.Response",
-                &format!("models.{name}"),
-            );
-            out.push_str(&format!(
-                "    return rspyts.internal.enum_from_wire(\n        response,\n        tag={},\n        variants={{\n",
-                py_string(tag)
-            ));
-            for variant in variants {
-                out.push_str(&mapping_entry_line(
-                    "            ",
-                    &py_string(&variant.wire_name),
-                    &enum_variant_decoder_name(name, &variant.name),
-                ));
-            }
-            out.push_str("        },\n    )\n");
-            for variant in variants {
-                out.push_str("\n\n");
-                out.push_str(&decode_model(
-                    enum_variant_decoder_name(name, &variant.name),
-                    &format!("{name}{}", variant.name),
-                    &variant.fields,
-                    Some((tag, &variant.wire_name)),
-                ));
-            }
-            out
-        }
-        (_, TypeDecl::ErrorEnum { .. }) => String::new(),
+            Some(TypeDef {
+                shape: TypeShape::Alias { target },
+                ..
+            }) => python_literal(value, target, contract),
+            _ => python_scalar(value, ty),
+        },
+        _ => python_scalar(value, ty),
     }
 }
 
-fn encode_model(
-    function: String,
-    name: &str,
-    fields: &[FieldDecl],
-    tag: Option<(&str, &str)>,
-) -> String {
-    let mut out = codec_def_line(&function, "value: object", "object");
-    out.push_str(&format!("    if type(value) is not models.{name}:\n"));
-    out.push_str(&raise_line(
-        "        ",
-        "TypeError",
-        &format!("f\"rspyts: expected {name}, got {{type(value).__name__}}\""),
+fn codecs(contract: &ResolvedContract) -> String {
+    let mut output = String::from("# Generated by rspyts 0.4. Do not edit.\n");
+    if !python_uses_buffer(contract) {
+        output.push_str("__all__: list[str] = []\n");
+        return output;
+    }
+    output.push_str(concat!(
+        "from __future__ import annotations\n\n",
+        "__all__: list[str] = []\n\n",
+        "import numpy as np\n\n",
+        "from . import native\n\n",
+        "DTYPES = {\n",
+        "    \"u8\": np.dtype(\"u1\"),\n",
+        "    \"i8\": np.dtype(\"i1\"),\n",
+        "    \"u16\": np.dtype(\"<u2\"),\n",
+        "    \"i16\": np.dtype(\"<i2\"),\n",
+        "    \"u32\": np.dtype(\"<u4\"),\n",
+        "    \"i32\": np.dtype(\"<i4\"),\n",
+        "    \"u64\": np.dtype(\"<u8\"),\n",
+        "    \"i64\": np.dtype(\"<i8\"),\n",
+        "    \"f32\": np.dtype(\"<f4\"),\n",
+        "    \"f64\": np.dtype(\"<f8\"),\n",
+        "}\n\n",
+        "def encode_buffer(value, dtype: str):\n",
+        "    array = np.ascontiguousarray(value, dtype=DTYPES[dtype])\n",
+        "    return native.BufferPayload(dtype, array.tobytes(order=\"C\"))\n\n",
+        "def decode_buffer(payload, dtype: str):\n",
+        "    if payload.dtype != dtype:\n",
+        "        raise TypeError(f\"expected {dtype} buffer, received {payload.dtype}\")\n",
+        "    return np.frombuffer(payload.data, dtype=DTYPES[dtype], count=payload.length).copy()\n",
     ));
-    out.push_str("    encoded: dict[str, object] = {}\n");
-    if let Some((tag_name, tag_value)) = tag {
-        out.push_str(&assignment_line(
-            "    ",
-            &format!("encoded[{}]", py_string(tag_name)),
-            &py_string(tag_value),
-        ));
-    }
-    for field in fields {
-        let attr = py_name(&field.name);
-        let value = format!("value.{attr}");
-        let encoded = encode_expr(&value, &field.ty);
-        if field.required {
-            out.push_str(&assignment_line(
-                "    ",
-                &format!("encoded[{}]", py_string(&field.wire_name)),
-                &encoded,
-            ));
-        } else {
-            out.push_str(&format!("    if {value} is not None:\n"));
-            out.push_str(&assignment_line(
-                "        ",
-                &format!("encoded[{}]", py_string(&field.wire_name)),
-                &encoded,
-            ));
-        }
-    }
-    out.push_str("    return encoded\n");
-    out
+    output
 }
 
-fn decode_model(
-    function: String,
-    name: &str,
-    fields: &[FieldDecl],
-    tag: Option<(&str, &str)>,
-) -> String {
-    let mut allowed: Vec<String> = fields
-        .iter()
-        .map(|field| py_string(&field.wire_name))
-        .collect();
-    if let Some((tag_name, _)) = tag {
-        allowed.push(py_string(tag_name));
-    }
-    let mut required: Vec<String> = fields
-        .iter()
-        .filter(|field| field.required)
-        .map(|field| py_string(&field.wire_name))
-        .collect();
-    if let Some((tag_name, _)) = tag {
-        required.push(py_string(tag_name));
-    }
-    let mut out = codec_def_line(
-        &function,
-        "response: rspyts.internal.Response",
-        &format!("models.{name}"),
+fn errors(contract: &ResolvedContract) -> String {
+    let manifest = &contract.manifest;
+    let mut output = String::from("# Generated by rspyts 0.4. Do not edit.\n");
+    output.push_str(&foreign_error_imports(contract));
+    let mut exports = vec!["ContractError".to_owned(), "ResourceClosedError".to_owned()];
+    exports.extend(
+        contract
+            .foreign_errors
+            .values()
+            .map(|item| item.name.clone()),
     );
-    out.push_str("    obj = rspyts.internal.map_from_wire(response)\n");
-    out.push_str(&set_operation_line(
-        "    ",
-        "unknown",
-        "set(obj) - ",
-        &allowed,
-        "",
+    exports.extend(manifest.errors.iter().map(|item| item.name.clone()));
+    output.push_str(&all_assignment(&exports));
+    output.push_str(concat!(
+        "class ContractError(Exception):\n",
+        "    code: str\n\n",
+        "    def __init__(self, message: str, code: str) -> None:\n",
+        "        super().__init__(message)\n",
+        "        self.code = code\n\n",
+        "class ResourceClosedError(RuntimeError):\n",
+        "    pass\n\n",
+        "def translate_error(error: RuntimeError, error_type):\n",
+        "    if len(error.args) >= 2:\n",
+        "        code, message = error.args[0], error.args[1]\n",
+        "    elif error.args and isinstance(error.args[0], tuple) and len(error.args[0]) >= 2:\n",
+        "        code, message = error.args[0][0], error.args[0][1]\n",
+        "    else:\n",
+        "        raise error\n",
+        "    return error_type(str(message), str(code))\n\n",
     ));
-    out.push_str("    if unknown:\n");
-    out.push_str(&raise_line(
-        "        ",
-        "TypeError",
-        &format!("f\"rspyts: unexpected {name} fields: {{sorted(unknown)!r}}\""),
-    ));
-    out.push_str(&set_operation_line(
-        "    ",
-        "missing",
-        "",
-        &required,
-        " - set(obj)",
-    ));
-    out.push_str("    if missing:\n");
-    out.push_str(&raise_line(
-        "        ",
-        "TypeError",
-        &format!("f\"rspyts: missing {name} fields: {{sorted(missing)!r}}\""),
-    ));
-    if let Some((tag_name, tag_value)) = tag {
-        out.push_str(&if_line(
-            "    ",
-            &format!(
-                "rspyts.internal.string_from_wire(obj[{}]) != {}",
-                py_string(tag_name),
-                py_string(tag_value)
-            ),
-        ));
-        out.push_str(&raise_line(
-            "        ",
-            "ValueError",
-            &format!("\"rspyts: invalid {name} discriminator\""),
+    for error in &manifest.errors {
+        output.push_str(&python_doc(error.docs.as_deref(), ""));
+        output.push_str(&format!(
+            "class {}(ContractError):\n    pass\n\n",
+            error.name
         ));
     }
-    out.push_str("    values: dict[str, object] = {}\n");
-    for field in fields {
-        let key = py_string(&field.wire_name);
-        let converted = decode_expr(&format!("obj[{key}]"), &field.ty);
-        if field.required {
-            out.push_str(&assignment_line(
-                "    ",
-                &format!("values[{}]", py_string(&py_name(&field.name))),
-                &converted,
-            ));
-        } else {
-            out.push_str(&format!("    if {key} in obj:\n"));
-            out.push_str(&assignment_line(
-                "        ",
-                &format!("values[{}]", py_string(&py_name(&field.name))),
-                &converted,
-            ));
-        }
-    }
-    if let Some((tag_name, tag_value)) = tag {
-        out.push_str(&assignment_line(
-            "    ",
-            &format!("values[{}]", py_string(&py_name(tag_name))),
-            &py_string(tag_value),
-        ));
-    }
-    out.push_str(&return_line(
-        "    ",
-        &format!("models.{name}.model_validate(values, strict=True)"),
-    ));
-    out
+    output
 }
 
-fn set_literal(values: &[String]) -> String {
-    match values {
-        [] => "set()".to_string(),
-        [only] => format!("{{{only}}}"),
-        _ => format!("{{{}}}", values.join(", ")),
-    }
-}
-
-fn enum_variant_decoder_name(enum_name: &str, variant_name: &str) -> String {
-    format!(
-        "decode_variant_{}_{}",
-        py_name(enum_name),
-        py_name(variant_name)
-    )
-}
-
-fn encode_expr(expr: &str, ty: &Ty) -> String {
-    let function = match ty {
-        Ty::Ref { name } => type_codec_name(Direction::Encode, name),
-        _ => format!("encode_{}", ty_slug(ty)),
-    };
-    format!("{function}({expr})")
-}
-
-fn decode_expr(expr: &str, ty: &Ty) -> String {
-    let function = match ty {
-        Ty::Ref { name } => type_codec_name(Direction::Decode, name),
-        _ => format!("decode_{}", ty_slug(ty)),
-    };
-    format!("{function}({expr})")
-}
-
-fn encode_leaf_expr(expr: &str, ty: &Ty) -> String {
-    match ty {
-        Ty::Bool => format!("rspyts.internal.bool_from_wire(rspyts.internal.Response({expr}))"),
-        Ty::U8 | Ty::U16 | Ty::U32 | Ty::I8 | Ty::I16 | Ty::I32 => {
-            let (minimum, maximum) = int_bounds(ty).expect("integer kind");
-            format!(
-                "rspyts.internal.bounded_int_from_wire(rspyts.internal.Response({expr}), minimum={minimum}, maximum={maximum})"
-            )
-        }
-        Ty::I64 => format!("rspyts.internal.i64_to_wire({expr})"),
-        Ty::U64 => format!("rspyts.internal.u64_to_wire({expr})"),
-        Ty::F32 => {
-            format!("rspyts.internal.float_from_wire(rspyts.internal.Response({expr}), f32=True)")
-        }
-        Ty::F64 => format!("rspyts.internal.float_from_wire(rspyts.internal.Response({expr}))"),
-        Ty::String => format!("rspyts.internal.string_from_wire(rspyts.internal.Response({expr}))"),
-        Ty::Bytes | Ty::Buf { .. } | Ty::Slice { .. } => expr.to_string(),
-        Ty::Unit | Ty::Null => {
-            format!("rspyts.internal.null_from_wire(rspyts.internal.Response({expr}))")
-        }
-        Ty::Json => format!("rspyts.internal.json_to_wire({expr})"),
-        Ty::Ref { .. }
-        | Ty::Option { .. }
-        | Ty::List { .. }
-        | Ty::Map { .. }
-        | Ty::Tuple { .. } => unreachable!("composite values use reusable codecs"),
-    }
-}
-
-fn decode_leaf_expr(expr: &str, ty: &Ty) -> String {
-    match ty {
-        Ty::Bool => format!("rspyts.internal.bool_from_wire({expr})"),
-        Ty::U8 | Ty::U16 | Ty::U32 | Ty::I8 | Ty::I16 | Ty::I32 => {
-            let (minimum, maximum) = int_bounds(ty).expect("integer kind");
-            format!(
-                "rspyts.internal.bounded_int_from_wire({expr}, minimum={minimum}, maximum={maximum})"
-            )
-        }
-        Ty::I64 => format!("rspyts.internal.i64_from_wire({expr})"),
-        Ty::U64 => format!("rspyts.internal.u64_from_wire({expr})"),
-        Ty::F32 => format!("rspyts.internal.float_from_wire({expr}, f32=True)"),
-        Ty::F64 => format!("rspyts.internal.float_from_wire({expr})"),
-        Ty::String => format!("rspyts.internal.string_from_wire({expr})"),
-        Ty::Bytes => format!("rspyts.internal.bytes_from_wire({expr})"),
-        Ty::Buf { dt } => format!(
-            "rspyts.internal.buffer_from_wire({expr}, dtype={})",
-            py_string(dt.wire_name())
-        ),
-        Ty::Unit | Ty::Null => format!("rspyts.internal.null_from_wire({expr})"),
-        Ty::Json => format!("rspyts.internal.json_from_wire({expr})"),
-        Ty::Ref { .. }
-        | Ty::Option { .. }
-        | Ty::List { .. }
-        | Ty::Map { .. }
-        | Ty::Tuple { .. } => unreachable!("composite values use reusable codecs"),
-        Ty::Slice { .. } => unreachable!("slice cannot be a return type"),
-    }
-}
-
-fn tuple_expr(values: &[String]) -> String {
-    let trailing = if values.len() == 1 { "," } else { "" };
-    format!("({}{trailing})", values.join(", "))
-}
-
-fn error_data_codec(error_name: &str, variant: &rspyts_core::ir::ErrorVariantDecl) -> String {
-    let function = error_codec_name(error_name, &variant.name);
-    let allowed: Vec<String> = variant
-        .fields
-        .iter()
-        .map(|field| py_string(&field.wire_name))
-        .collect();
-    let required: Vec<String> = variant
-        .fields
-        .iter()
-        .filter(|field| field.required)
-        .map(|field| py_string(&field.wire_name))
-        .collect();
-    let mut out = codec_def_line(
-        &function,
-        "response: rspyts.internal.Response",
-        "dict[str, object]",
+fn functions(contract: &ResolvedContract, names: &TypeNames) -> String {
+    let manifest = &contract.manifest;
+    let mut output = format!(
+        "# Generated by rspyts 0.4. Do not edit.\n\
+from __future__ import annotations\n\n\
+from . import {} as native\n\
+from .errors import *  # noqa: F403\n\
+from .errors import translate_error\n\
+from .models import *  # noqa: F403\n\n",
+        manifest.module_name
     );
-    out.push_str("    obj = rspyts.internal.map_from_wire(response)\n");
-    out.push_str(&set_operation_line(
-        "    ",
-        "unknown",
-        "set(obj) - ",
-        &allowed,
-        "",
-    ));
-    out.push_str("    if unknown:\n");
-    out.push_str(&raise_line(
-        "        ",
-        "TypeError",
-        "f\"rspyts: unexpected error data fields: {sorted(unknown)!r}\"",
-    ));
-    out.push_str(&set_operation_line(
-        "    ",
-        "missing",
-        "",
-        &required,
-        " - set(obj)",
-    ));
-    out.push_str("    if missing:\n");
-    out.push_str(&raise_line(
-        "        ",
-        "TypeError",
-        "f\"rspyts: missing error data fields: {sorted(missing)!r}\"",
-    ));
-    out.push_str("    data: dict[str, object] = {}\n");
-    for field in &variant.fields {
-        let key = py_string(&field.wire_name);
-        let decoded = decode_expr(&format!("obj[{key}]"), &field.ty);
-        if field.required {
-            out.push_str(&assignment_line("    ", &format!("data[{key}]"), &decoded));
-        } else {
-            out.push_str(&format!("    if {key} in obj:\n"));
-            out.push_str(&assignment_line(
-                "        ",
-                &format!("data[{key}]"),
-                &decoded,
-            ));
-        }
+    if functions_use_adapter(contract) {
+        output.push_str("from pydantic import AwareDatetime, TypeAdapter\n\n");
     }
-    out.push_str("    return data\n");
-    out
-}
-
-fn error_codec_name(error_name: &str, variant_name: &str) -> String {
-    format!(
-        "decode_error_{}_{}",
-        py_name(error_name),
-        py_name(variant_name)
-    )
-}
-
-// ---------------------------------------------------------------- errors.py
-
-fn errors_py(
-    manifest: &Manifest,
-    provenance: &Provenance<'_>,
-    imports: &BTreeMap<String, String>,
-) -> String {
-    let mut local = Vec::new();
-    let mut foreign: BTreeMap<&str, BTreeSet<String>> = BTreeMap::new();
-    for decl in &manifest.types {
-        let TypeDecl::ErrorEnum {
-            name,
-            docs,
-            variants,
-            ..
-        } = decl
-        else {
-            continue;
-        };
-        if is_imported(manifest, decl, imports) {
-            let mut names = projected_names(decl);
-            names.push(py_error_registry_name(name));
-            foreign
-                .entry(imports[decl.origin()].as_str())
-                .or_default()
-                .extend(names);
-        } else {
-            local.push((name, docs, variants));
-        }
+    if functions_use_buffer(contract) {
+        output.push_str("from .codecs import decode_buffer, encode_buffer\n");
+        output.push_str("import numpy as np\nfrom numpy.typing import NDArray\n\n");
     }
-
-    let mut out = py_header(provenance);
-    out.push_str(&format!(
-        "\"\"\"\nException classes bridged from `{}`.\n\"\"\"\n",
-        manifest.crate_name
-    ));
-    if local.is_empty() && foreign.is_empty() {
-        return out;
-    }
-    if !local.is_empty() {
-        let has_data = local
+    output.push_str(&all_assignment(
+        &manifest
+            .functions
             .iter()
-            .any(|(_, _, variants)| variants.iter().any(|variant| !variant.fields.is_empty()));
-        if has_data {
-            out.push_str("\nimport typing\n");
-        }
-        out.push_str("\nimport rspyts\nimport rspyts.internal\n");
-        if has_data {
-            out.push_str("\nfrom . import codecs\n");
-        }
-    }
-    for (module, names) in foreign {
-        out.push('\n');
-        out.push_str(&wrap_reexport_import(
-            module,
-            &names.into_iter().collect::<Vec<_>>(),
-        ));
-        out.push('\n');
-    }
-
-    for (name, docs, variants) in &local {
-        out.push_str("\n\n");
-        out.push_str(&error_class(name, "rspyts.BridgeError", docs, None));
-        for variant in *variants {
-            out.push_str("\n\n");
-            out.push_str(&error_class(
-                &format!("{name}{}", variant.name),
-                name,
-                &variant.docs,
-                (!variant.fields.is_empty()).then_some(error_codec_name(name, &variant.name)),
-            ));
-        }
-    }
-    for (name, _, variants) in &local {
-        out.push_str("\n\n");
-        out.push_str(&format!(
-            "{}: rspyts.internal.BridgeErrorRegistry = {{\n",
-            py_error_registry_name(name)
-        ));
-        for variant in *variants {
-            out.push_str(&format!(
-                "    {}: {name}{},\n",
-                py_string(&variant.wire_code),
-                variant.name
-            ));
-        }
-        out.push_str("}\n");
-    }
-    out
-}
-
-fn error_class(name: &str, base: &str, docs: &str, codec: Option<String>) -> String {
-    let noqa = if name.ends_with("Error") {
-        ""
-    } else {
-        "  # noqa: N818"
-    };
-    let doc = py_docstring(docs, "    ");
-    let Some(codec) = codec else {
-        if doc.is_empty() {
-            return format!("class {name}({base}): ...{noqa}\n");
-        }
-        return format!("class {name}({base}):{noqa}\n{doc}");
-    };
-    let mut out = format!("class {name}({base}):{noqa}\n");
-    out.push_str(&doc);
-    if !doc.is_empty() {
-        out.push('\n');
-    }
-    out.push_str(
-        "    def __init__(self, message: str, *, code: str, data: typing.Any | None = None) -> None:\n",
-    );
-    out.push_str(&format!(
-        "        if data is not None:\n            data = codecs.{codec}(rspyts.internal.Response(data))\n"
+            .filter(|function| matches!(function.target, Target::Both | Target::Python))
+            .map(|function| function.rust_name.clone())
+            .collect::<Vec<_>>(),
     ));
-    out.push_str("        super().__init__(message, code=code, data=data)\n");
-    out
-}
-
-// ---------------------------------------------------------------- library.py
-
-fn library_py(
-    manifest: &Manifest,
-    provenance: &Provenance<'_>,
-    library_search: &[String],
-) -> String {
-    let mut out = py_header(provenance);
-    out.push_str(&format!(
-        "\"\"\"\nLoader for the compiled `{}` bridge library.\n\"\"\"\n",
-        manifest.crate_name
-    ));
-    out.push_str("\nimport pathlib\n\nimport rspyts\nimport rspyts.internal\n\n");
-    out.push_str("rspyts.internal.require_emitter_api(4)\n\n");
-    out.push_str("LIB = rspyts.Library(\n");
-    out.push_str(&format!(
-        "    name={},\n",
-        py_string(&manifest.crate_name.replace('-', "_"))
-    ));
-    out.push_str("    search=[\n");
-    for directory in library_search {
-        out.push_str(&format!("        {},\n", py_string(directory)));
-    }
-    out.push_str("    ],\n");
-    out.push_str("    anchor=pathlib.Path(__file__).parent,\n");
-    out.push_str(&format!(
-        "    expected_contract_fingerprint={},\n",
-        py_string(provenance.manifest_hash)
-    ));
-    out.push_str(")\n");
-    out
-}
-
-// -------------------------------------------------------------- constants.py
-
-fn constants_py(manifest: &Manifest, provenance: &Provenance<'_>) -> String {
-    let mut body = String::new();
-    let mut model_imports = BTreeSet::new();
-    for constant in &manifest.constants {
-        body.push('\n');
-        for line in doc_lines(&constant.docs) {
-            if line.trim().is_empty() {
-                body.push_str("#\n");
-            } else {
-                body.push_str(&format!("# {line}\n"));
-            }
-        }
-        record_model_uses(manifest, &constant.ty, &mut model_imports);
-        body.push_str(&constant_decl(manifest, constant));
-    }
-    let mut out = py_header(provenance);
-    out.push_str("\"\"\"\nConstants bridged from Rust.\n\"\"\"\n");
-    if !manifest.constants.is_empty() {
-        out.push_str("\nimport typing\n");
-        if !model_imports.is_empty() {
-            out.push('\n');
-            out.push_str(&wrap_from_import(
-                ".models",
-                &model_imports.into_iter().collect::<Vec<_>>(),
-            ));
-        }
-    }
-    out.push_str(&body);
-    out
-}
-
-fn constant_decl(manifest: &Manifest, constant: &rspyts_core::ir::ConstDecl) -> String {
-    let annotation = py_type(&constant.ty, false, &|_| false);
-    let prefix = format!("{}: typing.Final[{annotation}] = ", constant.name);
-    let compact = py_const_expr_compact(manifest, &constant.ty, &constant.value);
-    if prefix.len() + compact.len() <= LINE_LIMIT {
-        return format!("{prefix}{compact}\n");
-    }
-    let rendered = py_const_expr_pretty(manifest, &constant.ty, &constant.value, 0, true);
-    if prefix.len() <= LINE_LIMIT {
-        format!("{prefix}{rendered}\n")
-    } else {
-        format!(
-            "{}: typing.Final[\n    {annotation}\n] = {rendered}\n",
-            constant.name
-        )
-    }
-}
-
-fn py_bool(value: bool) -> &'static str {
-    if value { "True" } else { "False" }
-}
-
-fn py_const_expr_compact(manifest: &Manifest, ty: &Ty, value: &serde_json::Value) -> String {
-    match ty {
-        Ty::Bool => py_bool(value.as_bool().expect("validated bool")).to_string(),
-        Ty::U8 | Ty::U16 | Ty::U32 | Ty::I8 | Ty::I16 | Ty::I32 => value.to_string(),
-        Ty::I64 | Ty::U64 => value
-            .as_str()
-            .map(ToString::to_string)
-            .unwrap_or_else(|| value.to_string()),
-        Ty::F32 | Ty::F64 => {
-            let number = value.as_f64().expect("validated float");
-            if number == 0.0 {
-                "0.0".to_string()
-            } else {
-                format!("{number:?}")
-            }
-        }
-        Ty::String => py_string(value.as_str().expect("validated string")),
-        Ty::Unit | Ty::Null => "None".to_string(),
-        Ty::Json => py_json(value),
-        Ty::Option { inner } => {
-            if value.is_null() {
-                "None".to_string()
-            } else {
-                py_const_expr_compact(manifest, inner, value)
-            }
-        }
-        Ty::List { inner } => format!(
-            "[{}]",
-            value
-                .as_array()
-                .expect("validated list")
-                .iter()
-                .map(|item| py_const_expr_compact(manifest, inner, item))
-                .collect::<Vec<_>>()
-                .join(", ")
-        ),
-        Ty::Map { value: inner } => format!(
-            "{{{}}}",
-            value
-                .as_object()
-                .expect("validated map")
-                .iter()
-                .map(|(key, item)| format!(
-                    "{}: {}",
-                    py_string(key),
-                    py_const_expr_compact(manifest, inner, item)
-                ))
-                .collect::<Vec<_>>()
-                .join(", ")
-        ),
-        Ty::Tuple { items } => {
-            let values = value.as_array().expect("validated tuple");
-            tuple_expr(
-                &items
-                    .iter()
-                    .zip(values)
-                    .map(|(item_ty, item)| py_const_expr_compact(manifest, item_ty, item))
-                    .collect::<Vec<_>>(),
-            )
-        }
-        Ty::Ref { name } => match find_type(manifest, name).expect("validated reference") {
-            TypeDecl::Newtype { inner, .. } => py_const_expr_compact(manifest, inner, value),
-            TypeDecl::StringEnum { .. } => format!(
-                "{name}({})",
-                py_string(value.as_str().expect("validated enum string"))
-            ),
-            TypeDecl::Struct { fields, .. } => {
-                model_const_compact(name, fields, value, manifest, None)
-            }
-            TypeDecl::Enum { tag, variants, .. } => {
-                let object = value.as_object().expect("validated enum object");
-                let wire = object[tag].as_str().expect("validated discriminator");
-                let variant = variants
-                    .iter()
-                    .find(|variant| variant.wire_name == wire)
-                    .expect("validated variant");
-                model_const_compact(
-                    &format!("{name}{}", variant.name),
-                    &variant.fields,
-                    value,
-                    manifest,
-                    Some((tag, wire)),
-                )
-            }
-            TypeDecl::ErrorEnum { .. } => unreachable!("error const type"),
-        },
-        Ty::Bytes | Ty::Buf { .. } | Ty::Slice { .. } => {
-            unreachable!("binary and slice constants are rejected")
-        }
-    }
-}
-
-fn model_const_compact(
-    name: &str,
-    fields: &[FieldDecl],
-    value: &serde_json::Value,
-    manifest: &Manifest,
-    tag: Option<(&str, &str)>,
-) -> String {
-    let object = value.as_object().expect("validated object");
-    let mut args = Vec::new();
-    if let Some((tag_name, tag_value)) = tag {
-        args.push(format!("{}={}", py_name(tag_name), py_string(tag_value)));
-    }
-    for field in fields {
-        if let Some(field_value) = object.get(&field.wire_name) {
-            args.push(format!(
-                "{}={}",
-                py_name(&field.name),
-                py_const_expr_compact(manifest, &field.ty, field_value)
-            ));
-        }
-    }
-    format!("{name}({})", args.join(", "))
-}
-
-fn py_json(value: &serde_json::Value) -> String {
-    match value {
-        serde_json::Value::Null => "None".to_string(),
-        serde_json::Value::Bool(value) => py_bool(*value).to_string(),
-        serde_json::Value::Number(value) => value.to_string(),
-        serde_json::Value::String(value) => py_string(value),
-        serde_json::Value::Array(values) => format!(
-            "[{}]",
-            values.iter().map(py_json).collect::<Vec<_>>().join(", ")
-        ),
-        serde_json::Value::Object(values) => format!(
-            "{{{}}}",
-            values
-                .iter()
-                .map(|(key, value)| format!("{}: {}", py_string(key), py_json(value)))
-                .collect::<Vec<_>>()
-                .join(", ")
-        ),
-    }
-}
-
-fn py_const_expr_pretty(
-    manifest: &Manifest,
-    ty: &Ty,
-    value: &serde_json::Value,
-    indent: usize,
-    force: bool,
-) -> String {
-    let compact = py_const_expr_compact(manifest, ty, value);
-    if !force && indent + compact.len() <= LINE_LIMIT {
-        return compact;
-    }
-    match ty {
-        Ty::Option { inner } if !value.is_null() => {
-            py_const_expr_pretty(manifest, inner, value, indent, force)
-        }
-        Ty::List { inner } => {
-            let items = value
-                .as_array()
-                .expect("validated list")
-                .iter()
-                .map(|item| py_const_expr_pretty(manifest, inner, item, indent + 4, false))
-                .collect();
-            multiline_items("[", "]", items, indent)
-        }
-        Ty::Map { value: inner } => {
-            let items = value
-                .as_object()
-                .expect("validated map")
-                .iter()
-                .map(|(key, item)| {
-                    format!(
-                        "{}: {}",
-                        py_string(key),
-                        py_const_expr_pretty(manifest, inner, item, indent + 4, false)
-                    )
-                })
-                .collect();
-            multiline_items("{", "}", items, indent)
-        }
-        Ty::Tuple { items } => {
-            let values = value.as_array().expect("validated tuple");
-            let items = items
-                .iter()
-                .zip(values)
-                .map(|(item_ty, item)| {
-                    py_const_expr_pretty(manifest, item_ty, item, indent + 4, false)
-                })
-                .collect();
-            multiline_items("(", ")", items, indent)
-        }
-        Ty::Json => py_json_pretty(value, indent),
-        Ty::Ref { name } => match find_type(manifest, name).expect("validated reference") {
-            TypeDecl::Newtype { inner, .. } => {
-                py_const_expr_pretty(manifest, inner, value, indent, force)
-            }
-            TypeDecl::Struct { fields, .. } => {
-                model_const_pretty(name, fields, value, manifest, None, indent)
-            }
-            TypeDecl::Enum { tag, variants, .. } => {
-                let object = value.as_object().expect("validated enum object");
-                let wire = object[tag].as_str().expect("validated discriminator");
-                let variant = variants
-                    .iter()
-                    .find(|variant| variant.wire_name == wire)
-                    .expect("validated variant");
-                model_const_pretty(
-                    &format!("{name}{}", variant.name),
-                    &variant.fields,
-                    value,
-                    manifest,
-                    Some((tag, wire)),
-                    indent,
-                )
-            }
-            TypeDecl::StringEnum { .. } | TypeDecl::ErrorEnum { .. } => compact,
-        },
-        _ => compact,
-    }
-}
-
-fn model_const_pretty(
-    name: &str,
-    fields: &[FieldDecl],
-    value: &serde_json::Value,
-    manifest: &Manifest,
-    tag: Option<(&str, &str)>,
-    indent: usize,
-) -> String {
-    let object = value.as_object().expect("validated object");
-    let mut args = Vec::new();
-    if let Some((tag_name, tag_value)) = tag {
-        args.push(format!("{}={}", py_name(tag_name), py_string(tag_value)));
-    }
-    for field in fields {
-        if let Some(field_value) = object.get(&field.wire_name) {
-            args.push(format!(
-                "{}={}",
-                py_name(&field.name),
-                py_const_expr_pretty(manifest, &field.ty, field_value, indent + 4, false)
-            ));
-        }
-    }
-    multiline_items(&format!("{name}("), ")", args, indent)
-}
-
-fn py_json_pretty(value: &serde_json::Value, indent: usize) -> String {
-    let compact = py_json(value);
-    if indent + compact.len() <= LINE_LIMIT {
-        return compact;
-    }
-    match value {
-        serde_json::Value::Array(values) => multiline_items(
-            "[",
-            "]",
-            values
-                .iter()
-                .map(|item| py_json_pretty(item, indent + 4))
-                .collect(),
-            indent,
-        ),
-        serde_json::Value::Object(values) => multiline_items(
-            "{",
-            "}",
-            values
-                .iter()
-                .map(|(key, item)| {
-                    format!("{}: {}", py_string(key), py_json_pretty(item, indent + 4))
-                })
-                .collect(),
-            indent,
-        ),
-        _ => compact,
-    }
-}
-
-fn multiline_items(open: &str, close: &str, items: Vec<String>, indent: usize) -> String {
-    if items.is_empty() {
-        return format!("{open}{close}");
-    }
-    let item_indent = " ".repeat(indent + 4);
-    let closing_indent = " ".repeat(indent);
-    let mut out = format!("{open}\n");
-    for item in items {
-        out.push_str(&item_indent);
-        out.push_str(&item);
-        out.push_str(",\n");
-    }
-    out.push_str(&closing_indent);
-    out.push_str(close);
-    out
-}
-
-// -------------------------------------------------------------- functions.py
-
-fn functions_py(manifest: &Manifest, provenance: &Provenance<'_>, codecs: &CodecPlan) -> String {
-    let functions: Vec<&FnDecl> = manifest
+    for function in manifest
         .functions
         .iter()
-        .filter(|function| function.targets.contains(&Target::Python))
-        .collect();
-    let mut body = String::new();
-    let mut model_imports = BTreeSet::new();
-    let mut uses_numpy = false;
-    for function in &functions {
-        body.push_str("\n\n");
-        body.push_str(&function_def(
-            manifest,
-            function,
-            codecs,
-            &mut model_imports,
-            &mut uses_numpy,
-        ));
-    }
-    let mut out = py_header(provenance);
-    out.push_str("\"\"\"\nTyped wrappers for bridged free functions.\n\"\"\"\n");
-    if !functions.is_empty() {
-        if body.contains("typing.") {
-            out.push_str("\nimport typing\n");
-        }
-        if uses_numpy {
-            out.push_str("\nimport numpy as np\n");
-        }
-        if body.contains("errors.") {
-            out.push_str("\nfrom . import codecs, errors, library\n");
-        } else {
-            out.push_str("\nfrom . import codecs, library\n");
-        }
-        if !model_imports.is_empty() {
-            out.push_str(&wrap_from_import(
-                ".models",
-                &model_imports.into_iter().collect::<Vec<_>>(),
-            ));
-        }
-    }
-    out.push_str(&body);
-    out
-}
-
-fn function_def(
-    manifest: &Manifest,
-    function: &FnDecl,
-    codecs: &CodecPlan,
-    model_imports: &mut BTreeSet<String>,
-    uses_numpy: &mut bool,
-) -> String {
-    let params = py_params(manifest, &function.params, model_imports, uses_numpy);
-    let ret = py_return_type(manifest, &function.ret, model_imports, uses_numpy);
-    let mut out = def_line("    ", &function.name, &params, &ret, 0);
-    out.push_str(&py_docstring(&function.docs, "    "));
-    out.push_str(&call_block(
-        "    ",
-        &format!("rspyts_fn__{}", function.name),
-        &function.params,
-        codecs,
-        false,
-        function.err.as_deref(),
-    ));
-    out.push_str(&format!(
-        "    return codecs.{}(response)\n",
-        codecs.decoder(&function.ret)
-    ));
-    out
-}
-
-// ---------------------------------------------------------------- classes.py
-
-fn classes_py(manifest: &Manifest, provenance: &Provenance<'_>, codecs: &CodecPlan) -> String {
-    let mut body = String::new();
-    let mut model_imports = BTreeSet::new();
-    let mut uses_numpy = false;
-    for class in &manifest.classes {
-        body.push_str("\n\n");
-        body.push_str(&class_def(
-            manifest,
-            class,
-            codecs,
-            &mut model_imports,
-            &mut uses_numpy,
-        ));
-    }
-    let mut out = py_header(provenance);
-    out.push_str("\"\"\"\nHandle classes for bridged Rust objects.\n\"\"\"\n");
-    if !manifest.classes.is_empty() {
-        out.push_str("\nimport typing\n\n");
-        if uses_numpy {
-            out.push_str("import numpy as np\n");
-        }
-        out.push_str("import rspyts.internal\n");
-        if body.contains("errors.") {
-            out.push_str("\nfrom . import codecs, errors, library\n");
-        } else {
-            out.push_str("\nfrom . import codecs, library\n");
-        }
-        if !model_imports.is_empty() {
-            out.push_str(&wrap_from_import(
-                ".models",
-                &model_imports.into_iter().collect::<Vec<_>>(),
-            ));
-        }
-    }
-    out.push_str(&body);
-    out
-}
-
-fn class_def(
-    manifest: &Manifest,
-    class: &ClassDecl,
-    codecs: &CodecPlan,
-    model_imports: &mut BTreeSet<String>,
-    uses_numpy: &mut bool,
-) -> String {
-    let name = &class.name;
-    let statics: Vec<&StaticDecl> = class
-        .statics
-        .iter()
-        .filter(|item| item.targets.contains(&Target::Python))
-        .collect();
-    let factories: Vec<&&StaticDecl> = statics.iter().filter(|item| item.returns_self).collect();
-    let mut out = format!("class {name}:\n");
-    out.push_str(&py_docstring(&class.docs, "    "));
-    if !out.ends_with(":\n") {
-        out.push('\n');
-    }
-    out.push_str("    handle: int\n\n");
-
-    if let Some(constructor) = &class.constructor {
-        let mut params = vec![("self".to_string(), String::new())];
-        params.extend(py_params(
-            manifest,
-            &constructor.params,
-            model_imports,
-            uses_numpy,
-        ));
-        out.push_str(&def_line("        ", "__init__", &params, "None", 4));
-        out.push_str(&py_docstring(&constructor.docs, "        "));
-        out.push_str(&call_block(
-            "        ",
-            &format!("rspyts_cls__{name}__new"),
-            &constructor.params,
-            codecs,
-            false,
-            constructor.err.as_deref(),
-        ));
-        out.push_str("        self.handle = rspyts.internal.bounded_int_from_wire(\n            response, minimum=1, maximum=9007199254740991\n        )\n");
-    } else {
-        let hint = if factories.is_empty() {
-            String::new()
-        } else {
-            format!(
-                "; use {}",
-                factories
-                    .iter()
-                    .map(|item| format!("{name}.{}(...)", item.name))
-                    .collect::<Vec<_>>()
-                    .join(" or ")
-            )
-        };
-        out.push_str(&format!(
-            "    def __init__(self) -> None:\n        raise TypeError({})\n",
-            py_string(&format!("{name} cannot be constructed directly{hint}"))
-        ));
-    }
-
-    for static_decl in &statics {
-        out.push('\n');
-        if static_decl.returns_self {
-            out.push_str("    @classmethod\n");
-            let mut params = vec![("cls".to_string(), String::new())];
-            params.extend(py_params(
-                manifest,
-                &static_decl.params,
-                model_imports,
-                uses_numpy,
-            ));
-            out.push_str(&def_line(
-                "        ",
-                &static_decl.name,
-                &params,
-                "typing.Self",
-                4,
-            ));
-            out.push_str(&py_docstring(&static_decl.docs, "        "));
-            out.push_str(&call_block(
-                "        ",
-                &format!("rspyts_cls__{name}__{}", static_decl.name),
-                &static_decl.params,
-                codecs,
-                false,
-                static_decl.err.as_deref(),
-            ));
-            out.push_str("        obj = cls.__new__(cls)\n        obj.handle = rspyts.internal.bounded_int_from_wire(\n            response, minimum=1, maximum=9007199254740991\n        )\n        return obj\n");
-        } else {
-            out.push_str("    @staticmethod\n");
-            let params = py_params(manifest, &static_decl.params, model_imports, uses_numpy);
-            let ret = py_return_type(manifest, &static_decl.ret, model_imports, uses_numpy);
-            out.push_str(&def_line("        ", &static_decl.name, &params, &ret, 4));
-            out.push_str(&py_docstring(&static_decl.docs, "        "));
-            out.push_str(&call_block(
-                "        ",
-                &format!("rspyts_cls__{name}__{}", static_decl.name),
-                &static_decl.params,
-                codecs,
-                false,
-                static_decl.err.as_deref(),
-            ));
-            out.push_str(&format!(
-                "        return codecs.{}(response)\n",
-                codecs.decoder(&static_decl.ret)
-            ));
-        }
-    }
-
-    for method in class
-        .methods
-        .iter()
-        .filter(|item| item.targets.contains(&Target::Python))
+        .filter(|function| matches!(function.target, Target::Both | Target::Python))
     {
-        out.push('\n');
-        let mut params = vec![("self".to_string(), String::new())];
-        params.extend(py_params(
-            manifest,
-            &method.params,
-            model_imports,
-            uses_numpy,
-        ));
-        let ret = py_return_type(manifest, &method.ret, model_imports, uses_numpy);
-        out.push_str(&def_line("        ", &method.name, &params, &ret, 4));
-        out.push_str(&py_docstring(&method.docs, "        "));
-        out.push_str(&call_block(
-            "        ",
-            &format!("rspyts_cls__{name}__{}", method.name),
-            &method.params,
-            codecs,
-            true,
-            method.err.as_deref(),
-        ));
-        out.push_str(&format!(
-            "        return codecs.{}(response)\n",
-            codecs.decoder(&method.ret)
+        output.push_str(&python_doc(function.docs.as_deref(), ""));
+        let params = function
+            .params
+            .iter()
+            .map(|param| format!("{}: {}", param.rust_name, python_ref(&param.ty, names)))
+            .collect::<Vec<_>>();
+        let args = function
+            .params
+            .iter()
+            .map(|param| param.rust_name.as_str())
+            .collect::<Vec<_>>();
+        let call = format!(
+            "native.{}({})",
+            function.host_name,
+            function
+                .params
+                .iter()
+                .zip(args)
+                .map(|(param, argument)| python_to_native(&param.ty, argument, contract))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        let body = match error_name(function.error.as_ref(), contract) {
+            Some(error) => format!(
+                "    try:\n        result = {call}\n    except RuntimeError as error:\n        raise translate_error(error, {error}) from None\n"
+            ),
+            None => format!("    result = {call}\n"),
+        };
+        output.push_str(&format!(
+            "def {}({}) -> {}:\n{}    return {}\n\n",
+            function.rust_name,
+            params.join(", "),
+            python_ref(&function.returns, names),
+            body,
+            python_from_native(&function.returns, "result", contract)
         ));
     }
+    output
+}
 
-    out.push_str(&format!(
-        "\n    def __copy__(self) -> typing.NoReturn:\n        raise TypeError(\"{name} owns a Rust handle and cannot be copied\")\n\n    def __deepcopy__(self, memo: dict[int, object]) -> typing.NoReturn:\n        raise TypeError(\"{name} owns a Rust handle and cannot be copied\")\n\n    def __reduce__(self) -> typing.NoReturn:\n        raise TypeError(\"{name} owns a Rust handle and cannot be pickled\")\n\n    def __reduce_ex__(self, protocol: typing.SupportsIndex) -> typing.NoReturn:\n        raise TypeError(\"{name} owns a Rust handle and cannot be pickled\")\n\n    def close(self) -> None:\n        \"\"\"Release the Rust object. Safe to call more than once.\"\"\"\n        handle = getattr(self, \"handle\", None)\n        if handle is not None:\n            library.LIB.call_drop(\"rspyts_cls__{name}__drop\", handle)\n\n    def __enter__(self) -> typing.Self:\n        return self\n\n    def __exit__(self, *exc: object) -> None:\n        self.close()\n\n    def __del__(self) -> None:\n        try:\n            self.close()\n        except Exception:\n            pass\n"
+fn resources(contract: &ResolvedContract, names: &TypeNames) -> String {
+    let manifest = &contract.manifest;
+    let mut output = format!(
+        "# Generated by rspyts 0.4. Do not edit.\n\
+from __future__ import annotations\n\n\
+from . import {} as native\n\n",
+        manifest.module_name
+    );
+    output.push_str(
+        "from .errors import *  # noqa: F403\n\
+from .errors import translate_error\n\
+from .models import *  # noqa: F403\n\n",
+    );
+    if resources_use_adapter(contract) {
+        output.push_str("from pydantic import AwareDatetime, TypeAdapter\n");
+    }
+    if resources_use_buffer(contract) {
+        output.push_str("from .codecs import decode_buffer, encode_buffer\n");
+        output.push_str("import numpy as np\nfrom numpy.typing import NDArray\n");
+    }
+    output.push('\n');
+    output.push_str(&all_assignment(
+        &manifest
+            .resources
+            .iter()
+            .filter(|resource| matches!(resource.target, Target::Both | Target::Python))
+            .map(|resource| resource.name.clone())
+            .collect::<Vec<_>>(),
     ));
-    out
-}
-
-// ------------------------------------------------------------------ wrappers
-
-fn py_params(
-    manifest: &Manifest,
-    params: &[ParamDecl],
-    model_imports: &mut BTreeSet<String>,
-    uses_numpy: &mut bool,
-) -> Vec<(String, String)> {
-    params
+    for resource in manifest
+        .resources
         .iter()
-        .map(|param| {
-            record_model_uses(manifest, &param.ty, model_imports);
-            *uses_numpy |= uses_ndarray(&param.ty);
-            (
-                py_param_name(&param.name),
-                py_type(&param.ty, false, &|_| false),
-            )
-        })
-        .collect()
+        .filter(|resource| matches!(resource.target, Target::Both | Target::Python))
+    {
+        output.push_str(&python_doc(resource.docs.as_deref(), ""));
+        output.push_str(&format!("class {}:\n", resource.name));
+        let constructors = resource
+            .constructors
+            .iter()
+            .filter(|constructor| matches!(constructor.target, Target::Both | Target::Python))
+            .collect::<Vec<_>>();
+        let primary = constructors
+            .iter()
+            .copied()
+            .find(|constructor| constructor.rust_name == "new")
+            .or_else(|| constructors.first().copied());
+        if let Some(constructor) = primary {
+            let params = constructor
+                .params
+                .iter()
+                .map(|param| format!("{}: {}", param.rust_name, python_ref(&param.ty, names)))
+                .collect::<Vec<_>>();
+            let args = constructor
+                .params
+                .iter()
+                .map(|param| python_to_native(&param.ty, &param.rust_name, contract))
+                .collect::<Vec<_>>();
+            let call = format!("native.{}({})", resource.name, args.join(", "));
+            let body = match error_name(constructor.error.as_ref(), contract) {
+                Some(error) => format!(
+                    "        try:\n            self.handle = {call}\n        except RuntimeError as error:\n            raise translate_error(error, {error}) from None\n"
+                ),
+                None => format!("        self.handle = {call}\n"),
+            };
+            output.push_str(&format!(
+                "    def __init__(self{}{}) -> None:\n{body}",
+                if params.is_empty() { "" } else { ", " },
+                params.join(", ")
+            ));
+        } else {
+            output.push_str("    def __init__(self) -> None:\n        raise TypeError(\"resource has no public constructor\")\n");
+        }
+        for constructor in constructors
+            .into_iter()
+            .filter(|constructor| Some(*constructor) != primary)
+        {
+            output.push_str(&python_doc(constructor.docs.as_deref(), "    "));
+            let params = constructor
+                .params
+                .iter()
+                .map(|param| format!("{}: {}", param.rust_name, python_ref(&param.ty, names)))
+                .collect::<Vec<_>>();
+            let args = constructor
+                .params
+                .iter()
+                .map(|param| python_to_native(&param.ty, &param.rust_name, contract))
+                .collect::<Vec<_>>();
+            let call = format!(
+                "native.{}.{}({})",
+                resource.name,
+                constructor.host_name,
+                args.join(", ")
+            );
+            let body = match error_name(constructor.error.as_ref(), contract) {
+                Some(error) => format!(
+                    "        try:\n            resource.handle = {call}\n        except RuntimeError as error:\n            raise translate_error(error, {error}) from None\n"
+                ),
+                None => format!("        resource.handle = {call}\n"),
+            };
+            output.push_str(&format!(
+                "    @classmethod\n    def {}(cls{}{}) -> {}:\n        resource = cls.__new__(cls)\n{body}        return resource\n",
+                constructor.rust_name,
+                if params.is_empty() { "" } else { ", " },
+                params.join(", "),
+                resource.name,
+            ));
+        }
+        for method in resource
+            .methods
+            .iter()
+            .filter(|method| matches!(method.target, Target::Both | Target::Python))
+        {
+            output.push_str(&python_doc(method.docs.as_deref(), "    "));
+            let params = method
+                .params
+                .iter()
+                .map(|param| format!("{}: {}", param.rust_name, python_ref(&param.ty, names)))
+                .collect::<Vec<_>>();
+            let args = method
+                .params
+                .iter()
+                .map(|param| python_to_native(&param.ty, &param.rust_name, contract))
+                .collect::<Vec<_>>();
+            let call = format!("self.handle.{}({})", method.host_name, args.join(", "));
+            let body = match error_name(method.error.as_ref(), contract) {
+                Some(error) => format!(
+                    "        try:\n            result = {call}\n        except RuntimeError as error:\n            raise translate_error(error, {error}) from None\n"
+                ),
+                None => format!("        result = {call}\n"),
+            };
+            output.push_str(&format!(
+                "    def {}(self{}{}) -> {}:\n        if self.handle is None:\n            raise ResourceClosedError(\"{} is closed\")\n{}        return {}\n",
+                method.rust_name,
+                if params.is_empty() { "" } else { ", " },
+                params.join(", "),
+                python_ref(&method.returns, names),
+                resource.name,
+                body,
+                python_from_native(&method.returns, "result", contract)
+            ));
+        }
+        output.push_str(concat!(
+            "    def close(self) -> None:\n",
+            "        if self.handle is not None:\n",
+            "            self.handle.close()\n",
+            "            self.handle = None\n\n",
+            "    def __enter__(self):\n",
+            "        return self\n\n",
+            "    def __exit__(self, exception_type, exception, traceback) -> None:\n",
+            "        self.close()\n\n",
+        ));
+    }
+    output
 }
 
-fn py_return_type(
-    manifest: &Manifest,
-    ty: &Ty,
-    model_imports: &mut BTreeSet<String>,
-    uses_numpy: &mut bool,
-) -> String {
-    record_model_uses(manifest, ty, model_imports);
-    *uses_numpy |= uses_ndarray(ty);
-    py_type(ty, false, &|_| false)
+fn constants(contract: &ResolvedContract, fingerprint: &str, names: &TypeNames) -> String {
+    let manifest = &contract.manifest;
+    let constants = manifest
+        .constants
+        .iter()
+        .filter(|constant| matches!(constant.target, Target::Both | Target::Python))
+        .collect::<Vec<_>>();
+    let mut output = format!(
+        "# Generated by rspyts 0.4. Do not edit.\n\
+from __future__ import annotations\n\n\
+from .models import *  # noqa: F403\n\n\
+CONTRACT_FINGERPRINT = {fingerprint:?}\n"
+    );
+    if constants
+        .iter()
+        .any(|constant| reference_contains_datetime(&constant.ty, contract))
+    {
+        output.push_str("from pydantic import AwareDatetime, TypeAdapter\n\n");
+    }
+    if constants
+        .iter()
+        .any(|constant| contains_buffer(&constant.ty))
+    {
+        output.push_str("import numpy as np\nfrom numpy.typing import NDArray\n\n");
+    }
+    output.push_str(&all_assignment(
+        &std::iter::once("CONTRACT_FINGERPRINT".to_owned())
+            .chain(constants.iter().map(|constant| constant.host_name.clone()))
+            .collect::<Vec<_>>(),
+    ));
+    for constant in constants {
+        output.push_str(&python_doc(constant.docs.as_deref(), ""));
+        output.push_str(&format!(
+            "{}: {} = {}\n",
+            constant.host_name,
+            python_ref(&constant.ty, names),
+            python_value(&constant.value, &constant.ty, contract)
+        ));
+    }
+    output
 }
 
-fn record_model_uses(manifest: &Manifest, ty: &Ty, model_imports: &mut BTreeSet<String>) {
-    let mut refs = BTreeSet::new();
-    collect_refs(ty, &mut refs);
-    for name in refs {
-        let Some(decl) = find_type(manifest, &name) else {
-            continue;
-        };
-        match decl {
-            TypeDecl::ErrorEnum { .. } => {}
-            _ => {
-                model_imports.insert(name);
+fn init_module(contract: &ResolvedContract) -> String {
+    let manifest = &contract.manifest;
+    let mut output = String::from(
+        "# Generated by rspyts 0.4. Do not edit.\n\
+from .models import *  # noqa: F403\n\
+from .errors import *  # noqa: F403\n\
+from .functions import *  # noqa: F403\n\
+from .resources import *  # noqa: F403\n\
+from .constants import *  # noqa: F403\n\n",
+    );
+    let mut exports = vec!["JsonValue".to_owned()];
+    exports.extend(
+        contract
+            .foreign_types
+            .values()
+            .map(|item| item.name.clone()),
+    );
+    for item in &manifest.types {
+        exports.push(item.name.clone());
+        if let TypeShape::TaggedEnum { variants, .. } = &item.shape {
+            exports.extend(
+                variants
+                    .iter()
+                    .map(|variant| format!("{}{}", item.name, pascal_case(&variant.rust_name))),
+            );
+        }
+    }
+    exports.extend(["ContractError".to_owned(), "ResourceClosedError".to_owned()]);
+    exports.extend(
+        contract
+            .foreign_errors
+            .values()
+            .map(|item| item.name.clone()),
+    );
+    exports.extend(manifest.errors.iter().map(|item| item.name.clone()));
+    exports.extend(
+        manifest
+            .functions
+            .iter()
+            .filter(|function| matches!(function.target, Target::Both | Target::Python))
+            .map(|function| function.rust_name.clone()),
+    );
+    exports.extend(
+        manifest
+            .resources
+            .iter()
+            .filter(|resource| matches!(resource.target, Target::Both | Target::Python))
+            .map(|resource| resource.name.clone()),
+    );
+    exports.push("CONTRACT_FINGERPRINT".to_owned());
+    exports.extend(
+        manifest
+            .constants
+            .iter()
+            .filter(|constant| matches!(constant.target, Target::Both | Target::Python))
+            .map(|constant| constant.host_name.clone()),
+    );
+    output.push_str(&all_assignment(&exports));
+    output.push_str(&format!(
+        "__contract_module__ = {:?}\n",
+        manifest.module_name
+    ));
+    output
+}
+
+fn foreign_type_imports(contract: &ResolvedContract) -> String {
+    let mut output = String::new();
+    for dependency in contract.dependencies.values() {
+        let names = contract
+            .foreign_types
+            .iter()
+            .filter(|(identity, _)| identity.owner == dependency.owner)
+            .map(|(_, definition)| definition.name.as_str())
+            .collect::<Vec<_>>();
+        if !names.is_empty() {
+            let package = dependency
+                .python
+                .as_deref()
+                .expect("Python dependency mapping is validated before emission");
+            output.push_str(&format!("from {package} import {}\n", names.join(", ")));
+        }
+    }
+    output
+}
+
+fn foreign_error_imports(contract: &ResolvedContract) -> String {
+    let mut output = String::new();
+    for dependency in contract.dependencies.values() {
+        let names = contract
+            .foreign_errors
+            .iter()
+            .filter(|(identity, _)| identity.owner == dependency.owner)
+            .map(|(_, definition)| definition.name.as_str())
+            .collect::<Vec<_>>();
+        if !names.is_empty() {
+            let package = dependency
+                .python
+                .as_deref()
+                .expect("Python dependency mapping is validated before emission");
+            output.push_str(&format!("from {package} import {}\n", names.join(", ")));
+        }
+    }
+    output
+}
+
+fn all_assignment(names: &[String]) -> String {
+    let mut seen = std::collections::BTreeSet::new();
+    let names = names
+        .iter()
+        .filter(|name| seen.insert(name.as_str()))
+        .collect::<Vec<_>>();
+    if names.is_empty() {
+        return "__all__: list[str] = []\n\n".into();
+    }
+    format!(
+        "__all__ = [\n{}]\n\n",
+        names
+            .iter()
+            .map(|name| format!("    {name:?},\n"))
+            .collect::<String>()
+    )
+}
+
+fn python_ref(reference: &TypeRef, names: &TypeNames) -> String {
+    match reference {
+        TypeRef::Unit => "None".into(),
+        TypeRef::Bool => "bool".into(),
+        TypeRef::Int { .. } => "int".into(),
+        TypeRef::Float { .. } => "float".into(),
+        TypeRef::String => "str".into(),
+        TypeRef::DateTime => "AwareDatetime".into(),
+        TypeRef::Json => "JsonValue".into(),
+        TypeRef::Option { item } => format!("{} | None", python_ref(item, names)),
+        TypeRef::List { item } => format!("list[{}]", python_ref(item, names)),
+        TypeRef::Map { value } => format!("dict[str, {}]", python_ref(value, names)),
+        TypeRef::Tuple { items } => format!(
+            "tuple[{}]",
+            items
+                .iter()
+                .map(|item| python_ref(item, names))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        TypeRef::Named { identity } => names
+            .get(identity)
+            .cloned()
+            .unwrap_or_else(|| identity.to_string()),
+        TypeRef::Bytes => "bytes".into(),
+        TypeRef::Buffer { element } => format!("NDArray[np.{}]", numpy_scalar(*element)),
+    }
+}
+
+fn python_to_native(reference: &TypeRef, expression: &str, contract: &ResolvedContract) -> String {
+    match reference {
+        TypeRef::Named { identity } => {
+            match type_definition(contract, identity).map(|item| &item.shape) {
+                Some(TypeShape::Struct { fields }) => format!(
+                    "{{{}}}",
+                    fields
+                        .iter()
+                        .map(|field| format!(
+                            "{:?}: {}",
+                            field.wire_name,
+                            python_to_native(
+                                &field.ty,
+                                &format!("{expression}.{}", field.rust_name),
+                                contract
+                            )
+                        ))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+                Some(TypeShape::TaggedEnum { .. }) => {
+                    format!("{expression}.model_dump(mode=\"json\", by_alias=True)")
+                }
+                Some(TypeShape::StringEnum { .. }) => format!("{expression}.value"),
+                Some(TypeShape::Alias { target }) => python_to_native(target, expression, contract),
+                None => expression.to_owned(),
             }
         }
+        TypeRef::Option { item } => format!(
+            "None if {expression} is None else {}",
+            python_to_native(item, expression, contract)
+        ),
+        TypeRef::List { item } => format!(
+            "[{} for item in {expression}]",
+            python_to_native(item, "item", contract)
+        ),
+        TypeRef::Map { value } => format!(
+            "{{key: {} for key, item in {expression}.items()}}",
+            python_to_native(value, "item", contract)
+        ),
+        TypeRef::Tuple { items } => format!(
+            "({})",
+            items
+                .iter()
+                .enumerate()
+                .map(|(index, item)| {
+                    python_to_native(item, &format!("{expression}[{index}]"), contract)
+                })
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        TypeRef::Buffer { element } => {
+            format!("encode_buffer({expression}, {:?})", buffer_name(*element))
+        }
+        TypeRef::DateTime => format!("{expression}.isoformat()"),
+        _ => expression.to_owned(),
     }
 }
 
-fn uses_ndarray(ty: &Ty) -> bool {
-    match ty {
-        Ty::Buf { .. } | Ty::Slice { .. } => true,
-        Ty::Option { inner } | Ty::List { inner } => uses_ndarray(inner),
-        Ty::Map { value } => uses_ndarray(value),
-        Ty::Tuple { items } => items.iter().any(uses_ndarray),
+fn python_from_native(
+    reference: &TypeRef,
+    expression: &str,
+    contract: &ResolvedContract,
+) -> String {
+    match reference {
+        TypeRef::Named { identity } => match type_definition(contract, identity) {
+            Some(TypeDef {
+                name,
+                shape: TypeShape::Struct { fields },
+                ..
+            }) => {
+                let overrides = fields
+                    .iter()
+                    .map(|field| {
+                        let key = format!("{:?}", field.wire_name);
+                        format!(
+                            "**({{{key}: {}}} if {key} in {expression} else {{}})",
+                            python_from_native(
+                                &field.ty,
+                                &format!("{expression}[{key}]"),
+                                contract
+                            )
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!("{name}.model_validate({{**{expression}, {overrides}}})")
+            }
+            Some(TypeDef {
+                name,
+                shape: TypeShape::TaggedEnum { .. },
+                ..
+            }) => format!("TypeAdapter({name}).validate_python({expression})"),
+            Some(TypeDef {
+                name,
+                shape: TypeShape::StringEnum { .. },
+                ..
+            }) => format!("{name}({expression})"),
+            Some(TypeDef {
+                shape: TypeShape::Alias { target },
+                ..
+            }) => python_from_native(target, expression, contract),
+            _ => expression.to_owned(),
+        },
+        TypeRef::Option { item } => format!(
+            "None if {expression} is None else {}",
+            python_from_native(item, expression, contract)
+        ),
+        TypeRef::List { item } => format!(
+            "[{} for item in {expression}]",
+            python_from_native(item, "item", contract)
+        ),
+        TypeRef::Map { value } => format!(
+            "{{key: {} for key, item in {expression}.items()}}",
+            python_from_native(value, "item", contract)
+        ),
+        TypeRef::Tuple { items } => format!(
+            "({})",
+            items
+                .iter()
+                .enumerate()
+                .map(|(index, item)| {
+                    python_from_native(item, &format!("{expression}[{index}]"), contract)
+                })
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        TypeRef::Buffer { element } => {
+            format!("decode_buffer({expression}, {:?})", buffer_name(*element))
+        }
+        TypeRef::DateTime => {
+            format!("TypeAdapter(AwareDatetime).validate_python({expression})")
+        }
+        _ => expression.to_owned(),
+    }
+}
+
+fn error_name<'a>(
+    identity: Option<&rspyts::ir::DefinitionId>,
+    contract: &'a ResolvedContract,
+) -> Option<&'a str> {
+    error_definition(contract, identity?).map(|error| error.name.as_str())
+}
+
+fn models_use_buffer(contract: &ResolvedContract) -> bool {
+    contract
+        .manifest
+        .types
+        .iter()
+        .chain(contract.foreign_types.values())
+        .any(|item| match &item.shape {
+            TypeShape::Struct { fields } => fields.iter().any(|field| contains_buffer(&field.ty)),
+            TypeShape::TaggedEnum { variants, .. } | TypeShape::StringEnum { variants } => variants
+                .iter()
+                .flat_map(|variant| &variant.fields)
+                .any(|field| contains_buffer(&field.ty)),
+            TypeShape::Alias { target } => contains_buffer(target),
+        })
+}
+
+fn functions_use_buffer(contract: &ResolvedContract) -> bool {
+    contract.manifest.functions.iter().any(|function| {
+        matches!(function.target, Target::Both | Target::Python)
+            && (reference_contains_buffer(&function.returns, contract)
+                || function
+                    .params
+                    .iter()
+                    .any(|param| reference_contains_buffer(&param.ty, contract)))
+    })
+}
+
+fn resources_use_buffer(contract: &ResolvedContract) -> bool {
+    contract.manifest.resources.iter().any(|resource| {
+        matches!(resource.target, Target::Both | Target::Python)
+            && (resource.constructors.iter().any(|constructor| {
+                matches!(constructor.target, Target::Both | Target::Python)
+                    && constructor
+                        .params
+                        .iter()
+                        .any(|param| reference_contains_buffer(&param.ty, contract))
+            }) || resource.methods.iter().any(|method| {
+                matches!(method.target, Target::Both | Target::Python)
+                    && (reference_contains_buffer(&method.returns, contract)
+                        || method
+                            .params
+                            .iter()
+                            .any(|param| reference_contains_buffer(&param.ty, contract)))
+            }))
+    })
+}
+
+fn python_uses_buffer(contract: &ResolvedContract) -> bool {
+    models_use_buffer(contract)
+        || functions_use_buffer(contract)
+        || resources_use_buffer(contract)
+        || contract.manifest.constants.iter().any(|constant| {
+            matches!(constant.target, Target::Both | Target::Python)
+                && reference_contains_buffer(&constant.ty, contract)
+        })
+}
+
+fn contains_buffer(reference: &TypeRef) -> bool {
+    match reference {
+        TypeRef::Buffer { .. } => true,
+        TypeRef::Option { item } | TypeRef::List { item } => contains_buffer(item),
+        TypeRef::Map { value } => contains_buffer(value),
+        TypeRef::Tuple { items } => items.iter().any(contains_buffer),
         _ => false,
     }
 }
 
-fn call_block(
-    indent: &str,
-    symbol: &str,
-    params: &[ParamDecl],
-    codecs: &CodecPlan,
-    handle: bool,
-    error: Option<&str>,
-) -> String {
-    let args: Vec<String> = params
-        .iter()
-        .filter(|param| !matches!(param.ty, Ty::Slice { .. }))
-        .map(|param| {
-            format!(
-                "{}: codecs.{}({})",
-                py_string(&param.wire_name),
-                codecs.encoder(&param.ty),
-                py_param_name(&param.name)
-            )
-        })
-        .collect();
-    let slices: Vec<(String, Dtype)> = params
-        .iter()
-        .filter_map(|param| match param.ty {
-            Ty::Slice { dt } => Some((py_param_name(&param.name), dt)),
-            _ => None,
-        })
-        .collect();
-    let mut out = format!("{indent}response = library.LIB.call(\n{indent}    {symbol:?},\n");
-    out.push_str(&args_dict(&args, &format!("{indent}    ")));
-    if !slices.is_empty() {
-        let values = slices
-            .iter()
-            .map(|(name, dtype)| format!("({name}, {:?})", dtype.wire_name()))
-            .collect::<Vec<_>>();
-        let trailing = if values.len() == 1 { "," } else { "" };
-        out.push_str(&format!(
-            "{indent}    slices=({}{trailing}),\n",
-            values.join(", ")
-        ));
-    }
-    if handle {
-        out.push_str(&format!("{indent}    handle=self.handle,\n"));
-    }
-    if let Some(error) = error {
-        out.push_str(&format!(
-            "{indent}    error_types=errors.{},\n",
-            py_error_registry_name(error)
-        ));
-    }
-    out.push_str(&format!("{indent})\n"));
-    out
+fn reference_contains_buffer(reference: &TypeRef, contract: &ResolvedContract) -> bool {
+    reference_contains(
+        reference,
+        contract,
+        &mut std::collections::BTreeSet::new(),
+        &|reference| matches!(reference, TypeRef::Buffer { .. }),
+    )
 }
 
-fn args_dict(entries: &[String], indent: &str) -> String {
-    if entries.is_empty() {
-        return format!("{indent}{{}},\n");
-    }
-    let one = format!("{indent}{{{}}},", entries.join(", "));
-    if one.len() <= LINE_LIMIT {
-        return one + "\n";
-    }
-    let mut out = format!("{indent}{{\n");
-    for entry in entries {
-        out.push_str(&format!("{indent}    {entry},\n"));
-    }
-    out.push_str(&format!("{indent}}},\n"));
-    out
+fn reference_contains_datetime(reference: &TypeRef, contract: &ResolvedContract) -> bool {
+    reference_contains(
+        reference,
+        contract,
+        &mut std::collections::BTreeSet::new(),
+        &|reference| matches!(reference, TypeRef::DateTime),
+    )
 }
 
-fn def_line(
-    body_indent: &str,
-    name: &str,
-    params: &[(String, String)],
-    ret: &str,
-    def_indent: usize,
-) -> String {
-    let indent = " ".repeat(def_indent);
-    let rendered = params
-        .iter()
-        .map(|(name, annotation)| {
-            if annotation.is_empty() {
-                name.clone()
-            } else {
-                format!("{name}: {annotation}")
+fn functions_use_adapter(contract: &ResolvedContract) -> bool {
+    contract.manifest.functions.iter().any(|function| {
+        matches!(function.target, Target::Both | Target::Python)
+            && (reference_needs_adapter(&function.returns, contract)
+                || function
+                    .params
+                    .iter()
+                    .any(|param| reference_needs_adapter(&param.ty, contract)))
+    })
+}
+
+fn resources_use_adapter(contract: &ResolvedContract) -> bool {
+    contract.manifest.resources.iter().any(|resource| {
+        matches!(resource.target, Target::Both | Target::Python)
+            && (resource.constructors.iter().any(|constructor| {
+                matches!(constructor.target, Target::Both | Target::Python)
+                    && constructor
+                        .params
+                        .iter()
+                        .any(|param| reference_needs_adapter(&param.ty, contract))
+            }) || resource.methods.iter().any(|method| {
+                matches!(method.target, Target::Both | Target::Python)
+                    && (reference_needs_adapter(&method.returns, contract)
+                        || method
+                            .params
+                            .iter()
+                            .any(|param| reference_needs_adapter(&param.ty, contract)))
+            }))
+    })
+}
+
+fn reference_needs_adapter(reference: &TypeRef, contract: &ResolvedContract) -> bool {
+    reference_needs_adapter_at(reference, contract, &mut std::collections::BTreeSet::new())
+}
+
+fn reference_needs_adapter_at(
+    reference: &TypeRef,
+    contract: &ResolvedContract,
+    visited: &mut std::collections::BTreeSet<rspyts::ir::DefinitionId>,
+) -> bool {
+    match reference {
+        TypeRef::DateTime => true,
+        TypeRef::Named { identity } if visited.insert(identity.clone()) => {
+            match type_definition(contract, identity).map(|item| &item.shape) {
+                Some(TypeShape::TaggedEnum { .. }) => true,
+                Some(TypeShape::Struct { fields }) => fields
+                    .iter()
+                    .any(|field| reference_needs_adapter_at(&field.ty, contract, visited)),
+                Some(TypeShape::StringEnum { .. }) | None => false,
+                Some(TypeShape::Alias { target }) => {
+                    reference_needs_adapter_at(target, contract, visited)
+                }
             }
-        })
-        .collect::<Vec<_>>();
-    let one = format!("{indent}def {name}({}) -> {ret}:", rendered.join(", "));
-    if one.len() <= LINE_LIMIT {
-        return one + "\n";
-    }
-    let mut out = format!("{indent}def {name}(\n");
-    for param in rendered {
-        out.push_str(&format!("{body_indent}{param},\n"));
-    }
-    out.push_str(&format!("{indent}) -> {ret}:\n"));
-    out
-}
-
-const PY_MODULE_NAMES: &[&str] = &["errors", "library", "models", "np"];
-
-fn py_param_name(name: &str) -> String {
-    let escaped = py_name(name);
-    if PY_MODULE_NAMES.contains(&escaped.as_str()) {
-        format!("{escaped}_")
-    } else {
-        escaped
+        }
+        TypeRef::Option { item } | TypeRef::List { item } => {
+            reference_needs_adapter_at(item, contract, visited)
+        }
+        TypeRef::Map { value } => reference_needs_adapter_at(value, contract, visited),
+        TypeRef::Tuple { items } => items
+            .iter()
+            .any(|item| reference_needs_adapter_at(item, contract, visited)),
+        _ => false,
     }
 }
 
-// ---------------------------------------------------------------- __init__.py
+fn reference_contains(
+    reference: &TypeRef,
+    contract: &ResolvedContract,
+    visited: &mut std::collections::BTreeSet<rspyts::ir::DefinitionId>,
+    predicate: &impl Fn(&TypeRef) -> bool,
+) -> bool {
+    if predicate(reference) {
+        return true;
+    }
+    match reference {
+        TypeRef::Named { identity } if visited.insert(identity.clone()) => {
+            match type_definition(contract, identity).map(|item| &item.shape) {
+                Some(TypeShape::Struct { fields }) => fields
+                    .iter()
+                    .any(|field| reference_contains(&field.ty, contract, visited, predicate)),
+                Some(TypeShape::TaggedEnum { variants, .. })
+                | Some(TypeShape::StringEnum { variants }) => variants
+                    .iter()
+                    .flat_map(|variant| &variant.fields)
+                    .any(|field| reference_contains(&field.ty, contract, visited, predicate)),
+                Some(TypeShape::Alias { target }) => {
+                    reference_contains(target, contract, visited, predicate)
+                }
+                None => false,
+            }
+        }
+        TypeRef::Option { item } | TypeRef::List { item } => {
+            reference_contains(item, contract, visited, predicate)
+        }
+        TypeRef::Map { value } => reference_contains(value, contract, visited, predicate),
+        TypeRef::Tuple { items } => items
+            .iter()
+            .any(|item| reference_contains(item, contract, visited, predicate)),
+        _ => false,
+    }
+}
 
-fn init_py(manifest: &Manifest, provenance: &Provenance<'_>) -> String {
-    let mut models = Vec::new();
-    let mut errors = Vec::new();
-    for decl in &manifest.types {
-        if let TypeDecl::ErrorEnum { name, .. } = decl {
-            errors.extend(projected_names(decl));
-            errors.push(py_error_registry_name(name));
-        } else {
-            models.extend(projected_names(decl));
+fn python_scalar(value: &ScalarValue, _ty: &TypeRef) -> String {
+    match value {
+        ScalarValue::Bool(value) => if *value { "True" } else { "False" }.to_owned(),
+        ScalarValue::I64(value) => value.to_string(),
+        ScalarValue::String(value) => {
+            serde_json::to_string(value).expect("a string is serializable")
         }
     }
-    let mut sections = vec![
-        (
-            ".classes",
-            manifest
-                .classes
-                .iter()
-                .map(|class| class.name.clone())
-                .collect::<Vec<_>>(),
-        ),
-        (
-            ".constants",
-            manifest
-                .constants
-                .iter()
-                .map(|constant| constant.name.clone())
-                .collect::<Vec<_>>(),
-        ),
-        (".errors", errors),
-        (
-            ".functions",
-            manifest
-                .functions
-                .iter()
-                .filter(|function| function.targets.contains(&Target::Python))
-                .map(|function| function.name.clone())
-                .collect::<Vec<_>>(),
-        ),
-        (".models", models),
-    ];
-    let mut out = py_header(provenance);
-    out.push_str(&format!(
-        "\"\"\"\nGenerated bridge surface for `{}`.\n\"\"\"\n",
-        manifest.crate_name
-    ));
-    let mut started_imports = false;
-    for (module, names) in &mut sections {
-        if names.is_empty() {
-            continue;
+}
+
+fn buffer_name(element: BufferElement) -> &'static str {
+    match element {
+        BufferElement::U8 => "u8",
+        BufferElement::I8 => "i8",
+        BufferElement::U16 => "u16",
+        BufferElement::I16 => "i16",
+        BufferElement::U32 => "u32",
+        BufferElement::I32 => "i32",
+        BufferElement::U64 => "u64",
+        BufferElement::I64 => "i64",
+        BufferElement::F32 => "f32",
+        BufferElement::F64 => "f64",
+    }
+}
+
+fn numpy_scalar(element: BufferElement) -> &'static str {
+    match element {
+        BufferElement::U8 => "uint8",
+        BufferElement::I8 => "int8",
+        BufferElement::U16 => "uint16",
+        BufferElement::I16 => "int16",
+        BufferElement::U32 => "uint32",
+        BufferElement::I32 => "int32",
+        BufferElement::U64 => "uint64",
+        BufferElement::I64 => "int64",
+        BufferElement::F32 => "float32",
+        BufferElement::F64 => "float64",
+    }
+}
+
+fn python_value(value: &Value, ty: &TypeRef, contract: &ResolvedContract) -> String {
+    match (value, ty) {
+        (Value::Null, _) => "None".into(),
+        (Value::Bool(value), _) => if *value { "True" } else { "False" }.into(),
+        (Value::Number(value), _) => value.to_string(),
+        (Value::String(value), TypeRef::Named { identity }) => {
+            match type_definition(contract, identity) {
+                Some(TypeDef {
+                    name,
+                    shape: TypeShape::StringEnum { .. },
+                    ..
+                }) => format!("{name}({value:?})"),
+                Some(TypeDef {
+                    shape: TypeShape::Alias { target },
+                    ..
+                }) => python_value(&Value::String(value.clone()), target, contract),
+                _ => format!("{value:?}"),
+            }
         }
-        names.sort();
-        if !started_imports {
-            out.push('\n');
-            started_imports = true;
+        (Value::String(value), TypeRef::DateTime) => {
+            format!("TypeAdapter(AwareDatetime).validate_python({value:?})")
         }
-        out.push_str(&wrap_from_import(module, names));
+        (Value::String(value), _) => format!("{value:?}"),
+        (Value::Array(items), TypeRef::List { item }) => format!(
+            "[{}]",
+            items
+                .iter()
+                .map(|value| python_value(value, item, contract))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        (Value::Array(items), TypeRef::Tuple { items: types }) => format!(
+            "({}{})",
+            items
+                .iter()
+                .zip(types)
+                .map(|(value, ty)| python_value(value, ty, contract))
+                .collect::<Vec<_>>()
+                .join(", "),
+            if items.len() == 1 { "," } else { "" }
+        ),
+        (Value::Array(items), TypeRef::Bytes) => format!(
+            "bytes([{}])",
+            items
+                .iter()
+                .map(Value::to_string)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        (Value::Array(items), TypeRef::Buffer { .. }) => format!(
+            "[{}]",
+            items
+                .iter()
+                .map(Value::to_string)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        (Value::Object(items), TypeRef::Map { value }) => format!(
+            "{{{}}}",
+            items
+                .iter()
+                .map(|(key, item)| format!("{key:?}: {}", python_value(item, value, contract)))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        (value, TypeRef::Option { item }) => python_value(value, item, contract),
+        (value, TypeRef::Named { identity }) => match type_definition(contract, identity) {
+            Some(TypeDef {
+                name,
+                shape: TypeShape::Struct { .. } | TypeShape::TaggedEnum { .. },
+                ..
+            }) => format!("{name}.model_validate({})", python_json(value)),
+            Some(TypeDef {
+                shape: TypeShape::Alias { target },
+                ..
+            }) => python_value(value, target, contract),
+            _ => serde_json::to_string(value).expect("JSON value is serializable"),
+        },
+        (Value::Array(items), _) => format!(
+            "[{}]",
+            items.iter().map(python_json).collect::<Vec<_>>().join(", ")
+        ),
+        (Value::Object(items), _) => format!(
+            "{{{}}}",
+            items
+                .iter()
+                .map(|(key, value)| format!("{key:?}: {}", python_json(value)))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
     }
-    let mut all = sections
-        .into_iter()
-        .flat_map(|(_, names)| names)
-        .collect::<Vec<_>>();
-    let screaming = |name: &str| {
-        !name.chars().any(|character| character.is_ascii_lowercase())
-            && name.chars().any(|character| character.is_ascii_uppercase())
-    };
-    all.sort_by(|left, right| {
-        (!screaming(left), left.as_str()).cmp(&(!screaming(right), right.as_str()))
-    });
-    out.push_str("\n__all__ = [\n");
-    for name in all {
-        out.push_str(&format!("    {name:?},\n"));
-    }
-    out.push_str("]\n");
-    out
 }
 
-// ---------------------------------------------------------------- formatting
-
-fn py_string(value: &str) -> String {
-    serde_json::to_string(value).expect("string serialization is infallible")
-}
-
-fn wrap_from_import(module: &str, names: &[String]) -> String {
-    let one = format!("from {module} import {}", names.join(", "));
-    if one.len() <= LINE_LIMIT {
-        return one + "\n";
+fn python_json(value: &Value) -> String {
+    match value {
+        Value::Null => "None".into(),
+        Value::Bool(value) => if *value { "True" } else { "False" }.into(),
+        Value::Number(value) => value.to_string(),
+        Value::String(value) => format!("{value:?}"),
+        Value::Array(values) => format!(
+            "[{}]",
+            values
+                .iter()
+                .map(python_json)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        Value::Object(values) => format!(
+            "{{{}}}",
+            values
+                .iter()
+                .map(|(key, value)| format!("{key:?}: {}", python_json(value)))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
     }
-    let mut out = format!("from {module} import (\n");
-    for name in names {
-        out.push_str(&format!("    {name},\n"));
-    }
-    out.push_str(")\n");
-    out
-}
-
-fn wrap_reexport_import(module: &str, names: &[String]) -> String {
-    let one = format!("from {module} import {}  # noqa: F401", names.join(", "));
-    if one.len() <= LINE_LIMIT {
-        return one;
-    }
-    let mut out = format!("from {module} import (  # noqa: F401\n");
-    for name in names {
-        out.push_str(&format!("    {name},\n"));
-    }
-    out.push(')');
-    out
 }
 
 #[cfg(test)]
 mod tests {
-    use super::super::test_manifest::{binary_manifest, exact_manifest, manifest, manifest_hash};
-    use super::*;
+    use std::collections::BTreeMap;
+    use std::fs;
+    use std::process::Command;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
-    fn emitted(manifest: &Manifest) -> Vec<(&'static str, String)> {
-        let hash = manifest_hash(manifest);
-        let provenance = Provenance {
-            manifest_hash: &hash,
-            rust_source: "../rust/src",
+    use super::*;
+    use rspyts::ir::Manifest;
+
+    fn owner() -> rspyts::ir::CargoPackageId {
+        rspyts::ir::CargoPackageId::new("sample")
+    }
+
+    fn identity(id: &str) -> rspyts::ir::DefinitionId {
+        rspyts::ir::DefinitionId {
+            owner: owner(),
+            id: id.into(),
+        }
+    }
+
+    fn resolved(manifest: Manifest) -> ResolvedContract {
+        ResolvedContract {
+            manifest,
+            hosts: crate::LockedHosts {
+                python: Some("sample".into()),
+                typescript: None,
+            },
+            dependencies: BTreeMap::new(),
+            foreign_types: BTreeMap::new(),
+            foreign_errors: BTreeMap::new(),
+        }
+    }
+
+    #[test]
+    fn json_is_recursive_and_precise() {
+        let manifest = Manifest {
+            ir_version: 4,
+            crate_name: "sample".into(),
+            crate_version: "1.0.0".into(),
+            module_name: "native".into(),
+            imports: vec![],
+            types: vec![TypeDef {
+                owner: owner(),
+                id: "value".into(),
+                name: "Value".into(),
+                docs: None,
+                shape: TypeShape::Alias {
+                    target: TypeRef::Json,
+                },
+            }],
+            errors: vec![],
+            functions: vec![],
+            resources: vec![],
+            constants: vec![],
+        };
+        let contract = resolved(manifest);
+        let generated = models(&contract, &type_names(&contract));
+        assert!(generated.contains("Field, JsonValue"));
+        assert!(!generated.contains("JsonValue: TypeAlias"));
+        assert!(generated.contains("Value: TypeAlias = JsonValue"));
+        assert!(!generated.contains("Any"));
+    }
+
+    #[test]
+    fn pydantic_json_value_validates_nested_annotation_payloads() {
+        if !Command::new("python3")
+            .arg("-c")
+            .arg("import sys, pydantic; assert sys.version_info >= (3, 11)")
+            .output()
+            .is_ok_and(|output| output.status.success())
+        {
+            return;
+        }
+        let manifest = Manifest {
+            ir_version: 4,
+            crate_name: "sample".into(),
+            crate_version: "1.0.0".into(),
+            module_name: "native".into(),
+            imports: vec![],
+            types: vec![TypeDef {
+                owner: owner(),
+                id: "sample::AnnotationLike".into(),
+                name: "AnnotationLike".into(),
+                docs: None,
+                shape: TypeShape::Struct {
+                    fields: vec![FieldDef {
+                        rust_name: "metadata".into(),
+                        wire_name: "metadata".into(),
+                        docs: None,
+                        ty: TypeRef::Json,
+                        required: true,
+                        default: None,
+                        constraints: Default::default(),
+                    }],
+                },
+            }],
+            errors: vec![],
+            functions: vec![],
+            resources: vec![],
+            constants: vec![],
+        };
+        let contract = resolved(manifest);
+        let root = std::env::temp_dir().join(format!(
+            "rspyts-pydantic-json-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        fs::write(
+            root.join("models.py"),
+            models(&contract, &type_names(&contract)),
+        )
+        .unwrap();
+        let result = Command::new("python3")
+            .env("PYTHONPATH", &root)
+            .arg("-c")
+            .arg(
+                "from models import AnnotationLike; \
+                 payload = {'segments': [1, {'stage': None, 'flags': [True, False]}]}; \
+                 model = AnnotationLike(metadata=payload); \
+                 assert model.model_dump() == {'metadata': payload}",
+            )
+            .output()
+            .expect("Python is required to verify generated Pydantic models");
+        assert!(
+            result.status.success(),
+            "nested JsonValue failed real Pydantic validation:\n{}{}",
+            String::from_utf8_lossy(&result.stdout),
+            String::from_utf8_lossy(&result.stderr)
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn buffer_free_modules_do_not_import_missing_codec_helpers() {
+        let manifest = Manifest {
+            ir_version: 4,
+            crate_name: "sample".into(),
+            crate_version: "1.0.0".into(),
+            module_name: "native".into(),
+            imports: vec![],
+            types: vec![],
+            errors: vec![],
+            functions: vec![rspyts::ir::FunctionDef {
+                owner: owner(),
+                rust_name: "answer".into(),
+                host_name: "answer".into(),
+                docs: None,
+                target: Target::Python,
+                params: vec![],
+                returns: TypeRef::Int {
+                    signed: true,
+                    bits: 32,
+                },
+                error: None,
+            }],
+            resources: vec![],
+            constants: vec![],
+        };
+        let contract = resolved(manifest);
+        let generated_codecs = codecs(&contract);
+        let generated_functions = functions(&contract, &type_names(&contract));
+
+        assert_eq!(
+            generated_codecs,
+            "# Generated by rspyts 0.4. Do not edit.\n__all__: list[str] = []\n"
+        );
+        assert!(!generated_functions.contains("from .codecs import"));
+        assert!(generated_functions.contains("__all__ = [\n    \"answer\",\n]"));
+    }
+
+    #[test]
+    fn models_are_frozen_strict_and_export_only_contract_names() {
+        let manifest = Manifest {
+            ir_version: 4,
+            crate_name: "sample".into(),
+            crate_version: "1.0.0".into(),
+            module_name: "native".into(),
+            imports: vec![],
+            types: vec![TypeDef {
+                owner: owner(),
+                id: "sample::Value".into(),
+                name: "Value".into(),
+                docs: None,
+                shape: TypeShape::Struct { fields: vec![] },
+            }],
+            errors: vec![],
+            functions: vec![],
+            resources: vec![],
+            constants: vec![],
+        };
+        let contract = resolved(manifest);
+        let generated = models(&contract, &type_names(&contract));
+
+        assert!(generated.contains(
+            "ConfigDict(populate_by_name=True, arbitrary_types_allowed=True, extra=\"forbid\", frozen=True, validate_default=True)"
+        ));
+        assert!(generated.contains("__all__ = [\n    \"JsonValue\",\n    \"Value\",\n]"));
+        assert!(!generated.contains("    \"TypeAdapter\","));
+        assert!(!generated.contains("    \"BaseModel\","));
+    }
+
+    #[test]
+    fn models_emit_literals_constraints_typed_defaults_and_aware_datetimes() {
+        let status_identity = identity("sample::Status");
+        let field = |rust_name: &str, ty: TypeRef, required: bool, default, constraints| FieldDef {
+            rust_name: rust_name.into(),
+            wire_name: rust_name.into(),
+            docs: None,
+            ty,
+            required,
+            default,
+            constraints,
+        };
+        let manifest = Manifest {
+            ir_version: 4,
+            crate_name: "sample".into(),
+            crate_version: "1.0.0".into(),
+            module_name: "native".into(),
+            imports: vec![],
+            types: vec![
+                TypeDef {
+                    owner: owner(),
+                    id: status_identity.id.clone(),
+                    name: "Status".into(),
+                    docs: None,
+                    shape: TypeShape::StringEnum {
+                        variants: vec![rspyts::ir::EnumVariantDef {
+                            rust_name: "Unknown".into(),
+                            wire_name: "unknown".into(),
+                            docs: None,
+                            fields: vec![],
+                        }],
+                    },
+                },
+                TypeDef {
+                    owner: owner(),
+                    id: "sample::Request".into(),
+                    name: "Request".into(),
+                    docs: None,
+                    shape: TypeShape::Struct {
+                        fields: vec![
+                            field(
+                                "contract_version",
+                                TypeRef::Int {
+                                    signed: false,
+                                    bits: 32,
+                                },
+                                true,
+                                None,
+                                rspyts::ir::FieldConstraints {
+                                    literal: Some(ScalarValue::I64(2)),
+                                    ..Default::default()
+                                },
+                            ),
+                            field(
+                                "batch",
+                                TypeRef::List {
+                                    item: Box::new(TypeRef::String),
+                                },
+                                true,
+                                None,
+                                rspyts::ir::FieldConstraints {
+                                    min_length: Some(1),
+                                    max_length: Some(200),
+                                    ..Default::default()
+                                },
+                            ),
+                            field(
+                                "quantity",
+                                TypeRef::Int {
+                                    signed: false,
+                                    bits: 32,
+                                },
+                                false,
+                                Some(ScalarValue::I64(1)),
+                                rspyts::ir::FieldConstraints {
+                                    ge: Some(1),
+                                    ..Default::default()
+                                },
+                            ),
+                            field(
+                                "status",
+                                TypeRef::Named {
+                                    identity: status_identity,
+                                },
+                                false,
+                                Some(ScalarValue::String("unknown".into())),
+                                Default::default(),
+                            ),
+                            field(
+                                "observed_at",
+                                TypeRef::DateTime,
+                                true,
+                                None,
+                                Default::default(),
+                            ),
+                        ],
+                    },
+                },
+            ],
+            errors: vec![],
+            functions: vec![],
+            resources: vec![],
+            constants: vec![],
+        };
+        let contract = resolved(manifest);
+        let generated = models(&contract, &type_names(&contract));
+
+        assert!(generated.contains("contract_version: Literal[2]"));
+        assert!(generated.contains("batch: list[str] = Field(min_length=1, max_length=200)"));
+        assert!(generated.contains("quantity: int = Field(default=1, ge=1)"));
+        assert!(!generated.contains("quantity: int | None"));
+        assert!(generated.contains("status: Status = Field(default=\"unknown\")"));
+        assert!(generated.contains("observed_at: AwareDatetime"));
+        assert!(generated.contains("validate_default=True"));
+    }
+
+    #[test]
+    fn nested_datetime_values_are_converted_at_the_native_boundary() {
+        let event_identity = identity("sample::Event");
+        let manifest = Manifest {
+            ir_version: 4,
+            crate_name: "sample".into(),
+            crate_version: "1.0.0".into(),
+            module_name: "native".into(),
+            imports: vec![],
+            types: vec![TypeDef {
+                owner: owner(),
+                id: event_identity.id.clone(),
+                name: "Event".into(),
+                docs: None,
+                shape: TypeShape::Struct {
+                    fields: vec![FieldDef {
+                        rust_name: "observed_at".into(),
+                        wire_name: "observedAt".into(),
+                        docs: None,
+                        ty: TypeRef::DateTime,
+                        required: true,
+                        default: None,
+                        constraints: Default::default(),
+                    }],
+                },
+            }],
+            errors: vec![],
+            functions: vec![rspyts::ir::FunctionDef {
+                owner: owner(),
+                rust_name: "round_trip".into(),
+                host_name: "round_trip".into(),
+                docs: None,
+                target: Target::Python,
+                params: vec![rspyts::ir::ParamDef {
+                    rust_name: "event".into(),
+                    host_name: "event".into(),
+                    ty: TypeRef::Named {
+                        identity: event_identity.clone(),
+                    },
+                }],
+                returns: TypeRef::Named {
+                    identity: event_identity,
+                },
+                error: None,
+            }],
+            resources: vec![],
+            constants: vec![],
+        };
+        let contract = resolved(manifest);
+        let generated = functions(&contract, &type_names(&contract));
+
+        assert!(generated.contains("event.observed_at.isoformat()"));
+        assert!(
+            generated
+                .contains("TypeAdapter(AwareDatetime).validate_python(result[\"observedAt\"])")
+        );
+        assert!(generated.contains("from pydantic import AwareDatetime, TypeAdapter"));
+    }
+
+    #[test]
+    fn python_constants_filter_targets_and_keep_all_strict() {
+        let constant = |name: &str, target| rspyts::ir::ConstantDef {
+            owner: owner(),
+            rust_name: name.into(),
+            host_name: name.into(),
+            docs: None,
+            target,
+            ty: TypeRef::String,
+            value: Value::String(name.into()),
+        };
+        let manifest = Manifest {
+            ir_version: 4,
+            crate_name: "sample".into(),
+            crate_version: "1.0.0".into(),
+            module_name: "native".into(),
+            imports: vec![],
+            types: vec![],
+            errors: vec![],
+            functions: vec![],
+            resources: vec![],
+            constants: vec![
+                constant("PYTHON_VALUE", Target::Python),
+                constant("SHARED_VALUE", Target::Both),
+                constant("TYPESCRIPT_VALUE", Target::Typescript),
+                constant("STATIC_VALUE", Target::Static),
+            ],
+        };
+        let contract = resolved(manifest);
+        let generated_constants = constants(&contract, "sha256:test", &type_names(&contract));
+        let generated_init = init_module(&contract);
+
+        for generated in [&generated_constants, &generated_init] {
+            assert!(generated.contains("PYTHON_VALUE"));
+            assert!(generated.contains("SHARED_VALUE"));
+            assert!(!generated.contains("TYPESCRIPT_VALUE"));
+            assert!(!generated.contains("STATIC_VALUE"));
+        }
+        assert!(generated_constants.contains(
+            "__all__ = [\n    \"CONTRACT_FINGERPRINT\",\n    \"PYTHON_VALUE\",\n    \"SHARED_VALUE\",\n]"
+        ));
+    }
+
+    #[test]
+    fn source_mode_preserves_shared_namespace_while_standalone_initializes_it() {
+        let root = std::env::temp_dir().join(format!(
+            "rspyts-python-namespace-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let hardware = root.join("hardware");
+        let algorithms = root.join("algorithms");
+        let standalone = root.join("standalone");
+        for (staging, package, marker) in [
+            (&hardware, "neurovirtual.hardware.contracts", "hardware"),
+            (
+                &algorithms,
+                "neurovirtual.algorithms.contracts",
+                "algorithms",
+            ),
+        ] {
+            let parent = staging
+                .join("python")
+                .join(package.replace(".contracts", "").replace('.', "/"));
+            fs::create_dir_all(&parent).unwrap();
+            fs::write(
+                parent.join("__init__.py"),
+                format!("PACKAGE_MARKER = {marker:?}\n"),
+            )
+            .unwrap();
+            let config = PythonConfig {
+                package: package.into(),
+                source: None,
+                mode: PythonMode::Source,
+            };
+            emit(
+                staging,
+                &config,
+                &resolved(Manifest {
+                    ir_version: 4,
+                    crate_name: marker.into(),
+                    crate_version: "1.0.0".into(),
+                    module_name: "native".into(),
+                    imports: vec![],
+                    types: vec![],
+                    errors: vec![],
+                    functions: vec![],
+                    resources: vec![],
+                    constants: vec![],
+                }),
+                "sha256:test",
+                None,
+            )
+            .unwrap();
+
+            assert!(!staging.join("python/neurovirtual/__init__.py").exists());
+            assert_eq!(
+                fs::read_to_string(parent.join("__init__.py")).unwrap(),
+                format!("PACKAGE_MARKER = {marker:?}\n")
+            );
+            assert!(parent.join("contracts/__init__.py").is_file());
+        }
+
+        let python_path =
+            std::env::join_paths([hardware.join("python"), algorithms.join("python")]).unwrap();
+        let import = Command::new("python3")
+            .env("PYTHONPATH", python_path)
+            .arg("-c")
+            .arg(
+                "import neurovirtual.hardware as hardware; \
+                 import neurovirtual.algorithms as algorithms; \
+                 assert hardware.PACKAGE_MARKER == 'hardware'; \
+                 assert algorithms.PACKAGE_MARKER == 'algorithms'",
+            )
+            .output()
+            .expect("Python is required to verify namespace package imports");
+        assert!(
+            import.status.success(),
+            "separately staged namespace packages did not coexist:\n{}{}",
+            String::from_utf8_lossy(&import.stdout),
+            String::from_utf8_lossy(&import.stderr)
+        );
+
+        let config = PythonConfig {
+            package: "neurovirtual.hardware.contracts".into(),
+            source: None,
+            mode: PythonMode::Standalone,
         };
         emit(
-            manifest,
-            &provenance,
-            &["lib".to_string()],
-            &BTreeMap::new(),
+            &standalone,
+            &config,
+            &resolved(Manifest {
+                ir_version: 4,
+                crate_name: "standalone".into(),
+                crate_version: "1.0.0".into(),
+                module_name: "native".into(),
+                imports: vec![],
+                types: vec![],
+                errors: vec![],
+                functions: vec![],
+                resources: vec![],
+                constants: vec![],
+            }),
+            "sha256:test",
+            None,
         )
-    }
-
-    fn file<'a>(files: &'a [(&str, String)], name: &str) -> &'a str {
-        &files.iter().find(|(path, _)| *path == name).unwrap().1
-    }
-
-    #[test]
-    fn emits_compact_codecs_and_one_call_path() {
-        let files = emitted(&manifest());
-        let codecs = file(&files, "codecs.py");
-        let functions = file(&files, "functions.py");
-        let init = file(&files, "__init__.py");
-        assert!(codecs.contains("import rspyts.internal"));
-        assert!(codecs.contains("def encode_type_query_options"));
-        assert!(codecs.contains("def decode_type_query_options"));
-        assert!(functions.contains("library.LIB.call("));
-        assert!(!functions.contains("call_raw"));
-        assert!(!init.contains("codecs"));
-    }
-
-    #[test]
-    fn named_refs_are_called_not_expanded_in_wrappers() {
-        let files = emitted(&manifest());
-        let functions = file(&files, "functions.py");
-        assert!(functions.contains("codecs.encode_type_query_options(options)"));
-        assert!(!functions.contains("model_dump"));
-        assert!(!functions.contains("minimumValue"));
-    }
-
-    #[test]
-    fn models_are_host_only_and_required_options_stay_required() {
-        let files = emitted(&manifest());
-        let models = file(&files, "models.py");
-        assert!(!models.contains("_from_wire"));
-        assert!(!models.contains("codecs"));
-        assert!(models.contains("metadata: typing.Any"));
-    }
-
-    #[test]
-    fn explicit_response_context_reaches_nested_attachments() {
-        let manifest = binary_manifest();
-        let files = emitted(&manifest);
-        let codecs = file(&files, "codecs.py");
-        assert!(codecs.contains("rspyts.internal.bytes_from_wire"));
-        assert!(codecs.contains("rspyts.internal.buffer_from_wire"));
-        assert!(codecs.contains("rspyts.internal.list_from_wire"));
-        assert!(codecs.contains("rspyts.internal.map_from_wire"));
-    }
-
-    #[test]
-    fn exact_integers_are_plain_host_ints_with_strict_codecs() {
-        let manifest = exact_manifest();
-        let files = emitted(&manifest);
-        let models = file(&files, "models.py");
-        let codecs = file(&files, "codecs.py");
-        assert!(models.contains("delta: int"));
-        assert!(!models.contains("rspyts.I64"));
-        assert!(codecs.contains("rspyts.internal.i64_to_wire"));
-        assert!(codecs.contains("rspyts.internal.u64_from_wire"));
-    }
-
-    #[test]
-    fn loader_pins_emitter_api_and_contract_fingerprint() {
-        let manifest = manifest();
-        let hash = manifest_hash(&manifest);
-        let provenance = Provenance {
-            manifest_hash: &hash,
-            rust_source: "../rust/src",
-        };
-        let files = emit(
-            &manifest,
-            &provenance,
-            &["lib".to_string()],
-            &BTreeMap::new(),
+        .unwrap();
+        assert!(standalone.join("python/neurovirtual/__init__.py").is_file());
+        assert!(
+            standalone
+                .join("python/neurovirtual/hardware/__init__.py")
+                .is_file()
         );
-        let library = file(&files, "library.py");
-        assert!(library.contains("rspyts.internal.require_emitter_api(4)"));
-        assert!(library.contains(&format!("expected_contract_fingerprint={hash:?}")));
+        assert!(
+            standalone
+                .join("python/neurovirtual/hardware/contracts/__init__.py")
+                .is_file()
+        );
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
-    fn codecs_are_readable_instead_of_single_giant_lines() {
-        let manifest = binary_manifest();
-        let files = emitted(&manifest);
-        let codecs = file(&files, "codecs.py");
-        assert!(codecs.lines().all(|line| line.len() <= MAX_LINE_LENGTH));
-        assert!(codecs.lines().count() > 40);
+    fn foreign_models_are_imported_from_the_configured_python_package() {
+        let hardware_owner = rspyts::ir::CargoPackageId::new("hardware");
+        let hardware_identity =
+            rspyts::ir::DefinitionId::new(hardware_owner.as_str(), "hardware::SignalDefinition");
+        let foreign = TypeDef {
+            owner: hardware_owner.clone(),
+            id: hardware_identity.id.clone(),
+            name: "SignalDefinition".into(),
+            docs: None,
+            shape: TypeShape::Struct { fields: vec![] },
+        };
+        let manifest = Manifest {
+            ir_version: 4,
+            crate_name: "sample".into(),
+            crate_version: "1.0.0".into(),
+            module_name: "native".into(),
+            imports: vec![],
+            types: vec![TypeDef {
+                owner: owner(),
+                id: "sample::Request".into(),
+                name: "Request".into(),
+                docs: None,
+                shape: TypeShape::Struct {
+                    fields: vec![rspyts::ir::FieldDef {
+                        rust_name: "signal".into(),
+                        wire_name: "signal".into(),
+                        docs: None,
+                        ty: TypeRef::Named {
+                            identity: hardware_identity.clone(),
+                        },
+                        required: true,
+                        default: None,
+                        constraints: rspyts::ir::FieldConstraints::default(),
+                    }],
+                },
+            }],
+            errors: vec![],
+            functions: vec![],
+            resources: vec![],
+            constants: vec![],
+        };
+        let contract = ResolvedContract {
+            manifest,
+            hosts: crate::LockedHosts {
+                python: Some("sample".into()),
+                typescript: None,
+            },
+            dependencies: BTreeMap::from([(
+                "hardware".into(),
+                crate::LockedDependency {
+                    owner: hardware_owner,
+                    fingerprint: "sha256:hardware".into(),
+                    python: Some("neurovirtual.hardware.contracts".into()),
+                    typescript: None,
+                    types: vec![foreign.clone()],
+                    errors: vec![],
+                },
+            )]),
+            foreign_types: BTreeMap::from([(hardware_identity, foreign)]),
+            foreign_errors: BTreeMap::new(),
+        };
+        let generated = models(&contract, &type_names(&contract));
+
+        assert!(generated.contains("from neurovirtual.hardware.contracts import SignalDefinition"));
+        assert!(generated.contains("    signal: SignalDefinition"));
+        assert!(!generated.contains("class SignalDefinition"));
     }
 
     #[test]
-    fn every_generated_python_file_respects_the_line_limit() {
-        for manifest in [manifest(), binary_manifest(), exact_manifest()] {
-            for (path, source) in emitted(&manifest) {
-                let longest = source.lines().map(str::len).max().unwrap_or_default();
-                assert!(
-                    longest <= MAX_LINE_LENGTH,
-                    "{path} contains a {longest}-column generated line"
-                );
-            }
+    fn resources_emit_named_python_factories_and_filter_other_targets() {
+        let constructor = |rust_name: &str, host_name: &str, target| rspyts::ir::FunctionDef {
+            owner: owner(),
+            rust_name: rust_name.into(),
+            host_name: host_name.into(),
+            docs: None,
+            target,
+            params: vec![],
+            returns: TypeRef::Named {
+                identity: identity("sample::Runner"),
+            },
+            error: None,
+        };
+        let method = |rust_name: &str, host_name: &str, target| rspyts::ir::MethodDef {
+            rust_name: rust_name.into(),
+            host_name: host_name.into(),
+            docs: None,
+            target,
+            mutable: false,
+            params: vec![],
+            returns: TypeRef::Unit,
+            error: None,
+        };
+        let manifest = Manifest {
+            ir_version: 4,
+            crate_name: "sample".into(),
+            crate_version: "1.0.0".into(),
+            module_name: "native".into(),
+            imports: vec![],
+            types: vec![],
+            errors: vec![],
+            functions: vec![],
+            resources: vec![rspyts::ir::ResourceDef {
+                owner: owner(),
+                id: "sample::Runner".into(),
+                name: "Runner".into(),
+                docs: None,
+                target: Target::Both,
+                constructors: vec![
+                    constructor("new", "new", Target::Python),
+                    constructor("from_cache", "fromCache", Target::Both),
+                    constructor("from_browser", "fromBrowser", Target::Typescript),
+                ],
+                methods: vec![
+                    method("run", "run", Target::Python),
+                    method("browser_only", "browserOnly", Target::Typescript),
+                ],
+            }],
+            constants: vec![],
+        };
+        let contract = resolved(manifest);
+        let generated = resources(&contract, &type_names(&contract));
+
+        assert!(generated.contains("def __init__(self) -> None"));
+        assert!(generated.contains("@classmethod\n    def from_cache(cls) -> Runner"));
+        assert!(generated.contains("def run(self) -> None"));
+        assert!(!generated.contains("from_browser"));
+        assert!(!generated.contains("browser_only"));
+    }
+
+    #[test]
+    fn every_generated_python_module_compiles() {
+        let manifest = Manifest {
+            ir_version: 4,
+            crate_name: "sample".into(),
+            crate_version: "1.0.0".into(),
+            module_name: "native".into(),
+            imports: vec![],
+            types: vec![TypeDef {
+                owner: owner(),
+                id: "sample::ResultValue".into(),
+                name: "ResultValue".into(),
+                docs: None,
+                shape: TypeShape::Struct {
+                    fields: vec![rspyts::ir::FieldDef {
+                        rust_name: "values".into(),
+                        wire_name: "values".into(),
+                        docs: None,
+                        ty: TypeRef::Buffer {
+                            element: BufferElement::F64,
+                        },
+                        required: true,
+                        default: None,
+                        constraints: rspyts::ir::FieldConstraints::default(),
+                    }],
+                },
+            }],
+            errors: vec![rspyts::ir::ErrorDef {
+                owner: owner(),
+                id: "sample::SampleError".into(),
+                name: "SampleError".into(),
+                docs: None,
+                variants: vec![],
+            }],
+            functions: vec![rspyts::ir::FunctionDef {
+                owner: owner(),
+                rust_name: "run_sample".into(),
+                host_name: "runSample".into(),
+                docs: None,
+                target: Target::Both,
+                params: vec![rspyts::ir::ParamDef {
+                    rust_name: "values".into(),
+                    host_name: "values".into(),
+                    ty: TypeRef::Buffer {
+                        element: BufferElement::F64,
+                    },
+                }],
+                returns: TypeRef::Named {
+                    identity: identity("sample::ResultValue"),
+                },
+                error: Some(identity("sample::SampleError")),
+            }],
+            resources: vec![rspyts::ir::ResourceDef {
+                owner: owner(),
+                id: "sample::Runner".into(),
+                name: "Runner".into(),
+                docs: None,
+                target: Target::Both,
+                constructors: vec![rspyts::ir::FunctionDef {
+                    owner: owner(),
+                    rust_name: "new".into(),
+                    host_name: "new".into(),
+                    docs: None,
+                    target: Target::Both,
+                    params: vec![],
+                    returns: TypeRef::Named {
+                        identity: identity("sample::Runner"),
+                    },
+                    error: Some(identity("sample::SampleError")),
+                }],
+                methods: vec![rspyts::ir::MethodDef {
+                    rust_name: "run_sample".into(),
+                    host_name: "runSample".into(),
+                    docs: None,
+                    target: Target::Both,
+                    mutable: true,
+                    params: vec![],
+                    returns: TypeRef::Named {
+                        identity: identity("sample::ResultValue"),
+                    },
+                    error: Some(identity("sample::SampleError")),
+                }],
+            }],
+            constants: vec![],
+        };
+        let contract = resolved(manifest);
+        let root = std::env::temp_dir().join(format!(
+            "rspyts-python-source-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let names = type_names(&contract);
+        for (name, source) in [
+            ("models.py", models(&contract, &names)),
+            ("codecs.py", codecs(&contract)),
+            ("errors.py", errors(&contract)),
+            ("functions.py", functions(&contract, &names)),
+            ("resources.py", resources(&contract, &names)),
+            ("constants.py", constants(&contract, "sha256:test", &names)),
+            ("__init__.py", init_module(&contract)),
+        ] {
+            fs::write(root.join(name), source).unwrap();
         }
-    }
-
-    #[test]
-    fn generated_python_has_no_single_underscore_prefixes() {
-        for manifest in [manifest(), binary_manifest(), exact_manifest()] {
-            for (path, source) in emitted(&manifest) {
-                assert!(
-                    !path.starts_with('_') || path == "__init__.py",
-                    "generated Python filename {path:?} has a single-underscore prefix"
-                );
-                for identifier in source
-                    .split(|character: char| !character.is_ascii_alphanumeric() && character != '_')
-                {
-                    let is_dunder = identifier.starts_with("__") && identifier.ends_with("__");
-                    assert!(
-                        !identifier.starts_with('_') || is_dunder,
-                        "{path} contains the single-underscore identifier {identifier:?}"
-                    );
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn constants_use_python_boolean_literals() {
-        assert_eq!(py_bool(true), "True");
-        assert_eq!(py_bool(false), "False");
-        assert_eq!(py_json(&serde_json::json!([true, false])), "[True, False]");
+        let result = Command::new("python3")
+            .arg("-m")
+            .arg("compileall")
+            .arg("-q")
+            .arg(&root)
+            .output()
+            .expect("Python is required to verify generated Python syntax");
+        assert!(
+            result.status.success(),
+            "generated Python did not compile:\n{}{}",
+            String::from_utf8_lossy(&result.stdout),
+            String::from_utf8_lossy(&result.stderr)
+        );
+        fs::remove_dir_all(root).unwrap();
     }
 }
