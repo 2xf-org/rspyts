@@ -22,6 +22,18 @@ use crate::load::load_contract;
 
 const LOCK_VERSION: u32 = 2;
 
+fn atomic_sibling(path: &Path, suffix: &str) -> Result<PathBuf> {
+    let parent = path
+        .parent()
+        .with_context(|| format!("{} has no parent directory", path.display()))?;
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .with_context(|| format!("{} has no valid UTF-8 file name", path.display()))?;
+    let hidden_prefix = if name.starts_with('.') { "" } else { "." };
+    Ok(parent.join(format!("{hidden_prefix}{name}.{suffix}")))
+}
+
 #[derive(Debug, Parser)]
 #[command(
     name = "rspyts",
@@ -432,22 +444,10 @@ fn write_atomic_file(path: &Path, bytes: &[u8]) -> Result<()> {
         .parent()
         .with_context(|| format!("{} has no parent directory", path.display()))?;
     fs::create_dir_all(parent)?;
-    let temporary = parent.join(format!(
-        ".{}.tmp-{}",
-        path.file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or("rspyts"),
-        std::process::id()
-    ));
+    let temporary = atomic_sibling(path, &format!("tmp-{}", std::process::id()))?;
     fs::write(&temporary, bytes)
         .with_context(|| format!("failed to write {}", temporary.display()))?;
-    let backup = parent.join(format!(
-        ".{}.old-{}",
-        path.file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or("rspyts"),
-        std::process::id()
-    ));
+    let backup = atomic_sibling(path, &format!("old-{}", std::process::id()))?;
     if backup.exists() {
         fs::remove_file(&backup)?;
     }
@@ -490,6 +490,51 @@ mod tests {
 
     fn test_fingerprint(manifest: &Manifest) -> String {
         fingerprint(manifest, &no_hosts(), &empty_dependencies()).unwrap()
+    }
+
+    #[test]
+    fn hidden_lock_uses_single_dot_siblings_and_is_replaced_atomically() {
+        let root = std::env::temp_dir().join(format!(
+            "rspyts-lock-atomic-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let lock = root.join(".rspyts.lock");
+        fs::write(&lock, "old").unwrap();
+        let temporary = atomic_sibling(&lock, &format!("tmp-{}", std::process::id())).unwrap();
+        let backup = atomic_sibling(&lock, &format!("old-{}", std::process::id())).unwrap();
+        assert_eq!(
+            temporary.file_name().unwrap().to_string_lossy(),
+            format!(".rspyts.lock.tmp-{}", std::process::id())
+        );
+        assert_eq!(
+            backup.file_name().unwrap().to_string_lossy(),
+            format!(".rspyts.lock.old-{}", std::process::id())
+        );
+
+        write_atomic_file(&lock, b"new").unwrap();
+
+        assert_eq!(fs::read_to_string(&lock).unwrap(), "new");
+        assert!(!temporary.exists());
+        assert!(!backup.exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn visible_atomic_outputs_are_hidden_siblings() {
+        let path = Path::new("rspyts.lock");
+        assert_eq!(
+            atomic_sibling(path, "tmp-123").unwrap(),
+            PathBuf::from(".rspyts.lock.tmp-123")
+        );
+        assert_eq!(
+            atomic_sibling(path, "old-123").unwrap(),
+            PathBuf::from(".rspyts.lock.old-123")
+        );
     }
 
     #[test]

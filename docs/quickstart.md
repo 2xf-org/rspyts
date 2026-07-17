@@ -6,7 +6,7 @@ may configure either target alone.
 ## 1. Install the compiler
 
 ```sh
-cargo install rspyts-cli --version =0.4.0 --locked
+cargo install rspyts-cli --version =0.4.1 --locked
 ```
 
 During development in this repository, use:
@@ -25,7 +25,7 @@ dependencies.
 crate-type = ["rlib", "cdylib"]
 
 [dependencies]
-rspyts = { version = "0.4.0", default-features = false }
+rspyts = { version = "0.4.1", default-features = false }
 serde = { version = "1", features = ["derive"] }
 thiserror = "2"
 chrono = { version = "0.4", default-features = false, features = ["serde", "std"] }
@@ -176,9 +176,14 @@ Add this rule to the consuming repository's `.gitignore`:
 
 ```gitignore
 .rspyts/
+.rspyts.tmp-*
+.rspyts.old-*
+.rspyts.lock.tmp-*
+.rspyts.lock.old-*
 ```
 
-Do not ignore `rspyts.lock`.
+The sibling patterns cover interrupted atomic staging replacements. Do not
+ignore `rspyts.lock`.
 
 ## 5. Build and accept the contract
 

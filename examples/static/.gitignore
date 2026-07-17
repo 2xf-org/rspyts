@@ -1,4 +1,8 @@
 .rspyts/
+.rspyts.tmp-*
+.rspyts.old-*
+.rspyts.lock.tmp-*
+.rspyts.lock.old-*
 rust/target/
 typescript/node_modules/
 typescript/coverage/

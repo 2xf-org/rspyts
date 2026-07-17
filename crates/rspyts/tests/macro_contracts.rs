@@ -56,7 +56,7 @@ impl Counter {
 
 #[test]
 fn one_parameter_result_aliases_have_explicit_error_identity() {
-    let manifest = rspyts::registry::manifest("rspyts", "0.4.0", "native").unwrap();
+    let manifest = rspyts::registry::manifest("rspyts", "0.4.1", "native").unwrap();
     let function = manifest
         .functions
         .iter()
@@ -84,7 +84,7 @@ fn one_parameter_result_aliases_have_explicit_error_identity() {
 
 #[test]
 fn field_semantics_and_constant_targets_are_registered_exactly() {
-    let manifest = rspyts::registry::manifest("rspyts", "0.4.0", "native").unwrap();
+    let manifest = rspyts::registry::manifest("rspyts", "0.4.1", "native").unwrap();
     let policy = manifest
         .types
         .iter()
