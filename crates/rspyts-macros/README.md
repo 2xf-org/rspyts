@@ -1,11 +1,17 @@
 # rspyts-macros
 
-Proc-macro implementation for [`rspyts`](https://crates.io/crates/rspyts).
+Procedural macro implementation for
+[`rspyts`](https://crates.io/crates/rspyts).
 
-Applications should depend on and import `rspyts`, which re-exports the public
-derives and attributes. This crate is released separately only because Rust
-requires procedural macros to live in a proc-macro crate.
+Do not depend on this crate directly. Add `rspyts` instead; it exposes the
+public `Type`, `Error`, `export`, and `module!` macros:
 
-Version 0.4 is a clean-slate API with no 0.3 compatibility surface.
+```toml
+[dependencies]
+rspyts = { version = "0.4.1", default-features = false }
+```
+
+See the [project README](https://github.com/2xf-org/rspyts#readme)
+and [macro reference](https://github.com/2xf-org/rspyts/blob/main/docs/reference.md).
 
 Licensed under MIT.
