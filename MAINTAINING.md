@@ -38,7 +38,7 @@ Use the repository toolchain from `rust-toolchain.toml`. From a clean checkout,
 build and test the exact Cargo archives:
 
 ```sh
-version=0.4.2
+version=0.4.3
 scripts/release/verify-crates.sh "$version"
 ```
 
@@ -67,7 +67,7 @@ git switch main
 git pull --ff-only origin main
 test "$(git rev-parse HEAD)" = "$(git rev-parse origin/main)"
 test -z "$(git status --porcelain)"
-version=0.4.2
+version=0.4.3
 git tag -a "v$version" -m "rspyts v$version"
 git push origin "refs/tags/v$version"
 ```
@@ -85,7 +85,9 @@ releases use GitHub OIDC and need neither `cargo login` nor a long-lived token.
 The `RELEASE_PRIVATE_PATTERNS_B64` repository secret contains a base64-encoded,
 newline-delimited set of protected extended regular expressions. Candidate
 archives and release notes fail closed if that list is unavailable, empty,
-invalid, or matched. Keep the plaintext patterns outside the public repository.
+invalid, or matched. Pushes to `main` run the same protected tree scan before a
+release tag is created. Keep the plaintext patterns outside the public
+repository.
 
 Do not publish manually, move or reuse a release tag, or overwrite a published
 version. If a published checksum differs from the preserved candidate, stop and

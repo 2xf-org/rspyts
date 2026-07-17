@@ -7,14 +7,14 @@ This reference describes the intentionally constrained rspyts 0.4 product.
 | Component | Supported value |
 | --- | --- |
 | Rust and Cargo | One workspace pinned to `1.88.0` |
-| rspyts crates and CLI | One exact matching version, currently `0.4.2` |
+| rspyts crates and CLI | One exact matching version, currently `0.4.3` |
 | Python artifact | Generated source packaged as one CPython 3.11+ abi3 wheel |
 | TypeScript runtime | Browser WASM built with wasm-bindgen `0.2.126` |
 | Static TypeScript | ESM, declarations, and JSON-safe values |
 | Contract dependency | Zero or one direct leaf lock |
 
-Install rspyts from Cargo. Generated Python and npm artifacts have no PyPI or
-npm `rspyts` runtime dependency.
+Install rspyts from Cargo. Generated artifacts contain no rspyts runtime
+dependency.
 
 ## `rspyts.toml`
 

@@ -49,6 +49,19 @@ jobs:
         shell: bash
         run: |
           git ls-files -z | xargs -0 scripts/release/verify-private-data.sh
+      - name: Reject protected private release content before tagging
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        shell: bash
+        env:
+          RELEASE_PRIVATE_PATTERNS_B64: ${{ secrets.RELEASE_PRIVATE_PATTERNS_B64 }}
+        run: |
+          set -euo pipefail
+          test -n "$RELEASE_PRIVATE_PATTERNS_B64"
+          patterns="$RUNNER_TEMP/release-private-patterns"
+          printf '%s' "$RELEASE_PRIVATE_PATTERNS_B64" | base64 --decode > "$patterns"
+          test -s "$patterns"
+          export RSPYTS_PRIVATE_PATTERNS_FILE="$patterns"
+          git ls-files -z | xargs -0 scripts/release/verify-private-data.sh
 
   target-features:
     name: ${{ matrix.name }}
