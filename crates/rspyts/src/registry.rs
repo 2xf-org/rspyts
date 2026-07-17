@@ -2,14 +2,17 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use crate::ir::{
     CargoPackageId, ConstantDef, DefinitionId, ErrorDef, FunctionDef, IR_VERSION, ImportedPackage,
-    Manifest, ResourceDef, TypeDef, TypeRef, TypeShape,
+    Manifest, ResourceDef, Target, TypeDef, TypeRef, TypeShape,
 };
 
 pub struct TypeRegistration(pub fn() -> TypeDef);
 pub struct ErrorRegistration(pub fn() -> ErrorDef);
 pub struct FunctionRegistration(pub fn() -> FunctionDef);
 pub struct ResourceRegistration(pub fn() -> ResourceDef);
-pub struct ConstantRegistration(pub fn() -> ConstantDef);
+pub struct ConstantRegistration {
+    pub owner: &'static str,
+    pub build: fn() -> Result<ConstantDef, String>,
+}
 
 inventory::collect!(TypeRegistration);
 inventory::collect!(ErrorRegistration);
@@ -37,6 +40,8 @@ pub enum RegistryError {
         expected: CargoPackageId,
         actual: CargoPackageId,
     },
+    #[error("invalid exported constant: {message}")]
+    InvalidConstant { message: String },
 }
 
 pub fn manifest(
@@ -58,11 +63,23 @@ pub fn manifest(
             .into_iter()
             .map(|registration| (registration.0)())
             .collect(),
-        inventory::iter::<ConstantRegistration>
-            .into_iter()
-            .map(|registration| (registration.0)())
-            .collect(),
+        constants_for_owner(
+            crate_name,
+            inventory::iter::<ConstantRegistration>.into_iter(),
+        )?,
     )
+}
+
+fn constants_for_owner<'a>(
+    owner: &str,
+    registrations: impl Iterator<Item = &'a ConstantRegistration>,
+) -> Result<Vec<ConstantDef>, RegistryError> {
+    registrations
+        .filter(|registration| registration.owner == owner)
+        .map(|registration| {
+            (registration.build)().map_err(|message| RegistryError::InvalidConstant { message })
+        })
+        .collect()
 }
 
 /// Returns the complete, deterministic type graph linked into the consumer.
@@ -161,20 +178,38 @@ fn resolve_manifest(
 
     types.sort_by(|left, right| left.id.cmp(&right.id));
     errors.sort_by(|left, right| left.id.cmp(&right.id));
-    functions.sort_by(|left, right| left.host_name.cmp(&right.host_name));
+    functions.sort_by(|left, right| {
+        (&left.host_name, target_rank(left.target), &left.rust_name).cmp(&(
+            &right.host_name,
+            target_rank(right.target),
+            &right.rust_name,
+        ))
+    });
     resources.sort_by(|left, right| left.id.cmp(&right.id));
-    constants.sort_by(|left, right| left.host_name.cmp(&right.host_name));
+    constants.sort_by(|left, right| {
+        (&left.host_name, target_rank(left.target), &left.rust_name).cmp(&(
+            &right.host_name,
+            target_rank(right.target),
+            &right.rust_name,
+        ))
+    });
 
     unique_strings("type", types.iter().map(|item| item.id.as_str()))?;
     unique_strings("error", errors.iter().map(|item| item.id.as_str()))?;
-    unique_strings(
+    unique_host_surfaces(
         "function",
-        functions.iter().map(|item| item.host_name.as_str()),
+        functions
+            .iter()
+            .map(|item| (item.host_name.as_str(), item.target)),
+        false,
     )?;
     unique_strings("resource", resources.iter().map(|item| item.id.as_str()))?;
-    unique_strings(
+    unique_host_surfaces(
         "constant",
-        constants.iter().map(|item| item.host_name.as_str()),
+        constants
+            .iter()
+            .map(|item| (item.host_name.as_str(), item.target)),
+        true,
     )?;
 
     for resource in &resources {
@@ -397,6 +432,7 @@ fn enqueue_type(ty: &TypeRef, pending: &mut VecDeque<DefinitionId>) {
         | TypeRef::DateTime
         | TypeRef::Json
         | TypeRef::Bytes
+        | TypeRef::FixedBytes { .. }
         | TypeRef::Buffer { .. } => {}
     }
 }
@@ -456,6 +492,47 @@ fn unique_strings<'a>(
     Ok(())
 }
 
+fn unique_host_surfaces<'a>(
+    kind: &'static str,
+    definitions: impl Iterator<Item = (&'a str, Target)>,
+    static_is_typescript: bool,
+) -> Result<(), RegistryError> {
+    let mut seen = BTreeMap::<&str, Vec<Target>>::new();
+    for (identity, target) in definitions {
+        let targets = seen.entry(identity).or_default();
+        if targets
+            .iter()
+            .any(|previous| targets_overlap(*previous, target, static_is_typescript))
+        {
+            return Err(RegistryError::Duplicate {
+                kind,
+                identity: identity.to_owned(),
+            });
+        }
+        targets.push(target);
+    }
+    Ok(())
+}
+
+const fn targets_overlap(left: Target, right: Target, static_is_typescript: bool) -> bool {
+    let python = matches!(left, Target::Both | Target::Python)
+        && matches!(right, Target::Both | Target::Python);
+    let typescript = (matches!(left, Target::Both | Target::Typescript)
+        || static_is_typescript && matches!(left, Target::Static))
+        && (matches!(right, Target::Both | Target::Typescript)
+            || static_is_typescript && matches!(right, Target::Static));
+    python || typescript
+}
+
+const fn target_rank(target: Target) -> u8 {
+    match target {
+        Target::Both => 0,
+        Target::Python => 1,
+        Target::Typescript => 2,
+        Target::Static => 3,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -508,46 +585,217 @@ mod tests {
         }
     }
 
+    fn constant(owner_name: &str, rust_name: &str, host_name: &str, target: Target) -> ConstantDef {
+        ConstantDef {
+            owner: owner(owner_name),
+            rust_name: rust_name.to_owned(),
+            host_name: host_name.to_owned(),
+            docs: None,
+            target,
+            ty: TypeRef::String,
+            value: serde_json::Value::String(rust_name.to_owned()),
+        }
+    }
+
+    fn evaluation_constant() -> Result<ConstantDef, String> {
+        let value = serde_json::to_value("evaluation")
+            .map_err(|error| format!("could not serialize evaluation constant: {error}"))?;
+        let mut definition = constant(
+            "evaluation",
+            "EVALUATION_POLICY",
+            "EVALUATION_POLICY",
+            Target::Both,
+        );
+        definition.value = value;
+        Ok(definition)
+    }
+
+    fn invalid_hardware_constant() -> Result<ConstantDef, String> {
+        Err("constant `HARDWARE_LIMIT` must contain only finite values".to_owned())
+    }
+
+    #[test]
+    fn dependency_constant_builders_are_filtered_before_evaluation() {
+        let registrations = [
+            ConstantRegistration {
+                owner: "hardware",
+                build: invalid_hardware_constant,
+            },
+            ConstantRegistration {
+                owner: "evaluation",
+                build: evaluation_constant,
+            },
+        ];
+
+        let evaluation = constants_for_owner("evaluation", registrations.iter()).unwrap();
+        assert_eq!(evaluation.len(), 1);
+        assert_eq!(evaluation[0].owner, owner("evaluation"));
+        assert_eq!(evaluation[0].host_name, "EVALUATION_POLICY");
+
+        let error = constants_for_owner("hardware", registrations.iter()).unwrap_err();
+        assert!(matches!(
+            error,
+            RegistryError::InvalidConstant { message }
+                if message == "constant `HARDWARE_LIMIT` must contain only finite values"
+        ));
+    }
+
+    #[test]
+    fn host_names_may_repeat_only_across_disjoint_emitter_surfaces() {
+        let mut python_function = function("sample", "shared", TypeRef::String);
+        python_function.rust_name = "python_shared".to_owned();
+        python_function.target = Target::Python;
+        let mut typescript_function = function("sample", "shared", TypeRef::String);
+        typescript_function.rust_name = "typescript_shared".to_owned();
+        typescript_function.target = Target::Typescript;
+
+        let manifest = resolve_manifest(
+            owner("sample"),
+            "0.1.0",
+            "native",
+            vec![],
+            vec![],
+            vec![typescript_function, python_function],
+            vec![],
+            vec![
+                constant("sample", "PYTHON_VALUE", "SHARED_VALUE", Target::Python),
+                constant(
+                    "sample",
+                    "TYPESCRIPT_VALUE",
+                    "SHARED_VALUE",
+                    Target::Typescript,
+                ),
+                constant("sample", "PYTHON_STATIC", "PYTHON_STATIC", Target::Python),
+                constant("sample", "STATIC_VALUE", "PYTHON_STATIC", Target::Static),
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(
+            manifest
+                .functions
+                .iter()
+                .map(|item| (item.rust_name.as_str(), item.target))
+                .collect::<Vec<_>>(),
+            [
+                ("python_shared", Target::Python),
+                ("typescript_shared", Target::Typescript),
+            ]
+        );
+        assert_eq!(
+            manifest
+                .constants
+                .iter()
+                .filter(|item| item.host_name == "SHARED_VALUE")
+                .map(|item| item.target)
+                .collect::<Vec<_>>(),
+            [Target::Python, Target::Typescript]
+        );
+    }
+
+    #[test]
+    fn host_names_are_rejected_when_emitter_surfaces_overlap() {
+        for (left, right) in [
+            (Target::Both, Target::Python),
+            (Target::Both, Target::Typescript),
+            (Target::Python, Target::Python),
+            (Target::Typescript, Target::Typescript),
+        ] {
+            let mut first = function("sample", "shared", TypeRef::String);
+            first.rust_name = "first".to_owned();
+            first.target = left;
+            let mut second = function("sample", "shared", TypeRef::String);
+            second.rust_name = "second".to_owned();
+            second.target = right;
+            let error = resolve_manifest(
+                owner("sample"),
+                "0.1.0",
+                "native",
+                vec![],
+                vec![],
+                vec![first, second],
+                vec![],
+                vec![],
+            )
+            .unwrap_err();
+            assert!(matches!(
+                error,
+                RegistryError::Duplicate {
+                    kind: "function",
+                    identity
+                } if identity == "shared"
+            ));
+        }
+
+        for (left, right) in [
+            (Target::Both, Target::Static),
+            (Target::Typescript, Target::Static),
+            (Target::Static, Target::Static),
+        ] {
+            let error = resolve_manifest(
+                owner("sample"),
+                "0.1.0",
+                "native",
+                vec![],
+                vec![],
+                vec![],
+                vec![],
+                vec![
+                    constant("sample", "FIRST", "SHARED", left),
+                    constant("sample", "SECOND", "SHARED", right),
+                ],
+            )
+            .unwrap_err();
+            assert!(matches!(
+                error,
+                RegistryError::Duplicate {
+                    kind: "constant",
+                    identity
+                } if identity == "SHARED"
+            ));
+        }
+    }
+
     #[test]
     fn root_manifest_excludes_dependency_definitions_and_exports() {
-        let hardware_signal = type_definition(
-            "hardware",
-            "signal::SignalDefinition",
+        let owner_item = type_definition(
+            "owner",
+            "model::Item",
             TypeShape::Struct {
                 fields: vec![field("id", TypeRef::String)],
             },
         );
-        let evaluation_rule = type_definition(
-            "evaluation",
-            "rule::Rule",
+        let consumer_selection = type_definition(
+            "consumer",
+            "model::Selection",
             TypeShape::Struct {
                 fields: vec![field(
-                    "signal",
+                    "item",
                     TypeRef::Named {
-                        identity: identity("hardware", "signal::SignalDefinition"),
+                        identity: identity("owner", "model::Item"),
                     },
                 )],
             },
         );
         let manifest = resolve_manifest(
-            owner("evaluation"),
+            owner("consumer"),
             "0.1.0",
             "native",
-            vec![hardware_signal.clone(), evaluation_rule],
+            vec![owner_item.clone(), consumer_selection],
             vec![],
             vec![
                 function(
-                    "hardware",
-                    "defineSignal",
+                    "owner",
+                    "createItem",
                     TypeRef::Named {
-                        identity: identity("hardware", "signal::SignalDefinition"),
+                        identity: identity("owner", "model::Item"),
                     },
                 ),
                 function(
-                    "evaluation",
-                    "evaluate",
+                    "consumer",
+                    "select",
                     TypeRef::Named {
-                        identity: identity("hardware", "signal::SignalDefinition"),
+                        identity: identity("owner", "model::Item"),
                     },
                 ),
             ],
@@ -562,7 +810,7 @@ mod tests {
                 .iter()
                 .map(|definition| definition.id.as_str())
                 .collect::<Vec<_>>(),
-            ["rule::Rule"]
+            ["model::Selection"]
         );
         assert_eq!(
             manifest
@@ -570,30 +818,30 @@ mod tests {
                 .iter()
                 .map(|definition| definition.host_name.as_str())
                 .collect::<Vec<_>>(),
-            ["evaluate"]
+            ["select"]
         );
         assert_eq!(
             manifest.imports,
             [ImportedPackage {
-                owner: owner("hardware"),
-                types: vec![hardware_signal],
+                owner: owner("owner"),
+                types: vec![owner_item],
                 errors: vec![],
             }]
         );
-        assert!(!manifest.canonical_json().unwrap().contains("defineSignal"));
+        assert!(!manifest.canonical_json().unwrap().contains("createItem"));
     }
 
     #[test]
     fn equal_local_ids_from_different_packages_remain_distinct() {
         let root_type = type_definition(
-            "evaluation",
+            "consumer",
             "model::Payload",
             TypeShape::Alias {
                 target: TypeRef::String,
             },
         );
         let foreign_type = type_definition(
-            "hardware",
+            "owner",
             "model::Payload",
             TypeShape::Alias {
                 target: TypeRef::Int {
@@ -603,16 +851,16 @@ mod tests {
             },
         );
         let manifest = resolve_manifest(
-            owner("evaluation"),
+            owner("consumer"),
             "0.1.0",
             "native",
             vec![root_type, foreign_type.clone()],
             vec![],
             vec![function(
-                "evaluation",
+                "consumer",
                 "readForeign",
                 TypeRef::Named {
-                    identity: identity("hardware", "model::Payload"),
+                    identity: identity("owner", "model::Payload"),
                 },
             )],
             vec![],
@@ -620,24 +868,24 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(manifest.types[0].owner, owner("evaluation"));
-        assert_eq!(manifest.imports[0].owner, owner("hardware"));
+        assert_eq!(manifest.types[0].owner, owner("consumer"));
+        assert_eq!(manifest.imports[0].owner, owner("owner"));
         assert_eq!(manifest.imports[0].types, [foreign_type]);
     }
 
     #[test]
     fn missing_foreign_schema_is_rejected_by_full_identity() {
         let error = resolve_manifest(
-            owner("evaluation"),
+            owner("consumer"),
             "0.1.0",
             "native",
             vec![],
             vec![],
             vec![function(
-                "evaluation",
-                "evaluate",
+                "consumer",
+                "select",
                 TypeRef::Named {
-                    identity: identity("hardware", "signal::Missing"),
+                    identity: identity("owner", "model::Missing"),
                 },
             )],
             vec![],
@@ -650,7 +898,7 @@ mod tests {
             RegistryError::MissingDefinition {
                 kind: "type",
                 identity
-            } if identity == DefinitionId::new("hardware", "signal::Missing")
+            } if identity == DefinitionId::new("owner", "model::Missing")
         ));
     }
 }

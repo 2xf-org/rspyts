@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::fmt;
 
-pub const IR_VERSION: u32 = 4;
+pub const IR_VERSION: u32 = 5;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -107,6 +107,7 @@ pub enum TypeRef {
     Tuple { items: Vec<TypeRef> },
     Named { identity: DefinitionId },
     Bytes,
+    FixedBytes { length: u64 },
     Buffer { element: BufferElement },
 }
 

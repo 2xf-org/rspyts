@@ -33,16 +33,6 @@ struct CrateConfig {
 pub struct PythonConfig {
     pub package: String,
     pub source: Option<PathBuf>,
-    #[serde(default)]
-    pub mode: PythonMode,
-}
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum PythonMode {
-    #[default]
-    Standalone,
-    Source,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -50,7 +40,6 @@ pub enum PythonMode {
 pub struct TypeScriptConfig {
     pub package: String,
     pub mode: TypeScriptMode,
-    pub source: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -107,6 +96,19 @@ impl Project {
             .parent()
             .context("rspyts.toml has no parent directory")?
             .to_path_buf();
+        if config.rust_crate.path.as_os_str().is_empty()
+            || config.rust_crate.path.is_absolute()
+            || config.rust_crate.path.components().any(|component| {
+                matches!(
+                    component,
+                    std::path::Component::ParentDir
+                        | std::path::Component::RootDir
+                        | std::path::Component::Prefix(_)
+                )
+            })
+        {
+            bail!("[crate].path must stay inside the rspyts project");
+        }
         let crate_path = root.join(&config.rust_crate.path);
         let cargo_manifest = if crate_path
             .file_name()
@@ -122,6 +124,12 @@ impl Project {
                 cargo_manifest.display()
             );
         }
+        let cargo_manifest = cargo_manifest
+            .canonicalize()
+            .with_context(|| format!("failed to resolve {}", cargo_manifest.display()))?;
+        if !cargo_manifest.starts_with(&root) {
+            bail!("[crate].path must stay inside the rspyts project");
+        }
 
         validate_python_package(config.python.as_ref())?;
         validate_typescript_package(config.typescript.as_ref())?;
@@ -134,10 +142,7 @@ impl Project {
         if let Some(config) = python.as_mut() {
             config.source = resolve_source(&root, config.source.as_deref(), "python")?;
         }
-        let mut typescript = config.typescript;
-        if let Some(config) = typescript.as_mut() {
-            config.source = resolve_source(&root, config.source.as_deref(), "typescript")?;
-        }
+        let typescript = config.typescript;
         let dependencies = resolve_dependencies(&root, config.dependencies)?;
 
         let probe_features = config
@@ -193,7 +198,9 @@ fn resolve_dependencies(
     root: &Path,
     dependencies: BTreeMap<String, RawDependencyConfig>,
 ) -> Result<BTreeMap<String, DependencyConfig>> {
-    let mut owners = BTreeSet::new();
+    if dependencies.len() > 1 {
+        bail!("rspyts supports at most one direct dependency");
+    }
     dependencies
         .into_iter()
         .map(|(alias, dependency)| {
@@ -202,12 +209,6 @@ fn resolve_dependencies(
             }
             if !is_cargo_package_name(&dependency.owner) {
                 bail!("dependency `{alias}` has an invalid Cargo package owner");
-            }
-            if !owners.insert(dependency.owner.clone()) {
-                bail!(
-                    "Cargo package owner `{}` is mapped by more than one dependency alias",
-                    dependency.owner
-                );
             }
             if dependency.lock.as_os_str().is_empty() || dependency.lock.is_absolute() {
                 bail!("dependency `{alias}` lock must be a non-empty relative path");
@@ -295,6 +296,15 @@ fn validate_python_name(package: &str) -> Result<()> {
     {
         bail!("Python package `{package}` must contain only dot-separated identifiers");
     }
+    let root = package
+        .split('.')
+        .next()
+        .expect("a non-empty package has a root segment");
+    if matches!(root, "math" | "enum" | "typing" | "pydantic" | "numpy") {
+        bail!(
+            "Python package root `{root}` shadows a runtime module required by generated bindings"
+        );
+    }
     Ok(())
 }
 
@@ -312,6 +322,7 @@ fn validate_typescript_name(package: &str) -> Result<()> {
     if package.is_empty()
         || package.len() > 214
         || parts.len() != expected_parts
+        || (!package.starts_with('@') && matches!(package, "node_modules" | "favicon.ico"))
         || parts.iter().any(|part| {
             part.is_empty()
                 || part.starts_with(['.', '_'])
@@ -415,17 +426,15 @@ mod tests {
     fn accepts_host_package_names() {
         assert!(
             validate_python_package(Some(&PythonConfig {
-                package: "neurovirtual.hardware".into(),
+                package: "example.shared".into(),
                 source: None,
-                mode: PythonMode::Standalone,
             }))
             .is_ok()
         );
         assert!(
             validate_typescript_package(Some(&TypeScriptConfig {
-                package: "@neurovirtual/hardware".into(),
+                package: "@example/shared".into(),
                 mode: TypeScriptMode::Static,
-                source: None,
             }))
             .is_ok()
         );
@@ -435,22 +444,109 @@ mod tests {
     fn rejects_ambiguous_package_names() {
         assert!(
             validate_python_package(Some(&PythonConfig {
-                package: "neurovirtual/hardware".into(),
+                package: "example/shared".into(),
                 source: None,
-                mode: PythonMode::Standalone,
             }))
             .is_err()
         );
         assert!(
             validate_typescript_package(Some(&TypeScriptConfig {
-                package: "@neurovirtual".into(),
+                package: "@example".into(),
                 mode: TypeScriptMode::Wasm,
-                source: None,
             }))
             .is_err()
         );
-        assert!(validate_python_name("neurovirtual.class").is_err());
-        assert!(validate_typescript_name("@Neurovirtual/Hardware").is_err());
+        assert!(validate_python_name("example.class").is_err());
+        assert!(validate_typescript_name("@Example/Shared").is_err());
+        assert!(validate_typescript_name("node_modules").is_err());
+        assert!(validate_typescript_name("favicon.ico").is_err());
+        assert!(validate_typescript_name("@example/node_modules").is_ok());
+        assert!(validate_typescript_name("@example/favicon.ico").is_ok());
+        for root in ["math", "enum", "typing", "pydantic", "numpy"] {
+            let error = validate_python_name(&format!("{root}.contract")).unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("shadows a runtime module required by generated bindings")
+            );
+        }
+        assert!(validate_python_name("example.math").is_ok());
+    }
+
+    #[test]
+    fn project_config_rejects_python_packages_that_shadow_runtime_imports() {
+        let root = std::env::temp_dir().join(format!(
+            "rspyts-config-python-shadow-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(root.join("rust/src")).unwrap();
+        fs::write(
+            root.join("rust/Cargo.toml"),
+            "[package]\nname = \"fixture\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+        )
+        .unwrap();
+        fs::write(root.join("rust/src/lib.rs"), "").unwrap();
+
+        for package in ["math", "enum.contract", "typing", "pydantic.v2", "numpy"] {
+            fs::write(
+                root.join("rspyts.toml"),
+                format!("[crate]\npath = \"rust\"\n\n[python]\npackage = \"{package}\"\n"),
+            )
+            .unwrap();
+            let error = Project::read(&root.join("rspyts.toml")).unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("shadows a runtime module required by generated bindings"),
+                "unexpected error for {package}: {error:#}"
+            );
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn rejects_removed_python_mode_configuration() {
+        let error = toml::from_str::<Config>(
+            "[crate]\npath = \"rust\"\n\n[python]\npackage = \"fixture\"\nmode = \"source\"\n",
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("unknown field `mode`"));
+    }
+
+    #[test]
+    fn rejects_crates_outside_the_project() {
+        let root = std::env::temp_dir().join(format!(
+            "rspyts-config-crate-path-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).unwrap();
+
+        for path in ["/outside", "../outside"] {
+            fs::write(
+                root.join("rspyts.toml"),
+                format!(
+                    "[crate]\npath = {path:?}\n\n[typescript]\npackage = \"fixture\"\nmode = \"static\"\n"
+                ),
+            )
+            .unwrap();
+            let error = Project::read(&root.join("rspyts.toml")).unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("[crate].path must stay inside the rspyts project"),
+                "unexpected error for {path}: {error:#}"
+            );
+        }
+
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -460,6 +556,27 @@ mod tests {
         assert!(validate_features("probe-features", &["wasm".into()]).is_err());
         assert!(validate_features("features", &["one,two".into()]).is_err());
         assert!(validate_features("features", &["formats/native".into()]).is_ok());
+    }
+
+    #[test]
+    fn rejects_more_than_one_direct_dependency() {
+        let dependency = |owner: &str| RawDependencyConfig {
+            owner: owner.into(),
+            lock: PathBuf::from(format!("{owner}.lock")),
+            python: None,
+            typescript: None,
+        };
+        let dependencies = BTreeMap::from([
+            ("first".into(), dependency("first-owner")),
+            ("second".into(), dependency("second-owner")),
+        ]);
+
+        let error = resolve_dependencies(Path::new("."), dependencies).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("supports at most one direct dependency")
+        );
     }
 
     #[test]
@@ -533,5 +650,14 @@ mod tests {
                 .default_features()
         );
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn rejects_typescript_source_instead_of_staging_unpublished_files() {
+        let error = toml::from_str::<Config>(
+            "[crate]\npath = \"rust\"\n\n[typescript]\npackage = \"fixture\"\nmode = \"static\"\nsource = \"typescript/src\"\n",
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("unknown field `source`"));
     }
 }

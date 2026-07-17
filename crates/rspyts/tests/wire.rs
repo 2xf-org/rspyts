@@ -11,7 +11,7 @@ fn serde_json_values_map_to_the_exact_wire_vocabulary() {
         "negative": -4,
         "positive": 4,
         "float": 1.25,
-        "string": "signal",
+        "string": "sample",
         "sequence": [1, "two"]
     });
 
@@ -25,7 +25,7 @@ fn serde_json_values_map_to_the_exact_wire_vocabulary() {
     assert_eq!(fields["negative"], WireValue::I64(-4));
     assert_eq!(fields["positive"], WireValue::U64(4));
     assert_eq!(fields["float"], WireValue::F64(1.25));
-    assert_eq!(fields["string"], WireValue::String("signal".into()));
+    assert_eq!(fields["string"], WireValue::String("sample".into()));
     assert_eq!(
         fields["sequence"],
         WireValue::Sequence(vec![WireValue::U64(1), WireValue::String("two".into())])
