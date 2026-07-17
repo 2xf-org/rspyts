@@ -1,0 +1,18 @@
+[package]
+name = "cross-package-reports"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[features]
+default = []
+python = ["rspyts/python-extension"]
+wasm = ["rspyts/wasm"]
+
+[dependencies]
+cross-package-catalog = { path = "../../catalog/rust" }
+rspyts = { path = "../../../../crates/rspyts" }
+serde = { version = "1", features = ["derive"] }

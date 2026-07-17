@@ -1,0 +1,15 @@
+{
+  "name": "@rspyts/acceptance-host-tests",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node scripts/test-packed.mjs"
+  },
+  "devDependencies": {
+    "@vitest/browser-playwright": "^4.1.10",
+    "playwright": "^1.61.1",
+    "typescript": "^6.0.3",
+    "vitest": "^4.1.10"
+  }
+}

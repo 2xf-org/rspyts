@@ -1,5 +1,0 @@
-error: #[bridge(rename_all = …)] competes with the adopted Serde contract; put `rename_all` in #[serde(...)] instead
- --> tests/ui/serde_rename_all_conflict.rs:4:30
-  |
-4 | #[bridge(serde, rename_all = "camelCase")]
-  |                              ^^^^^^^^^^^

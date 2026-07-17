@@ -1,5 +1,0 @@
-error: unsupported Serde attribute `untagged` on this type; rspyts can reflect only `rename`, `rename_all`, `tag`, `transparent`, and `deny_unknown_fields`. Use `serde_json::Value` for deliberately schemaless data
- --> tests/ui/serde_untagged.rs:6:9
-  |
-6 | #[serde(untagged)]
-  |         ^^^^^^^^

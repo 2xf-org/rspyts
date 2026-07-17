@@ -1,0 +1,22 @@
+[build-system]
+requires = ["maturin>=1.9,<2"]
+build-backend = "maturin"
+
+[project]
+name = "rspyts-acceptance"
+version = "0.1.0"
+requires-python = ">=3.11"
+dependencies = ["numpy>=2", "pydantic>=2.11"]
+
+[project.optional-dependencies]
+test = ["pytest>=8"]
+
+[tool.maturin]
+manifest-path = "../rust/Cargo.toml"
+python-source = "../.rspyts/python"
+module-name = "rspyts_acceptance.native"
+features = ["python"]
+include = [{ path = "rspyts_acceptance/**/*", format = "wheel" }]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

@@ -1,0 +1,6 @@
+[crate]
+path = "rust"
+
+[typescript]
+package = "@rspyts/static-acceptance"
+mode = "static"

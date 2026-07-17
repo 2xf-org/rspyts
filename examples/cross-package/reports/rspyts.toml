@@ -1,0 +1,15 @@
+[crate]
+path = "rust"
+
+[python]
+package = "example.reports"
+
+[typescript]
+package = "@example/reports"
+mode = "static"
+
+[dependencies.catalog]
+crate = "cross-package-catalog"
+lock = "../catalog/rspyts.lock"
+python = "example.catalog"
+typescript = "@example/catalog"

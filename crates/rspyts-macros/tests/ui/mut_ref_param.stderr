@@ -1,5 +1,0 @@
-error: `&mut` parameters are not supported; parameters cross the boundary by value
- --> tests/ui/mut_ref_param.rs:4:20
-  |
-4 | pub fn bump(value: &mut u32) {
-  |                    ^^^^^^^^

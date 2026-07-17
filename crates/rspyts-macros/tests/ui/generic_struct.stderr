@@ -1,5 +1,0 @@
-error: bridged structs cannot be generic — no type parameters, lifetimes, or const generics (docs/design/type-system.md §9)
- --> tests/ui/generic_struct.rs:4:20
-  |
-4 | pub struct Wrapper<T> {
-  |                    ^

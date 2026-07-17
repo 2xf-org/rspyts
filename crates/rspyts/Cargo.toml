@@ -1,6 +1,5 @@
 [package]
 name = "rspyts"
-description = "Define it in Rust, call it in Python and TypeScript: one macro, generated pydantic models, TS types, JSON Schema, and a tiny C ABI."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -8,17 +7,31 @@ license.workspace = true
 repository.workspace = true
 homepage.workspace = true
 authors.workspace = true
-keywords.workspace = true
-categories.workspace = true
-readme = "README.md"
+description = "Compile one Rust API into Python and TypeScript packages"
+keywords = ["ffi", "python", "typescript", "wasm", "codegen"]
+categories = ["development-tools::ffi", "wasm"]
+
+[features]
+default = []
+python = ["dep:pyo3"]
+python-extension = ["python", "pyo3/extension-module"]
+wasm = ["dep:js-sys", "dep:wasm-bindgen"]
 
 [dependencies]
-rspyts-core = { workspace = true }
-rspyts-macros = { workspace = true }
-inventory = { workspace = true }
-serde = { workspace = true }
-serde_json = { workspace = true }
+chrono.workspace = true
+rspyts-macros.workspace = true
+inventory.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+pyo3 = { workspace = true, optional = true }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+js-sys = { workspace = true, optional = true }
+wasm-bindgen = { workspace = true, optional = true }
 
 [dev-dependencies]
-serde = { workspace = true }
-serde_json = { workspace = true }
+wasm-bindgen-test.workspace = true

@@ -1,5 +1,0 @@
-error: #[bridge(serde)] adopts an existing derived contract and requires syntactic Serde derives for both Serialize and Deserialize; missing Deserialize
- --> tests/ui/bridge_serde_missing_derive.rs:6:12
-  |
-6 | pub struct MissingDeserialize {
-  |            ^^^^^^^^^^^^^^^^^^

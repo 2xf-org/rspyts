@@ -1,0 +1,520 @@
+{
+  "schemaVersion": 2,
+  "fingerprint": "sha256:dd08a6455ca3da6ecc5cab638092378f23f83906504a26a29f351b166cbe4f23",
+  "hosts": {
+    "python": "rspyts_acceptance",
+    "typescript": {
+      "package": "@rspyts/acceptance",
+      "mode": "wasm"
+    }
+  },
+  "dependencies": {},
+  "manifest": {
+    "irVersion": 4,
+    "crateName": "rspyts-acceptance",
+    "crateVersion": "0.1.0",
+    "moduleName": "native",
+    "imports": [],
+    "types": [
+      {
+        "owner": "rspyts-acceptance",
+        "id": "rspyts_acceptance::Channel",
+        "name": "Channel",
+        "docs": "The source channel attached to an analysis result.",
+        "shape": {
+          "kind": "struct",
+          "fields": [
+            {
+              "rustName": "id",
+              "wireName": "id",
+              "docs": null,
+              "ty": {
+                "kind": "string"
+              },
+              "required": true,
+              "default": null,
+              "constraints": {
+                "literal": null,
+                "minLength": null,
+                "maxLength": null,
+                "ge": null
+              }
+            },
+            {
+              "rustName": "sample_rate_hz",
+              "wireName": "sampleRateHz",
+              "docs": null,
+              "ty": {
+                "kind": "int",
+                "signed": false,
+                "bits": 32
+              },
+              "required": true,
+              "default": null,
+              "constraints": {
+                "literal": null,
+                "minLength": null,
+                "maxLength": null,
+                "ge": null
+              }
+            }
+          ]
+        }
+      },
+      {
+        "owner": "rspyts-acceptance",
+        "id": "rspyts_acceptance::ContractRequest",
+        "name": "ContractRequest",
+        "docs": "A constrained request proving defaults and aware datetimes in both hosts.",
+        "shape": {
+          "kind": "struct",
+          "fields": [
+            {
+              "rustName": "contract_version",
+              "wireName": "contractVersion",
+              "docs": null,
+              "ty": {
+                "kind": "int",
+                "signed": false,
+                "bits": 32
+              },
+              "required": true,
+              "default": null,
+              "constraints": {
+                "literal": 2,
+                "minLength": null,
+                "maxLength": null,
+                "ge": null
+              }
+            },
+            {
+              "rustName": "actor",
+              "wireName": "actor",
+              "docs": null,
+              "ty": {
+                "kind": "string"
+              },
+              "required": true,
+              "default": null,
+              "constraints": {
+                "literal": null,
+                "minLength": 1,
+                "maxLength": 32,
+                "ge": null
+              }
+            },
+            {
+              "rustName": "quantity",
+              "wireName": "quantity",
+              "docs": null,
+              "ty": {
+                "kind": "int",
+                "signed": false,
+                "bits": 32
+              },
+              "required": false,
+              "default": 1,
+              "constraints": {
+                "literal": null,
+                "minLength": null,
+                "maxLength": null,
+                "ge": 1
+              }
+            },
+            {
+              "rustName": "occurred_at",
+              "wireName": "occurredAt",
+              "docs": null,
+              "ty": {
+                "kind": "dateTime"
+              },
+              "required": true,
+              "default": null,
+              "constraints": {
+                "literal": null,
+                "minLength": null,
+                "maxLength": null,
+                "ge": null
+              }
+            },
+            {
+              "rustName": "tags",
+              "wireName": "tags",
+              "docs": null,
+              "ty": {
+                "kind": "list",
+                "item": {
+                  "kind": "string"
+                }
+              },
+              "required": true,
+              "default": null,
+              "constraints": {
+                "literal": null,
+                "minLength": 1,
+                "maxLength": 3,
+                "ge": null
+              }
+            }
+          ]
+        }
+      },
+      {
+        "owner": "rspyts-acceptance",
+        "id": "rspyts_acceptance::Quality",
+        "name": "Quality",
+        "docs": "A portable quality classification.",
+        "shape": {
+          "kind": "stringEnum",
+          "variants": [
+            {
+              "rustName": "Good",
+              "wireName": "good",
+              "docs": null,
+              "fields": []
+            },
+            {
+              "rustName": "Noisy",
+              "wireName": "noisy",
+              "docs": null,
+              "fields": []
+            }
+          ]
+        }
+      },
+      {
+        "owner": "rspyts-acceptance",
+        "id": "rspyts_acceptance::Summary",
+        "name": "Summary",
+        "docs": "The nested result returned by the real Rust implementation.",
+        "shape": {
+          "kind": "struct",
+          "fields": [
+            {
+              "rustName": "channel",
+              "wireName": "channel",
+              "docs": null,
+              "ty": {
+                "kind": "named",
+                "identity": {
+                  "owner": "rspyts-acceptance",
+                  "id": "rspyts_acceptance::Channel"
+                }
+              },
+              "required": true,
+              "default": null,
+              "constraints": {
+                "literal": null,
+                "minLength": null,
+                "maxLength": null,
+                "ge": null
+              }
+            },
+            {
+              "rustName": "quality",
+              "wireName": "quality",
+              "docs": null,
+              "ty": {
+                "kind": "named",
+                "identity": {
+                  "owner": "rspyts-acceptance",
+                  "id": "rspyts_acceptance::Quality"
+                }
+              },
+              "required": true,
+              "default": null,
+              "constraints": {
+                "literal": null,
+                "minLength": null,
+                "maxLength": null,
+                "ge": null
+              }
+            },
+            {
+              "rustName": "count",
+              "wireName": "count",
+              "docs": null,
+              "ty": {
+                "kind": "int",
+                "signed": false,
+                "bits": 64
+              },
+              "required": true,
+              "default": null,
+              "constraints": {
+                "literal": null,
+                "minLength": null,
+                "maxLength": null,
+                "ge": null
+              }
+            },
+            {
+              "rustName": "average",
+              "wireName": "average",
+              "docs": null,
+              "ty": {
+                "kind": "float",
+                "bits": 64
+              },
+              "required": true,
+              "default": null,
+              "constraints": {
+                "literal": null,
+                "minLength": null,
+                "maxLength": null,
+                "ge": null
+              }
+            },
+            {
+              "rustName": "normalized",
+              "wireName": "normalized",
+              "docs": null,
+              "ty": {
+                "kind": "buffer",
+                "element": "f64"
+              },
+              "required": true,
+              "default": null,
+              "constraints": {
+                "literal": null,
+                "minLength": null,
+                "maxLength": null,
+                "ge": null
+              }
+            },
+            {
+              "rustName": "fingerprint",
+              "wireName": "fingerprint",
+              "docs": null,
+              "ty": {
+                "kind": "bytes"
+              },
+              "required": true,
+              "default": null,
+              "constraints": {
+                "literal": null,
+                "minLength": null,
+                "maxLength": null,
+                "ge": null
+              }
+            }
+          ]
+        }
+      }
+    ],
+    "errors": [
+      {
+        "owner": "rspyts-acceptance",
+        "id": "rspyts_acceptance::AnalyzeError",
+        "name": "AnalyzeError",
+        "docs": "Intentional API failures, exposed as typed host exceptions.",
+        "variants": [
+          {
+            "rustName": "Empty",
+            "code": "empty",
+            "docs": null,
+            "fields": []
+          },
+          {
+            "rustName": "InvalidScale",
+            "code": "invalid_scale",
+            "docs": null,
+            "fields": []
+          },
+          {
+            "rustName": "InvalidFingerprint",
+            "code": "invalid_fingerprint",
+            "docs": null,
+            "fields": []
+          }
+        ]
+      }
+    ],
+    "functions": [
+      {
+        "owner": "rspyts-acceptance",
+        "rustName": "summarize",
+        "hostName": "summarize",
+        "docs": "Analyze one signal without introducing a transport DTO.",
+        "target": "both",
+        "params": [
+          {
+            "rustName": "channel",
+            "hostName": "channel",
+            "ty": {
+              "kind": "named",
+              "identity": {
+                "owner": "rspyts-acceptance",
+                "id": "rspyts_acceptance::Channel"
+              }
+            }
+          },
+          {
+            "rustName": "values",
+            "hostName": "values",
+            "ty": {
+              "kind": "buffer",
+              "element": "f64"
+            }
+          },
+          {
+            "rustName": "fingerprint",
+            "hostName": "fingerprint",
+            "ty": {
+              "kind": "bytes"
+            }
+          },
+          {
+            "rustName": "scale",
+            "hostName": "scale",
+            "ty": {
+              "kind": "float",
+              "bits": 64
+            }
+          }
+        ],
+        "returns": {
+          "kind": "named",
+          "identity": {
+            "owner": "rspyts-acceptance",
+            "id": "rspyts_acceptance::Summary"
+          }
+        },
+        "error": {
+          "owner": "rspyts-acceptance",
+          "id": "rspyts_acceptance::AnalyzeError"
+        }
+      },
+      {
+        "owner": "rspyts-acceptance",
+        "rustName": "validate_request",
+        "hostName": "validateRequest",
+        "docs": "Round-trip a constrained request through the real Rust boundary.",
+        "target": "both",
+        "params": [
+          {
+            "rustName": "request",
+            "hostName": "request",
+            "ty": {
+              "kind": "named",
+              "identity": {
+                "owner": "rspyts-acceptance",
+                "id": "rspyts_acceptance::ContractRequest"
+              }
+            }
+          }
+        ],
+        "returns": {
+          "kind": "named",
+          "identity": {
+            "owner": "rspyts-acceptance",
+            "id": "rspyts_acceptance::ContractRequest"
+          }
+        },
+        "error": null
+      }
+    ],
+    "resources": [
+      {
+        "owner": "rspyts-acceptance",
+        "id": "rspyts_acceptance::Analyzer",
+        "name": "Analyzer",
+        "docs": null,
+        "target": "both",
+        "constructors": [
+          {
+            "owner": "rspyts-acceptance",
+            "rustName": "new",
+            "hostName": "new",
+            "docs": null,
+            "target": "both",
+            "params": [
+              {
+                "rustName": "channel",
+                "hostName": "channel",
+                "ty": {
+                  "kind": "named",
+                  "identity": {
+                    "owner": "rspyts-acceptance",
+                    "id": "rspyts_acceptance::Channel"
+                  }
+                }
+              },
+              {
+                "rustName": "scale",
+                "hostName": "scale",
+                "ty": {
+                  "kind": "float",
+                  "bits": 64
+                }
+              }
+            ],
+            "returns": {
+              "kind": "named",
+              "identity": {
+                "owner": "rspyts-acceptance",
+                "id": "rspyts_acceptance::Analyzer"
+              }
+            },
+            "error": {
+              "owner": "rspyts-acceptance",
+              "id": "rspyts_acceptance::AnalyzeError"
+            }
+          }
+        ],
+        "methods": [
+          {
+            "rustName": "summarize",
+            "hostName": "summarize",
+            "docs": null,
+            "target": "both",
+            "mutable": true,
+            "params": [
+              {
+                "rustName": "values",
+                "hostName": "values",
+                "ty": {
+                  "kind": "buffer",
+                  "element": "f64"
+                }
+              },
+              {
+                "rustName": "fingerprint",
+                "hostName": "fingerprint",
+                "ty": {
+                  "kind": "bytes"
+                }
+              }
+            ],
+            "returns": {
+              "kind": "named",
+              "identity": {
+                "owner": "rspyts-acceptance",
+                "id": "rspyts_acceptance::Summary"
+              }
+            },
+            "error": {
+              "owner": "rspyts-acceptance",
+              "id": "rspyts_acceptance::AnalyzeError"
+            }
+          },
+          {
+            "rustName": "calls",
+            "hostName": "calls",
+            "docs": null,
+            "target": "both",
+            "mutable": false,
+            "params": [],
+            "returns": {
+              "kind": "int",
+              "signed": false,
+              "bits": 64
+            },
+            "error": null
+          }
+        ]
+      }
+    ],
+    "constants": []
+  }
+}

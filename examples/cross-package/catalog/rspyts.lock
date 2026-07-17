@@ -1,0 +1,104 @@
+{
+  "schemaVersion": 2,
+  "fingerprint": "sha256:04705ab04e2a7809f285b394e1ded61ca5dc12966c827a6322c553a47835db4f",
+  "hosts": {
+    "python": "example.catalog",
+    "typescript": {
+      "package": "@example/catalog",
+      "mode": "static"
+    }
+  },
+  "dependencies": {},
+  "manifest": {
+    "irVersion": 4,
+    "crateName": "cross-package-catalog",
+    "crateVersion": "0.1.0",
+    "moduleName": "native",
+    "imports": [],
+    "types": [
+      {
+        "owner": "cross-package-catalog",
+        "id": "cross_package_catalog::SignalDefinition",
+        "name": "SignalDefinition",
+        "docs": "Immutable signal identity shared with downstream domain packages.",
+        "shape": {
+          "kind": "struct",
+          "fields": [
+            {
+              "rustName": "id",
+              "wireName": "id",
+              "docs": null,
+              "ty": {
+                "kind": "string"
+              },
+              "required": true,
+              "default": null,
+              "constraints": {
+                "literal": null,
+                "minLength": null,
+                "maxLength": null,
+                "ge": null
+              }
+            },
+            {
+              "rustName": "sample_rate_hz",
+              "wireName": "sampleRateHz",
+              "docs": null,
+              "ty": {
+                "kind": "int",
+                "signed": false,
+                "bits": 32
+              },
+              "required": true,
+              "default": null,
+              "constraints": {
+                "literal": null,
+                "minLength": null,
+                "maxLength": null,
+                "ge": null
+              }
+            }
+          ]
+        }
+      }
+    ],
+    "errors": [],
+    "functions": [
+      {
+        "owner": "cross-package-catalog",
+        "rustName": "define_signal",
+        "hostName": "defineSignal",
+        "docs": "The Catalog implementation that constructs the shared domain value.",
+        "target": "both",
+        "params": [
+          {
+            "rustName": "id",
+            "hostName": "id",
+            "ty": {
+              "kind": "string"
+            }
+          },
+          {
+            "rustName": "sample_rate_hz",
+            "hostName": "sampleRateHz",
+            "ty": {
+              "kind": "int",
+              "signed": false,
+              "bits": 32
+            }
+          }
+        ],
+        "returns": {
+          "kind": "named",
+          "identity": {
+            "owner": "cross-package-catalog",
+            "id": "cross_package_catalog::SignalDefinition"
+          }
+        },
+        "error": null
+      }
+    ],
+    "resources": [],
+    "constants": []
+  }
+}
