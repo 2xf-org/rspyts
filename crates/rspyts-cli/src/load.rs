@@ -743,18 +743,26 @@ mod tests {
 
     #[test]
     fn artifact_paths_are_remapped_from_the_fixed_workspace_and_target() {
+        let workspace_root = PathBuf::from("/home/user/workspace");
+        let target_directory = workspace_root.join("target");
         let package = PackageIdentity {
             id: "example@0.1.0".to_owned(),
             name: "example".to_owned(),
-            workspace_root: PathBuf::from("/home/user/workspace"),
-            target_directory: PathBuf::from("/home/user/workspace/target"),
+            workspace_root: workspace_root.clone(),
+            target_directory: target_directory.clone(),
             rust_target: "aarch64-apple-darwin".to_owned(),
         };
         let isolated = package.target_directory.join("rspyts");
         let flags = path_remap_flags(&package, &isolated);
-        assert!(flags.contains("--remap-path-prefix=/home/user/workspace=/workspace"));
-        assert!(flags.contains("--remap-path-prefix=/home/user/workspace/target=/target"));
-        assert!(flags.contains("--remap-path-prefix=/home/user/workspace/target/rspyts=/target"));
+        let workspace_remap = format!(
+            "--remap-path-prefix={}=/workspace",
+            workspace_root.display()
+        );
+        let target_remap = format!("--remap-path-prefix={}=/target", target_directory.display());
+        let isolated_remap = format!("--remap-path-prefix={}=/target", isolated.display());
+        assert!(flags.contains(&workspace_remap));
+        assert!(flags.contains(&target_remap));
+        assert!(flags.contains(&isolated_remap));
         let source_workspace = Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
             .and_then(Path::parent)
@@ -766,12 +774,7 @@ mod tests {
             )));
         }
         assert!(
-            flags
-                .find("--remap-path-prefix=/home/user/workspace/target/rspyts=/target")
-                .unwrap()
-                > flags
-                    .find("--remap-path-prefix=/home/user/workspace=/workspace")
-                    .unwrap(),
+            flags.find(&isolated_remap).unwrap() > flags.find(&workspace_remap).unwrap(),
             "specific paths must follow their parent paths so rustc resolves them first"
         );
     }

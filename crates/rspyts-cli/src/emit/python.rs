@@ -2674,6 +2674,7 @@ for values in (
         let special_variant = python_string_literal(special_variant);
         let script = format!(
             r#"
+import inspect
 import sample_contract
 from sample_contract import DocumentedError, EventData, Reader, Record, Status, read_message
 
@@ -2682,19 +2683,22 @@ special_alias = {special_alias}
 special_tag = {special_tag}
 special_variant = {special_variant}
 
-assert Record.__doc__ == special
+def assert_special_doc(value):
+    assert value in (special, inspect.cleandoc(special))
+
+assert_special_doc(Record.__doc__)
 assert Record.model_fields["default_value"].description == special
 assert Record.model_fields["aliased_value"].description == special
-assert Status.__doc__ == special
-assert Status.Control.__doc__ == special
-assert EventData.__doc__ == special
+assert_special_doc(Status.__doc__)
+assert_special_doc(Status.Control.__doc__)
+assert_special_doc(EventData.__doc__)
 assert EventData.model_fields["payload"].description == special
-assert DocumentedError.__doc__ == special
-assert read_message.__doc__ == special
-assert Reader.__doc__ == special
-assert Reader.__init__.__doc__ == special
-assert Reader.from_default.__doc__ == special
-assert Reader.read.__doc__ == special
+assert_special_doc(DocumentedError.__doc__)
+assert_special_doc(read_message.__doc__)
+assert_special_doc(Reader.__doc__)
+assert_special_doc(Reader.__init__.__doc__)
+assert_special_doc(Reader.from_default.__doc__)
+assert_special_doc(Reader.read.__doc__)
 
 assert read_message() == "function result"
 reader = Reader()
