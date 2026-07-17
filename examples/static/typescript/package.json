@@ -1,5 +1,5 @@
 {
-  "name": "@rspyts/static-acceptance-tests",
+  "name": "@example/independent-host-tests",
   "version": "0.1.0",
   "private": true,
   "type": "module",

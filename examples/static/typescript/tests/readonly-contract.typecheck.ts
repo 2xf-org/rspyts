@@ -1,35 +1,42 @@
 import {
+  FEATURES,
+  FEATURE_TABLE,
+  FORMAT_MAGIC,
   IDENTITY,
-  METER_DEFINITIONS,
-  METER_TABLE,
-  REQUIRED_HEADERS,
-  SUPPORTED_EVENTS,
-  PlatformEvent,
-  type MeterDefinition,
-  type ProtocolIdentity,
+  RELEASE_CHANNELS,
+  REQUIRED_SECTIONS,
+  ReleaseChannel,
+  type FeatureDefinition,
+  type FormatIdentity,
 } from "../../.rspyts/typescript/index.js";
 
-declare const identity: ProtocolIdentity;
-declare const meter: MeterDefinition;
+// @ts-expect-error Python-only functions are not part of a static TypeScript package.
+import { releaseChannelLabel } from "../../.rspyts/typescript/index.js";
+void releaseChannelLabel;
 
-const identities: Readonly<ProtocolIdentity> = IDENTITY;
-const meters: readonly Readonly<MeterDefinition>[] = METER_DEFINITIONS;
-const events: readonly PlatformEvent[] = SUPPORTED_EVENTS;
+declare const identity: FormatIdentity;
+declare const feature: FeatureDefinition;
+
+const identities: Readonly<FormatIdentity> = IDENTITY;
+const features: readonly Readonly<FeatureDefinition>[] = FEATURES;
+const channels: readonly ReleaseChannel[] = RELEASE_CHANNELS;
 void identities;
-void meters;
-void events;
+void features;
+void channels;
 
 // @ts-expect-error Generated struct fields are readonly.
-identity.service = "other";
+identity.name = "other";
 // @ts-expect-error Generated struct fields are readonly.
-meter.billable = false;
+feature.enabledByDefault = false;
 // @ts-expect-error Exported struct constants are deeply readonly.
-IDENTITY.protocolVersion = 5;
+IDENTITY.formatVersion = 5;
+// @ts-expect-error Exported fixed byte arrays are readonly tuples.
+FORMAT_MAGIC[0] = 0;
 // @ts-expect-error Exported list constants are readonly tuples.
-METER_DEFINITIONS.push(meter);
+FEATURES.push(feature);
 // @ts-expect-error Objects nested in exported constants are readonly.
-METER_DEFINITIONS[0].meter = "other";
+FEATURES[0].key = "other";
 // @ts-expect-error Exported string slices are readonly.
-REQUIRED_HEADERS[0] = "other";
+REQUIRED_SECTIONS[0] = "other";
 // @ts-expect-error Tuples nested in exported constants are readonly.
-METER_TABLE[0][0] = "other";
+FEATURE_TABLE[0][0] = "other";

@@ -159,6 +159,44 @@ fn nested_rust_values_round_trip_without_json_loss() {
 }
 
 #[test]
+fn json_codec_rejects_nested_unsafe_and_nonfinite_numbers() {
+    let unsafe_json = serde_json::json!({"items": [{"count": 9_007_199_254_740_992_u64}]});
+    let error = encode(&unsafe_json, &TypeRef::Json, &[]).unwrap_err();
+    assert!(
+        error.to_string().contains("$.items[0].count"),
+        "unexpected error: {error}"
+    );
+
+    let unsafe_wire = WireValue::Object(BTreeMap::from([(
+        "items".to_owned(),
+        WireValue::Sequence(vec![WireValue::Object(BTreeMap::from([(
+            "count".to_owned(),
+            WireValue::F64(f64::INFINITY),
+        )]))]),
+    )]));
+    let error = decode::<serde_json::Value>(unsafe_wire, &TypeRef::Json, &[]).unwrap_err();
+    assert!(
+        error.to_string().contains("finite"),
+        "unexpected error: {error}"
+    );
+
+    let safe_json = serde_json::json!({
+        "minimum": -9_007_199_254_740_991_i64,
+        "maximum": 9_007_199_254_740_991_u64,
+        "fraction": 1.25,
+    });
+    assert_eq!(
+        decode::<serde_json::Value>(
+            encode(&safe_json, &TypeRef::Json, &[]).unwrap(),
+            &TypeRef::Json,
+            &[],
+        )
+        .unwrap(),
+        safe_json,
+    );
+}
+
+#[test]
 fn every_rust_numeric_vector_uses_the_declared_buffer_dtype() {
     macro_rules! check {
         ($values:expr, $element:ident, $variant:ident, $type:ty) => {{
@@ -187,24 +225,24 @@ fn every_rust_numeric_vector_uses_the_declared_buffer_dtype() {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "camelCase")]
-enum Event {
-    Started { sequence: u64 },
-    Stopped,
+enum Selection {
+    Included { sequence: u64 },
+    Excluded,
 }
 
 #[test]
 fn internally_tagged_enums_round_trip_through_their_real_serde_shape() {
     let types = vec![TypeDef {
         owner: owner(),
-        id: "Event".to_owned(),
-        name: "Event".to_owned(),
+        id: "Selection".to_owned(),
+        name: "Selection".to_owned(),
         docs: None,
         shape: TypeShape::TaggedEnum {
             tag: "kind".to_owned(),
             variants: vec![
                 EnumVariantDef {
-                    rust_name: "Started".to_owned(),
-                    wire_name: "started".to_owned(),
+                    rust_name: "Included".to_owned(),
+                    wire_name: "included".to_owned(),
                     docs: None,
                     fields: vec![field(
                         "sequence",
@@ -215,25 +253,25 @@ fn internally_tagged_enums_round_trip_through_their_real_serde_shape() {
                     )],
                 },
                 EnumVariantDef {
-                    rust_name: "Stopped".to_owned(),
-                    wire_name: "stopped".to_owned(),
+                    rust_name: "Excluded".to_owned(),
+                    wire_name: "excluded".to_owned(),
                     docs: None,
                     fields: vec![],
                 },
             ],
         },
     }];
-    let ty = named("Event");
-    let value = Event::Started { sequence: u64::MAX };
+    let ty = named("Selection");
+    let value = Selection::Included { sequence: u64::MAX };
     let wire = encode(&value, &ty, &types).unwrap();
     assert_eq!(
         wire,
         WireValue::Object(BTreeMap::from([
-            ("kind".to_owned(), WireValue::String("started".to_owned()),),
+            ("kind".to_owned(), WireValue::String("included".to_owned()),),
             ("sequence".to_owned(), WireValue::U64(u64::MAX)),
         ])),
     );
-    assert_eq!(decode::<Event>(wire, &ty, &types).unwrap(), value);
+    assert_eq!(decode::<Selection>(wire, &ty, &types).unwrap(), value);
 }
 
 #[test]
@@ -270,6 +308,23 @@ fn integer_rust_values_widen_to_float_contracts() {
         decode::<f64>(WireValue::I64(7), &TypeRef::Float { bits: 64 }, &[],).unwrap(),
         7.0,
     );
+}
+
+#[test]
+fn fixed_byte_arrays_round_trip_and_enforce_the_rust_length() {
+    let value = [1_u8, 2, 3, 4];
+    let ty = TypeRef::FixedBytes { length: 4 };
+    let wire = encode(&value, &ty, &[]).unwrap();
+    assert_eq!(wire, WireValue::Bytes(value.to_vec()));
+    assert_eq!(decode::<[u8; 4]>(wire, &ty, &[]).unwrap(), value);
+
+    let error = encode(&[1_u8, 2, 3], &ty, &[]).unwrap_err();
+    assert!(error.to_string().contains("expected 4-byte array"));
+    assert!(error.to_string().contains("received 3 bytes"));
+
+    let error = decode::<Vec<u8>>(WireValue::Bytes(vec![1, 2, 3, 4, 5]), &ty, &[]).unwrap_err();
+    assert!(error.to_string().contains("expected 4-byte array"));
+    assert!(error.to_string().contains("received 5 bytes"));
 }
 
 #[test]

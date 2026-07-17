@@ -3,15 +3,16 @@
 Procedural macro implementation for
 [`rspyts`](https://crates.io/crates/rspyts).
 
-Do not depend on this crate directly. Add `rspyts` instead; it exposes the
-public `Type`, `Error`, `export`, and `module!` macros:
+Do not depend on this crate directly. Depend on the exact matching `rspyts`
+release, which exposes `Type`, `Error`, `export`, and `module!`:
 
 ```toml
 [dependencies]
-rspyts = { version = "0.4.1", default-features = false }
+rspyts = { version = "=0.4.2", default-features = false }
 ```
 
-See the [project README](https://github.com/2xf-org/rspyts#readme)
-and [macro reference](https://github.com/2xf-org/rspyts/blob/main/docs/reference.md).
+Each contract crate declares exactly one `rspyts::module!`. See the
+[project README](https://github.com/2xf-org/rspyts/blob/main/README.md) and
+[macro reference](https://github.com/2xf-org/rspyts/blob/main/docs/reference.md).
 
 Licensed under MIT.

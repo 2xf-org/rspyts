@@ -114,7 +114,7 @@ fn encode_at(
             Ok(array.into())
         }
         TypeRef::Named { identity } => encode_named(value, identity, types, path),
-        TypeRef::Bytes => match value {
+        TypeRef::Bytes | TypeRef::FixedBytes { .. } => match value {
             WireValue::Bytes(value) => Ok(js_sys::Uint8Array::from(value.as_slice()).into()),
             _ => Err(type_error(&path, "bytes", wire_kind(value))),
         },
@@ -225,7 +225,7 @@ fn decode_at(
                 .map(WireValue::Sequence)
         }
         TypeRef::Named { identity } => decode_named(value, identity, types, path),
-        TypeRef::Bytes => decode_bytes(value).map(WireValue::Bytes),
+        TypeRef::Bytes | TypeRef::FixedBytes { .. } => decode_bytes(value).map(WireValue::Bytes),
         TypeRef::Buffer { element } => decode_buffer(value, element_dtype(*element))
             .map(WireValue::Buffer)
             .map_err(|error| at_path(error, &path)),

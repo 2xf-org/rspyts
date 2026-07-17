@@ -8,9 +8,13 @@ mod validate;
 
 use std::collections::BTreeMap;
 use std::fs;
+use std::fs::OpenOptions;
+use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::{Context, Result, bail};
+use atomicwrites::replace_atomic;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -20,7 +24,8 @@ use crate::config::Project;
 use crate::diff::ContractDiff;
 use crate::load::load_contract;
 
-const LOCK_VERSION: u32 = 2;
+const LOCK_VERSION: u32 = 3;
+static ATOMIC_FILE_ID: AtomicU64 = AtomicU64::new(0);
 
 fn atomic_sibling(path: &Path, suffix: &str) -> Result<PathBuf> {
     let parent = path
@@ -70,9 +75,6 @@ struct ProjectArgs {
 struct BuildArgs {
     #[command(flatten)]
     project: ProjectArgs,
-    /// Override the .rspyts staging directory (for package build frontends).
-    #[arg(long)]
-    staging: Option<PathBuf>,
     /// Build only one configured host package.
     #[arg(long, value_enum, default_value_t = BuildTarget::All)]
     target: BuildTarget,
@@ -133,9 +135,10 @@ pub(crate) struct ContractLock {
 pub(crate) struct LockedDependency {
     #[serde(rename = "crate")]
     pub owner: rspyts::ir::CargoPackageId,
+    pub crate_version: String,
     pub fingerprint: String,
     pub python: Option<String>,
-    pub typescript: Option<String>,
+    pub typescript: Option<LockedTypeScriptHost>,
     pub types: Vec<rspyts::ir::TypeDef>,
     pub errors: Vec<rspyts::ir::ErrorDef>,
 }
@@ -165,7 +168,6 @@ fn run_from(cli: Cli) -> Result<()> {
             let report = build::build(
                 &project,
                 BuildOptions {
-                    staging: args.staging,
                     target: args.target,
                 },
             )?;
@@ -173,25 +175,26 @@ fn run_from(cli: Cli) -> Result<()> {
         }
         Command::Check(args) => {
             let project = Project::read(&args.project.config)?;
-            let report = build::build(
+            let prepared = build::prepare(
                 &project,
                 BuildOptions {
-                    staging: None,
                     target: args.target,
                 },
             )?;
             if args.locked {
-                check_lock(&project, &report)?;
+                check_lock(&project, prepared.report())?;
             }
+            let report = prepared.commit()?;
             print_json(&report)
         }
         Command::Lock(args) => {
             let project = Project::read(&args.config)?;
+            let _lock = build::lock_project(&project)?;
             let loaded = load_contract(&project)?;
             validate::manifest(&loaded.manifest)?;
             let resolved = resolve::contract(&project, loaded.manifest)?;
             let lock = create_lock(resolved)?;
-            write_atomic_file(&project.lock_path(), &pretty_json_line(&lock)?)?;
+            write_atomic_file(&project.lock_path(), &compact_json_line(&lock)?)?;
             print_json(&lock)
         }
         Command::Inspect(args) => {
@@ -216,11 +219,7 @@ fn run_from(cli: Cli) -> Result<()> {
         }
         Command::Clean(args) => {
             let project = Project::read(&args.config)?;
-            let output = project.output_dir();
-            if output.exists() {
-                fs::remove_dir_all(&output)
-                    .with_context(|| format!("failed to remove {}", output.display()))?;
-            }
+            let output = build::clean(&project)?;
             print_json(&CleanReport {
                 schema_version: 1,
                 removed: output,
@@ -276,12 +275,35 @@ fn check_lock(project: &Project, report: &BuildReport) -> Result<()> {
             lock.fingerprint
         );
     }
+    if lock.manifest.crate_version != report.manifest.crate_version {
+        bail!(
+            "compiled contract crate version `{}` does not match locked version `{}`",
+            report.manifest.crate_version,
+            lock.manifest.crate_version
+        );
+    }
+    let semantic_locked = semantic_manifest(&lock.manifest);
     let semantic_current = semantic_manifest(&report.manifest);
-    if semantic_manifest(&lock.manifest) == semantic_current
-        && lock.dependencies == report.dependencies
-        && lock.hosts == report.hosts
-        && lock.fingerprint == report.fingerprint
-    {
+    if semantic_locked == semantic_current {
+        let metadata_changes = lock_metadata_changes(&lock, report);
+        if !metadata_changes.is_empty() {
+            bail!(
+                "compiled contract lock metadata does not match {}\n{}",
+                path.display(),
+                metadata_changes
+                    .iter()
+                    .map(|change| format!("  - {change}"))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            );
+        }
+        if lock.fingerprint != report.fingerprint {
+            bail!(
+                "compiled contract fingerprint {} does not match locked fingerprint {}",
+                report.fingerprint,
+                lock.fingerprint
+            );
+        }
         return Ok(());
     }
 
@@ -291,6 +313,74 @@ fn check_lock(project: &Project, report: &BuildReport) -> Result<()> {
         path.display(),
         diff
     )
+}
+
+fn lock_metadata_changes(lock: &ContractLock, report: &BuildReport) -> Vec<String> {
+    let mut changes = Vec::new();
+    if lock.hosts.python != report.hosts.python {
+        changes.push(format!(
+            "root Python host changed from {:?} to {:?}",
+            lock.hosts.python, report.hosts.python
+        ));
+    }
+    if lock.hosts.typescript != report.hosts.typescript {
+        changes.push(format!(
+            "root TypeScript host changed from {:?} to {:?}",
+            lock.hosts.typescript, report.hosts.typescript
+        ));
+    }
+
+    let aliases = lock
+        .dependencies
+        .keys()
+        .chain(report.dependencies.keys())
+        .collect::<std::collections::BTreeSet<_>>();
+    for alias in aliases {
+        match (lock.dependencies.get(alias), report.dependencies.get(alias)) {
+            (None, Some(_)) => changes.push(format!("added dependency `{alias}`")),
+            (Some(_), None) => changes.push(format!("removed dependency `{alias}`")),
+            (Some(locked), Some(current)) => {
+                if locked.owner != current.owner {
+                    changes.push(format!(
+                        "dependency `{alias}` Cargo owner changed from `{}` to `{}`",
+                        locked.owner, current.owner
+                    ));
+                }
+                if locked.crate_version != current.crate_version {
+                    changes.push(format!(
+                        "dependency `{alias}` crate version changed from `{}` to `{}`",
+                        locked.crate_version, current.crate_version
+                    ));
+                }
+                if locked.fingerprint != current.fingerprint {
+                    changes.push(format!(
+                        "dependency `{alias}` fingerprint changed from `{}` to `{}`",
+                        locked.fingerprint, current.fingerprint
+                    ));
+                }
+                if locked.python != current.python {
+                    changes.push(format!(
+                        "dependency `{alias}` Python host changed from {:?} to {:?}",
+                        locked.python, current.python
+                    ));
+                }
+                if locked.typescript != current.typescript {
+                    changes.push(format!(
+                        "dependency `{alias}` TypeScript host changed from {:?} to {:?}",
+                        locked.typescript, current.typescript
+                    ));
+                }
+                if locked.types != current.types {
+                    changes.push(format!("dependency `{alias}` type snapshot changed"));
+                }
+                if locked.errors != current.errors {
+                    changes.push(format!("dependency `{alias}` error snapshot changed"));
+                }
+            }
+            (None, None) => unreachable!(),
+        }
+    }
+    changes
 }
 
 #[derive(Serialize)]
@@ -357,23 +447,46 @@ fn semantic_manifest(manifest: &rspyts::ir::Manifest) -> rspyts::ir::Manifest {
         .errors
         .sort_by(|left, right| (&left.owner, &left.id).cmp(&(&right.owner, &right.id)));
     semantic.functions.sort_by(|left, right| {
-        (&left.owner, &left.host_name, &left.rust_name).cmp(&(
-            &right.owner,
-            &right.host_name,
-            &right.rust_name,
-        ))
+        (
+            &left.owner,
+            &left.host_name,
+            &left.rust_name,
+            semantic_target_rank(left.target),
+        )
+            .cmp(&(
+                &right.owner,
+                &right.host_name,
+                &right.rust_name,
+                semantic_target_rank(right.target),
+            ))
     });
     semantic
         .resources
         .sort_by(|left, right| (&left.owner, &left.id).cmp(&(&right.owner, &right.id)));
     semantic.constants.sort_by(|left, right| {
-        (&left.owner, &left.host_name, &left.rust_name).cmp(&(
-            &right.owner,
-            &right.host_name,
-            &right.rust_name,
-        ))
+        (
+            &left.owner,
+            &left.host_name,
+            &left.rust_name,
+            semantic_target_rank(left.target),
+        )
+            .cmp(&(
+                &right.owner,
+                &right.host_name,
+                &right.rust_name,
+                semantic_target_rank(right.target),
+            ))
     });
     semantic
+}
+
+const fn semantic_target_rank(target: rspyts::ir::Target) -> u8 {
+    match target {
+        rspyts::ir::Target::Both => 0,
+        rspyts::ir::Target::Python => 1,
+        rspyts::ir::Target::Typescript => 2,
+        rspyts::ir::Target::Static => 3,
+    }
 }
 
 pub(crate) fn semantic_type_def(item: &rspyts::ir::TypeDef) -> rspyts::ir::TypeDef {
@@ -428,8 +541,8 @@ fn clear_field_docs(fields: &mut [rspyts::ir::FieldDef]) {
     }
 }
 
-fn pretty_json_line<T: Serialize>(value: &T) -> Result<Vec<u8>> {
-    let mut bytes = serde_json::to_vec_pretty(value)?;
+fn compact_json_line<T: Serialize>(value: &T) -> Result<Vec<u8>> {
+    let mut bytes = serde_json::to_vec(value)?;
     bytes.push(b'\n');
     Ok(bytes)
 }
@@ -444,29 +557,60 @@ fn write_atomic_file(path: &Path, bytes: &[u8]) -> Result<()> {
         .parent()
         .with_context(|| format!("{} has no parent directory", path.display()))?;
     fs::create_dir_all(parent)?;
-    let temporary = atomic_sibling(path, &format!("tmp-{}", std::process::id()))?;
-    fs::write(&temporary, bytes)
-        .with_context(|| format!("failed to write {}", temporary.display()))?;
-    let backup = atomic_sibling(path, &format!("old-{}", std::process::id()))?;
-    if backup.exists() {
-        fs::remove_file(&backup)?;
-    }
-    let had_existing = path.exists();
-    if had_existing {
-        fs::rename(path, &backup)
-            .with_context(|| format!("failed to stage replacement of {}", path.display()))?;
-    }
-    if let Err(error) = fs::rename(&temporary, path) {
-        if had_existing {
-            let _ = fs::rename(&backup, path);
-        }
+    validate_atomic_destination(path)?;
+    let (temporary, mut file) = create_atomic_sibling_file(path)?;
+    if let Err(error) = file.write_all(bytes).and_then(|()| file.sync_all()) {
+        drop(file);
         let _ = fs::remove_file(&temporary);
-        return Err(error).with_context(|| format!("failed to replace {}", path.display()));
+        return Err(error)
+            .with_context(|| format!("failed to write atomic output {}", path.display()));
     }
-    if had_existing {
-        fs::remove_file(backup)?;
+    drop(file);
+    if let Err(error) = validate_atomic_destination(path) {
+        let _ = fs::remove_file(&temporary);
+        return Err(error);
+    }
+    if let Err(error) = replace_atomic(&temporary, path) {
+        let _ = fs::remove_file(&temporary);
+        return Err(error)
+            .with_context(|| format!("failed to commit atomic output {}", path.display()));
     }
     Ok(())
+}
+
+fn create_atomic_sibling_file(path: &Path) -> Result<(PathBuf, fs::File)> {
+    for _ in 0..1024 {
+        let id = ATOMIC_FILE_ID.fetch_add(1, Ordering::Relaxed);
+        let candidate = atomic_sibling(path, &format!("tmp-{}-{id}", std::process::id()))?;
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&candidate)
+        {
+            Ok(file) => return Ok((candidate, file)),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("failed to reserve {}", candidate.display()));
+            }
+        }
+    }
+    bail!("failed to reserve a temporary file for {}", path.display())
+}
+
+fn validate_atomic_destination(path: &Path) -> Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            bail!("refusing to replace symlink {}", path.display())
+        }
+        Ok(metadata) if !metadata.is_file() => {
+            bail!("refusing to replace non-file {}", path.display())
+        }
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error)
+            .with_context(|| format!("failed to inspect atomic output {}", path.display())),
+    }
 }
 
 #[cfg(test)]
@@ -492,8 +636,31 @@ mod tests {
         fingerprint(manifest, &no_hosts(), &empty_dependencies()).unwrap()
     }
 
+    fn test_lock(crate_version: &str) -> ContractLock {
+        let manifest = Manifest {
+            ir_version: rspyts::ir::IR_VERSION,
+            crate_name: "sample".into(),
+            crate_version: crate_version.into(),
+            module_name: "sample".into(),
+            imports: vec![],
+            types: vec![],
+            errors: vec![],
+            functions: vec![],
+            resources: vec![],
+            constants: vec![],
+        };
+        create_lock(resolve::ResolvedContract {
+            manifest,
+            dependencies: BTreeMap::new(),
+            hosts: no_hosts(),
+            foreign_types: BTreeMap::new(),
+            foreign_errors: BTreeMap::new(),
+        })
+        .unwrap()
+    }
+
     #[test]
-    fn hidden_lock_uses_single_dot_siblings_and_is_replaced_atomically() {
+    fn lock_replacement_preserves_existing_temporary_siblings() {
         let root = std::env::temp_dir().join(format!(
             "rspyts-lock-atomic-{}-{}",
             std::process::id(),
@@ -505,35 +672,128 @@ mod tests {
         fs::create_dir_all(&root).unwrap();
         let lock = root.join(".rspyts.lock");
         fs::write(&lock, "old").unwrap();
-        let temporary = atomic_sibling(&lock, &format!("tmp-{}", std::process::id())).unwrap();
-        let backup = atomic_sibling(&lock, &format!("old-{}", std::process::id())).unwrap();
-        assert_eq!(
-            temporary.file_name().unwrap().to_string_lossy(),
-            format!(".rspyts.lock.tmp-{}", std::process::id())
-        );
-        assert_eq!(
-            backup.file_name().unwrap().to_string_lossy(),
-            format!(".rspyts.lock.old-{}", std::process::id())
-        );
-
+        let first_collision = root.join(".rspyts.lock.tmp-123-456");
+        let second_collision = root.join(".rspyts.lock.tmp-123-457");
+        fs::write(&first_collision, "authored temporary collision").unwrap();
+        fs::write(&second_collision, "another temporary collision").unwrap();
         write_atomic_file(&lock, b"new").unwrap();
 
         assert_eq!(fs::read_to_string(&lock).unwrap(), "new");
-        assert!(!temporary.exists());
-        assert!(!backup.exists());
+        assert_eq!(
+            fs::read_to_string(&first_collision).unwrap(),
+            "authored temporary collision"
+        );
+        assert_eq!(
+            fs::read_to_string(&second_collision).unwrap(),
+            "another temporary collision"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn atomic_lock_rejects_a_directory_without_mutating_it() {
+        let root = std::env::temp_dir().join(format!(
+            "rspyts-lock-directory-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let lock = root.join("rspyts.lock");
+        fs::create_dir_all(&lock).unwrap();
+        fs::write(lock.join("authored"), "keep").unwrap();
+
+        let error = write_atomic_file(&lock, b"new").unwrap_err();
+        assert!(error.to_string().contains("non-file"));
+        assert_eq!(fs::read_to_string(lock.join("authored")).unwrap(), "keep");
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_lock_rejects_a_symlink_without_mutating_its_target() {
+        use std::os::unix::fs::symlink;
+
+        let root = std::env::temp_dir().join(format!(
+            "rspyts-lock-symlink-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let target = root.join("authored");
+        let lock = root.join("rspyts.lock");
+        fs::write(&target, "keep").unwrap();
+        symlink(&target, &lock).unwrap();
+
+        let error = write_atomic_file(&lock, b"new").unwrap_err();
+        assert!(error.to_string().contains("symlink"));
+        assert!(
+            fs::symlink_metadata(&lock)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(fs::read_to_string(&target).unwrap(), "keep");
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn concurrent_atomic_lock_writes_remain_complete_regular_files() {
+        use std::sync::{Arc, Barrier};
+
+        let root = std::env::temp_dir().join(format!(
+            "rspyts-lock-concurrent-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let lock = Arc::new(root.join("rspyts.lock"));
+        let barrier = Arc::new(Barrier::new(8));
+        let writers = (0..8)
+            .map(|index| {
+                let lock = Arc::clone(&lock);
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    let value = format!("complete-{index}\n");
+                    barrier.wait();
+                    write_atomic_file(&lock, value.as_bytes()).unwrap();
+                })
+            })
+            .collect::<Vec<_>>();
+        for writer in writers {
+            writer.join().unwrap();
+        }
+
+        let value = fs::read_to_string(lock.as_ref()).unwrap();
+        assert!(
+            (0..8).any(|index| value == format!("complete-{index}\n")),
+            "unexpected partial lock: {value:?}"
+        );
+        assert!(fs::symlink_metadata(lock.as_ref()).unwrap().is_file());
+        assert_eq!(fs::read_dir(&root).unwrap().count(), 1);
+
         fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
     fn visible_atomic_outputs_are_hidden_siblings() {
-        let path = Path::new("rspyts.lock");
+        let path = Path::new("generated");
         assert_eq!(
             atomic_sibling(path, "tmp-123").unwrap(),
-            PathBuf::from(".rspyts.lock.tmp-123")
+            PathBuf::from(".generated.tmp-123")
         );
         assert_eq!(
             atomic_sibling(path, "old-123").unwrap(),
-            PathBuf::from(".rspyts.lock.old-123")
+            PathBuf::from(".generated.old-123")
         );
     }
 
@@ -588,39 +848,111 @@ mod tests {
     }
 
     #[test]
-    fn lock_retains_the_compiled_package_version() {
-        let manifest = Manifest {
-            ir_version: 4,
+    fn fingerprints_ignore_order_for_disjoint_same_name_host_exports() {
+        let owner = rspyts::ir::CargoPackageId::new("sample");
+        let function = |target| rspyts::ir::FunctionDef {
+            owner: owner.clone(),
+            rust_name: "shared".into(),
+            host_name: "shared".into(),
+            docs: None,
+            target,
+            params: vec![],
+            returns: rspyts::ir::TypeRef::Unit,
+            error: None,
+        };
+        let constant = |target| rspyts::ir::ConstantDef {
+            owner: owner.clone(),
+            rust_name: "SHARED".into(),
+            host_name: "SHARED".into(),
+            docs: None,
+            target,
+            ty: rspyts::ir::TypeRef::String,
+            value: serde_json::Value::String("value".into()),
+        };
+        let mut left = Manifest {
+            ir_version: rspyts::ir::IR_VERSION,
             crate_name: "sample".into(),
-            crate_version: "1.2.3".into(),
+            crate_version: "1.0.0".into(),
             module_name: "sample".into(),
             imports: vec![],
             types: vec![],
+            errors: vec![],
+            functions: vec![
+                function(rspyts::ir::Target::Typescript),
+                function(rspyts::ir::Target::Python),
+            ],
+            resources: vec![],
+            constants: vec![
+                constant(rspyts::ir::Target::Typescript),
+                constant(rspyts::ir::Target::Python),
+            ],
+        };
+        let mut right = left.clone();
+        right.functions.reverse();
+        right.constants.reverse();
+
+        assert_eq!(test_fingerprint(&left), test_fingerprint(&right));
+        left.functions.reverse();
+        left.constants.reverse();
+        assert_eq!(test_fingerprint(&left), test_fingerprint(&right));
+    }
+
+    #[test]
+    fn fingerprints_distinguish_dynamic_bytes_and_every_fixed_length() {
+        let manifest = |target| Manifest {
+            ir_version: rspyts::ir::IR_VERSION,
+            crate_name: "sample".into(),
+            crate_version: "1.0.0".into(),
+            module_name: "sample".into(),
+            imports: vec![],
+            types: vec![rspyts::ir::TypeDef {
+                owner: rspyts::ir::CargoPackageId::new("sample"),
+                id: "sample::Digest".into(),
+                name: "Digest".into(),
+                docs: None,
+                shape: rspyts::ir::TypeShape::Alias { target },
+            }],
             errors: vec![],
             functions: vec![],
             resources: vec![],
             constants: vec![],
         };
-        let lock = create_lock(resolve::ResolvedContract {
-            manifest,
-            dependencies: BTreeMap::new(),
-            hosts: no_hosts(),
-            foreign_types: BTreeMap::new(),
-            foreign_errors: BTreeMap::new(),
-        })
-        .unwrap();
+        let dynamic = test_fingerprint(&manifest(rspyts::ir::TypeRef::Bytes));
+        let fixed_four = test_fingerprint(&manifest(rspyts::ir::TypeRef::FixedBytes { length: 4 }));
+        let fixed_eight =
+            test_fingerprint(&manifest(rspyts::ir::TypeRef::FixedBytes { length: 8 }));
+
+        assert_ne!(dynamic, fixed_four);
+        assert_ne!(fixed_four, fixed_eight);
+        assert_ne!(dynamic, fixed_eight);
+    }
+
+    #[test]
+    fn lock_retains_the_compiled_package_version() {
+        let lock = test_lock("1.2.3");
 
         assert_eq!(lock.manifest.crate_version, "1.2.3");
         let encoded = serde_json::to_value(&lock).unwrap();
         assert_eq!(encoded["manifest"]["crateVersion"], "1.2.3");
+    }
 
-        let first = pretty_json_line(&lock).unwrap();
-        let second = pretty_json_line(&lock).unwrap();
+    #[test]
+    fn lock_serialization_is_compact_deterministic_and_roundtrips() {
+        let lock = test_lock("1.2.3");
+        let first = compact_json_line(&lock).unwrap();
+        let second = compact_json_line(&lock).unwrap();
         assert_eq!(first, second);
         assert!(first.ends_with(b"\n"));
-        assert!(String::from_utf8_lossy(&first).contains("\n  \"schemaVersion\""));
+        assert_eq!(first.iter().filter(|byte| **byte == b'\n').count(), 1);
+        assert_eq!(
+            &first[..first.len() - 1],
+            serde_json::to_vec(&lock).unwrap()
+        );
         let decoded: ContractLock = serde_json::from_slice(&first).unwrap();
-        assert_eq!(serde_json::to_value(decoded).unwrap(), encoded);
+        assert_eq!(
+            serde_json::to_value(decoded).unwrap(),
+            serde_json::to_value(lock).unwrap()
+        );
     }
 
     #[test]
@@ -650,7 +982,51 @@ mod tests {
     }
 
     #[test]
-    fn locked_check_accepts_documentation_and_package_version_changes() {
+    fn dependency_package_version_changes_the_root_fingerprint() {
+        let manifest = Manifest {
+            ir_version: 4,
+            crate_name: "sample".into(),
+            crate_version: "1.0.0".into(),
+            module_name: "sample".into(),
+            imports: vec![],
+            types: vec![],
+            errors: vec![],
+            functions: vec![],
+            resources: vec![],
+            constants: vec![],
+        };
+        let mut dependency = LockedDependency {
+            owner: rspyts::ir::CargoPackageId::new("dependency"),
+            crate_version: "1.0.0".into(),
+            fingerprint: "sha256:dependency".into(),
+            python: Some("example.dependency".into()),
+            typescript: Some(LockedTypeScriptHost {
+                package: "@example/dependency".into(),
+                mode: crate::config::TypeScriptMode::Static,
+            }),
+            types: vec![],
+            errors: vec![],
+        };
+        let before = fingerprint(
+            &manifest,
+            &no_hosts(),
+            &BTreeMap::from([("dependency".into(), dependency.clone())]),
+        )
+        .unwrap();
+
+        dependency.crate_version = "1.0.1".into();
+        let after = fingerprint(
+            &manifest,
+            &no_hosts(),
+            &BTreeMap::from([("dependency".into(), dependency)]),
+        )
+        .unwrap();
+
+        assert_ne!(before, after);
+    }
+
+    #[test]
+    fn locked_check_accepts_documentation_but_rejects_package_version_changes() {
         let root = std::env::temp_dir().join(format!(
             "rspyts-lock-semantic-{}-{}",
             std::process::id(),
@@ -673,7 +1049,7 @@ mod tests {
         .unwrap();
         let project = Project::read(&root.join("rspyts.toml")).unwrap();
         let mut manifest = Manifest {
-            ir_version: 4,
+            ir_version: rspyts::ir::IR_VERSION,
             crate_name: "fixture".into(),
             crate_version: "1.0.0".into(),
             module_name: "fixture".into(),
@@ -707,7 +1083,7 @@ mod tests {
         };
         fs::write(
             project.lock_path(),
-            pretty_json_line(&lock).expect("serialize lock"),
+            compact_json_line(&lock).expect("serialize lock"),
         )
         .unwrap();
 
@@ -718,19 +1094,77 @@ mod tests {
             status: "ok",
             fingerprint: fingerprint(&manifest, &hosts, &dependencies).unwrap(),
             contract: root.join(".rspyts/contract.json"),
-            staging: root.join(".rspyts"),
+            output: root.join(".rspyts"),
             python: None,
             typescript: None,
             manifest,
             dependencies,
             hosts,
         };
+        assert_eq!(lock.fingerprint, report.fingerprint);
+        let error = check_lock(&project, &report).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("crate version `2.0.0` does not match locked version `1.0.0`")
+        );
+
+        let mut report = report;
+        report.manifest.crate_version = lock.manifest.crate_version.clone();
         check_lock(&project, &report).unwrap();
+
+        let locked_dependency = LockedDependency {
+            owner: rspyts::ir::CargoPackageId::new("dependency"),
+            crate_version: "1.0.0".into(),
+            fingerprint: "sha256:dependency".into(),
+            python: Some("example.dependency".into()),
+            typescript: Some(LockedTypeScriptHost {
+                package: "@example/dependency".into(),
+                mode: crate::config::TypeScriptMode::Static,
+            }),
+            types: vec![],
+            errors: vec![],
+        };
+        lock.dependencies
+            .insert("dependency".into(), locked_dependency.clone());
+        lock.fingerprint = fingerprint(&lock.manifest, &lock.hosts, &lock.dependencies).unwrap();
+        fs::write(
+            project.lock_path(),
+            compact_json_line(&lock).expect("serialize lock with dependency"),
+        )
+        .unwrap();
+
+        let mut current_dependency = locked_dependency;
+        current_dependency.crate_version = "2.0.0".into();
+        report
+            .dependencies
+            .insert("dependency".into(), current_dependency.clone());
+        report.fingerprint =
+            fingerprint(&report.manifest, &report.hosts, &report.dependencies).unwrap();
+        let error = check_lock(&project, &report).unwrap_err().to_string();
+        assert!(error.contains("dependency `dependency` crate version changed"));
+        assert!(!error.contains("no semantic changes"));
+
+        current_dependency.crate_version = "1.0.0".into();
+        current_dependency.python = Some("example.renamed".into());
+        current_dependency.typescript = Some(LockedTypeScriptHost {
+            package: "@example/renamed".into(),
+            mode: crate::config::TypeScriptMode::Wasm,
+        });
+        report
+            .dependencies
+            .insert("dependency".into(), current_dependency);
+        report.fingerprint =
+            fingerprint(&report.manifest, &report.hosts, &report.dependencies).unwrap();
+        let error = check_lock(&project, &report).unwrap_err().to_string();
+        assert!(error.contains("dependency `dependency` Python host changed"));
+        assert!(error.contains("dependency `dependency` TypeScript host changed"));
+        assert!(!error.contains("no semantic changes"));
 
         lock.fingerprint = "sha256:tampered".into();
         fs::write(
             project.lock_path(),
-            pretty_json_line(&lock).expect("serialize tampered lock"),
+            compact_json_line(&lock).expect("serialize tampered lock"),
         )
         .unwrap();
         assert!(

@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
-use rspyts::ir::Manifest;
+use rspyts::ir::{Manifest, Target};
 use serde_json::Value;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -87,12 +87,18 @@ impl ContractDiff {
         compare_items(
             &mut changes,
             "function",
-            old.functions
-                .iter()
-                .map(|item| (format!("{}::{}", item.owner, item.host_name), item)),
-            new.functions
-                .iter()
-                .map(|item| (format!("{}::{}", item.owner, item.host_name), item)),
+            old.functions.iter().map(|item| {
+                (
+                    host_identity(&item.owner, &item.host_name, item.target),
+                    item,
+                )
+            }),
+            new.functions.iter().map(|item| {
+                (
+                    host_identity(&item.owner, &item.host_name, item.target),
+                    item,
+                )
+            }),
         );
         compare_items(
             &mut changes,
@@ -107,12 +113,18 @@ impl ContractDiff {
         compare_items(
             &mut changes,
             "constant",
-            old.constants
-                .iter()
-                .map(|item| (format!("{}::{}", item.owner, item.host_name), item)),
-            new.constants
-                .iter()
-                .map(|item| (format!("{}::{}", item.owner, item.host_name), item)),
+            old.constants.iter().map(|item| {
+                (
+                    host_identity(&item.owner, &item.host_name, item.target),
+                    item,
+                )
+            }),
+            new.constants.iter().map(|item| {
+                (
+                    host_identity(&item.owner, &item.host_name, item.target),
+                    item,
+                )
+            }),
         );
         changes.sort_by(|left, right| {
             left.compatibility
@@ -120,6 +132,19 @@ impl ContractDiff {
                 .then(left.description.cmp(&right.description))
         });
         Self { changes }
+    }
+}
+
+fn host_identity(owner: &rspyts::ir::CargoPackageId, host_name: &str, target: Target) -> String {
+    format!("{owner}::{host_name}::{}", target_name(target))
+}
+
+const fn target_name(target: Target) -> &'static str {
+    match target {
+        Target::Both => "both",
+        Target::Python => "python",
+        Target::Typescript => "typescript",
+        Target::Static => "static",
     }
 }
 
@@ -471,6 +496,88 @@ mod tests {
         assert_eq!(
             ContractDiff::between(&old, &manifest_with_field(datetime)).changes[0].compatibility,
             Compatibility::Breaking
+        );
+    }
+
+    #[test]
+    fn changing_a_fixed_byte_length_is_breaking() {
+        let mut four_bytes = string_field();
+        four_bytes.ty = TypeRef::FixedBytes { length: 4 };
+        let mut eight_bytes = four_bytes.clone();
+        eight_bytes.ty = TypeRef::FixedBytes { length: 8 };
+
+        let diff = ContractDiff::between(
+            &manifest_with_field(four_bytes),
+            &manifest_with_field(eight_bytes),
+        );
+
+        assert!(
+            !diff.changes.is_empty()
+                && diff
+                    .changes
+                    .iter()
+                    .all(|change| change.compatibility == Compatibility::Breaking)
+        );
+    }
+
+    #[test]
+    fn disjoint_host_targets_remain_distinct_semantic_diff_items() {
+        let function = |target, returns| FunctionDef {
+            owner: CargoPackageId::new("sample"),
+            rust_name: "shared".into(),
+            host_name: "shared".into(),
+            docs: None,
+            target,
+            params: vec![],
+            returns,
+            error: None,
+        };
+        let constant = |target, value: &str| ConstantDef {
+            owner: CargoPackageId::new("sample"),
+            rust_name: "SHARED".into(),
+            host_name: "SHARED".into(),
+            docs: None,
+            target,
+            ty: TypeRef::String,
+            value: Value::String(value.into()),
+        };
+        let mut old = manifest();
+        old.functions = vec![
+            function(Target::Python, TypeRef::String),
+            function(Target::Typescript, TypeRef::String),
+        ];
+        old.constants = vec![
+            constant(Target::Python, "python"),
+            constant(Target::Typescript, "typescript"),
+        ];
+        let mut new = old.clone();
+        new.functions[0].returns = TypeRef::Bool;
+        new.constants[0].value = Value::String("changed".into());
+
+        let diff = ContractDiff::between(&old, &new);
+        assert_eq!(diff.changes.len(), 2, "unexpected diff: {diff:#?}");
+        assert!(
+            diff.changes.iter().any(|change| {
+                change
+                    .description
+                    .contains("function `sample::shared::python`")
+                    && change.description.contains(".returns")
+            }),
+            "missing Python function change: {diff:#?}"
+        );
+        assert!(
+            diff.changes.iter().any(|change| {
+                change
+                    .description
+                    .contains("constant `sample::SHARED::python`.value")
+            }),
+            "missing Python constant change: {diff:#?}"
+        );
+        assert!(
+            diff.changes
+                .iter()
+                .all(|change| !change.description.contains("::typescript`")),
+            "unchanged TypeScript definitions appeared in the diff: {diff:#?}"
         );
     }
 }

@@ -10,6 +10,7 @@ authors.workspace = true
 description = "Compiler and build orchestrator for rspyts"
 keywords = ["ffi", "python", "typescript", "wasm", "codegen"]
 categories = ["command-line-utilities", "development-tools::ffi"]
+include = ["src/**", "README.md", "LICENSE"]
 
 [[bin]]
 name = "rspyts"
@@ -19,9 +20,12 @@ doc = false
 [dependencies]
 rspyts.workspace = true
 anyhow.workspace = true
+atomicwrites.workspace = true
 clap.workspace = true
+fs4.workspace = true
 libloading.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
+tempfile.workspace = true
 toml.workspace = true

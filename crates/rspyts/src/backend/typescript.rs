@@ -95,7 +95,11 @@ fn encode_json_at(value: &WireValue, path: String) -> Result<JsValue, BackendErr
     Ok(match value {
         WireValue::Null => JsValue::NULL,
         WireValue::Bool(value) => JsValue::from_bool(*value),
-        WireValue::I64(value) if *value >= MIN_SAFE_INTEGER => JsValue::from_f64(*value as f64),
+        WireValue::I64(value)
+            if *value >= MIN_SAFE_INTEGER && *value <= MAX_SAFE_INTEGER as i64 =>
+        {
+            JsValue::from_f64(*value as f64)
+        }
         WireValue::U64(value) if *value <= MAX_SAFE_INTEGER => JsValue::from_f64(*value as f64),
         WireValue::I64(_) | WireValue::U64(_) => {
             return Err(BackendError::IntegerOutOfRange {
@@ -103,7 +107,20 @@ fn encode_json_at(value: &WireValue, path: String) -> Result<JsValue, BackendErr
                 expected: "an exact safe integer",
             });
         }
-        WireValue::F64(value) if value.is_finite() => JsValue::from_f64(*value),
+        WireValue::F64(value)
+            if value.is_finite()
+                && (value.fract() != 0.0
+                    || (*value >= MIN_SAFE_INTEGER as f64
+                        && *value <= MAX_SAFE_INTEGER as f64)) =>
+        {
+            JsValue::from_f64(*value)
+        }
+        WireValue::F64(value) if value.is_finite() => {
+            return Err(BackendError::IntegerOutOfRange {
+                host: "JavaScript JSON",
+                expected: "an exact safe integer",
+            });
+        }
         WireValue::F64(_) => return Err(BackendError::NonFiniteStructuredFloat),
         WireValue::String(value) => JsValue::from_str(value),
         WireValue::Sequence(values) => {
