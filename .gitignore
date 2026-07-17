@@ -2,6 +2,12 @@
 **/target/
 /.rspyts/
 **/.rspyts/
+/.rspyts.tmp-*
+/.rspyts.old-*
+**/.rspyts.tmp-*
+**/.rspyts.old-*
+**/.rspyts.lock.tmp-*
+**/.rspyts.lock.old-*
 **/dist/
 **/.venv/
 **/node_modules/

@@ -10,7 +10,7 @@ generic application-call C ABI, and no installed Python or npm runtime.
 
 ```toml
 [dependencies]
-rspyts = { version = "0.4.0", default-features = false }
+rspyts = { version = "0.4.1", default-features = false }
 serde = { version = "1", features = ["derive"] }
 wasm-bindgen = { version = "0.2.126", optional = true }
 
@@ -42,7 +42,9 @@ pub fn greet(name: String) -> Greeting {
 rspyts::module!(native);
 ```
 
-Generated staging output belongs below `.rspyts/` and is ignored. Commit the
+Generated staging output belongs below `.rspyts/`; ignore it together with
+`.rspyts.tmp-*`, `.rspyts.old-*`, `.rspyts.lock.tmp-*`, and
+`.rspyts.lock.old-*`. Commit the
 deterministic, pretty-printed semantic `rspyts.lock` produced by `rspyts-cli`
 instead.
 
