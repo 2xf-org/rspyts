@@ -1,0 +1,15 @@
+{
+  "name": "@rspyts/static-acceptance-tests",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "generate": "cargo run --manifest-path ../../../crates/rspyts-cli/Cargo.toml -- build --config ../rspyts.toml",
+    "check:contract": "cargo run --manifest-path ../../../crates/rspyts-cli/Cargo.toml -- check --config ../rspyts.toml --locked",
+    "test": "npm run generate && npm run check:contract && tsc --noEmit && vitest run"
+  },
+  "devDependencies": {
+    "typescript": "^6.0.3",
+    "vitest": "^4.1.10"
+  }
+}

@@ -1,22 +1,13 @@
-# Documentation
+# rspyts documentation
 
-rspyts lets a Rust crate expose one typed API to Python and TypeScript.
+- [Quickstart](quickstart.md) — define a contract and build it.
+- [Reference](reference.md) — configuration, commands, annotations, and types.
+- [Packaging](packaging.md) — include generated output without a host runtime.
+- [Limitations](limitations.md) — the deliberately closed 0.4 surface.
+- [Troubleshooting](troubleshooting.md) — common build and lock failures.
+- [Architecture](design/v0.4.md) — ownership and implementation invariants.
+- [Delivery gates](design/v0.4-delivery.md) — acceptance criteria for 0.4.
+- [Releasing](releasing.md) — maintainer release procedure.
 
-Start here:
-
-- [Quickstart](introduction/quickstart.md) — build a small bridge and call it.
-- [How rspyts works](introduction/how-rspyts-works.md) — the idea in five minutes.
-- [Python](python.md) — generated models, native loading, buffers, errors, and handles.
-- [TypeScript](typescript.md) — generated clients, WebAssembly, buffers, errors, and disposal.
-
-The contract is written down here:
-
-- [Type system](design/type-system.md) — what may cross the boundary.
-- [ABI](design/abi.md) — symbols, memory, envelopes, attachments, and handles.
-- [Code generation](design/codegen.md) — configuration, generated files, and drift checks.
-- [Decisions](design/decisions.md) — why the project has these limits.
-
-For contributors:
-
-- [Architecture](architecture.md) — where each piece lives.
-- [Releasing](releasing.md) — the complete release gate and registry order.
+The 0.3 documentation remains available from the `v0.3.2` Git tag. Version
+0.4 intentionally provides no compatibility path for 0.3 projects.

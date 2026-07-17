@@ -1,0 +1,11 @@
+[crate]
+path = "rust"
+features = ["bindings"]
+
+[python]
+package = "rspyts_acceptance"
+mode = "source"
+
+[typescript]
+package = "@rspyts/acceptance"
+mode = "wasm"

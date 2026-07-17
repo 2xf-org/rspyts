@@ -1,180 +1,102 @@
 # Releasing
 
-rspyts releases are tag-driven. A stable tag publishes four Rust crates, the
-Python runtime, and the npm runtime at one shared version.
+rspyts 0.4 publishes three Cargo crates and one GitHub release. It publishes no
+PyPI or npm rspyts package.
 
-## One-time registry setup
+## Prerequisites
 
-Configure trusted publishing for `.github/workflows/deploy.yml`:
+- Release from a clean `main` commit already pushed to `origin/main`.
+- Keep the trusted-publishing workflow at `.github/workflows/deploy.yml` unless
+  the crates.io publisher configuration is deliberately updated.
+- Use the GitHub `crates-io` environment with OIDC (`id-token: write`).
+- Never use a long-lived registry token for the normal release.
+- The reusable [validation workflow](../.github/workflows/validation.yml) must
+  be green.
+- All [delivery gates](design/v0.4-delivery.md) must pass against exact local
+  candidates, including downstream consumer acceptance.
 
-- crates.io: the `crates-io` environment for `rspyts-core`, `rspyts-macros`,
-  `rspyts`, and `rspyts-cli`;
-- PyPI: the `pypi` environment for `rspyts`;
-- npm: the `npm` environment for `rspyts`.
+Trusted publishing is a one-time crates.io setting for each of
+`rspyts-macros`, `rspyts`, and `rspyts-cli`. In each crate's settings, configure
+the GitHub publisher as:
 
-The workflow uses short-lived OIDC credentials. Do not add registry tokens to
-repository secrets.
+| Field | Value |
+| --- | --- |
+| Organization | `2xf-org` |
+| Repository | `rspyts` |
+| Workflow | `deploy.yml` |
+| Environment | `crates-io` |
 
-## Prepare a version
+The workflow and crates.io setting must match exactly. The action exchanges a
+GitHub OIDC identity for a short-lived token and revokes it after the job; no
+GitHub secret, personal crates.io API key, or `cargo login` is part of the
+normal release. See the official
+[crates.io trusted-publishing guide](https://crates.io/docs/trusted-publishing).
 
-Update these sources together:
+## Candidate checks
 
-- `[workspace.package].version` and internal dependency versions in the root
-  `Cargo.toml`;
-- `runtimes/python/pyproject.toml` and
-  `runtimes/python/src/rspyts/__init__.py`;
-- `runtimes/typescript/package.json`.
+Before creating a tag:
 
-Refresh the workspace and example lockfiles, then regenerate the examples:
+1. Verify every workspace package reports the intended version.
+2. Run the full validation matrix: format, Clippy, tests, MSRV, operating
+   systems, target features, generated Python wheel, browser/WASM package,
+   static TypeScript package, docs, links, and package archives.
+3. Run `scripts/release/verify-crates.sh VERSION` to package all three crates.
+4. Let that script unpack and test the exact `.crate` archives in dependency
+   order.
+5. Exercise consumer wheel and browser artifacts built with those candidates.
+6. Confirm generated output is untracked and consumer artifacts have no
+   Python/npm rspyts runtime dependency.
+7. Confirm `main`, documentation, and lockfiles contain the same release
+   version.
 
-```sh
-cargo update --workspace
-(cd runtimes/python && uv lock)
-(cd runtimes/typescript && npm install --package-lock-only)
-
-for directory in \
-  examples/basic/python \
-  examples/multi-crate/shared/python \
-  examples/multi-crate/app/python; do
-  (cd "$directory" && uv lock)
-done
-
-for directory in \
-  examples/basic/typescript \
-  examples/multi-crate/shared/typescript \
-  examples/multi-crate/app/typescript; do
-  (cd "$directory" && npm install --package-lock-only)
-done
-
-cargo run -p rspyts-cli -- generate --config examples/basic/rspyts.toml
-cargo run -p rspyts-cli -- generate --config examples/multi-crate/shared/rspyts.toml
-cargo run -p rspyts-cli -- generate --config examples/multi-crate/app/rspyts.toml
-```
-
-Review generated changes. A version header change is expected; unexplained API
-changes are not.
-
-## Run the release gate
-
-The candidate commit must pass the validation workflow. A useful local subset
-is:
-
-```sh
-cargo fmt --all --check
-cargo clippy --workspace --all-targets -- -D warnings
-cargo test --workspace
-RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
-cargo check --workspace --all-targets --locked
-
-(cd runtimes/python && \
-  uv sync --dev --extra hatch --locked --python 3.11 && \
-  uv run ruff check . && \
-  uv run ty check src && \
-  uv run vulture && \
-  uv run pytest)
-
-(cd runtimes/typescript && \
-  npm ci && \
-  npm run build && \
-  npm run typecheck && \
-  npm run test:cov && \
-  npm run check:surface)
-
-cargo run -p rspyts-cli -- check --config examples/basic/rspyts.toml
-cargo run -p rspyts-cli -- check --config examples/multi-crate/shared/rspyts.toml
-cargo run -p rspyts-cli -- check --config examples/multi-crate/app/rspyts.toml
-```
-
-Build and smoke the exact registry candidates before tagging. `--allow-dirty`
-is for a reviewed local tree; the deploy workflow omits it.
-
-```sh
-version=0.3.2
-scripts/release/verify-rust-archives.sh --allow-dirty "$version"
-
-rm -rf target/release-candidate
-mkdir -p target/release-candidate/python target/release-candidate/npm
-(cd runtimes/python && \
-  uv build \
-    --build-constraints ../../scripts/release/python-build-constraints.txt \
-    --out-dir ../../target/release-candidate/python)
-python3 scripts/release/check-python-sdist.py \
-  target/release-candidate/python/rspyts-"$version".tar.gz \
-  runtimes/python
-scripts/release/smoke-python-distributions.sh \
-  target/release-candidate/python "$version"
-
-(cd runtimes/typescript && \
-  npm ci && npm run build && \
-  npm pack --pack-destination ../../target/release-candidate/npm)
-scripts/release/smoke-npm-tarball.sh \
-  target/release-candidate/npm "$version"
-```
-
-The Rust check unpacks and tests all four exact `.crate` archives together with
-local dependency patches. This is needed before the new internal crate versions
-exist on crates.io. The Python and npm checks install the exact wheel, sdist,
-and tarball in isolated consumers and verify their package versions and public
-and generator-facing import entrypoints. Runtime semantics are covered by the
-normal test suites, not duplicated in release smokes.
+Candidate artifacts can be tested before publication; registry artifacts
+cannot. Do not describe a pre-tag check as a published-artifact smoke test.
 
 ## Tag and publish
 
-After the candidate commit is on `main`, create and push an annotated stable
-tag:
+Create one annotated immutable tag:
 
 ```sh
-git tag -a v0.3.2 -m "rspyts v0.3.2"
-git push origin v0.3.2
+git fetch origin
+git switch main
+git pull --ff-only origin main
+test "$(git rev-parse HEAD)" = "$(git rev-parse origin/main)"
+test -z "$(git status --porcelain)"
+git tag -a v0.4.0 -m "rspyts v0.4.0"
+git push origin refs/tags/v0.4.0
 ```
 
-The source guard rejects prerelease tags and verifies all of the following
-before credentials or package publication are possible:
+The tag-driven [deployment workflow](../.github/workflows/deploy.yml) reruns
+validation, preserves the exact archives and SHA-256 checksums, then publishes
+sequentially:
 
-- the event is the exact tag push and `GITHUB_SHA` is its target commit;
-- the tag is annotated and targets the workflow commit;
-- the tag target is contained in `origin/main`;
-- the complete reusable validation workflow passes at that immutable commit;
-- the tag version matches the Cargo workspace version. Reusable validation
-  separately checks that the Python and npm package versions match Cargo.
+1. `rspyts-macros`;
+2. `rspyts`;
+3. `rspyts-cli`;
+4. clean crates.io smoke: install the exact CLI and compile a fresh consumer
+   using `rspyts` and its derive macros;
+5. GitHub release with the preserved archives and checksums.
 
-The deploy workflow then:
+Do not run `cargo publish` manually. Do not create a PyPI or npm release job.
 
-1. builds and tests the exact Rust package archives;
-2. builds, checks, and installs the exact Python wheel and sdist;
-3. builds, checks, and installs the exact npm tarball;
-4. uploads the Python and npm candidates once as an immutable workflow
-   artifact;
-5. publishes Rust crates in dependency order: core, macros, facade, CLI;
-6. downloads and publishes the preserved Python distributions;
-7. downloads and publishes the preserved npm tarball with provenance;
-8. creates a GitHub release with generated notes.
+## Verify the registries
 
-GitHub's artifact service records and verifies the upload digest, so the
-workflow does not maintain a second checksum file. The workflow preserves the
-tested `.crate` files so a rerun can compare their SHA-256 digests with crates.io.
-Cargo still publishes from the same immutable commit: `cargo publish` performs
-its own package build rather than accepting a prebuilt `.crate` upload, and the
-workflow verifies that the resulting registry checksum matches the tested
-candidate. Equivalent checksum checks protect PyPI and npm recovery as well.
-
-Registry stages are sequential. The Rust stage waits for each dependency to
-become visible before publishing the next. An existing version is accepted only
-when its registry digest matches the tested candidate, so an interrupted
-release is resumed by rerunning the same tag workflow. Never move a release tag
-or reuse a registry version.
-
-## Verify the release
-
-After the workflow completes, inspect installed artifacts rather than the
-working tree:
+The workflow performs a clean crates.io install and compile smoke before it
+creates the GitHub release. After the workflow succeeds, repeat the CLI install
+locally when performing downstream acceptance:
 
 ```sh
-cargo install rspyts-cli --version 0.3.2 --locked
-python -m venv /tmp/rspyts-release
-/tmp/rspyts-release/bin/pip install rspyts==0.3.2
-npm view rspyts@0.3.2 version
+cargo install rspyts-cli --version =0.4.0 --locked --force
 ```
 
-Confirm that each registry page renders its README, the GitHub release points
-to the tagged commit, and published contents contain no repository-only files.
+Create the quickstart contract, run `build`, `lock`, and `check --locked`, then
+rebuild downstream consumers using registry dependencies instead of local
+paths. Compare their semantic fingerprints with the accepted candidates.
+
+## Partial failure
+
+Rerun failed jobs on the same tag. The workflow must treat an already-published
+crate as complete only when its registry checksum matches the candidate.
+
+Never move or reuse a release tag, overwrite a published version, or continue
+after a checksum mismatch. Fix the cause and release the next patch version.

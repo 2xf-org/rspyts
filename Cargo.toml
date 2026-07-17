@@ -1,50 +1,51 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/rspyts-core",
-    "crates/rspyts-macros",
     "crates/rspyts",
+    "crates/rspyts-macros",
     "crates/rspyts-cli",
-    "examples/basic/rust",
-    "examples/multi-crate/shared/rust",
-    "examples/multi-crate/app/rust",
+    "examples/contract/rust",
+    "examples/static/rust",
 ]
 default-members = [
-    "crates/rspyts-core",
-    "crates/rspyts-macros",
     "crates/rspyts",
+    "crates/rspyts-macros",
     "crates/rspyts-cli",
 ]
 
 [workspace.package]
-version = "0.3.2"
+version = "0.4.0"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.88"
 license = "MIT"
 repository = "https://github.com/2xf-org/rspyts"
 homepage = "https://github.com/2xf-org/rspyts"
 authors = ["Felipe Faria", "The rspyts contributors"]
-keywords = ["ffi", "codegen", "python", "typescript", "wasm"]
-categories = ["development-tools::ffi", "wasm"]
 
 [workspace.dependencies]
-rspyts-core = { version = "0.3.2", path = "crates/rspyts-core" }
-rspyts-macros = { version = "0.3.2", path = "crates/rspyts-macros" }
-rspyts = { version = "0.3.2", path = "crates/rspyts" }
+rspyts = { version = "0.4.0", path = "crates/rspyts" }
+rspyts-macros = { version = "0.4.0", path = "crates/rspyts-macros" }
 
-anyhow = "1"
-clap = { version = "4", features = ["derive"] }
+anyhow = "1.0"
+chrono = { version = "0.4", default-features = false, features = ["serde", "std"] }
+clap = { version = "4.5", features = ["derive"] }
 heck = "0.5"
-inventory = "0.3"
-libloading = "0.8"
+inventory = "0.3.24"
+js-sys = "0.3.103"
+libloading = "0.9"
 pathdiff = "0.2"
-proc-macro2 = "1"
-quote = "1"
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-similar = "3"
-syn = { version = "2", features = ["full", "extra-traits"] }
-toml = "1.1"
+proc-macro2 = "1.0"
+pyo3 = { version = "0.29.0", features = ["abi3-py311"] }
+quote = "1.0"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sha2 = "0.10"
+syn = { version = "2.0", features = ["full", "extra-traits"] }
+thiserror = "2.0"
+toml = "1.0"
+wasm-bindgen = "0.2.126"
+wasm-bindgen-test = "0.3.76"
 
 [profile.release]
 lto = true
+codegen-units = 1

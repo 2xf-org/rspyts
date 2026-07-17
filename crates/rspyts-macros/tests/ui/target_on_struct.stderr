@@ -1,5 +1,0 @@
-error: `target` does not apply to structs; it scopes free functions, methods, and statics
- --> tests/ui/target_on_struct.rs:3:19
-  |
-3 | #[bridge(target = "python")]
-  |                   ^^^^^^^^

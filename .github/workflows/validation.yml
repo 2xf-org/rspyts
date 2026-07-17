@@ -1,21 +1,4 @@
-# Continuous integration for the rspyts workspace.
-#
-# Jobs:
-#   rust          - rustfmt + clippy + full test suite + WASM build proof (Linux).
-#   rust-msrv     - locked workspace check on the declared Rust 1.85 floor.
-#   rust-os       - test suite on Windows and macOS.
-#   python        - lint + tests on Python 3.11 through 3.14.
-#   python-os     - main/release Python 3.11 and native-wheel spots on all OSes.
-#   typescript    - build + tests on Node 22 and 24.
-#   package-metadata - floor consistency and all six registry artifacts.
-#   example-e2e   - the examples end to end: codegen drift gates, native
-#                   cdylibs exercised from Python (ctypes), and the WASM
-#                   builds exercised from TypeScript — first the basic
-#                   example, then the multi-crate example (cross-crate
-#                   type identity through [python.imports]/[typescript.imports]).
-#
-# Coverage gates live next to the Python and TypeScript tests: pytest-cov
-# addopts in pyproject.toml and vitest thresholds behind `npm run test:cov`.
+# The complete validation surface for the Cargo-only rspyts workspace.
 
 name: Validation
 
@@ -23,392 +6,337 @@ on:
   workflow_call:
     inputs:
       ref:
-        description: "Git ref to validate; defaults to the triggering event ref"
+        description: Git ref to validate
         required: false
         type: string
         default: ""
+  pull_request:
   push:
     branches: [main]
-  pull_request:
 
-# At most one in-flight run per ref: a new push cancels the previous run.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: validation-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
-# Every job only reads the repo.
 permissions:
   contents: read
 
 env:
   CARGO_TERM_COLOR: always
-  VALIDATION_REF: ${{ inputs.ref || github.ref }}
+  VALIDATION_REF: ${{ inputs.ref || github.sha }}
 
 jobs:
   rust:
-    name: Rust (lint, test, wasm)
+    name: Rust (format, lint, test)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
         with:
           ref: ${{ env.VALIDATION_REF }}
           persist-credentials: false
-
-      # rustfmt/clippy for the lint steps; the wasm32 target is needed to
-      # prove the example crate compiles for the TypeScript (WASM) side.
-      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
         with:
-          components: rustfmt, clippy
-          targets: wasm32-unknown-unknown
-
+          toolchain: 1.88.0
+          components: clippy, rustfmt
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-
-      - name: Format
+      - name: Check formatting
         run: cargo fmt --all --check
+      - name: Lint every target and feature
+        run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+      - name: Test workspace
+        run: cargo test --workspace --locked
 
-      - name: Clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
-
-      - name: Test
-        run: cargo test --workspace
-
-      # Dogfood the target-aware builder and its stable staging layout.
-      - name: Build and stage example artifacts
+  target-features:
+    name: ${{ matrix.name }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Python feature
+            target: x86_64-unknown-linux-gnu
+            feature: python
+          - name: TypeScript/WASM feature
+            target: wasm32-unknown-unknown
+            feature: wasm
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          ref: ${{ env.VALIDATION_REF }}
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
+        with:
+          toolchain: 1.88.0
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          key: ${{ matrix.target }}-${{ matrix.feature }}
+      - name: Check target feature
         run: |
-          cargo run -p rspyts-cli -- build --config examples/basic/rspyts.toml --target wasm32-unknown-unknown --locked
-          test -f target/rspyts/wasm32-unknown-unknown/debug/basic_example.wasm
+          cargo check --locked -p rspyts --no-default-features \
+            --features ${{ matrix.feature }} --target ${{ matrix.target }}
+          cargo check --locked -p rspyts-acceptance --no-default-features \
+            --features ${{ matrix.feature }} --target ${{ matrix.target }}
 
-  rust-msrv:
-    name: Rust 1.85 (locked check)
+  python-acceptance:
+    name: Generated Python wheel
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
         with:
           ref: ${{ env.VALIDATION_REF }}
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@98effd2fc0b766278e30ab86762dd5e9a8531399 # 1.85.0
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: "3.11"
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
+        with:
+          toolchain: 1.88.0
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-      - name: Check locked workspace
-        run: cargo check --workspace --all-targets --locked
+        with:
+          key: python-acceptance
+      - name: Build the generated Python target
+        run: |
+          cargo run --locked -p rspyts-cli -- \
+            build --config examples/contract/rspyts.toml --target python
+          cargo run --locked -p rspyts-cli -- \
+            check --config examples/contract/rspyts.toml --target python --locked
+      - name: Build, install, and test the wheel
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m venv "$RUNNER_TEMP/python-build"
+          builder="$RUNNER_TEMP/python-build/bin/python"
+          "$builder" -m pip install --disable-pip-version-check \
+            'maturin>=1.9,<2'
+          (
+            cd examples/contract/python
+            "$builder" -m maturin build --release --out "$RUNNER_TEMP/wheels"
+          )
+          wheels=("$RUNNER_TEMP"/wheels/*.whl)
+          test "${#wheels[@]}" -eq 1
+          wheel=${wheels[0]}
+          [[ $(basename "$wheel") == *-cp311-abi3-* ]]
+          "$builder" - "$wheel" <<'PY'
+          import email
+          import re
+          import sys
+          import zipfile
 
-  # Documentation must build warning-clean, and every relative markdown
-  # link must resolve — the docs' counterpart to the codegen drift gate.
-  docs:
-    name: Docs (rustdoc + links)
+          with zipfile.ZipFile(sys.argv[1]) as archive:
+              native = [
+                  name
+                  for name in archive.namelist()
+                  if name.endswith((".so", ".pyd", ".dylib"))
+              ]
+              assert len(native) == 1, native
+              metadata_name, = [
+                  name
+                  for name in archive.namelist()
+                  if name.endswith(".dist-info/METADATA")
+              ]
+              metadata = email.message_from_bytes(archive.read(metadata_name))
+              requirements = metadata.get_all("Requires-Dist", [])
+              assert not any(
+                  re.match(r"^\s*rspyts(?:\s|[<=>!~(\[]|$)", requirement, re.I)
+                  for requirement in requirements
+              ), requirements
+          PY
+          python3 -m venv "$RUNNER_TEMP/python-runtime"
+          python="$RUNNER_TEMP/python-runtime/bin/python"
+          "$python" -m pip install --disable-pip-version-check 'pytest>=8'
+          "$python" -m pip install --disable-pip-version-check "$wheel"
+          (
+            cd "$RUNNER_TEMP"
+            "$python" -m pytest \
+              "$GITHUB_WORKSPACE/examples/contract/python/tests"
+          )
+          if "$python" -m pip show rspyts >/dev/null 2>&1; then
+            echo 'generated wheel unexpectedly installed a Python rspyts runtime' >&2
+            exit 1
+          fi
+
+  browser-acceptance:
+    name: Generated browser/WASM package
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
         with:
           ref: ${{ env.VALIDATION_REF }}
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
+        with:
+          toolchain: 1.88.0
+          targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-      - name: rustdoc (deny warnings)
-        run: cargo doc --workspace --no-deps
+        with:
+          key: browser-acceptance
+      - name: Install the matching wasm-bindgen compiler
+        run: cargo install wasm-bindgen-cli --version 0.2.126 --locked
+      - name: Test the type-directed WASM backend
         env:
-          RUSTDOCFLAGS: -D warnings
-      - name: Markdown links
-        uses: lycheeverse/lychee-action@e7477775783ea5526144ba13e8db5eec57747ce8 # v2
-        with:
-          args: --offline --no-progress './**/*.md'
-          fail: true
+          CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER: wasm-bindgen-test-runner
+        run: >-
+          cargo test --locked -p rspyts --test backend_wasm --features wasm
+          --target wasm32-unknown-unknown
+      - name: Build and lock-check the generated TypeScript target
+        run: |
+          cargo run --locked -p rspyts-cli -- \
+            build --config examples/contract/rspyts.toml --target typescript
+          cargo run --locked -p rspyts-cli -- \
+            check --config examples/contract/rspyts.toml --target typescript --locked
+      - name: Pack, install, and test in headless Chromium
+        working-directory: examples/contract/typescript
+        run: |
+          npm ci
+          npx playwright install --with-deps chromium
+          npm test
 
-  rust-os:
+  static-typescript-acceptance:
+    name: Generated static TypeScript package
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          ref: ${{ env.VALIDATION_REF }}
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
+        with:
+          toolchain: 1.88.0
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          key: static-typescript-acceptance
+      - name: Generate, type-check, and test static output
+        working-directory: examples/static/typescript
+        run: |
+          npm ci
+          npm test
+
+  cross-package-acceptance:
+    name: Cross-package identity and stale-lock rejection
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          ref: ${{ env.VALIDATION_REF }}
+          persist-credentials: false
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: "3.11"
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
+        with:
+          toolchain: 1.88.0
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          key: cross-package-acceptance
+      - name: Build and verify package identity
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m venv "$RUNNER_TEMP/cross-package-python"
+          python="$RUNNER_TEMP/cross-package-python/bin/python"
+          "$python" -m pip install --disable-pip-version-check \
+            'pydantic>=2.11' 'numpy>=2'
+          cargo build --locked -p rspyts-cli
+          cargo test --locked --manifest-path examples/cross-package/Cargo.toml
+          cargo run --locked -p rspyts-cli -- \
+            check --locked --config examples/cross-package/hardware/rspyts.toml
+          cargo run --locked -p rspyts-cli -- \
+            build --config examples/cross-package/hardware/rspyts.toml
+          cargo run --locked -p rspyts-cli -- \
+            check --locked --config examples/cross-package/evaluation/rspyts.toml
+          cargo run --locked -p rspyts-cli -- \
+            build --config examples/cross-package/evaluation/rspyts.toml
+          python examples/cross-package/assert_identity.py
+          "$python" examples/cross-package/assert_runtime_identity.py
+          python examples/cross-package/assert_stale_locks.py
+
+  msrv:
+    name: Rust 1.88 MSRV
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          ref: ${{ env.VALIDATION_REF }}
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
+        with:
+          toolchain: 1.88.0
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          key: msrv
+      - name: Check locked workspace
+        run: |
+          cargo check --workspace --all-targets --locked
+          cargo check --locked -p rspyts-acceptance --features python
+          cargo check --locked -p rspyts-acceptance \
+            --target wasm32-unknown-unknown --features wasm
+
+  operating-systems:
     name: Rust (${{ matrix.name }})
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
         include:
-          - name: Windows
-            os: windows-latest
+          - name: Linux
+            os: ubuntu-latest
           - name: macOS
             os: macos-latest
+          - name: Windows
+            os: windows-latest
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
         with:
           ref: ${{ env.VALIDATION_REF }}
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
+        with:
+          toolchain: 1.88.0
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-      - name: Test
-        run: cargo test --workspace
+        with:
+          key: ${{ matrix.os }}
+      - name: Test workspace
+        run: cargo test --workspace --locked
 
-  python:
-    name: Python runtime (${{ matrix.python }})
+  docs:
+    name: Documentation
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        python: ["3.11", "3.12", "3.13", "3.14"]
-    defaults:
-      run:
-        working-directory: runtimes/python
-    env:
-      PYTHON_VERSION: ${{ matrix.python }}
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
         with:
           ref: ${{ env.VALIDATION_REF }}
           persist-credentials: false
-
-      # uv provisions the interpreter declared in pyproject.toml and manages
-      # the virtualenv; no separate setup-python step is needed.
-      - uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
         with:
-          version: "0.10.9"
-
-      - name: Install
-        run: uv sync --dev --extra hatch --locked --python "$PYTHON_VERSION"
-
-      - name: Lint
-        run: uv run --no-sync --python "$PYTHON_VERSION" ruff check .
-
-      - name: Static analysis
-        if: matrix.python == '3.11'
-        run: |
-          uv run --no-sync --python "$PYTHON_VERSION" ty check src
-          uv run --no-sync --python "$PYTHON_VERSION" vulture
-
-      - name: Test
-        run: uv run --no-sync --python "$PYTHON_VERSION" pytest
-
-  python-os:
-    name: Python 3.11 (${{ matrix.os }})
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
-    defaults:
-      run:
-        working-directory: runtimes/python
-    steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
-        with:
-          ref: ${{ env.VALIDATION_REF }}
-          persist-credentials: false
-      - uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7
-        with:
-          version: "0.10.9"
-      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+          toolchain: 1.88.0
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-      - name: Install
-        run: uv sync --dev --extra hatch --locked --python 3.11
-      - name: Test
-        run: uv run --no-sync --python 3.11 pytest
-      - name: Install workspace CLI
-        working-directory: ${{ github.workspace }}
-        run: cargo install --path crates/rspyts-cli --locked
-      - name: Native wheel smoke
-        run: uv run --no-sync --python 3.11 python ../../scripts/ci/smoke-native-wheel.py
-
-  python-minimum:
-    name: Python minimum dependencies
-    runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: runtimes/python
-    steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
         with:
-          ref: ${{ env.VALIDATION_REF }}
-          persist-credentials: false
-      - uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7
+          key: docs
+      - name: Build API documentation without warnings
+        run: cargo doc --workspace --all-features --no-deps --locked
+        env:
+          RUSTDOCFLAGS: -D warnings
+      - name: Check local documentation links
+        uses: lycheeverse/lychee-action@e7477775783ea5526144ba13e8db5eec57747ce8 # v2
         with:
-          version: "0.10.9"
-      - name: Install lowest direct dependency versions
-        run: uv sync --dev --extra hatch --resolution lowest-direct --upgrade --python 3.11
-      - name: Test
-        run: uv run --no-sync --python 3.11 pytest
+          args: --offline --no-progress './**/*.md'
+          fail: true
 
-  typescript:
-    name: TypeScript runtime (Node ${{ matrix.node }})
-    runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        node: ["22.12.0", "24"]
-    defaults:
-      run:
-        working-directory: runtimes/typescript
-    steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
-        with:
-          ref: ${{ env.VALIDATION_REF }}
-          persist-credentials: false
-
-      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
-        with:
-          node-version: ${{ matrix.node }}
-
-      - name: Install
-        run: npm ci
-
-      - name: Build
-        run: npm run build
-
-      - name: Typecheck tests
-        run: npm run typecheck
-
-      # test:cov is `vitest run --coverage`; the thresholds it enforces live
-      # in vitest.config.ts.
-      - name: Test
-        run: npm run test:cov
-
-      - name: Public declaration surface
-        run: npm run check:surface
-
-  package-metadata:
-    name: Package metadata and contents
+  packages:
+    name: Exact crate archives
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
         with:
           ref: ${{ env.VALIDATION_REF }}
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
-      - uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
         with:
-          version: "0.10.9"
-      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
-        with:
-          node-version: "24.18.0"
-      - name: Check release versions
-        run: |
-          version=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "rspyts") | .version')
-          test "$(jq -r .version runtimes/typescript/package.json)" = "$version"
-          test "$(sed -n 's/^version = "\([^"]*\)"/\1/p' runtimes/python/pyproject.toml | head -1)" = "$version"
-          test "$(sed -n 's/^__version__ = "\([^"]*\)"/\1/p' runtimes/python/src/rspyts/__init__.py | head -1)" = "$version"
-      - name: Check crates.io packages
-        run: |
-          for crate in rspyts-core rspyts-macros rspyts rspyts-cli; do
-            cargo package --list --locked -p "$crate"
-          done
-      - name: Check PyPI package
-        working-directory: runtimes/python
-        run: |
-          uv build \
-            --build-constraints ../../scripts/release/python-build-constraints.txt \
-            --out-dir "$RUNNER_TEMP/rspyts-python"
-          uvx --from 'twine==6.1.0' twine check --strict "$RUNNER_TEMP"/rspyts-python/*
-          sdist=$(find "$RUNNER_TEMP/rspyts-python" -maxdepth 1 -name '*.tar.gz' -print -quit)
-          ../../scripts/release/check-python-sdist.py "$sdist" .
-      - name: Check npm package
-        working-directory: runtimes/typescript
-        run: |
-          npm ci
-          npm run build
-          npm run check:surface
-          npm pack --dry-run
-      - name: Test release checks
-        run: python3 -m unittest discover -s scripts/release/tests -v
-
-  # Full pipeline over the examples: they are the only place where
-  # the macros, the CLI, both runtimes, and both build targets meet.
-  example-e2e:
-    name: Example end-to-end
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
-        with:
-          ref: ${{ env.VALIDATION_REF }}
-          persist-credentials: false
-
-      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
-        with:
-          targets: wasm32-unknown-unknown
-
+          toolchain: 1.94.0
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-
-      - uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7
         with:
-          version: "0.10.9"
-
-      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
-        with:
-          node-version: "22.12.0"
-
-      # One config builds and stages both the native cdylib and WASM module.
-      - name: Build and stage basic artifacts
-        run: |
-          cargo run -p rspyts-cli -- build --config examples/basic/rspyts.toml --target host --target wasm32-unknown-unknown --locked
-          test -f examples/basic/python/src/basic_example/generated/lib/libbasic_example.so
-          test -f target/rspyts/wasm32-unknown-unknown/debug/basic_example.wasm
-
-      # Codegen drift gate: the generated Python/TypeScript/schema committed
-      # in the repo must match what the current manifest renders. `rspyts
-      # check` exits 1 with a unified diff when anything is stale (codegen §2).
-      - name: Check generated code is current
-        run: cargo run -p rspyts-cli -- check --config examples/basic/rspyts.toml
-
-      - name: Python example tests
-        working-directory: examples/basic/python
-        run: |
-          unset RSPYTS_LIBRARY_BASIC_EXAMPLE
-          uv sync --locked
-          uv run pytest
-
-      # test:cov enforces the coverage floor for the generated TypeScript
-      # (thresholds in the example's vitest.config.ts).
-      # The example depends on the runtime via file:../../../runtimes/typescript,
-      # whose package exports point at dist/ — build it first on fresh checkouts.
-      - name: Build TypeScript runtime
-        working-directory: runtimes/typescript
-        run: |
-          npm ci
-          npm run build
-
-      - name: TypeScript example tests
-        working-directory: examples/basic/typescript
-        run: |
-          npm ci
-          npm run typecheck
-          npm run test:cov
-
-      # ---- multi-crate example: shared cross-crate imports ----
-
-      # Build both standalone modules through their own checked-in configs.
-      - name: Build and stage multi-crate artifacts
-        run: |
-          cargo run -p rspyts-cli -- build --config examples/multi-crate/shared/rspyts.toml --target host --target wasm32-unknown-unknown --locked
-          cargo run -p rspyts-cli -- build --config examples/multi-crate/app/rspyts.toml --target host --target wasm32-unknown-unknown --locked
-          test -f examples/multi-crate/shared/python/src/shared_types/generated/lib/libshared_types.so
-          test -f target/rspyts/wasm32-unknown-unknown/debug/shared_types.wasm
-          test -f examples/multi-crate/app/python/src/multi_crate_app/generated/lib/libmulti_crate_app.so
-          test -f target/rspyts/wasm32-unknown-unknown/debug/multi_crate_app.wasm
-
-      # Drift gates for both configs — the app's generated code must keep
-      # importing Point/Axis from shared-types' packages, never re-emit them.
-      - name: Check multi-crate generated code is current
-        run: |
-          cargo run -p rspyts-cli -- check --config examples/multi-crate/shared/rspyts.toml
-          cargo run -p rspyts-cli -- check --config examples/multi-crate/app/rspyts.toml
-
-      # shared-types is types-only, so its suite needs no native library:
-      # it pins the import surface and wire aliases the app builds on.
-      - name: Python shared-types tests
-        working-directory: examples/multi-crate/shared/python
-        run: |
-          uv sync --locked
-          uv run pytest
-
-      # Import smoke tests: multi_crate_app.Point IS shared_types.Point.
-      - name: Python multi-crate tests
-        working-directory: examples/multi-crate/app/python
-        run: |
-          unset RSPYTS_LIBRARY_MULTI_CRATE_APP
-          uv sync --locked
-          uv run pytest
-
-      # The shared package must resolve its own `rspyts` dependency from its
-      # real path (the app's node_modules symlinks it), so install both.
-      - name: TypeScript multi-crate tests
-        run: |
-          (cd examples/multi-crate/shared/typescript && npm ci && npm run typecheck)
-          (
-            cd examples/multi-crate/app/typescript || exit 1
-            npm ci
-            npm run typecheck
-            npm test
-          )
+          key: packages
+      - name: Build and test packaged sources
+        run: scripts/release/verify-crates.sh
