@@ -62,8 +62,8 @@ git switch main
 git pull --ff-only origin main
 test "$(git rev-parse HEAD)" = "$(git rev-parse origin/main)"
 test -z "$(git status --porcelain)"
-git tag -a v0.4.0 -m "rspyts v0.4.0"
-git push origin refs/tags/v0.4.0
+git tag -a v0.4.1 -m "rspyts v0.4.1"
+git push origin refs/tags/v0.4.1
 ```
 
 The tag-driven [deployment workflow](../.github/workflows/deploy.yml) reruns
@@ -86,7 +86,7 @@ creates the GitHub release. After the workflow succeeds, repeat the CLI install
 locally when performing downstream acceptance:
 
 ```sh
-cargo install rspyts-cli --version =0.4.0 --locked --force
+cargo install rspyts-cli --version =0.4.1 --locked --force
 ```
 
 Create the quickstart contract, run `build`, `lock`, and `check --locked`, then

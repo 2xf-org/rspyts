@@ -92,7 +92,7 @@ Python consumer cdylibs enable rspyts's extension feature:
 
 ```toml
 [dependencies]
-rspyts = { version = "0.4.0", default-features = false }
+rspyts = { version = "0.4.1", default-features = false }
 
 [features]
 python = ["rspyts/python-extension"]
@@ -108,7 +108,7 @@ feature:
 
 ```toml
 [dependencies]
-rspyts = { version = "0.4.0", default-features = false }
+rspyts = { version = "0.4.1", default-features = false }
 wasm-bindgen = { version = "0.2.126", optional = true }
 
 [features]
@@ -384,6 +384,8 @@ explicit scalar default.
 | Path | Policy |
 | --- | --- |
 | `.rspyts/**` | Generated staging output; ignore it |
+| `.rspyts.tmp-*`, `.rspyts.old-*` | Transient atomic replacement siblings; ignore them |
+| `.rspyts.lock.tmp-*`, `.rspyts.lock.old-*` | Transient semantic-lock replacement siblings; ignore them |
 | `rspyts.lock` | Semantic public-contract review; commit it |
 | `rspyts.toml` | Authored configuration; commit it |
 | generated Python/TypeScript copied into artifacts | Publish it inside the consumer artifact; do not commit it as source |

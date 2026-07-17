@@ -30,7 +30,9 @@ new lock. Never make CI update the lock automatically.
 
 ## A generated file appears in Git
 
-Remove it from the tracked source tree and include `.rspyts/` in `.gitignore`.
+Remove it from the tracked source tree and include `.rspyts/`,
+`.rspyts.tmp-*`, `.rspyts.old-*`, `.rspyts.lock.tmp-*`, and
+`.rspyts.lock.old-*` in `.gitignore`.
 Packaging should consume `rspyts build` output directly. `rspyts.lock` is the
 only generated contract file intended for source control.
 

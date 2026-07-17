@@ -14,8 +14,11 @@ rspyts packages are the three Cargo crates:
 
 Consumer wheels use PyO3's `abi3-py311` interface. Executable TypeScript
 packages use wasm-bindgen; vocabulary-only packages can use static TypeScript
-output. Generated source and compiled staging artifacts live in `.rspyts/` and
-must not be committed. The deterministic, pretty-printed `rspyts.lock`
+output. Generated source and compiled staging artifacts live in `.rspyts/`;
+the atomic replacement siblings `.rspyts.tmp-*`, `.rspyts.old-*`,
+`.rspyts.lock.tmp-*`, and `.rspyts.lock.old-*` are also build output. All five
+patterns must be ignored and must not be committed. The
+deterministic, pretty-printed `rspyts.lock`
 semantic contract is intended to be diffed, reviewed, and committed.
 
 The consumer crate keeps `default-features = false`. Its `rspyts.toml` names
@@ -42,7 +45,7 @@ rspyts::module!(native);
 ```
 
 ```sh
-cargo install rspyts-cli --version =0.4.0 --locked
+cargo install rspyts-cli --version =0.4.1 --locked
 rspyts build
 rspyts lock
 rspyts check --locked

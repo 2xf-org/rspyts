@@ -14,7 +14,7 @@ default-members = [
 ]
 
 [workspace.package]
-version = "0.4.0"
+version = "0.4.1"
 edition = "2024"
 rust-version = "1.88"
 license = "MIT"
@@ -23,8 +23,8 @@ homepage = "https://github.com/2xf-org/rspyts"
 authors = ["Felipe Faria", "The rspyts contributors"]
 
 [workspace.dependencies]
-rspyts = { version = "0.4.0", path = "crates/rspyts" }
-rspyts-macros = { version = "0.4.0", path = "crates/rspyts-macros" }
+rspyts = { version = "0.4.1", path = "crates/rspyts" }
+rspyts-macros = { version = "0.4.1", path = "crates/rspyts-macros" }
 
 anyhow = "1.0"
 chrono = { version = "0.4", default-features = false, features = ["serde", "std"] }
