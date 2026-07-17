@@ -1,5 +1,0 @@
-error: unknown #[bridge] argument; expected `error`, `serde`, `constructor`, `static`, `tag = "…"`, `rename_all = "…"`, or `target = "…"`
- --> tests/ui/unknown_key.rs:3:10
-  |
-3 | #[bridge(frobnicate)]
-  |          ^^^^^^^^^^

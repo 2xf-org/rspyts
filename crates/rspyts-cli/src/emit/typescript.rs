@@ -1,1993 +1,1599 @@
-//! The TypeScript emitter (codegen.md §5, §8).
-//!
-//! Produces `client.ts`, generated `codecs.ts`, `constants.ts`, `errors.ts`,
-//! `index.ts`, and `types.ts`. Output targets ES2022, 2-space indent, semicolons,
-//! double quotes, `strict` tsc. The surface is camelCase throughout —
-//! identical to the wire names, so values need no key mapping at
-//! runtime. Types whose origin crate has an entry in
-//! `[typescript.imports]` are imported from that module instead of
-//! re-emitted (codegen.md §9).
+use std::path::Path;
+
+use anyhow::Result;
+use rspyts::ir::{
+    BufferElement, DefinitionId, FieldDef, ScalarValue, Target, TypeDef, TypeRef, TypeShape,
+};
+use serde_json::Value;
+
+use crate::config::{TypeScriptConfig, TypeScriptMode};
+use crate::resolve::ResolvedContract;
 
 use super::util::{
-    Provenance, collect_refs, int_bounds, pascal, ts_doc, ts_doc_from_lines,
-    ts_error_registry_name, ts_header, ts_type, ts_typed_array,
+    TypeNames, error_definition, ordered_types, ts_doc, ts_property, type_definition, type_names,
 };
-use heck::ToLowerCamelCase;
-use rspyts_core::ir::{
-    ClassDecl, ConstDecl, FieldDecl, FnDecl, Manifest, ParamDecl, StaticDecl, Target, Ty, TypeDecl,
-};
-use std::collections::{BTreeMap, BTreeSet};
+use super::{write, write_json};
 
-/// Emit all five files: `(file name, content)` pairs, name-sorted.
 pub fn emit(
-    m: &Manifest,
-    provenance: &Provenance<'_>,
-    imports: &BTreeMap<String, String>,
-) -> Vec<(&'static str, String)> {
-    vec![
-        ("client.ts", client_ts(m, provenance)),
-        ("codecs.ts", codecs_ts(m, provenance)),
-        ("constants.ts", constants_ts(m, provenance)),
-        ("errors.ts", errors_ts(m, provenance, imports)),
-        ("index.ts", index_ts(provenance)),
-        ("types.ts", types_ts(m, provenance, imports)),
-    ]
-}
-
-/// Is `decl` imported from another crate's generated module instead of
-/// emitted here? Foreign-origin types without a mapping stay local, so
-/// the output is always self-contained.
-fn is_imported(m: &Manifest, decl: &TypeDecl, imports: &BTreeMap<String, String>) -> bool {
-    decl.origin() != m.crate_name && imports.contains_key(decl.origin())
-}
-
-fn on_ts(targets: &[Target]) -> bool {
-    targets.contains(&Target::Typescript)
-}
-
-// ----------------------------------------------------------------- types.ts
-
-fn types_ts(
-    m: &Manifest,
-    provenance: &Provenance<'_>,
-    imports: &BTreeMap<String, String>,
-) -> String {
-    let mut out = ts_header(provenance);
-    let mut any = false;
-
-    // Imported foreign data types: import for local use, re-export so
-    // `index.ts`'s `export * from "./types.js"` surfaces them.
-    let mut by_module: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
-    for decl in &m.types {
-        if matches!(decl, TypeDecl::ErrorEnum { .. }) || !is_imported(m, decl, imports) {
-            continue;
+    root: &Path,
+    config: &TypeScriptConfig,
+    contract: &ResolvedContract,
+    fingerprint: &str,
+) -> Result<()> {
+    let manifest = &contract.manifest;
+    let output = root.join("typescript");
+    let names = type_names(contract);
+    let declarations = declarations(contract, fingerprint, &names, config.mode);
+    match config.mode {
+        TypeScriptMode::Wasm => {
+            write(&output.join("index.d.ts"), &declarations)?;
+            write(
+                &output.join("index.js"),
+                &wasm_runtime(contract, fingerprint),
+            )?;
         }
-        by_module
-            .entry(imports[decl.origin()].as_str())
-            .or_default()
-            .push(decl.name());
-    }
-    if !by_module.is_empty() {
-        out.push('\n');
-        let mut all_names: Vec<&str> = Vec::new();
-        for (module, mut names) in by_module {
-            names.sort_unstable();
-            out.push_str(&format!(
-                "import type {{ {} }} from {};\n",
-                names.join(", "),
-                ts_module_specifier(module)
-            ));
-            all_names.extend(names);
+        TypeScriptMode::Static => {
+            write(&output.join("index.d.ts"), &declarations)?;
+            write(
+                &output.join("index.js"),
+                &static_runtime(contract, fingerprint),
+            )?;
         }
-        all_names.sort_unstable();
-        out.push('\n');
-        out.push_str(&format!("export type {{ {} }};\n", all_names.join(", ")));
-        any = true;
     }
-
-    for decl in &m.types {
-        if is_imported(m, decl, imports) {
-            continue;
-        }
-        match decl {
-            TypeDecl::Newtype {
-                name, docs, inner, ..
-            } => {
-                out.push('\n');
-                out.push_str(&ts_doc(docs, ""));
-                out.push_str(&format!("export type {name} = {};\n", ts_type(inner)));
-            }
-            TypeDecl::Struct {
-                name, docs, fields, ..
-            } => {
-                out.push('\n');
-                out.push_str(&ts_doc(docs, ""));
-                out.push_str(&format!("export interface {name} {{\n"));
-                for f in fields {
-                    out.push_str(&ts_doc(&f.docs, "  "));
-                    out.push_str(&format!(
-                        "  {};\n",
-                        ts_field(&f.wire_name, &f.ty, f.required)
-                    ));
-                }
-                out.push_str("}\n");
-            }
-            TypeDecl::StringEnum {
-                name,
-                docs,
-                variants,
-                ..
-            } => {
-                out.push('\n');
-                out.push_str(&ts_doc(docs, ""));
-                let literals: Vec<String> =
-                    variants.iter().map(|v| ts_string(&v.wire_name)).collect();
-                out.push_str(&format!("export type {name} = {};\n", literals.join(" | ")));
-            }
-            TypeDecl::Enum {
-                name,
-                docs,
-                tag,
-                variants,
-                ..
-            } => {
-                out.push('\n');
-                out.push_str(&ts_doc(docs, ""));
-                out.push_str(&format!("export type {name} ="));
-                for v in variants {
-                    let mut members =
-                        vec![format!("{}: {}", ts_prop(tag), ts_string(&v.wire_name))];
-                    members.extend(
-                        v.fields
-                            .iter()
-                            .map(|f| ts_field(&f.wire_name, &f.ty, f.required)),
-                    );
-                    out.push_str(&format!("\n  | {{ {} }}", members.join("; ")));
-                }
-                out.push_str(";\n");
-            }
-            TypeDecl::ErrorEnum { .. } => continue,
-        }
-        any = true;
-    }
-    if !any {
-        out.push_str("\nexport {};\n");
-    }
-    wrap_ts_source(&out, 120)
-}
-
-/// `name: T`, or `name?: Inner | null` for optional fields.
-fn ts_field(wire_name: &str, ty: &Ty, required: bool) -> String {
-    let name = ts_prop(wire_name);
-    if required {
-        format!("{name}: {}", ts_type(ty))
-    } else {
-        format!("{name}?: {}", ts_type(ty))
-    }
-}
-
-fn ts_string(value: &str) -> String {
-    serde_json::to_string(value).expect("serializing a string cannot fail")
-}
-
-/// Render an import-map target as an ESM module specifier. Relative targets
-/// name generated TypeScript modules, so their runtime-facing specifier must
-/// point at the emitted JavaScript file. Bare/package specifiers stay exact.
-fn ts_module_specifier(value: &str) -> String {
-    let value = if value.starts_with("./") || value.starts_with("../") {
-        if let Some(stem) = value.strip_suffix(".ts") {
-            format!("{stem}.js")
-        } else if value.ends_with(".js")
-            || value
-                .rsplit('/')
-                .next()
-                .is_some_and(|part| part.contains('.'))
-        {
-            value.to_string()
-        } else {
-            format!("{value}.js")
-        }
-    } else {
-        value.to_string()
-    };
-    ts_string(&value)
-}
-
-fn ts_prop(value: &str) -> String {
-    if value == "__proto__" {
-        return format!("[{}]", ts_string(value));
-    }
-    if is_ts_ident(value) {
-        value.to_string()
-    } else {
-        ts_string(value)
-    }
-}
-
-fn ts_quoted_prop(value: &str) -> String {
-    if value == "__proto__" {
-        format!("[{}]", ts_string(value))
-    } else {
-        ts_string(value)
-    }
-}
-
-fn is_ts_ident(name: &str) -> bool {
-    let mut chars = name.chars();
-    chars
-        .next()
-        .is_some_and(|c| c.is_ascii_alphabetic() || c == '_' || c == '$')
-        && name
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '$')
-}
-
-// -------------------------------------------------------------- constants.ts
-
-fn constants_ts(m: &Manifest, provenance: &Provenance<'_>) -> String {
-    let mut out = ts_header(provenance);
-    if m.constants.is_empty() {
-        out.push_str("\nexport {};\n");
-        return wrap_ts_source(&out, 120);
-    }
-    for c in &m.constants {
-        out.push('\n');
-        out.push_str(&ts_doc(&c.docs, ""));
-        out.push_str(&const_line(m, c));
-    }
-    wrap_ts_source(&out, 120)
-}
-
-/// One `export const NAME = <literal> as const;` line. `as const` is
-/// skipped for `null`, which cannot take a const assertion.
-fn const_line(m: &Manifest, c: &ConstDecl) -> String {
-    let literal = ts_const_expr(m, &c.ty, &c.value);
-    if c.value.is_null() {
-        format!("export const {} = null;\n", c.name)
-    } else {
-        format!("export const {} = {literal} as const;\n", c.name)
-    }
-}
-
-fn ts_const_expr(m: &Manifest, ty: &Ty, value: &serde_json::Value) -> String {
-    match ty {
-        Ty::Json => ts_json(value),
-        Ty::I64 | Ty::U64 => value
-            .as_str()
-            .map(|value| format!("{value}n"))
-            .unwrap_or_else(|| ts_json(value)),
-        Ty::Option { inner } => {
-            if value.is_null() {
-                "null".to_string()
-            } else {
-                ts_const_expr(m, inner, value)
-            }
-        }
-        Ty::List { inner } => value.as_array().map_or_else(
-            || ts_json(value),
-            |items| {
-                format!(
-                    "[{}]",
-                    items
-                        .iter()
-                        .map(|item| ts_const_expr(m, inner, item))
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                )
+    let peer_dependencies = contract
+        .dependencies
+        .values()
+        .filter_map(|dependency| dependency.typescript.as_ref())
+        .map(|package| (package.clone(), "*"))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    write_json(
+        &output.join("package.json"),
+        &serde_json::json!({
+            "name": config.package,
+            "version": manifest.crate_version,
+            "type": "module",
+            "sideEffects": false,
+            "main": "./index.js",
+            "types": "./index.d.ts",
+            "exports": {
+                ".": {
+                    "types": "./index.d.ts",
+                    "import": "./index.js",
+                    "default": "./index.js"
+                },
+                "./contract.json": "./contract.json"
             },
-        ),
-        Ty::Map { value: value_ty } => value.as_object().map_or_else(
-            || ts_json(value),
-            |entries| {
-                let rendered = entries
-                    .iter()
-                    .map(|(key, value)| {
-                        let key = ts_prop(key);
-                        format!("{key}: {}", ts_const_expr(m, value_ty, value))
-                    })
-                    .collect::<Vec<_>>();
-                format!("{{ {} }}", rendered.join(", "))
-            },
-        ),
-        Ty::Tuple { items } => value.as_array().map_or_else(
-            || ts_json(value),
-            |values| {
-                format!(
-                    "[{}]",
-                    items
-                        .iter()
-                        .zip(values)
-                        .map(|(ty, value)| ts_const_expr(m, ty, value))
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                )
-            },
-        ),
-        Ty::Ref { name } => match super::util::find_type(m, name) {
-            Some(TypeDecl::Newtype { inner, .. }) => ts_const_expr(m, inner, value),
-            Some(TypeDecl::Struct { fields, .. }) => ts_const_object(m, fields, value, None),
-            Some(TypeDecl::Enum { tag, variants, .. }) => {
-                let fields = value
-                    .get(tag)
-                    .and_then(serde_json::Value::as_str)
-                    .and_then(|wire| variants.iter().find(|variant| variant.wire_name == wire))
-                    .map(|variant| variant.fields.as_slice())
-                    .unwrap_or(&[]);
-                ts_const_object(m, fields, value, Some(tag))
-            }
-            _ => ts_json(value),
-        },
-        _ => ts_json(value),
-    }
+            "files": ["index.js", "index.d.ts", "contract.json", "native.js", "native_bg.wasm"]
+            ,"peerDependencies": peer_dependencies
+        }),
+    )?;
+    write_json(
+        &output.join("contract.json"),
+        &serde_json::json!({
+            "schemaVersion": crate::LOCK_VERSION,
+            "fingerprint": fingerprint,
+            "hosts": contract.hosts,
+            "dependencies": contract.dependencies,
+            "manifest": manifest,
+        }),
+    )
 }
 
-fn ts_const_object(
-    m: &Manifest,
-    fields: &[FieldDecl],
-    value: &serde_json::Value,
-    tag: Option<&str>,
+fn declarations(
+    contract: &ResolvedContract,
+    fingerprint: &str,
+    names: &TypeNames,
+    mode: TypeScriptMode,
 ) -> String {
-    let Some(entries) = value.as_object() else {
-        return ts_json(value);
-    };
-    let rendered = entries
-        .iter()
-        .map(|(key, value)| {
-            let key_expr = ts_prop(key);
-            let rendered = if tag == Some(key.as_str()) {
-                ts_json(value)
-            } else if let Some(field) = fields.iter().find(|field| field.wire_name == *key) {
-                ts_const_expr(m, &field.ty, value)
-            } else {
-                ts_json(value)
-            };
-            format!("{key_expr}: {rendered}")
-        })
-        .collect::<Vec<_>>();
-    format!("{{ {} }}", rendered.join(", "))
-}
-
-/// A JSON value as a TypeScript literal expression.
-fn ts_json(value: &serde_json::Value) -> String {
-    use serde_json::Value;
-    match value {
-        Value::Null => "null".to_string(),
-        Value::Bool(b) => b.to_string(),
-        Value::Number(n) => n.to_string(),
-        Value::String(s) => serde_json::to_string(s).expect("string serializes"),
-        Value::Array(items) => {
-            let rendered: Vec<String> = items.iter().map(ts_json).collect();
-            format!("[{}]", rendered.join(", "))
-        }
-        Value::Object(entries) => {
-            if entries.is_empty() {
-                return "{}".to_string();
-            }
-            let rendered: Vec<String> = entries
-                .iter()
-                .map(|(k, v)| {
-                    let key = ts_prop(k);
-                    format!("{key}: {}", ts_json(v))
-                })
-                .collect();
-            format!("{{ {} }}", rendered.join(", "))
-        }
-    }
-}
-
-// ---------------------------------------------------------------- errors.ts
-
-fn errors_ts(
-    m: &Manifest,
-    provenance: &Provenance<'_>,
-    imports: &BTreeMap<String, String>,
-) -> String {
-    let mut local: Vec<(&String, &String, &Vec<rspyts_core::ir::ErrorVariantDecl>)> = Vec::new();
-    let mut foreign: BTreeMap<&str, Vec<String>> = BTreeMap::new();
-    for t in &m.types {
-        let TypeDecl::ErrorEnum {
-            name,
-            docs,
-            variants,
-            ..
-        } = t
-        else {
-            continue;
-        };
-        if is_imported(m, t, imports) {
-            let names = foreign.entry(imports[t.origin()].as_str()).or_default();
-            names.push(name.clone());
-            names.extend(variants.iter().map(|v| format!("{name}{}", v.name)));
-            names.push(ts_error_registry_name(name));
-        } else {
-            local.push((name, docs, variants));
-        }
-    }
-
-    let mut out = ts_header(provenance);
-    if local.is_empty() && foreign.is_empty() {
-        out.push_str("\nexport {};\n");
-        return wrap_ts_source(&out, 120);
-    }
-
-    out.push('\n');
-    if !local.is_empty() {
-        out.push_str(
-            "import { type BridgeErrorRegistry, RspytsError, wireResponse } from \"rspyts/internal/abi3\";\n",
-        );
-        if local
-            .iter()
-            .any(|(_, _, variants)| variants.iter().any(|variant| !variant.fields.is_empty()))
-        {
-            out.push_str("import * as codecs from \"./codecs.js\";\n");
-        }
-    }
-    // Value imports include the foreign error classes and their scoped map.
-    if !foreign.is_empty() {
-        let mut all_names: Vec<String> = Vec::new();
-        for (module, mut names) in foreign {
-            names.sort();
-            out.push_str(&format!(
-                "import {{ {} }} from {};\n",
-                names.join(", "),
-                ts_module_specifier(module)
-            ));
-            all_names.extend(names);
-        }
-        all_names.sort();
-        out.push('\n');
-        out.push_str(&format!("export {{ {} }};\n", all_names.join(", ")));
-    }
-
-    for (name, docs, variants) in &local {
-        out.push('\n');
-        out.push_str(&ts_doc(docs, ""));
-        out.push_str(&format!("export class {name} extends RspytsError {{}}\n"));
-        for v in *variants {
-            let mut lines: Vec<String> = super::util::doc_lines(&v.docs)
-                .into_iter()
-                .map(str::to_string)
-                .collect();
-            if !v.fields.is_empty() {
-                if !lines.is_empty() {
-                    lines.push(String::new());
-                }
-                let entries: Vec<String> = v
-                    .fields
-                    .iter()
-                    .map(|f| format!("{}: {}", ts_prop(&f.wire_name), ts_type(&f.ty)))
-                    .collect();
-                lines.push(format!("`.data`: {{ {} }}", entries.join("; ")));
-            }
-            out.push('\n');
-            out.push_str(&ts_doc_from_lines(&lines, ""));
-            // The registry contract (BridgeErrorConstructor) bakes the code
-            // into the subclass: throw sites pass only (message, data).
-            let data = ts_error_data_expr(name, &v.name, &v.fields);
-            out.push_str(&format!(
-                "export class {name}{} extends {name} {{\n  constructor(message: string, data?: unknown) {{\n    super(message, {}, {data});\n  }}\n}}\n",
-                v.name,
-                ts_string(&v.wire_code),
-            ));
-        }
-    }
-    for (name, _, variants) in &local {
-        out.push('\n');
-        out.push_str(&format!(
-            "export const {} = {{\n",
-            ts_error_registry_name(name)
-        ));
-        for v in *variants {
-            out.push_str(&format!(
-                "  {}: {name}{},\n",
-                ts_quoted_prop(&v.wire_code),
-                v.name
-            ));
-        }
-        out.push_str("} as const satisfies BridgeErrorRegistry;\n");
-    }
-    wrap_ts_source(&out, 120)
-}
-
-fn ts_error_data_expr(error: &str, variant: &str, fields: &[FieldDecl]) -> String {
-    if fields.is_empty() {
-        return "data".to_string();
-    }
-    format!(
-        "data === undefined ? undefined : codecs.decode{error}{variant}Data(wireResponse(data))"
-    )
-}
-
-// ---------------------------------------------------------------- codecs.ts
-
-/// Generator/runtime plumbing. This module is imported by `client.ts` and
-/// `errors.ts`, but deliberately never re-exported by `index.ts`.
-fn codecs_ts(m: &Manifest, provenance: &Provenance<'_>) -> String {
-    let (encode_names, decode_names) = codec_type_requirements(m);
-    let mut body = String::new();
-
-    for name in &encode_names {
-        let declaration = super::util::find_type(m, name).expect("validated type reference");
-        body.push_str(&named_encoder(m, declaration));
-    }
-    for name in &decode_names {
-        let declaration = super::util::find_type(m, name).expect("validated type reference");
-        body.push_str(&named_decoder(m, declaration));
-    }
-    for declaration in &m.types {
-        let TypeDecl::ErrorEnum { name, variants, .. } = declaration else {
-            continue;
-        };
-        for variant in variants.iter().filter(|variant| !variant.fields.is_empty()) {
-            body.push_str(&error_data_decoder(m, name, &variant.name, &variant.fields));
-        }
-    }
-    for function in m
-        .functions
-        .iter()
-        .filter(|function| on_ts(&function.targets))
-    {
-        body.push_str(&args_encoder(m, &fn_args_codec(function), &function.params));
-        body.push_str(&result_decoder(
-            m,
-            &fn_result_codec(function),
-            &function.ret,
-        ));
-    }
-    for class in &m.classes {
-        if let Some(constructor) = &class.constructor {
-            body.push_str(&args_encoder(
-                m,
-                &ctor_args_codec(class),
-                &constructor.params,
-            ));
-        }
-        for method in class.methods.iter().filter(|method| on_ts(&method.targets)) {
-            body.push_str(&args_encoder(
-                m,
-                &method_args_codec(class, &method.name),
-                &method.params,
-            ));
-            body.push_str(&result_decoder(
-                m,
-                &method_result_codec(class, &method.name),
-                &method.ret,
-            ));
-        }
-        for method in class.statics.iter().filter(|method| on_ts(&method.targets)) {
-            body.push_str(&args_encoder(
-                m,
-                &static_args_codec(class, &method.name),
-                &method.params,
-            ));
-            if !method.returns_self {
-                body.push_str(&result_decoder(
-                    m,
-                    &static_result_codec(class, &method.name),
-                    &method.ret,
-                ));
-            }
-        }
-    }
-
-    let mut out = ts_header(provenance);
-    if body.is_empty() {
-        out.push_str("\nexport {};\n");
-        return wrap_ts_source(&out, 120);
-    }
-
-    let runtime_helpers = [
-        "boolFromWire",
-        "boundedIntFromWire",
-        "bufferFromWire",
-        "bytesFromWire",
-        "enumFromWire",
-        "f32FromWire",
-        "floatFromWire",
-        "i64FromWire",
-        "i64ToWire",
-        "jsonFromWire",
-        "jsonToWire",
-        "listFromWire",
-        "mapFromWire",
-        "nullFromWire",
-        "objectFromWire",
-        "stringEnumFromWire",
-        "stringFromWire",
-        "tupleFromWire",
-        "type WireResponse",
-        "u64FromWire",
-        "u64ToWire",
-        "wireBuffer",
-    ];
-    let used = runtime_helpers
-        .into_iter()
-        .filter(|helper| body.contains(helper.trim_start_matches("type ")))
-        .collect::<Vec<_>>();
-    out.push('\n');
-    if !used.is_empty() {
-        out.push_str(&format!(
-            "import {{ {} }} from \"rspyts/internal/abi3\";\n",
-            used.join(", ")
-        ));
-    }
-    let mut types = encode_names;
-    types.extend(decode_names);
-    if !types.is_empty() {
-        out.push_str(&format!(
-            "import type {{ {} }} from \"./types.js\";\n",
-            types.into_iter().collect::<Vec<_>>().join(", ")
-        ));
-    }
-    out.push_str(&body);
-    wrap_ts_source(&out, 120)
-}
-
-fn codec_type_requirements(m: &Manifest) -> (BTreeSet<String>, BTreeSet<String>) {
-    let mut encode = BTreeSet::new();
-    let mut decode = BTreeSet::new();
-    for function in m
-        .functions
-        .iter()
-        .filter(|function| on_ts(&function.targets))
-    {
-        for parameter in &function.params {
-            collect_codec_refs(m, &parameter.ty, &mut encode);
-        }
-        collect_codec_refs(m, &function.ret, &mut decode);
-    }
-    for class in &m.classes {
-        if let Some(constructor) = &class.constructor {
-            for parameter in &constructor.params {
-                collect_codec_refs(m, &parameter.ty, &mut encode);
-            }
-        }
-        for method in class.methods.iter().filter(|method| on_ts(&method.targets)) {
-            for parameter in &method.params {
-                collect_codec_refs(m, &parameter.ty, &mut encode);
-            }
-            collect_codec_refs(m, &method.ret, &mut decode);
-        }
-        for method in class.statics.iter().filter(|method| on_ts(&method.targets)) {
-            for parameter in &method.params {
-                collect_codec_refs(m, &parameter.ty, &mut encode);
-            }
-            if !method.returns_self {
-                collect_codec_refs(m, &method.ret, &mut decode);
-            }
-        }
-    }
-    for declaration in &m.types {
-        if let TypeDecl::ErrorEnum { variants, .. } = declaration {
-            for variant in variants {
-                for field in &variant.fields {
-                    collect_codec_refs(m, &field.ty, &mut decode);
-                }
-            }
-        }
-    }
-    (encode, decode)
-}
-
-fn collect_codec_refs(m: &Manifest, ty: &Ty, names: &mut BTreeSet<String>) {
-    match ty {
-        Ty::Ref { name } => {
-            if !names.insert(name.clone()) {
-                return;
-            }
-            let Some(declaration) = super::util::find_type(m, name) else {
-                return;
-            };
-            match declaration {
-                TypeDecl::Newtype { inner, .. } => collect_codec_refs(m, inner, names),
-                TypeDecl::Struct { fields, .. } => {
-                    for field in fields {
-                        collect_codec_refs(m, &field.ty, names);
-                    }
-                }
-                TypeDecl::Enum { variants, .. } => {
-                    for variant in variants {
-                        for field in &variant.fields {
-                            collect_codec_refs(m, &field.ty, names);
-                        }
-                    }
-                }
-                TypeDecl::StringEnum { .. } | TypeDecl::ErrorEnum { .. } => {}
-            }
-        }
-        Ty::Option { inner } | Ty::List { inner } => collect_codec_refs(m, inner, names),
-        Ty::Map { value } => collect_codec_refs(m, value, names),
-        Ty::Tuple { items } => {
-            for item in items {
-                collect_codec_refs(m, item, names);
-            }
-        }
-        _ => {}
-    }
-}
-
-fn named_encoder(m: &Manifest, declaration: &TypeDecl) -> String {
-    let name = declaration.name();
-    let expression = match declaration {
-        TypeDecl::Newtype { inner, .. } => {
-            ts_wire_expr("value", inner, m, 0).unwrap_or_else(|| "value".to_string())
-        }
-        TypeDecl::Struct { fields, .. } => {
-            let fields = ts_converted_fields("value", fields, m, 0);
-            if fields.is_empty() {
-                "value".to_string()
-            } else {
-                format!("{{ ...value, {} }}", fields.join(", "))
-            }
-        }
-        TypeDecl::Enum { tag, variants, .. } => {
-            let access = ts_access("value", tag);
-            let arms = variants
-                .iter()
-                .filter_map(|variant| {
-                    let fields = ts_converted_fields("value", &variant.fields, m, 0);
-                    (!fields.is_empty()).then(|| {
-                        format!(
-                            "{access} === {} ? {{ ...value, {} }}",
-                            ts_string(&variant.wire_name),
-                            fields.join(", ")
-                        )
-                    })
-                })
-                .collect::<Vec<_>>();
-            if arms.is_empty() {
-                "value".to_string()
-            } else {
-                format!("{} : value", arms.join(" : "))
-            }
-        }
-        TypeDecl::StringEnum { .. } => "value".to_string(),
-        TypeDecl::ErrorEnum { .. } => return String::new(),
-    }
-    .replace("codecs.", "");
-    format!(
-        "\nexport function encode{name}(value: {name}): unknown {{\n  return {expression};\n}}\n"
-    )
-}
-
-fn named_decoder(m: &Manifest, declaration: &TypeDecl) -> String {
-    let name = declaration.name();
-    let ty = Ty::Ref {
-        name: name.to_string(),
-    };
-    let expression = match declaration {
-        TypeDecl::Newtype { inner, .. } => ts_response_expr("response", inner, m, 0),
-        TypeDecl::Struct { fields, .. } => ts_response_object("response", &ty, fields, m, 0),
-        TypeDecl::StringEnum { variants, .. } => {
-            let variants = variants
-                .iter()
-                .map(|variant| ts_string(&variant.wire_name))
-                .collect::<Vec<_>>()
-                .join(", ");
-            format!("stringEnumFromWire(response, [{variants}])")
-        }
-        TypeDecl::Enum { tag, variants, .. } => {
-            ts_response_enum("response", &ty, tag, variants, m, 0)
-        }
-        TypeDecl::ErrorEnum { .. } => return String::new(),
-    }
-    .replace("codecs.", "");
-    format!(
-        "\nexport function decode{name}(response: WireResponse): {name} {{\n  return {expression};\n}}\n"
-    )
-}
-
-fn error_data_decoder(m: &Manifest, error: &str, variant: &str, fields: &[FieldDecl]) -> String {
-    let required = fields
-        .iter()
-        .filter(|field| field.required)
-        .map(|field| ts_string(&field.wire_name))
-        .collect::<Vec<_>>()
-        .join(", ");
-    let optional = fields
-        .iter()
-        .filter(|field| !field.required)
-        .map(|field| ts_string(&field.wire_name))
-        .collect::<Vec<_>>()
-        .join(", ");
-    let converted = ts_response_object_fields("value", fields, m, 1).replace("codecs.", "");
-    let host = fields
-        .iter()
-        .map(|field| ts_field(&field.wire_name, &field.ty, field.required))
-        .collect::<Vec<_>>()
-        .join("; ");
-    format!(
-        "\nexport function decode{error}{variant}Data(response: WireResponse): {{ {host} }} {{\n  const value = objectFromWire(response, [{required}], [{optional}]);\n  return {{ {converted} }};\n}}\n"
-    )
-}
-
-fn args_encoder(m: &Manifest, name: &str, params: &[ParamDecl]) -> String {
-    let plain = params
-        .iter()
-        .filter(|parameter| !matches!(parameter.ty, Ty::Slice { .. }))
-        .collect::<Vec<_>>();
-    let signature = plain
-        .iter()
-        .map(|parameter| {
-            format!(
-                "{}: {}",
-                ts_binding(&parameter.name),
-                ts_type(&parameter.ty)
-            )
-        })
-        .collect::<Vec<_>>()
-        .join(", ");
-    let fields = plain
-        .iter()
-        .map(|parameter| {
-            let binding = ts_binding(&parameter.name);
-            let value = ts_wire_expr(&binding, &parameter.ty, m, 0)
-                .unwrap_or_else(|| binding.clone())
-                .replace("codecs.", "");
-            format!("{}: {value}", ts_prop(&parameter.wire_name))
-        })
-        .collect::<Vec<_>>()
-        .join(", ");
-    format!(
-        "\nexport function {name}({signature}): Record<string, unknown> {{\n  return {{ {fields} }};\n}}\n"
-    )
-}
-
-fn result_decoder(m: &Manifest, name: &str, ty: &Ty) -> String {
-    let converted = ts_response_expr("response", ty, m, 0).replace("codecs.", "");
-    if matches!(ty, Ty::Unit) {
-        format!("\nexport function {name}(response: WireResponse): void {{\n  {converted};\n}}\n")
-    } else {
-        format!(
-            "\nexport function {name}(response: WireResponse): {} {{\n  return {converted};\n}}\n",
-            ts_type(ty)
-        )
-    }
-}
-
-fn fn_args_codec(function: &FnDecl) -> String {
-    format!("encodeFn{}Args", pascal(&function.name))
-}
-
-fn fn_result_codec(function: &FnDecl) -> String {
-    format!("decodeFn{}Result", pascal(&function.name))
-}
-
-fn ctor_args_codec(class: &ClassDecl) -> String {
-    format!("encodeClass{}ConstructorArgs", class.name)
-}
-
-fn method_args_codec(class: &ClassDecl, method: &str) -> String {
-    format!("encodeClass{}Method{}Args", class.name, pascal(method))
-}
-
-fn method_result_codec(class: &ClassDecl, method: &str) -> String {
-    format!("decodeClass{}Method{}Result", class.name, pascal(method))
-}
-
-fn static_args_codec(class: &ClassDecl, method: &str) -> String {
-    format!("encodeClass{}Static{}Args", class.name, pascal(method))
-}
-
-fn static_result_codec(class: &ClassDecl, method: &str) -> String {
-    format!("decodeClass{}Static{}Result", class.name, pascal(method))
-}
-
-// ---------------------------------------------------------------- client.ts
-
-fn client_ts(m: &Manifest, provenance: &Provenance<'_>) -> String {
-    let client_name = format!("{}Client", pascal(&m.crate_name));
-    let fns: Vec<&FnDecl> = m.functions.iter().filter(|f| on_ts(&f.targets)).collect();
-    let has_errors = fns.iter().any(|function| function.err.is_some())
-        || m.classes.iter().any(|class| {
-            class
-                .constructor
-                .as_ref()
-                .is_some_and(|constructor| constructor.err.is_some())
-                || class
-                    .methods
-                    .iter()
-                    .any(|method| on_ts(&method.targets) && method.err.is_some())
-                || class.statics.iter().any(|static_method| {
-                    on_ts(&static_method.targets) && static_method.err.is_some()
-                })
-        });
-    let has_calls = !fns.is_empty() || !m.classes.is_empty();
-    let has_classes = !m.classes.is_empty();
-    // Any class whose instances are made from a raw handle (factories,
-    // or a missing constructor) routes construction through INTERNAL.
-    let needs_internal = m.classes.iter().any(|c| {
-        c.constructor.is_none()
-            || c.statics
-                .iter()
-                .any(|s| s.returns_self && on_ts(&s.targets))
-    });
-
-    // Named types referenced anywhere in the TS-visible callable surface.
-    let mut type_imports: BTreeSet<String> = BTreeSet::new();
-    let mut all_params: Vec<&ParamDecl> = Vec::new();
-    let mut all_rets: Vec<&Ty> = Vec::new();
-    for f in &fns {
-        all_params.extend(f.params.iter());
-        all_rets.push(&f.ret);
-    }
-    for c in &m.classes {
-        if let Some(ctor) = &c.constructor {
-            all_params.extend(ctor.params.iter());
-        }
-        for method in c.methods.iter().filter(|method| on_ts(&method.targets)) {
-            all_params.extend(method.params.iter());
-            all_rets.push(&method.ret);
-        }
-        for s in c.statics.iter().filter(|s| on_ts(&s.targets)) {
-            all_params.extend(s.params.iter());
-            if !s.returns_self {
-                all_rets.push(&s.ret);
-            }
-        }
-    }
-    for p in &all_params {
-        collect_refs(&p.ty, &mut type_imports);
-    }
-    for r in &all_rets {
-        collect_refs(r, &mut type_imports);
-    }
-
-    let mut out = ts_header(provenance);
-    out.push('\n');
-    let mut rspyts_names = vec![
-        "type BridgeModule".to_string(),
-        "verifyModuleContract".to_string(),
-    ];
-    if has_classes {
-        rspyts_names.push("callDrop".to_string());
-        rspyts_names.push("boundedIntFromWire".to_string());
-    }
-    if has_calls {
-        rspyts_names.push("callFn".to_string());
-    }
-    out.push_str(&format!(
-        "import {{ {} }} from \"rspyts/internal/abi3\";\n",
-        rspyts_names.join(", ")
-    ));
-    out.push_str("import * as codecs from \"./codecs.js\";\n");
-    if !type_imports.is_empty() {
-        let names: Vec<String> = type_imports.into_iter().collect();
-        out.push_str(&format!(
-            "import type {{ {} }} from \"./types.js\";\n",
-            names.join(", ")
-        ));
-    }
-    if has_errors {
-        out.push_str("import * as errors from \"./errors.js\";\n");
-    }
-
-    // Instance interfaces for handle classes.
-    for class in &m.classes {
-        out.push('\n');
-        out.push_str(&ts_doc(&class.docs, ""));
-        out.push_str(&format!("export interface {} {{\n", class.name));
-        for method in class.methods.iter().filter(|method| on_ts(&method.targets)) {
-            out.push_str(&ts_doc(&method.docs, "  "));
-            out.push_str(&format!(
-                "  {}({}): {};\n",
-                method.name.to_lower_camel_case(),
-                ts_params(&method.params),
-                ts_type(&method.ret)
-            ));
-        }
-        out.push_str("  /** Release the underlying Rust object. Safe to call more than once. */\n");
-        out.push_str("  free(): void;\n");
-        out.push_str("  [Symbol.dispose](): void;\n");
-        out.push_str("}\n");
-    }
-
-    // The client interface.
-    out.push('\n');
-    out.push_str(&format!(
-        "/** The typed surface of the `{}` bridge module. */\n",
-        m.crate_name
-    ));
-    out.push_str(&format!("export interface {client_name} {{\n"));
-    for f in &fns {
-        out.push_str(&ts_doc(&f.docs, "  "));
-        out.push_str(&format!(
-            "  {}({}): {};\n",
-            f.name.to_lower_camel_case(),
-            ts_params(&f.params),
-            ts_type(&f.ret)
-        ));
-    }
-    for class in &m.classes {
-        let statics: Vec<&StaticDecl> =
-            class.statics.iter().filter(|s| on_ts(&s.targets)).collect();
-        match (&class.constructor, statics.as_slice()) {
-            (Some(ctor), []) => {
-                out.push_str(&ts_doc(&ctor.docs, "  "));
-                out.push_str(&format!(
-                    "  {}: new ({}) => {};\n",
-                    class.name,
-                    ts_params(&ctor.params),
-                    class.name
-                ));
-            }
-            (ctor, _) => {
-                out.push_str(&format!("  {}: {{\n", class.name));
-                if let Some(ctor) = ctor {
-                    out.push_str(&ts_doc(&ctor.docs, "    "));
-                    out.push_str(&format!(
-                        "    new ({}): {};\n",
-                        ts_params(&ctor.params),
-                        class.name
-                    ));
-                }
-                for s in &statics {
-                    let ret = if s.returns_self {
-                        class.name.clone()
-                    } else {
-                        ts_type(&s.ret)
-                    };
-                    out.push_str(&ts_doc(&s.docs, "    "));
-                    out.push_str(&format!(
-                        "    {}({}): {ret};\n",
-                        s.name.to_lower_camel_case(),
-                        ts_params(&s.params)
-                    ));
-                }
-                out.push_str("  };\n");
-            }
-        }
-    }
-    out.push_str("}\n");
-
-    if has_classes {
-        out.push('\n');
-        out.push_str("// Best-effort backstop: drops handles that were never free()d.\n");
-        out.push_str(
-            "const rspytsFinalizationRegistryConstructor = (\n  globalThis as unknown as {\n    FinalizationRegistry?: new (callback: (drop: () => void) => void) => {\n      register(target: object, drop: () => void, token?: object): void;\n      unregister(token: object): boolean;\n    };\n  }\n).FinalizationRegistry;\nconst finalizer =\n  rspytsFinalizationRegistryConstructor === undefined\n    ? {\n        register(target: object, drop: () => void, token?: object): void {\n          void target;\n          void drop;\n          void token;\n        },\n        unregister(token: object): boolean {\n          void token;\n          return false;\n        },\n      }\n    : new rspytsFinalizationRegistryConstructor((drop) => drop());\n",
-        );
-    }
-    if needs_internal {
-        out.push('\n');
-        out.push_str("// Gates the internal constructor path that wraps a fresh handle.\n");
-        out.push_str("const INTERNAL = Symbol(\"rspyts.internal\");\n");
-    }
-
-    out.push('\n');
-    out.push_str("/** Bind the generated API to an instantiated bridge module. */\n");
-    out.push_str(&format!(
-        "export function createClient(mod: BridgeModule): {client_name} {{\n"
-    ));
-    out.push_str(&format!(
-        "  verifyModuleContract(mod, {});\n",
-        ts_string(provenance.manifest_hash)
-    ));
-    if fns.is_empty() && m.classes.is_empty() {
-        out.push_str("  return {};\n}\n");
-        return wrap_ts_source(&out, 120);
-    }
-    out.push_str("  return {\n");
-    for f in &fns {
-        out.push_str(&fn_property(m, f));
-    }
-    for class in &m.classes {
-        out.push_str(&class_property(m, class));
-    }
-    out.push_str("  };\n}\n");
-    wrap_ts_source(&out, 120)
-}
-
-/// Reserved words (including strict-mode ones, which apply everywhere in
-/// modules) that cannot be parameter binding names in TypeScript.
-const TS_RESERVED: &[&str] = &[
-    "arguments",
-    "await",
-    "break",
-    "case",
-    "catch",
-    "class",
-    "const",
-    "continue",
-    "debugger",
-    "default",
-    "delete",
-    "do",
-    "else",
-    "enum",
-    "eval",
-    "export",
-    "extends",
-    "false",
-    "finally",
-    "for",
-    "function",
-    "if",
-    "implements",
-    "import",
-    "in",
-    "instanceof",
-    "interface",
-    "let",
-    "new",
-    "null",
-    "of",
-    "package",
-    "private",
-    "protected",
-    "public",
-    "return",
-    "static",
-    "super",
-    "switch",
-    "this",
-    "throw",
-    "true",
-    "try",
-    "typeof",
-    "var",
-    "void",
-    "while",
-    "with",
-    "yield",
-];
-
-/// Project a Rust parameter name to a stable TypeScript binding. Wire keys
-/// remain independent and exact in the request object.
-fn ts_binding(rust_name: &str) -> String {
-    let source = rust_name.strip_prefix("r#").unwrap_or(rust_name);
-    let name = source.to_lower_camel_case();
-    if TS_RESERVED.contains(&name.as_str()) {
-        format!("{name}_")
-    } else {
-        name
-    }
-}
-
-/// `name: Type, …` for a signature, slices typed as typed arrays.
-fn ts_params(params: &[ParamDecl]) -> String {
-    params
-        .iter()
-        .map(|p| format!("{}: {}", ts_binding(&p.name), ts_type(&p.ty)))
-        .collect::<Vec<_>>()
-        .join(", ")
-}
-
-fn call_args_codec(
-    params: &[ParamDecl],
-    codec: &str,
-    handle: Option<&str>,
-    err: Option<&str>,
-) -> String {
-    let bindings = params
-        .iter()
-        .filter(|parameter| !matches!(parameter.ty, Ty::Slice { .. }))
-        .map(|parameter| ts_binding(&parameter.name))
-        .collect::<Vec<_>>();
-    let mut out = format!("codecs.{codec}({})", bindings.join(", "));
-    let slices = params
-        .iter()
-        .filter_map(|parameter| match parameter.ty {
-            Ty::Slice { dt } => Some(format!(
-                "{{ data: {}, dt: \"{}\" }}",
-                ts_binding(&parameter.name),
-                dt.wire_name()
-            )),
-            _ => None,
-        })
-        .collect::<Vec<_>>();
-    if !slices.is_empty() {
-        out.push_str(&format!(", [{}]", slices.join(", ")));
-    } else if handle.is_some() || err.is_some() {
-        out.push_str(", []");
-    }
-    if let Some(handle) = handle {
-        out.push_str(&format!(", {handle}"));
-    } else if err.is_some() {
-        out.push_str(", undefined");
-    }
-    if let Some(error) = err {
-        out.push_str(&format!(", errors.{}", ts_error_registry_name(error)));
-    }
-    out
-}
-
-fn ts_wire_expr(expr: &str, ty: &Ty, _m: &Manifest, depth: usize) -> Option<String> {
-    match ty {
-        Ty::Json => Some(format!("jsonToWire({expr})")),
-        Ty::I64 => Some(format!("i64ToWire({expr})")),
-        Ty::U64 => Some(format!("u64ToWire({expr})")),
-        Ty::Buf { dt } => Some(format!("wireBuffer({expr}, \"{}\")", dt.wire_name())),
-        Ty::Option { inner } => ts_wire_expr(expr, inner, _m, depth)
-            .map(|converted| format!("{expr} === null ? null : {converted}")),
-        Ty::List { inner } => {
-            let item = format!("item{depth}");
-            ts_wire_expr(&item, inner, _m, depth + 1)
-                .map(|converted| format!("{expr}.map(({item}) => ({converted}))"))
-        }
-        Ty::Map { value } => {
-            let key = format!("key{depth}");
-            let item = format!("value{depth}");
-            ts_wire_expr(&item, value, _m, depth + 1).map(|converted| {
-                format!(
-                    "Object.fromEntries(Object.entries({expr}).map(([{key}, {item}]) => [{key}, {converted}]))"
-                )
-            })
-        }
-        Ty::Tuple { items } => {
-            let mut changed = false;
-            let converted = items
-                .iter()
-                .enumerate()
-                .map(|(index, item)| {
-                    let access = format!("{expr}[{index}]");
-                    match ts_wire_expr(&access, item, _m, depth + 1) {
-                        Some(converted) => {
-                            changed = true;
-                            converted
-                        }
-                        None => access,
-                    }
-                })
-                .collect::<Vec<_>>();
-            changed.then(|| format!("[{}]", converted.join(", ")))
-        }
-        Ty::Ref { name } => Some(format!("codecs.encode{name}({expr})")),
-        _ => None,
-    }
-}
-
-fn ts_converted_fields(
-    expr: &str,
-    fields: &[rspyts_core::ir::FieldDecl],
-    m: &Manifest,
-    depth: usize,
-) -> Vec<String> {
-    fields
-        .iter()
-        .filter_map(|field| {
-            let access = ts_access(expr, &field.wire_name);
-            let converted = ts_wire_expr(&access, &field.ty, m, depth + 1)?;
-            let converted = if !field.required {
-                format!("{access} === undefined ? undefined : {converted}")
-            } else {
-                converted
-            };
-            let key = ts_prop(&field.wire_name);
-            Some(format!("{key}: {converted}"))
-        })
-        .collect()
-}
-
-fn ts_access(expr: &str, field: &str) -> String {
-    if is_ts_ident(field) {
-        format!("{expr}.{field}")
-    } else {
-        format!(
-            "{expr}[{}]",
-            serde_json::to_string(field).expect("field serializes")
-        )
-    }
-}
-
-/// Recursively validate one successful wire value before projecting it to
-/// its public host type. Every cast emitted around an inline object wire type
-/// is downstream of the corresponding exact shape/tag check.
-fn ts_response_expr(expr: &str, ty: &Ty, _m: &Manifest, depth: usize) -> String {
-    match ty {
-        Ty::Null | Ty::Unit => format!("nullFromWire({expr})"),
-        Ty::Bool => format!("boolFromWire({expr})"),
-        Ty::U8 | Ty::U16 | Ty::U32 | Ty::I8 | Ty::I16 | Ty::I32 => {
-            let (minimum, maximum) = int_bounds(ty).expect("guarded above");
-            format!("boundedIntFromWire({expr}, {minimum}, {maximum})")
-        }
-        Ty::F32 => format!("f32FromWire({expr})"),
-        Ty::F64 => format!("floatFromWire({expr})"),
-        Ty::String => format!("stringFromWire({expr})"),
-        Ty::Bytes => format!("bytesFromWire({expr})"),
-        Ty::Buf { dt } => format!(
-            "(bufferFromWire({expr}, {}) as {})",
-            ts_string(dt.wire_name()),
-            ts_typed_array(*dt)
-        ),
-        // Json stays wrapped through generic envelope decoding; schema-aware
-        // conversion is what distinguishes it from an ordinary string map.
-        Ty::Json => format!("jsonFromWire({expr})"),
-        Ty::I64 => format!("i64FromWire({expr})"),
-        Ty::U64 => format!("u64FromWire({expr})"),
-        Ty::Option { inner } => format!(
-            "{expr}.value === null ? null : {}",
-            ts_response_expr(expr, inner, _m, depth)
-        ),
-        Ty::List { inner } => {
-            let item = format!("item{depth}");
-            let converted = ts_response_expr(&item, inner, _m, depth + 1);
-            format!("listFromWire({expr}).map(({item}) => ({converted}))")
-        }
-        Ty::Map { value } => {
-            let key = format!("key{depth}");
-            let item = format!("value{depth}");
-            let converted = ts_response_expr(&item, value, _m, depth + 1);
-            format!(
-                "Object.fromEntries(Object.entries(mapFromWire({expr})).map(([{key}, {item}]) => [{key}, {converted}]))"
-            )
-        }
-        Ty::Tuple { items } => {
-            let value = format!("value{depth}");
-            let converted = items
-                .iter()
-                .enumerate()
-                .map(|(index, item)| {
-                    ts_response_expr(&format!("{value}[{index}]"), item, _m, depth + 1)
-                })
-                .collect::<Vec<_>>()
-                .join(", ");
-            format!(
-                "(({value}: WireResponse[]): {} => [{converted}])(tupleFromWire({expr}, {}))",
-                ts_type(ty),
-                items.len()
-            )
-        }
-        Ty::Ref { name } => format!("codecs.decode{name}({expr})"),
-        // Slices are parameters only and validation rejects them in returns.
-        Ty::Slice { .. } => expr.to_string(),
-    }
-}
-
-fn ts_response_object(
-    expr: &str,
-    ty: &Ty,
-    fields: &[FieldDecl],
-    m: &Manifest,
-    depth: usize,
-) -> String {
-    let host = ts_type(ty);
-    let value = format!("value{depth}");
-    let required = fields
-        .iter()
-        .filter(|field| field.required)
-        .map(|field| ts_string(&field.wire_name))
-        .collect::<Vec<_>>()
-        .join(", ");
-    let optional = fields
-        .iter()
-        .filter(|field| !field.required)
-        .map(|field| ts_string(&field.wire_name))
-        .collect::<Vec<_>>()
-        .join(", ");
-    let converted = ts_response_object_fields(&value, fields, m, depth + 1);
-    format!(
-        "(({value}: Record<string, WireResponse>): {host} => ({{ {converted} }}))(objectFromWire({expr}, [{required}], [{optional}]))"
-    )
-}
-
-fn ts_response_object_fields(
-    expr: &str,
-    fields: &[FieldDecl],
-    m: &Manifest,
-    depth: usize,
-) -> String {
-    fields
-        .iter()
-        .map(|field| {
-            let access = ts_access(expr, &field.wire_name);
-            let key = ts_prop(&field.wire_name);
-            let converted = ts_response_expr(&access, &field.ty, m, depth);
-            if !field.required {
-                format!(
-                    "...(Object.prototype.hasOwnProperty.call({expr}, {}) ? {{ {key}: {converted} }} : {{}})",
-                    ts_string(&field.wire_name)
-                )
-            } else {
-                format!("{key}: {converted}")
-            }
-        })
-        .collect::<Vec<_>>()
-        .join(", ")
-}
-
-fn ts_response_enum(
-    expr: &str,
-    ty: &Ty,
-    tag: &str,
-    variants: &[rspyts_core::ir::VariantDecl],
-    m: &Manifest,
-    depth: usize,
-) -> String {
-    let host = ts_type(ty);
-    let value = format!("value{depth}");
-    let shapes = variants
-        .iter()
-        .map(|variant| {
-            let required = variant
-                .fields
-                .iter()
-                .filter(|field| field.required)
-                .map(|field| ts_string(&field.wire_name))
-                .collect::<Vec<_>>()
-                .join(", ");
-            let optional = variant
-                .fields
-                .iter()
-                .filter(|field| !field.required)
-                .map(|field| ts_string(&field.wire_name))
-                .collect::<Vec<_>>()
-                .join(", ");
-            format!(
-                "{}: {{ required: [{required}], optional: [{optional}] }}",
-                ts_quoted_prop(&variant.wire_name)
-            )
-        })
-        .collect::<Vec<_>>()
-        .join(", ");
-    let arms = variants
-        .iter()
-        .enumerate()
-        .map(|(index, variant)| {
-            let converted = ts_response_object_fields(&value, &variant.fields, m, depth + 1);
-            let tag_field = format!("{}: {}", ts_prop(tag), ts_string(&variant.wire_name));
-            let fields = if converted.is_empty() {
-                tag_field
-            } else {
-                format!("{tag_field}, {converted}")
-            };
-            let object = format!("{{ {fields} }}");
-            if index + 1 == variants.len() {
-                object
-            } else {
-                format!(
-                    "stringFromWire({}) === {} ? {object} : ",
-                    ts_access(&value, tag),
-                    ts_string(&variant.wire_name)
-                )
-            }
-        })
-        .collect::<Vec<_>>()
-        .join("");
-    format!(
-        "(({value}: Record<string, WireResponse>): {host} => ({arms}))(enumFromWire({expr}, {}, {{ {shapes} }}))",
-        ts_string(tag)
-    )
-}
-
-/// One `name: (…) => …` property of the returned client object.
-fn fn_property(_m: &Manifest, f: &FnDecl) -> String {
-    let name = f.name.to_lower_camel_case();
-    let symbol = format!("rspyts_fn__{}", f.name);
-    let params = ts_params(&f.params);
-    let call = format!(
-        "callFn(mod, \"{symbol}\", {})",
-        call_args_codec(&f.params, &fn_args_codec(f), None, f.err.as_deref())
+    let manifest = &contract.manifest;
+    let mut output = String::from(
+        "// Generated by rspyts 0.4. Do not edit.\n\
+export type JsonValue = null | boolean | number | string | readonly JsonValue[] | { readonly [key: string]: JsonValue };\n\n",
     );
-    if matches!(f.ret, Ty::Unit) {
-        format!(
-            "    {name}: ({params}): void => {{\n      codecs.{}({call});\n    }},\n",
-            fn_result_codec(f)
-        )
-    } else {
-        let ret = ts_type(&f.ret);
-        format!(
-            "    {name}: ({params}): {ret} =>\n      codecs.{}({call}),\n",
-            fn_result_codec(f)
-        )
-    }
-}
-
-/// One `Name: class { … }` property of the returned client object.
-fn class_property(_m: &Manifest, class: &ClassDecl) -> String {
-    let name = &class.name;
-    let drop_symbol = format!("rspyts_cls__{name}__drop");
-    let statics: Vec<&StaticDecl> = class.statics.iter().filter(|s| on_ts(&s.targets)).collect();
-    let factories: Vec<&&StaticDecl> = statics.iter().filter(|s| s.returns_self).collect();
-    // Factories wrap a raw handle, so construction routes through the
-    // INTERNAL sentinel; a class with neither factories nor a bridged
-    // constructor still takes the guarded path (its ctor only throws).
-    let internal_route = class.constructor.is_none() || !factories.is_empty();
-
-    let mut out = format!("    {name}: class {{\n");
-    out.push_str("      #handle: bigint;\n\n");
-
-    match (&class.constructor, internal_route) {
-        (Some(ctor), false) => {
-            out.push_str(&format!(
-                "      constructor({}) {{\n",
-                ts_params(&ctor.params)
-            ));
-            out.push_str(&format!(
-                "        const raw = boundedIntFromWire(callFn(mod, \"rspyts_cls__{name}__new\", {}), 1, Number.MAX_SAFE_INTEGER);\n",
-                call_args_codec(&ctor.params, &ctor_args_codec(class), None, ctor.err.as_deref())
-            ));
-            out.push_str("        this.#handle = BigInt(raw);\n");
-        }
-        (Some(ctor), true) => {
-            // Overloads: the public signature, plus the internal one the
-            // factories use. The implementation dispatches on INTERNAL.
-            out.push_str(&format!(
-                "      constructor({});\n",
-                ts_params(&ctor.params)
-            ));
-            out.push_str("      constructor(internal: typeof INTERNAL, raw: number);\n");
-            out.push_str("      constructor(...args: unknown[]) {\n");
-            out.push_str("        let raw: number;\n");
-            out.push_str("        if (args[0] === INTERNAL) {\n");
-            out.push_str("          raw = args[1] as number;\n");
-            out.push_str("        } else {\n");
-            if ctor.params.is_empty() {
-                out.push_str(&format!(
-                    "          raw = boundedIntFromWire(callFn(mod, \"rspyts_cls__{name}__new\", {}), 1, Number.MAX_SAFE_INTEGER);\n",
-                    call_args_codec(&ctor.params, &ctor_args_codec(class), None, ctor.err.as_deref())
-                ));
-            } else {
-                let bindings: Vec<String> =
-                    ctor.params.iter().map(|p| ts_binding(&p.name)).collect();
-                let types: Vec<String> = ctor.params.iter().map(|p| ts_type(&p.ty)).collect();
-                out.push_str(&format!(
-                    "          const [{}] = args as [{}];\n",
-                    bindings.join(", "),
-                    types.join(", ")
-                ));
-                out.push_str(&format!(
-                    "          raw = boundedIntFromWire(callFn(mod, \"rspyts_cls__{name}__new\", {}), 1, Number.MAX_SAFE_INTEGER);\n",
-                    call_args_codec(&ctor.params, &ctor_args_codec(class), None, ctor.err.as_deref())
-                ));
-            }
-            out.push_str("        }\n");
-            out.push_str("        this.#handle = BigInt(raw);\n");
-        }
-        (None, _) => {
-            let hint = match factories.as_slice() {
-                [] => String::new(),
-                many => format!(
-                    "; use {}",
-                    many.iter()
-                        .map(|s| format!("{name}.{}(...)", s.name.to_lower_camel_case()))
-                        .collect::<Vec<_>>()
-                        .join(" or ")
-                ),
-            };
-            out.push_str("      constructor(internal: typeof INTERNAL, raw: number);\n");
-            out.push_str("      constructor(...args: unknown[]) {\n");
-            out.push_str("        if (args[0] !== INTERNAL) {\n");
-            out.push_str(&format!(
-                "          throw new Error(\"{name} cannot be constructed directly{hint}\");\n"
-            ));
-            out.push_str("        }\n");
-            out.push_str("        this.#handle = BigInt(args[1] as number);\n");
-        }
-    }
-    out.push_str("        const handle = this.#handle;\n");
-    out.push_str(&format!(
-        "        finalizer.register(this, () => callDrop(mod, \"{drop_symbol}\", handle), this);\n"
-    ));
-    out.push_str("      }\n");
-
-    for s in &statics {
-        let s_name = s.name.to_lower_camel_case();
-        let symbol = format!("rspyts_cls__{name}__{}", s.name);
-        out.push('\n');
-        out.push_str(&ts_doc(&s.docs, "      "));
-        if s.returns_self {
-            out.push_str(&format!(
-                "      static {s_name}({}): {name} {{\n",
-                ts_params(&s.params)
-            ));
-            out.push_str(&format!(
-                "        const raw = boundedIntFromWire(callFn(mod, \"{symbol}\", {}), 1, Number.MAX_SAFE_INTEGER);\n",
-                call_args_codec(&s.params, &static_args_codec(class, &s.name), None, s.err.as_deref())
-            ));
-            out.push_str("        return new this(INTERNAL, raw);\n");
-            out.push_str("      }\n");
-        } else if matches!(s.ret, Ty::Unit) {
-            out.push_str(&format!(
-                "      static {s_name}({}): void {{\n        codecs.{}(callFn(mod, \"{symbol}\", {}));\n      }}\n",
-                ts_params(&s.params),
-                static_result_codec(class, &s.name),
-                call_args_codec(&s.params, &static_args_codec(class, &s.name), None, s.err.as_deref())
-            ));
-        } else {
-            let ret = ts_type(&s.ret);
-            let call = format!(
-                "callFn(mod, \"{symbol}\", {})",
-                call_args_codec(
-                    &s.params,
-                    &static_args_codec(class, &s.name),
-                    None,
-                    s.err.as_deref()
-                )
-            );
-            out.push_str(&format!(
-                "      static {s_name}({}): {ret} {{\n        return codecs.{}({call});\n      }}\n",
-                ts_params(&s.params),
-                static_result_codec(class, &s.name),
-            ));
-        }
-    }
-
-    for method in class.methods.iter().filter(|method| on_ts(&method.targets)) {
-        let m_name = method.name.to_lower_camel_case();
-        let symbol = format!("rspyts_cls__{name}__{}", method.name);
-        let call = format!(
-            "callFn(mod, \"{symbol}\", {})",
-            call_args_codec(
-                &method.params,
-                &method_args_codec(class, &method.name),
-                Some("this.#handle"),
-                method.err.as_deref(),
-            )
+    output.push_str(&typescript_declaration_imports(contract));
+    if mode == TypeScriptMode::Wasm {
+        output.push_str(
+            "export type InitInput = RequestInfo | URL | Response | BufferSource | WebAssembly.Module;\n\
+export interface InitOutput { readonly memory: WebAssembly.Memory; }\n\
+export default function init(input?: InitInput | Promise<InitInput>): Promise<InitOutput>;\n\n",
         );
-        out.push('\n');
-        out.push_str(&ts_doc(&method.docs, "      "));
-        if matches!(method.ret, Ty::Unit) {
-            out.push_str(&format!(
-                "      {m_name}({}): void {{\n        codecs.{}({call});\n      }}\n",
-                ts_params(&method.params),
-                method_result_codec(class, &method.name),
-            ));
-        } else {
-            let ret = ts_type(&method.ret);
-            out.push_str(&format!(
-                "      {m_name}({}): {ret} {{\n        return codecs.{}({call});\n      }}\n",
-                ts_params(&method.params),
-                method_result_codec(class, &method.name),
-            ));
-        }
     }
-
-    out.push_str(&format!(
-        "
-      /** Release the underlying Rust object. Safe to call more than once. */
-      free(): void {{
-        finalizer.unregister(this);
-        callDrop(mod, \"{drop_symbol}\", this.#handle);
-      }}
-
-      [Symbol.dispose](): void {{
-        this.free();
-      }}
-    }},\n"
+    output.push_str(&format!(
+        "export declare const CONTRACT_FINGERPRINT: {};\n\n",
+        json_string(fingerprint)
     ));
-    out
-}
-
-/// Deterministically wrap generated implementation lines. The emitter owns
-/// formatting so checked-in output stays readable without a downstream
-/// formatter. Breaks occur only at TypeScript whitespace-safe delimiters.
-fn wrap_ts_source(source: &str, width: usize) -> String {
-    let mut out = String::with_capacity(source.len() + source.len() / 20);
-    for line in source.lines() {
-        wrap_ts_line(&mut out, line, width);
-    }
-    out
-}
-
-fn wrap_ts_line(out: &mut String, line: &str, width: usize) {
-    if line.len() <= width || line.trim_start().starts_with("//") {
-        out.push_str(line);
-        out.push('\n');
-        return;
+    if mode == TypeScriptMode::Wasm {
+        output.push_str(
+            "export declare class ResourceClosedError extends globalThis.Error {\n  constructor(resource: string);\n}\n\n",
+        );
     }
 
-    let leading = &line[..line.len() - line.trim_start().len()];
-    let continuation = format!("{leading}    ");
-    let mut remaining = line.trim_start();
-    let mut prefix = leading;
-    while prefix.len() + remaining.len() > width {
-        let available = width.saturating_sub(prefix.len());
-        let points = ts_wrap_points(remaining);
-        let split = points
+    for item in ordered_types(manifest) {
+        output.push_str(&typescript_type(item, names, contract));
+        output.push('\n');
+    }
+    for error in manifest
+        .errors
+        .iter()
+        .filter(|_| mode == TypeScriptMode::Wasm)
+    {
+        output.push_str(&ts_doc(error.docs.as_deref()));
+        output.push_str(&format!(
+            "export declare class {} extends globalThis.Error {{\n  readonly code: string;\n  constructor(message: string, code: string);\n}}\n\n",
+            error.name
+        ));
+    }
+    for function in manifest.functions.iter().filter(|function| {
+        mode == TypeScriptMode::Wasm && matches!(function.target, Target::Both | Target::Typescript)
+    }) {
+        output.push_str(&ts_doc(function.docs.as_deref()));
+        let declaration = if mode == TypeScriptMode::Wasm {
+            "export function"
+        } else {
+            "export declare function"
+        };
+        output.push_str(&format!(
+            "{declaration} {}({}): {};\n\n",
+            function.host_name,
+            function
+                .params
+                .iter()
+                .map(|param| format!("{}: {}", param.host_name, typescript_ref(&param.ty, names)))
+                .collect::<Vec<_>>()
+                .join(", "),
+            typescript_ref(&function.returns, names)
+        ));
+    }
+    for resource in manifest.resources.iter().filter(|resource| {
+        mode == TypeScriptMode::Wasm && matches!(resource.target, Target::Both | Target::Typescript)
+    }) {
+        output.push_str(&ts_doc(resource.docs.as_deref()));
+        output.push_str(&format!("export declare class {} {{\n", resource.name));
+        let constructors = resource
+            .constructors
+            .iter()
+            .filter(|constructor| matches!(constructor.target, Target::Both | Target::Typescript))
+            .collect::<Vec<_>>();
+        let primary = constructors
             .iter()
             .copied()
-            .rfind(|point| *point <= available && *point >= 16)
-            .or_else(|| points.iter().copied().find(|point| *point > available));
-        let Some(split) = split else {
-            break;
-        };
-        out.push_str(prefix);
-        out.push_str(remaining[..split].trim_end());
-        out.push('\n');
-        remaining = remaining[split..].trim_start();
-        prefix = &continuation;
+            .find(|constructor| constructor.rust_name == "new")
+            .or_else(|| constructors.first().copied());
+        if let Some(constructor) = primary {
+            output.push_str(&format!(
+                "  constructor({});\n",
+                constructor
+                    .params
+                    .iter()
+                    .map(|param| format!(
+                        "{}: {}",
+                        param.host_name,
+                        typescript_ref(&param.ty, names)
+                    ))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+        for constructor in constructors
+            .into_iter()
+            .filter(|constructor| Some(*constructor) != primary)
+        {
+            output.push_str(&format!(
+                "  static {}({}): {};\n",
+                constructor.host_name,
+                constructor
+                    .params
+                    .iter()
+                    .map(|param| format!(
+                        "{}: {}",
+                        param.host_name,
+                        typescript_ref(&param.ty, names)
+                    ))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                resource.name,
+            ));
+        }
+        for method in resource
+            .methods
+            .iter()
+            .filter(|method| matches!(method.target, Target::Both | Target::Typescript))
+        {
+            output.push_str(&format!(
+                "  {}({}): {};\n",
+                method.host_name,
+                method
+                    .params
+                    .iter()
+                    .map(|param| format!(
+                        "{}: {}",
+                        param.host_name,
+                        typescript_ref(&param.ty, names)
+                    ))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                typescript_ref(&method.returns, names)
+            ));
+        }
+        output.push_str("  free(): void;\n  [Symbol.dispose](): void;\n}\n\n");
     }
-    out.push_str(prefix);
-    out.push_str(remaining);
-    out.push('\n');
+    for constant in manifest
+        .constants
+        .iter()
+        .filter(|constant| constant_in_typescript(constant.target, mode))
+    {
+        output.push_str(&ts_doc(constant.docs.as_deref()));
+        output.push_str(&format!(
+            "export const {}: {};\n",
+            constant.host_name,
+            typescript_literal_type(&constant.value, &constant.ty, contract, names)
+        ));
+    }
+    output
 }
 
-fn ts_wrap_points(line: &str) -> Vec<usize> {
-    let bytes = line.as_bytes();
-    let mut points = Vec::new();
-    let mut quote = None;
-    let mut escaped = false;
-    let mut index = 0;
-    while index < bytes.len() {
-        let byte = bytes[index];
-        if let Some(active) = quote {
-            if escaped {
-                escaped = false;
-            } else if byte == b'\\' {
-                escaped = true;
-            } else if byte == active {
-                quote = None;
+fn wasm_runtime(contract: &ResolvedContract, fingerprint: &str) -> String {
+    let manifest = &contract.manifest;
+    let mut output = format!(
+        "// Generated by rspyts 0.4. Do not edit.\n{}\
+import initializeNative, * as native from \"./native.js\";\n\n\
+export const CONTRACT_FINGERPRINT = {};\n\n\
+let initializationPromise;\n\n\
+export default function init(input) {{\n\
+  if (initializationPromise === undefined) {{\n\
+    initializationPromise = Promise.resolve()\n\
+      .then(() => initializeNative(input))\n\
+      .catch((error) => {{\n\
+        initializationPromise = undefined;\n\
+        throw error;\n\
+      }});\n\
+  }}\n\
+  return initializationPromise;\n\
+}}\n\n\
+export class ResourceClosedError extends globalThis.Error {{\n\
+  constructor(resource) {{\n\
+    super(`${{resource}} is closed`);\n\
+    this.name = \"ResourceClosedError\";\n\
+  }}\n\
+}}\n\n",
+        typescript_runtime_imports(contract),
+        json_string(fingerprint)
+    );
+    output.push_str(deep_freeze_runtime());
+    for item in &manifest.types {
+        if let TypeShape::StringEnum { variants } = &item.shape {
+            output.push_str(&format!("export const {} = Object.freeze({{\n", item.name));
+            for variant in variants {
+                output.push_str(&format!(
+                    "  {}: {},\n",
+                    variant.rust_name,
+                    json_string(&variant.wire_name)
+                ));
             }
-            index += 1;
-            continue;
+            output.push_str("});\n\n");
         }
-        if matches!(byte, b'\"' | b'\'' | b'`') {
-            quote = Some(byte);
-            index += 1;
-            continue;
-        }
-        match byte {
-            b',' | b'(' | b'[' | b'{' => points.push(index + 1),
-            b'?' | b':' if surrounded_by_spaces(bytes, index) => points.push(index),
-            b'=' if bytes.get(index + 1) == Some(&b'>') => points.push(index + 2),
-            b'&' if bytes.get(index + 1) == Some(&b'&') => points.push(index),
-            b'&' if surrounded_by_spaces(bytes, index) => points.push(index),
-            b'|' if bytes.get(index + 1) == Some(&b'|') => points.push(index),
-            b'|' if surrounded_by_spaces(bytes, index) => points.push(index),
-            _ => {}
-        }
-        index += 1;
     }
-    points.sort_unstable();
-    points.dedup();
-    points
+    for error in &manifest.errors {
+        output.push_str(&format!(
+            "export class {} extends globalThis.Error {{\n  constructor(message, code) {{\n    super(message);\n    this.name = {};\n    this.code = code;\n  }}\n}}\n\n",
+            error.name,
+            json_string(&error.name)
+        ));
+    }
+    output.push_str(
+        "function translateError(error, expectedType, ErrorClass, codes) {\n\
+  if (error instanceof WebAssembly.RuntimeError || error instanceof globalThis.Error && !ErrorClass) {\n\
+    return error;\n\
+  }\n\
+  const typeId = error?.typeId ?? error?.type_id;\n\
+  let code = error?.code;\n\
+  let message = error?.message;\n\
+  if (typeof error === \"string\") {\n\
+    const separator = error.indexOf(\"\\n\");\n\
+    code = separator < 0 ? error : error.slice(0, separator);\n\
+    message = separator < 0 ? error : error.slice(separator + 1);\n\
+  }\n\
+  if (ErrorClass && (typeId === expectedType || codes.includes(code))) {\n\
+    return new ErrorClass(message ?? String(error), code ?? \"unknown\");\n\
+  }\n\
+  return error instanceof globalThis.Error ? error : new globalThis.Error(error?.message ?? String(error));\n\
+}\n\n",
+    );
+    for function in manifest
+        .functions
+        .iter()
+        .filter(|function| matches!(function.target, Target::Both | Target::Typescript))
+    {
+        let params = function
+            .params
+            .iter()
+            .map(|param| param.host_name.as_str())
+            .collect::<Vec<_>>();
+        output.push_str(&format!(
+            "export function {}({}) {{\n  try {{\n    return deepFreeze(native.{}({}));\n  }} catch (error) {{\n    throw {};\n  }}\n}}\n\n",
+            function.host_name,
+            params.join(", "),
+            function.host_name,
+            params.join(", "),
+            translate_error(&function.error, contract)
+        ));
+    }
+    for resource in manifest
+        .resources
+        .iter()
+        .filter(|resource| matches!(resource.target, Target::Both | Target::Typescript))
+    {
+        let constructors = resource
+            .constructors
+            .iter()
+            .filter(|constructor| matches!(constructor.target, Target::Both | Target::Typescript))
+            .collect::<Vec<_>>();
+        let constructor = constructors
+            .iter()
+            .copied()
+            .find(|constructor| constructor.rust_name == "new")
+            .or_else(|| constructors.first().copied());
+        let params = constructor
+            .map(|constructor| {
+                constructor
+                    .params
+                    .iter()
+                    .map(|param| param.host_name.as_str())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        output.push_str(&format!(
+            "export class {} {{\n  constructor({}) {{\n    try {{\n      this.handle = new native.__RspytsWasm{}({});\n    }} catch (error) {{\n      throw {};\n    }}\n  }}\n\n  requireHandle() {{\n    if (this.handle === null) throw new ResourceClosedError({});\n    return this.handle;\n  }}\n",
+            resource.name,
+            params.join(", "),
+            resource.name,
+            params.join(", "),
+            constructor
+                .map(|constructor| translate_error(&constructor.error, contract))
+                .unwrap_or_else(|| "translateError(error)".into()),
+            json_string(&resource.name)
+        ));
+        for factory in constructors
+            .into_iter()
+            .filter(|factory| Some(*factory) != constructor)
+        {
+            let params = factory
+                .params
+                .iter()
+                .map(|param| param.host_name.as_str())
+                .collect::<Vec<_>>();
+            output.push_str(&format!(
+                "\n  static {}({}) {{\n    try {{\n      const resource = Object.create({}.prototype);\n      resource.handle = native.__RspytsWasm{}.{}({});\n      return resource;\n    }} catch (error) {{\n      throw {};\n    }}\n  }}\n",
+                factory.host_name,
+                params.join(", "),
+                resource.name,
+                resource.name,
+                factory.host_name,
+                params.join(", "),
+                translate_error(&factory.error, contract),
+            ));
+        }
+        for method in resource
+            .methods
+            .iter()
+            .filter(|method| matches!(method.target, Target::Both | Target::Typescript))
+        {
+            let params = method
+                .params
+                .iter()
+                .map(|param| param.host_name.as_str())
+                .collect::<Vec<_>>();
+            output.push_str(&format!(
+                "\n  {}({}) {{\n    try {{\n      return deepFreeze(this.requireHandle().{}({}));\n    }} catch (error) {{\n      if (error instanceof WebAssembly.RuntimeError) this.free();\n      throw {};\n    }}\n  }}\n",
+                method.host_name,
+                params.join(", "),
+                method.host_name,
+                params.join(", "),
+                translate_error(&method.error, contract)
+            ));
+        }
+        output.push_str(
+            "\n  free() {\n    if (this.handle !== null) {\n      this.handle.free();\n      this.handle = null;\n    }\n  }\n\n  [Symbol.dispose]() {\n    this.free();\n  }\n}\n\n",
+        );
+    }
+    for constant in manifest
+        .constants
+        .iter()
+        .filter(|constant| constant_in_typescript(constant.target, TypeScriptMode::Wasm))
+    {
+        output.push_str(&format!(
+            "export const {} = deepFreeze({});\n",
+            constant.host_name,
+            typescript_value(&constant.value, &constant.ty, contract)
+        ));
+    }
+    output
 }
 
-fn surrounded_by_spaces(bytes: &[u8], index: usize) -> bool {
-    index > 0
-        && bytes[index - 1].is_ascii_whitespace()
-        && bytes.get(index + 1).is_some_and(u8::is_ascii_whitespace)
+fn translate_error(error_id: &Option<DefinitionId>, contract: &ResolvedContract) -> String {
+    match error_id
+        .as_ref()
+        .and_then(|identity| error_definition(contract, identity))
+    {
+        Some(error) => format!(
+            "translateError(error, {}, {}, [{}])",
+            json_string(
+                &DefinitionId {
+                    owner: error.owner.clone(),
+                    id: error.id.clone(),
+                }
+                .to_string()
+            ),
+            error.name,
+            error
+                .variants
+                .iter()
+                .map(|variant| json_string(&variant.code))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        None => "translateError(error)".into(),
+    }
 }
 
-// ----------------------------------------------------------------- index.ts
+fn static_runtime(contract: &ResolvedContract, fingerprint: &str) -> String {
+    let manifest = &contract.manifest;
+    let mut output = format!(
+        "// Generated by rspyts 0.4. Do not edit.\n{}export const CONTRACT_FINGERPRINT = {};\n\n",
+        typescript_runtime_imports(contract),
+        json_string(fingerprint)
+    );
+    output.push_str(deep_freeze_runtime());
+    for item in &manifest.types {
+        if let TypeShape::StringEnum { variants } = &item.shape {
+            output.push_str(&format!("export const {} = Object.freeze({{\n", item.name));
+            for variant in variants {
+                output.push_str(&format!(
+                    "  {}: {},\n",
+                    variant.rust_name,
+                    json_string(&variant.wire_name)
+                ));
+            }
+            output.push_str("});\n\n");
+        }
+    }
+    for constant in manifest
+        .constants
+        .iter()
+        .filter(|constant| constant_in_typescript(constant.target, TypeScriptMode::Static))
+    {
+        output.push_str(&format!(
+            "export const {} = deepFreeze({});\n",
+            constant.host_name,
+            typescript_value(&constant.value, &constant.ty, contract)
+        ));
+    }
+    output
+}
 
-fn index_ts(provenance: &Provenance<'_>) -> String {
-    let mut out = ts_header(provenance);
-    out.push('\n');
-    out.push_str("export * from \"./client.js\";\n");
-    out.push_str("export * from \"./constants.js\";\n");
-    out.push_str("export * from \"./errors.js\";\n");
-    out.push_str("export * from \"./types.js\";\n");
-    out
+fn deep_freeze_runtime() -> &'static str {
+    "function deepFreeze(value, seen = new WeakSet()) {\n\
+  if (value === null || typeof value !== \"object\" || ArrayBuffer.isView(value)) return value;\n\
+  if (seen.has(value)) return value;\n\
+  seen.add(value);\n\
+  for (const nested of Object.values(value)) deepFreeze(nested, seen);\n\
+  return Object.isFrozen(value) ? value : Object.freeze(value);\n\
+}\n\n"
+}
+
+fn constant_in_typescript(target: Target, mode: TypeScriptMode) -> bool {
+    matches!(target, Target::Both | Target::Typescript)
+        || target == Target::Static && mode == TypeScriptMode::Static
+}
+
+fn typescript_type(item: &TypeDef, names: &TypeNames, contract: &ResolvedContract) -> String {
+    let mut output = ts_doc(item.docs.as_deref());
+    match &item.shape {
+        TypeShape::Struct { fields } => {
+            output.push_str(&format!("export interface {} {{\n", item.name));
+            for field in fields {
+                if let Some(docs) = field.docs.as_deref() {
+                    output.push_str("  ");
+                    output.push_str(ts_doc(Some(docs)).replace('\n', "\n  ").trim_end());
+                    output.push('\n');
+                }
+                output.push_str(&format!(
+                    "  readonly {}{}: {};\n",
+                    ts_property(&field.wire_name),
+                    if field.required { "" } else { "?" },
+                    typescript_field_ref(field, names, contract)
+                ));
+            }
+            output.push_str("}\n");
+        }
+        TypeShape::StringEnum { variants } => {
+            output.push_str(&format!("export enum {} {{\n", item.name));
+            for variant in variants {
+                output.push_str(&format!(
+                    "  {} = {},\n",
+                    variant.rust_name,
+                    json_string(&variant.wire_name)
+                ));
+            }
+            output.push_str("}\n");
+        }
+        TypeShape::TaggedEnum { tag, variants } => {
+            output.push_str(&format!("export type {} =\n", item.name));
+            for (index, variant) in variants.iter().enumerate() {
+                output.push_str(if index == 0 { "  " } else { "  | " });
+                output.push_str(&format!(
+                    "{{ readonly {}: {}",
+                    ts_property(tag),
+                    json_string(&variant.wire_name)
+                ));
+                for field in &variant.fields {
+                    output.push_str(&format!(
+                        "; readonly {}{}: {}",
+                        ts_property(&field.wire_name),
+                        if field.required { "" } else { "?" },
+                        typescript_field_ref(field, names, contract)
+                    ));
+                }
+                output.push_str(" }\n");
+            }
+            output.push_str(";\n");
+        }
+        TypeShape::Alias { target } => output.push_str(&format!(
+            "export type {} = {};\n",
+            item.name,
+            typescript_ref(target, names)
+        )),
+    }
+    output
+}
+
+fn typescript_field_ref(
+    field: &FieldDef,
+    names: &TypeNames,
+    contract: &ResolvedContract,
+) -> String {
+    match &field.constraints.literal {
+        Some(value) => {
+            let literal = typescript_scalar(value, &field.ty, contract);
+            if matches!(field.ty, TypeRef::Option { .. }) {
+                format!("{literal} | null")
+            } else {
+                literal
+            }
+        }
+        None => typescript_ref(&field.ty, names),
+    }
+}
+
+fn typescript_ref(reference: &TypeRef, names: &TypeNames) -> String {
+    match reference {
+        TypeRef::Unit => "void".into(),
+        TypeRef::Bool => "boolean".into(),
+        TypeRef::Int { bits: 64, .. } => "bigint".into(),
+        TypeRef::Int { .. } | TypeRef::Float { .. } => "number".into(),
+        TypeRef::String => "string".into(),
+        TypeRef::DateTime => "string".into(),
+        TypeRef::Json => "JsonValue".into(),
+        TypeRef::Option { item } => format!("{} | null", typescript_ref(item, names)),
+        TypeRef::List { item } => format!("ReadonlyArray<{}>", typescript_ref(item, names)),
+        TypeRef::Map { value } => {
+            format!("Readonly<Record<string, {}>>", typescript_ref(value, names))
+        }
+        TypeRef::Tuple { items } => format!(
+            "readonly [{}]",
+            items
+                .iter()
+                .map(|item| typescript_ref(item, names))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        TypeRef::Named { identity } => names
+            .get(identity)
+            .cloned()
+            .unwrap_or_else(|| identity.to_string()),
+        TypeRef::Bytes => "Uint8Array".into(),
+        TypeRef::Buffer { element } => match element {
+            BufferElement::U8 => "Uint8Array",
+            BufferElement::I8 => "Int8Array",
+            BufferElement::U16 => "Uint16Array",
+            BufferElement::I16 => "Int16Array",
+            BufferElement::U32 => "Uint32Array",
+            BufferElement::I32 => "Int32Array",
+            BufferElement::U64 => "BigUint64Array",
+            BufferElement::I64 => "BigInt64Array",
+            BufferElement::F32 => "Float32Array",
+            BufferElement::F64 => "Float64Array",
+        }
+        .into(),
+    }
+}
+
+fn typescript_literal_type(
+    value: &Value,
+    ty: &TypeRef,
+    contract: &ResolvedContract,
+    names: &TypeNames,
+) -> String {
+    match (value, ty) {
+        (Value::Null, _) => "null".into(),
+        (value, TypeRef::Option { item }) => typescript_literal_type(value, item, contract, names),
+        (value, TypeRef::Named { identity }) => match type_definition(contract, identity) {
+            Some(TypeDef {
+                name,
+                shape: TypeShape::StringEnum { variants },
+                ..
+            }) => value
+                .as_str()
+                .and_then(|wire| {
+                    variants
+                        .iter()
+                        .find(|variant| variant.wire_name == wire)
+                        .map(|variant| format!("{name}.{}", variant.rust_name))
+                })
+                .unwrap_or_else(|| typescript_ref(ty, names)),
+            Some(TypeDef {
+                shape: TypeShape::Alias { target },
+                ..
+            }) => typescript_literal_type(value, target, contract, names),
+            Some(TypeDef {
+                shape: TypeShape::Struct { fields },
+                ..
+            }) => match value {
+                Value::Object(values) => {
+                    typescript_struct_literal_type(values, fields, contract, names)
+                }
+                _ => typescript_ref(ty, names),
+            },
+            Some(TypeDef {
+                shape: TypeShape::TaggedEnum { tag, variants },
+                ..
+            }) => match value {
+                Value::Object(values) => {
+                    let variant = values
+                        .get(tag)
+                        .and_then(Value::as_str)
+                        .and_then(|wire| variants.iter().find(|variant| variant.wire_name == wire));
+                    variant
+                        .map(|variant| {
+                            let fields = std::iter::once(rspyts::ir::FieldDef {
+                                rust_name: tag.clone(),
+                                wire_name: tag.clone(),
+                                docs: None,
+                                ty: TypeRef::String,
+                                required: true,
+                                default: None,
+                                constraints: rspyts::ir::FieldConstraints::default(),
+                            })
+                            .chain(variant.fields.iter().cloned())
+                            .collect::<Vec<_>>();
+                            typescript_struct_literal_type(values, &fields, contract, names)
+                        })
+                        .unwrap_or_else(|| typescript_ref(ty, names))
+                }
+                _ => typescript_ref(ty, names),
+            },
+            None => typescript_ref(ty, names),
+        },
+        (Value::Bool(value), _) => value.to_string(),
+        (Value::Number(value), TypeRef::Int { bits: 64, .. }) => format!("{value}n"),
+        (Value::Number(value), _) => value.to_string(),
+        (Value::String(value), _) => json_string(value),
+        (Value::Array(values), TypeRef::List { item }) => format!(
+            "readonly [{}]",
+            values
+                .iter()
+                .map(|value| typescript_literal_type(value, item, contract, names))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        (Value::Array(values), TypeRef::Tuple { items }) => format!(
+            "readonly [{}]",
+            values
+                .iter()
+                .zip(items)
+                .map(|(value, item)| typescript_literal_type(value, item, contract, names))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        (Value::Object(values), TypeRef::Map { value }) => format!(
+            "{{ {} }}",
+            values
+                .iter()
+                .map(|(key, item)| format!(
+                    "readonly {}: {}",
+                    json_string(key),
+                    typescript_literal_type(item, value, contract, names)
+                ))
+                .collect::<Vec<_>>()
+                .join("; ")
+        ),
+        (Value::Array(_), TypeRef::Bytes | TypeRef::Buffer { .. }) => typescript_ref(ty, names),
+        _ => typescript_json_literal_type(value, contract, names),
+    }
+}
+
+fn typescript_scalar(value: &ScalarValue, ty: &TypeRef, contract: &ResolvedContract) -> String {
+    if let TypeRef::Option { item } = ty {
+        return typescript_scalar(value, item, contract);
+    }
+    if let TypeRef::Named { identity } = ty {
+        return match type_definition(contract, identity) {
+            Some(TypeDef {
+                name,
+                shape: TypeShape::StringEnum { variants },
+                ..
+            }) => match value {
+                ScalarValue::String(value) => variants
+                    .iter()
+                    .find(|variant| variant.wire_name == *value)
+                    .map(|variant| format!("{name}.{}", variant.rust_name))
+                    .unwrap_or_else(|| json_string(value)),
+                _ => typescript_scalar_value(value, ty),
+            },
+            Some(TypeDef {
+                shape: TypeShape::Alias { target },
+                ..
+            }) => typescript_scalar(value, target, contract),
+            _ => typescript_scalar_value(value, ty),
+        };
+    }
+    typescript_scalar_value(value, ty)
+}
+
+fn typescript_scalar_value(value: &ScalarValue, ty: &TypeRef) -> String {
+    match value {
+        ScalarValue::Bool(value) => value.to_string(),
+        ScalarValue::I64(value) if matches!(ty, TypeRef::Int { bits: 64, .. }) => {
+            format!("{value}n")
+        }
+        ScalarValue::I64(value) => value.to_string(),
+        ScalarValue::String(value) => json_string(value),
+    }
+}
+
+fn typescript_struct_literal_type(
+    values: &serde_json::Map<String, Value>,
+    fields: &[rspyts::ir::FieldDef],
+    contract: &ResolvedContract,
+    names: &TypeNames,
+) -> String {
+    format!(
+        "{{ {} }}",
+        fields
+            .iter()
+            .filter_map(|field| {
+                values.get(&field.wire_name).map(|value| {
+                    format!(
+                        "readonly {}: {}",
+                        json_string(&field.wire_name),
+                        typescript_literal_type(value, &field.ty, contract, names)
+                    )
+                })
+            })
+            .collect::<Vec<_>>()
+            .join("; ")
+    )
+}
+
+fn typescript_json_literal_type(
+    value: &Value,
+    contract: &ResolvedContract,
+    names: &TypeNames,
+) -> String {
+    match value {
+        Value::Null => "null".into(),
+        Value::Bool(value) => value.to_string(),
+        Value::Number(value) => value.to_string(),
+        Value::String(value) => json_string(value),
+        Value::Array(values) => format!(
+            "readonly [{}]",
+            values
+                .iter()
+                .map(|value| typescript_literal_type(value, &TypeRef::Json, contract, names))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        Value::Object(values) => format!(
+            "{{ {} }}",
+            values
+                .iter()
+                .map(|(key, value)| format!(
+                    "readonly {}: {}",
+                    json_string(key),
+                    typescript_literal_type(value, &TypeRef::Json, contract, names)
+                ))
+                .collect::<Vec<_>>()
+                .join("; ")
+        ),
+    }
+}
+
+fn typescript_value(value: &Value, ty: &TypeRef, contract: &ResolvedContract) -> String {
+    match (value, ty) {
+        (Value::Number(number), TypeRef::Int { bits: 64, .. }) => format!("{number}n"),
+        (Value::Array(values), TypeRef::List { item }) => format!(
+            "[{}]",
+            values
+                .iter()
+                .map(|value| typescript_value(value, item, contract))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        (Value::Array(values), TypeRef::Tuple { items }) => format!(
+            "[{}]",
+            values
+                .iter()
+                .zip(items)
+                .map(|(value, item)| typescript_value(value, item, contract))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        (Value::Object(values), TypeRef::Map { value }) => format!(
+            "{{ {} }}",
+            values
+                .iter()
+                .map(|(key, item)| format!(
+                    "{}: {}",
+                    json_string(key),
+                    typescript_value(item, value, contract)
+                ))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        (value, TypeRef::Option { item }) if !value.is_null() => {
+            typescript_value(value, item, contract)
+        }
+        (value, TypeRef::Named { identity }) => match type_definition(contract, identity) {
+            Some(TypeDef {
+                shape: TypeShape::Alias { target },
+                ..
+            }) => typescript_value(value, target, contract),
+            Some(TypeDef {
+                shape: TypeShape::Struct { fields },
+                ..
+            }) => match value.as_object() {
+                Some(values) => format!(
+                    "{{ {} }}",
+                    fields
+                        .iter()
+                        .filter_map(|field| {
+                            values.get(&field.wire_name).map(|value| {
+                                format!(
+                                    "{}: {}",
+                                    ts_property(&field.wire_name),
+                                    typescript_value(value, &field.ty, contract)
+                                )
+                            })
+                        })
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+                None => serde_json::to_string(value).expect("JSON value is serializable"),
+            },
+            Some(TypeDef {
+                shape: TypeShape::TaggedEnum { tag, variants },
+                ..
+            }) => match value.as_object() {
+                Some(values) => {
+                    let variant = values
+                        .get(tag)
+                        .and_then(Value::as_str)
+                        .and_then(|tag| variants.iter().find(|variant| variant.wire_name == tag));
+                    match variant {
+                        Some(variant) => format!(
+                            "{{ {} }}",
+                            std::iter::once(format!(
+                                "{}: {}",
+                                ts_property(tag),
+                                json_string(&variant.wire_name)
+                            ))
+                            .chain(variant.fields.iter().filter_map(|field| {
+                                values.get(&field.wire_name).map(|value| {
+                                    format!(
+                                        "{}: {}",
+                                        ts_property(&field.wire_name),
+                                        typescript_value(value, &field.ty, contract)
+                                    )
+                                })
+                            }))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                        ),
+                        None => serde_json::to_string(value).expect("JSON value is serializable"),
+                    }
+                }
+                None => serde_json::to_string(value).expect("JSON value is serializable"),
+            },
+            _ => serde_json::to_string(value).expect("JSON value is serializable"),
+        },
+        (Value::Array(values), TypeRef::Bytes) => format!(
+            "new Uint8Array([{}])",
+            values
+                .iter()
+                .map(Value::to_string)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        (Value::Array(values), TypeRef::Buffer { element }) => format!(
+            "new {}([{}])",
+            match element {
+                BufferElement::U8 => "Uint8Array",
+                BufferElement::I8 => "Int8Array",
+                BufferElement::U16 => "Uint16Array",
+                BufferElement::I16 => "Int16Array",
+                BufferElement::U32 => "Uint32Array",
+                BufferElement::I32 => "Int32Array",
+                BufferElement::U64 => "BigUint64Array",
+                BufferElement::I64 => "BigInt64Array",
+                BufferElement::F32 => "Float32Array",
+                BufferElement::F64 => "Float64Array",
+            },
+            values
+                .iter()
+                .map(|value| {
+                    if matches!(element, BufferElement::U64 | BufferElement::I64) {
+                        format!("{value}n")
+                    } else {
+                        value.to_string()
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        _ => serde_json::to_string(value).expect("JSON value is serializable"),
+    }
+}
+
+fn json_string(value: &str) -> String {
+    serde_json::to_string(value).expect("a string is serializable")
+}
+
+fn typescript_declaration_imports(contract: &ResolvedContract) -> String {
+    let mut output = String::new();
+    for dependency in contract.dependencies.values() {
+        let Some(package) = dependency.typescript.as_deref() else {
+            continue;
+        };
+        let type_only = contract
+            .foreign_types
+            .iter()
+            .filter(|(identity, definition)| {
+                identity.owner == dependency.owner
+                    && !matches!(definition.shape, TypeShape::StringEnum { .. })
+            })
+            .map(|(_, definition)| definition.name.as_str())
+            .collect::<Vec<_>>();
+        let enums = contract
+            .foreign_types
+            .iter()
+            .filter(|(identity, definition)| {
+                identity.owner == dependency.owner
+                    && matches!(definition.shape, TypeShape::StringEnum { .. })
+            })
+            .map(|(_, definition)| definition.name.as_str())
+            .collect::<Vec<_>>();
+        let errors = contract
+            .foreign_errors
+            .iter()
+            .filter(|(identity, _)| identity.owner == dependency.owner)
+            .map(|(_, definition)| definition.name.as_str())
+            .collect::<Vec<_>>();
+        if !type_only.is_empty() {
+            output.push_str(&format!(
+                "import type {{ {} }} from {};\nexport type {{ {} }} from {};\n",
+                type_only.join(", "),
+                json_string(package),
+                type_only.join(", "),
+                json_string(package)
+            ));
+        }
+        if !enums.is_empty() {
+            output.push_str(&format!(
+                "import {{ {} }} from {};\nexport {{ {} }} from {};\n",
+                enums.join(", "),
+                json_string(package),
+                enums.join(", "),
+                json_string(package)
+            ));
+        }
+        if !errors.is_empty() {
+            output.push_str(&format!(
+                "import {{ {} }} from {};\nexport {{ {} }} from {};\n",
+                errors.join(", "),
+                json_string(package),
+                errors.join(", "),
+                json_string(package)
+            ));
+        }
+    }
+    if !output.is_empty() {
+        output.push('\n');
+    }
+    output
+}
+
+fn typescript_runtime_imports(contract: &ResolvedContract) -> String {
+    let mut output = String::new();
+    for dependency in contract.dependencies.values() {
+        let Some(package) = dependency.typescript.as_deref() else {
+            continue;
+        };
+        let errors = contract
+            .foreign_errors
+            .iter()
+            .filter(|(identity, _)| identity.owner == dependency.owner)
+            .map(|(_, definition)| definition.name.as_str())
+            .collect::<Vec<_>>();
+        if !errors.is_empty() {
+            output.push_str(&format!(
+                "import {{ {} }} from {};\nexport {{ {} }};\n",
+                errors.join(", "),
+                json_string(package),
+                errors.join(", ")
+            ));
+        }
+        let enums = contract
+            .foreign_types
+            .iter()
+            .filter(|(identity, definition)| {
+                identity.owner == dependency.owner
+                    && matches!(definition.shape, TypeShape::StringEnum { .. })
+            })
+            .map(|(_, definition)| definition.name.as_str())
+            .collect::<Vec<_>>();
+        if !enums.is_empty() {
+            output.push_str(&format!(
+                "export {{ {} }} from {};\n",
+                enums.join(", "),
+                json_string(package)
+            ));
+        }
+    }
+    output
 }
 
 #[cfg(test)]
 mod tests {
-    use super::super::test_manifest::{
-        FOREIGN_ORIGIN, binary_manifest, exact_manifest, manifest, manifest_hash,
-    };
+    use std::collections::BTreeMap;
+    use std::fs;
+    use std::process::Command;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use rspyts::ir::*;
+
     use super::*;
 
-    fn rendered(manifest: &Manifest) -> Vec<(&'static str, String)> {
-        let hash = manifest_hash(manifest);
-        let provenance = Provenance {
-            manifest_hash: &hash,
-            rust_source: "../rust/src",
-        };
-        emit(manifest, &provenance, &BTreeMap::new())
-    }
-
-    fn file<'a>(files: &'a [(&str, String)], name: &str) -> &'a str {
-        files
-            .iter()
-            .find(|(candidate, _)| *candidate == name)
-            .expect("generated file exists")
-            .1
-            .as_str()
-    }
-
-    #[test]
-    fn emits_codecs_and_only_the_abi3_runtime_path() {
-        let files = rendered(&manifest());
-        assert_eq!(
-            files.iter().map(|(name, _)| *name).collect::<Vec<_>>(),
-            [
-                "client.ts",
-                "codecs.ts",
-                "constants.ts",
-                "errors.ts",
-                "index.ts",
-                "types.ts",
-            ]
-        );
-        let client = file(&files, "client.ts");
-        assert!(client.contains("from \"rspyts/internal/abi3\""), "{client}");
-        assert!(client.contains("verifyModuleContract"), "{client}");
-        assert!(client.contains("callFn"), "{client}");
-        assert!(!client.contains("callFnRaw"), "{client}");
-        assert!(!client.contains("from \"rspyts\""), "{client}");
-        assert!(!file(&files, "index.ts").contains("codecs"));
-    }
-
-    #[test]
-    fn named_references_use_one_named_codec_call() {
-        let files = rendered(&exact_manifest());
-        let client = file(&files, "client.ts");
-        let codecs = file(&files, "codecs.ts");
-        assert!(
-            client.contains("codecs.encodeFnRoundTripExactArgs("),
-            "{client}"
-        );
-        assert!(
-            client.contains("codecs.decodeFnRoundTripExactResult"),
-            "{client}"
-        );
-        assert!(
-            codecs.contains("export function encodeExactRecord"),
-            "{codecs}"
-        );
-        assert!(
-            codecs.contains("sequence: encodeSequenceId(value.sequence)"),
-            "{codecs}"
-        );
-        assert!(
-            codecs.contains("return { value: encodeExactRecord(value) }"),
-            "{codecs}"
-        );
-        assert!(!client.contains("objectFromWire"), "{client}");
-        assert!(!client.contains("u64FromWire"), "{client}");
-    }
-
-    #[test]
-    fn response_codecs_keep_explicit_tail_context_for_nested_buffers() {
-        let files = rendered(&binary_manifest());
-        let codecs = file(&files, "codecs.ts");
-        assert!(codecs.contains("response: WireResponse"), "{codecs}");
-        assert!(
-            codecs.contains("bufferFromWire(value0.samples, \"f64\")")
-                || codecs.contains("bufferFromWire(value0[\"samples\"], \"f64\")"),
-            "{codecs}"
-        );
-        assert!(codecs.contains("decodeBinaryPacket(response)"), "{codecs}");
-    }
-
-    #[test]
-    fn json_is_transparent_and_exact_integers_are_bigints() {
-        let mut manifest = exact_manifest();
-        manifest.constants.push(ConstDecl {
-            name: "MARKER_SHAPED_JSON".to_string(),
-            docs: String::new(),
-            origin: manifest.crate_name.clone(),
-            ty: Ty::Json,
-            value: serde_json::json!({"__rspyts_json__": {"kept": true}}),
-        });
-        let files = rendered(&manifest);
-        let types = file(&files, "types.ts");
-        let constants = file(&files, "constants.ts");
-        let codecs = file(&files, "codecs.ts");
-        assert!(
-            types.contains("export type SequenceId = bigint;"),
-            "{types}"
-        );
-        assert!(constants.contains("18446744073709551615n"), "{constants}");
-        assert!(
-            constants.contains("__rspyts_json__") && constants.contains("kept: true"),
-            "{constants}"
-        );
-        assert!(codecs.contains("jsonToWire"), "{codecs}");
-        assert!(codecs.contains("jsonFromWire"), "{codecs}");
-        assert!(!codecs.contains("__rspyts_json__"), "{codecs}");
-    }
-
-    #[test]
-    fn required_controls_presence_and_option_controls_nullability() {
-        let files = rendered(&manifest());
-        let types = file(&files, "types.ts");
-        assert!(types.contains("minimumValue: number;"), "{types}");
-        assert!(types.contains("tolerance?: number | null;"), "{types}");
-    }
-
-    #[test]
-    fn error_data_uses_an_empty_tail_response_codec() {
-        let files = rendered(&manifest());
-        let errors = file(&files, "errors.ts");
-        let codecs = file(&files, "codecs.ts");
-        assert!(errors.contains("wireResponse(data)"), "{errors}");
-        assert!(errors.contains("rspyts/internal/abi3"), "{errors}");
-        assert!(
-            codecs.contains("decodeQueryErrorBatchTooLargeData"),
-            "{codecs}"
-        );
-    }
-
-    #[test]
-    fn retained_imported_types_still_have_local_wire_codecs() {
-        let manifest = manifest();
-        let imports = BTreeMap::from([(
-            FOREIGN_ORIGIN.to_string(),
-            "shared-types-example".to_string(),
-        )]);
-        let hash = manifest_hash(&manifest);
-        let provenance = Provenance {
-            manifest_hash: &hash,
-            rust_source: "../rust/src",
-        };
-        let files = emit(&manifest, &provenance, &imports);
-        assert!(
-            file(&files, "types.ts").contains("from \"shared-types-example\""),
-            "{}",
-            file(&files, "types.ts")
-        );
-        assert!(
-            file(&files, "codecs.ts").contains("decodeSourceInfo"),
-            "{}",
-            file(&files, "codecs.ts")
-        );
-    }
-
-    #[test]
-    fn every_generated_typescript_file_has_bounded_lines() {
-        let mut manifest = exact_manifest();
-        manifest.constants.push(ConstDecl {
-            name: "LARGE_CATALOG".to_string(),
-            docs: String::new(),
-            origin: manifest.crate_name.clone(),
-            ty: Ty::List {
-                inner: Box::new(Ty::String),
+    fn resolved(manifest: Manifest, mode: TypeScriptMode) -> ResolvedContract {
+        ResolvedContract {
+            manifest,
+            hosts: crate::LockedHosts {
+                python: None,
+                typescript: Some(crate::LockedTypeScriptHost {
+                    package: "sample".into(),
+                    mode,
+                }),
             },
-            value: serde_json::Value::Array(
-                (0..40)
-                    .map(|index| serde_json::Value::String(format!("catalog-entry-{index}")))
-                    .collect(),
-            ),
-        });
-        manifest.types.push(TypeDecl::StringEnum {
-            name: "LargeCatalogKind".to_string(),
-            docs: String::new(),
-            origin: manifest.crate_name.clone(),
-            variants: (0..40)
-                .map(|index| rspyts_core::ir::StringVariantDecl {
-                    name: format!("CatalogEntry{index}"),
-                    wire_name: format!("catalog-entry-{index}"),
-                    docs: String::new(),
-                })
-                .collect(),
-        });
-        let files = rendered(&manifest);
-        for name in [
-            "client.ts",
-            "codecs.ts",
-            "constants.ts",
-            "errors.ts",
-            "index.ts",
-            "types.ts",
-        ] {
-            let longest = file(&files, name)
-                .lines()
-                .map(str::len)
-                .max()
-                .unwrap_or_default();
-            assert!(longest <= 160, "{name} has a {longest}-character line");
+            dependencies: BTreeMap::new(),
+            foreign_types: BTreeMap::new(),
+            foreign_errors: BTreeMap::new(),
         }
     }
 
     #[test]
-    fn generated_typescript_has_no_single_underscore_prefixes() {
-        for manifest in [manifest(), binary_manifest(), exact_manifest()] {
-            for (path, source) in rendered(&manifest) {
-                assert!(
-                    !path.starts_with('_'),
-                    "generated TypeScript filename {path:?} has an underscore prefix"
-                );
-                for identifier in source
-                    .split(|character: char| !character.is_ascii_alphanumeric() && character != '_')
-                {
-                    let is_dunder = identifier.starts_with("__") && identifier.ends_with("__");
-                    assert!(
-                        !identifier.starts_with('_') || is_dunder,
-                        "{path} contains the single-underscore identifier {identifier:?}"
-                    );
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn module_specifiers_and_prototype_keys_are_safe() {
-        assert_eq!(
-            ts_module_specifier("../shared/generated"),
-            "\"../shared/generated.js\""
+    fn emits_exact_json_and_wide_integer_types() {
+        let owner = CargoPackageId::new("sample");
+        let manifest = Manifest {
+            ir_version: 4,
+            crate_name: "sample".into(),
+            crate_version: "1.0.0".into(),
+            module_name: "native".into(),
+            imports: vec![],
+            types: vec![],
+            errors: vec![],
+            functions: vec![FunctionDef {
+                owner,
+                rust_name: "read".into(),
+                host_name: "read".into(),
+                docs: None,
+                target: Target::Typescript,
+                params: vec![ParamDef {
+                    rust_name: "value".into(),
+                    host_name: "value".into(),
+                    ty: TypeRef::Json,
+                }],
+                returns: TypeRef::Int {
+                    signed: false,
+                    bits: 64,
+                },
+                error: None,
+            }],
+            resources: vec![],
+            constants: vec![],
+        };
+        let contract = resolved(manifest, TypeScriptMode::Wasm);
+        let generated = declarations(
+            &contract,
+            "sha256:test",
+            &type_names(&contract),
+            TypeScriptMode::Wasm,
         );
-        assert_eq!(ts_prop("__proto__"), "[\"__proto__\"]");
+        assert!(
+            generated.contains(
+                "type JsonValue = null | boolean | number | string | readonly JsonValue[]"
+            )
+        );
+        assert!(generated.contains("read(value: JsonValue): bigint"));
+        assert!(!generated.contains("unknown"));
+    }
+
+    #[test]
+    fn emits_datetime_literals_defaults_and_readonly_fields() {
+        let owner = CargoPackageId::new("sample");
+        let manifest = Manifest {
+            ir_version: 4,
+            crate_name: "sample".into(),
+            crate_version: "1.0.0".into(),
+            module_name: "native".into(),
+            imports: vec![],
+            types: vec![TypeDef {
+                owner,
+                id: "sample::Batch".into(),
+                name: "Batch".into(),
+                docs: None,
+                shape: TypeShape::Struct {
+                    fields: vec![
+                        FieldDef {
+                            rust_name: "contract_version".into(),
+                            wire_name: "contractVersion".into(),
+                            docs: None,
+                            ty: TypeRef::Int {
+                                signed: false,
+                                bits: 32,
+                            },
+                            required: true,
+                            default: None,
+                            constraints: FieldConstraints {
+                                literal: Some(ScalarValue::I64(2)),
+                                ..Default::default()
+                            },
+                        },
+                        FieldDef {
+                            rust_name: "observed_at".into(),
+                            wire_name: "observedAt".into(),
+                            docs: None,
+                            ty: TypeRef::DateTime,
+                            required: true,
+                            default: None,
+                            constraints: Default::default(),
+                        },
+                        FieldDef {
+                            rust_name: "quantity".into(),
+                            wire_name: "quantity".into(),
+                            docs: None,
+                            ty: TypeRef::Int {
+                                signed: false,
+                                bits: 32,
+                            },
+                            required: false,
+                            default: Some(ScalarValue::I64(1)),
+                            constraints: FieldConstraints {
+                                ge: Some(1),
+                                ..Default::default()
+                            },
+                        },
+                    ],
+                },
+            }],
+            errors: vec![],
+            functions: vec![],
+            resources: vec![],
+            constants: vec![],
+        };
+        let contract = resolved(manifest, TypeScriptMode::Static);
+        let generated = declarations(
+            &contract,
+            "sha256:test",
+            &type_names(&contract),
+            TypeScriptMode::Static,
+        );
+
+        assert!(generated.contains("readonly contractVersion: 2;"));
+        assert!(generated.contains("readonly observedAt: string;"));
+        assert!(generated.contains("readonly quantity?: number;"));
+    }
+
+    #[test]
+    fn declarations_are_deeply_readonly() {
+        let owner = CargoPackageId::new("sample");
+        let manifest = Manifest {
+            ir_version: 4,
+            crate_name: "sample".into(),
+            crate_version: "1.0.0".into(),
+            module_name: "native".into(),
+            imports: vec![],
+            types: vec![TypeDef {
+                owner,
+                id: "sample::Nested".into(),
+                name: "Nested".into(),
+                docs: None,
+                shape: TypeShape::Struct {
+                    fields: vec![
+                        FieldDef {
+                            rust_name: "items".into(),
+                            wire_name: "items".into(),
+                            docs: None,
+                            ty: TypeRef::List {
+                                item: Box::new(TypeRef::Map {
+                                    value: Box::new(TypeRef::Tuple {
+                                        items: vec![TypeRef::String, TypeRef::Json],
+                                    }),
+                                }),
+                            },
+                            required: true,
+                            default: None,
+                            constraints: Default::default(),
+                        },
+                        FieldDef {
+                            rust_name: "bytes".into(),
+                            wire_name: "bytes".into(),
+                            docs: None,
+                            ty: TypeRef::Bytes,
+                            required: true,
+                            default: None,
+                            constraints: Default::default(),
+                        },
+                    ],
+                },
+            }],
+            errors: vec![],
+            functions: vec![],
+            resources: vec![],
+            constants: vec![],
+        };
+        let contract = resolved(manifest, TypeScriptMode::Static);
+        let generated = declarations(
+            &contract,
+            "sha256:test",
+            &type_names(&contract),
+            TypeScriptMode::Static,
+        );
+
+        assert!(generated.contains(
+            "readonly items: ReadonlyArray<Readonly<Record<string, readonly [string, JsonValue]>>>;"
+        ));
+        assert!(generated.contains("readonly bytes: Uint8Array;"));
+        assert!(generated.contains("readonly JsonValue[]"));
+        assert!(generated.contains("{ readonly [key: string]: JsonValue }"));
+    }
+
+    #[test]
+    fn static_runtime_deeply_freezes_values_but_not_typed_arrays() {
+        if !Command::new("node")
+            .arg("--version")
+            .output()
+            .is_ok_and(|output| output.status.success())
+        {
+            return;
+        }
+        let owner = CargoPackageId::new("sample");
+        let manifest = Manifest {
+            ir_version: 4,
+            crate_name: "sample".into(),
+            crate_version: "1.0.0".into(),
+            module_name: "native".into(),
+            imports: vec![],
+            types: vec![],
+            errors: vec![],
+            functions: vec![],
+            resources: vec![],
+            constants: vec![
+                ConstantDef {
+                    owner: owner.clone(),
+                    rust_name: "CONFIG".into(),
+                    host_name: "CONFIG".into(),
+                    docs: None,
+                    target: Target::Static,
+                    ty: TypeRef::Json,
+                    value: serde_json::json!({
+                        "nested": {"items": [1, {"ready": true}]}
+                    }),
+                },
+                ConstantDef {
+                    owner,
+                    rust_name: "BYTES".into(),
+                    host_name: "BYTES".into(),
+                    docs: None,
+                    target: Target::Static,
+                    ty: TypeRef::Bytes,
+                    value: serde_json::json!([1, 2, 3]),
+                },
+            ],
+        };
+        let contract = resolved(manifest, TypeScriptMode::Static);
+        let mut generated = static_runtime(&contract, "sha256:test");
+        generated.push_str(
+            "\nconst shallow = Object.freeze({ nested: { mutable: true } });\n\
+             deepFreeze(shallow);\n\
+             if (!Object.isFrozen(CONFIG) || !Object.isFrozen(CONFIG.nested) || \
+                 !Object.isFrozen(CONFIG.nested.items) || \
+                 !Object.isFrozen(CONFIG.nested.items[1])) throw new Error('not deeply frozen');\n\
+             if (!Object.isFrozen(shallow.nested)) throw new Error('shallow parent skipped');\n\
+             if (Object.isFrozen(BYTES)) throw new Error('typed array was frozen');\n",
+        );
+        let root = std::env::temp_dir().join(format!(
+            "rspyts-typescript-freeze-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let module = root.join("generated.mjs");
+        fs::write(&module, generated).unwrap();
+        let result = Command::new("node")
+            .arg(&module)
+            .output()
+            .expect("Node is required to verify generated TypeScript runtime behavior");
+        assert!(
+            result.status.success(),
+            "generated runtime did not deeply freeze values:\n{}{}",
+            String::from_utf8_lossy(&result.stdout),
+            String::from_utf8_lossy(&result.stderr)
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn constants_are_target_filtered_and_enum_typed_in_both_modes() {
+        let owner = CargoPackageId::new("sample");
+        let status_identity = DefinitionId::new(owner.as_str(), "sample::Status");
+        let constant = |name: &str, target, value: &str| ConstantDef {
+            owner: owner.clone(),
+            rust_name: name.into(),
+            host_name: name.into(),
+            docs: None,
+            target,
+            ty: TypeRef::Named {
+                identity: status_identity.clone(),
+            },
+            value: Value::String(value.into()),
+        };
+        let manifest = Manifest {
+            ir_version: 4,
+            crate_name: "sample".into(),
+            crate_version: "1.0.0".into(),
+            module_name: "native".into(),
+            imports: vec![],
+            types: vec![TypeDef {
+                owner: owner.clone(),
+                id: status_identity.id.clone(),
+                name: "Status".into(),
+                docs: None,
+                shape: TypeShape::StringEnum {
+                    variants: vec![EnumVariantDef {
+                        rust_name: "Ready".into(),
+                        wire_name: "ready".into(),
+                        docs: None,
+                        fields: vec![],
+                    }],
+                },
+            }],
+            errors: vec![],
+            functions: vec![],
+            resources: vec![],
+            constants: vec![
+                constant("TYPESCRIPT_STATUS", Target::Typescript, "ready"),
+                constant("SHARED_STATUS", Target::Both, "ready"),
+                constant("STATIC_STATUS", Target::Static, "ready"),
+                constant("PYTHON_STATUS", Target::Python, "ready"),
+            ],
+        };
+        let contract = resolved(manifest, TypeScriptMode::Wasm);
+        let declarations = declarations(
+            &contract,
+            "sha256:test",
+            &type_names(&contract),
+            TypeScriptMode::Wasm,
+        );
+        let wasm = wasm_runtime(&contract, "sha256:test");
+        let static_js = static_runtime(&contract, "sha256:test");
+
+        assert!(declarations.contains("export const TYPESCRIPT_STATUS: Status.Ready;"));
+        assert!(declarations.contains("export const SHARED_STATUS: Status.Ready;"));
+        assert!(!declarations.contains("STATIC_STATUS"));
+        assert!(!declarations.contains("PYTHON_STATUS"));
+        assert!(wasm.contains("export const TYPESCRIPT_STATUS = deepFreeze(\"ready\");"));
+        assert!(wasm.contains("export const SHARED_STATUS = deepFreeze(\"ready\");"));
+        assert!(!wasm.contains("STATIC_STATUS"));
+        assert!(!wasm.contains("PYTHON_STATUS"));
+        assert!(static_js.contains("export const TYPESCRIPT_STATUS = deepFreeze(\"ready\");"));
+        assert!(static_js.contains("export const SHARED_STATUS = deepFreeze(\"ready\");"));
+        assert!(static_js.contains("export const STATIC_STATUS = deepFreeze(\"ready\");"));
+        assert!(!static_js.contains("PYTHON_STATUS"));
+    }
+
+    #[test]
+    fn contract_error_named_error_never_shadows_javascript_error() {
+        let owner = CargoPackageId::new("sample");
+        let manifest = Manifest {
+            ir_version: 4,
+            crate_name: "sample".into(),
+            crate_version: "1.0.0".into(),
+            module_name: "native".into(),
+            imports: vec![],
+            types: vec![],
+            errors: vec![ErrorDef {
+                owner,
+                id: "sample::Error".into(),
+                name: "Error".into(),
+                docs: None,
+                variants: vec![],
+            }],
+            functions: vec![],
+            resources: vec![],
+            constants: vec![],
+        };
+        let contract = resolved(manifest, TypeScriptMode::Wasm);
+        let declarations = declarations(
+            &contract,
+            "sha256:test",
+            &type_names(&contract),
+            TypeScriptMode::Wasm,
+        );
+        let runtime = wasm_runtime(&contract, "sha256:test");
+
+        assert!(declarations.contains("class Error extends globalThis.Error"));
+        assert!(runtime.contains("class Error extends globalThis.Error"));
+        assert!(runtime.contains("error instanceof globalThis.Error"));
+        assert!(runtime.contains("new globalThis.Error("));
+        assert!(!runtime.contains("class Error extends Error"));
+    }
+
+    #[test]
+    fn wasm_runtime_deeply_freezes_function_and_method_results() {
+        let owner = CargoPackageId::new("sample");
+        let runner_identity = DefinitionId::new(owner.as_str(), "sample::Runner");
+        let manifest = Manifest {
+            ir_version: 4,
+            crate_name: "sample".into(),
+            crate_version: "1.0.0".into(),
+            module_name: "native".into(),
+            imports: vec![],
+            types: vec![],
+            errors: vec![],
+            functions: vec![FunctionDef {
+                owner: owner.clone(),
+                rust_name: "snapshot".into(),
+                host_name: "snapshot".into(),
+                docs: None,
+                target: Target::Typescript,
+                params: vec![],
+                returns: TypeRef::Json,
+                error: None,
+            }],
+            resources: vec![ResourceDef {
+                owner: owner.clone(),
+                id: runner_identity.id.clone(),
+                name: "Runner".into(),
+                docs: None,
+                target: Target::Typescript,
+                constructors: vec![FunctionDef {
+                    owner,
+                    rust_name: "new".into(),
+                    host_name: "new".into(),
+                    docs: None,
+                    target: Target::Typescript,
+                    params: vec![],
+                    returns: TypeRef::Named {
+                        identity: runner_identity,
+                    },
+                    error: None,
+                }],
+                methods: vec![MethodDef {
+                    rust_name: "snapshot".into(),
+                    host_name: "snapshot".into(),
+                    docs: None,
+                    target: Target::Typescript,
+                    mutable: false,
+                    params: vec![],
+                    returns: TypeRef::Json,
+                    error: None,
+                }],
+            }],
+            constants: vec![],
+        };
+        let contract = resolved(manifest, TypeScriptMode::Wasm);
+        let runtime = wasm_runtime(&contract, "sha256:test");
+
+        assert!(runtime.contains("return deepFreeze(native.snapshot());"));
+        assert!(runtime.contains("return deepFreeze(this.requireHandle().snapshot());"));
+        assert!(runtime.contains("ArrayBuffer.isView(value)"));
+        assert!(runtime.contains("for (const nested of Object.values(value))"));
+    }
+
+    #[test]
+    fn wasm_init_coalesces_concurrent_calls_and_retries_after_rejection() {
+        if !Command::new("node")
+            .arg("--version")
+            .output()
+            .is_ok_and(|output| output.status.success())
+        {
+            return;
+        }
+        let contract = resolved(
+            Manifest {
+                ir_version: 4,
+                crate_name: "sample".into(),
+                crate_version: "1.0.0".into(),
+                module_name: "native".into(),
+                imports: vec![],
+                types: vec![],
+                errors: vec![],
+                functions: vec![],
+                resources: vec![],
+                constants: vec![],
+            },
+            TypeScriptMode::Wasm,
+        );
+        let runtime = wasm_runtime(&contract, "sha256:test");
+        assert!(runtime.contains("let initializationPromise;"));
+        assert!(runtime.contains("export default function init(input)"));
+        assert!(!runtime.contains("export default async function"));
+        assert!(runtime.contains("initializationPromise = undefined;"));
+
+        let root = std::env::temp_dir().join(format!(
+            "rspyts-typescript-init-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("package.json"), "{\"type\":\"module\"}\n").unwrap();
+        fs::write(root.join("index.js"), runtime).unwrap();
+        fs::write(
+            root.join("native.js"),
+            "export let calls = 0;\n\
+             export default function initialize(input) {\n\
+               calls += 1;\n\
+               if (input === 'fail') return Promise.reject(new Error('boom'));\n\
+               return Promise.resolve({ call: calls });\n\
+             }\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("acceptance.js"),
+            "import init from './index.js';\n\
+             import { calls } from './native.js';\n\
+             const first = init('fail');\n\
+             const concurrent = init('ignored');\n\
+             if (!(first instanceof Promise) || first !== concurrent) \
+               throw new Error('concurrent calls did not share one Promise');\n\
+             await first.then(\n\
+               () => { throw new Error('expected initialization rejection'); },\n\
+               () => undefined,\n\
+             );\n\
+             if (calls !== 1) throw new Error(`expected one first attempt, received ${calls}`);\n\
+             const retry = init('ok');\n\
+             if (retry === first) throw new Error('rejection did not clear cached Promise');\n\
+             const result = await retry;\n\
+             if (result.call !== 2 || calls !== 2) throw new Error('retry did not initialize once');\n\
+             if (init('ignored-again') !== retry) throw new Error('success was not cached');\n\
+             if (calls !== 2) throw new Error('cached success initialized again');\n",
+        )
+        .unwrap();
+        let result = Command::new("node")
+            .arg(root.join("acceptance.js"))
+            .output()
+            .expect("Node is required to verify generated TypeScript initialization");
+        assert!(
+            result.status.success(),
+            "generated WASM init cache failed:\n{}{}",
+            String::from_utf8_lossy(&result.stdout),
+            String::from_utf8_lossy(&result.stderr)
+        );
+        fs::remove_dir_all(root).unwrap();
     }
 }

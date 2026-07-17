@@ -1,0 +1,346 @@
+{
+  "schemaVersion": 2,
+  "fingerprint": "sha256:31e5a2f1b783ce4efa1a2c265650ccaf6e1fe7aa6768c4171b2d09eea3e99219",
+  "hosts": {
+    "python": null,
+    "typescript": {
+      "package": "@rspyts/static-acceptance",
+      "mode": "static"
+    }
+  },
+  "dependencies": {},
+  "manifest": {
+    "irVersion": 4,
+    "crateName": "rspyts-static-acceptance",
+    "crateVersion": "0.1.0",
+    "moduleName": "native",
+    "imports": [],
+    "types": [
+      {
+        "owner": "rspyts-static-acceptance",
+        "id": "rspyts_static_acceptance::MeterDefinition",
+        "name": "MeterDefinition",
+        "docs": "One stable mapping from an event to its metering identity.",
+        "shape": {
+          "kind": "struct",
+          "fields": [
+            {
+              "rustName": "event",
+              "wireName": "event",
+              "docs": null,
+              "ty": {
+                "kind": "named",
+                "identity": {
+                  "owner": "rspyts-static-acceptance",
+                  "id": "rspyts_static_acceptance::PlatformEvent"
+                }
+              },
+              "required": true,
+              "default": null,
+              "constraints": {
+                "literal": null,
+                "minLength": null,
+                "maxLength": null,
+                "ge": null
+              }
+            },
+            {
+              "rustName": "meter",
+              "wireName": "meter",
+              "docs": null,
+              "ty": {
+                "kind": "string"
+              },
+              "required": true,
+              "default": null,
+              "constraints": {
+                "literal": null,
+                "minLength": null,
+                "maxLength": null,
+                "ge": null
+              }
+            },
+            {
+              "rustName": "unit",
+              "wireName": "unit",
+              "docs": null,
+              "ty": {
+                "kind": "string"
+              },
+              "required": true,
+              "default": null,
+              "constraints": {
+                "literal": null,
+                "minLength": null,
+                "maxLength": null,
+                "ge": null
+              }
+            },
+            {
+              "rustName": "billable",
+              "wireName": "billable",
+              "docs": null,
+              "ty": {
+                "kind": "bool"
+              },
+              "required": true,
+              "default": null,
+              "constraints": {
+                "literal": null,
+                "minLength": null,
+                "maxLength": null,
+                "ge": null
+              }
+            }
+          ]
+        }
+      },
+      {
+        "owner": "rspyts-static-acceptance",
+        "id": "rspyts_static_acceptance::PlatformEvent",
+        "name": "PlatformEvent",
+        "docs": "Protocol events shared by Portal and Hub.",
+        "shape": {
+          "kind": "stringEnum",
+          "variants": [
+            {
+              "rustName": "PortalHeartbeat",
+              "wireName": "portal_heartbeat",
+              "docs": null,
+              "fields": []
+            },
+            {
+              "rustName": "StudyOpened",
+              "wireName": "study_opened",
+              "docs": null,
+              "fields": []
+            },
+            {
+              "rustName": "SessionClosed",
+              "wireName": "session_closed",
+              "docs": null,
+              "fields": []
+            }
+          ]
+        }
+      },
+      {
+        "owner": "rspyts-static-acceptance",
+        "id": "rspyts_static_acceptance::ProtocolIdentity",
+        "name": "ProtocolIdentity",
+        "docs": "Identity shipped with every platform event.",
+        "shape": {
+          "kind": "struct",
+          "fields": [
+            {
+              "rustName": "service",
+              "wireName": "service",
+              "docs": null,
+              "ty": {
+                "kind": "string"
+              },
+              "required": true,
+              "default": null,
+              "constraints": {
+                "literal": null,
+                "minLength": null,
+                "maxLength": null,
+                "ge": null
+              }
+            },
+            {
+              "rustName": "protocol_version",
+              "wireName": "protocolVersion",
+              "docs": null,
+              "ty": {
+                "kind": "int",
+                "signed": false,
+                "bits": 32
+              },
+              "required": true,
+              "default": null,
+              "constraints": {
+                "literal": null,
+                "minLength": null,
+                "maxLength": null,
+                "ge": null
+              }
+            }
+          ]
+        }
+      }
+    ],
+    "errors": [],
+    "functions": [],
+    "resources": [],
+    "constants": [
+      {
+        "owner": "rspyts-static-acceptance",
+        "rustName": "IDENTITY",
+        "hostName": "IDENTITY",
+        "docs": null,
+        "target": "static",
+        "ty": {
+          "kind": "named",
+          "identity": {
+            "owner": "rspyts-static-acceptance",
+            "id": "rspyts_static_acceptance::ProtocolIdentity"
+          }
+        },
+        "value": {
+          "protocolVersion": 4,
+          "service": "sample"
+        }
+      },
+      {
+        "owner": "rspyts-static-acceptance",
+        "rustName": "METER_DEFINITIONS",
+        "hostName": "METER_DEFINITIONS",
+        "docs": null,
+        "target": "static",
+        "ty": {
+          "kind": "list",
+          "item": {
+            "kind": "named",
+            "identity": {
+              "owner": "rspyts-static-acceptance",
+              "id": "rspyts_static_acceptance::MeterDefinition"
+            }
+          }
+        },
+        "value": [
+          {
+            "billable": false,
+            "event": "portal_heartbeat",
+            "meter": "portal.active_seconds",
+            "unit": "second"
+          },
+          {
+            "billable": true,
+            "event": "study_opened",
+            "meter": "study.opens",
+            "unit": "event"
+          },
+          {
+            "billable": true,
+            "event": "session_closed",
+            "meter": "session.seconds",
+            "unit": "second"
+          }
+        ]
+      },
+      {
+        "owner": "rspyts-static-acceptance",
+        "rustName": "METER_TABLE",
+        "hostName": "METER_TABLE",
+        "docs": null,
+        "target": "static",
+        "ty": {
+          "kind": "list",
+          "item": {
+            "kind": "tuple",
+            "items": [
+              {
+                "kind": "string"
+              },
+              {
+                "kind": "string"
+              }
+            ]
+          }
+        },
+        "value": [
+          [
+            "portal_heartbeat",
+            "portal.active_seconds"
+          ],
+          [
+            "study_opened",
+            "study.opens"
+          ],
+          [
+            "session_closed",
+            "session.seconds"
+          ]
+        ]
+      },
+      {
+        "owner": "rspyts-static-acceptance",
+        "rustName": "PLATFORM_TOPIC",
+        "hostName": "PLATFORM_TOPIC",
+        "docs": null,
+        "target": "static",
+        "ty": {
+          "kind": "string"
+        },
+        "value": "example.platform.v4"
+      },
+      {
+        "owner": "rspyts-static-acceptance",
+        "rustName": "PROTOCOL_EPOCH",
+        "hostName": "PROTOCOL_EPOCH",
+        "docs": null,
+        "target": "static",
+        "ty": {
+          "kind": "int",
+          "signed": false,
+          "bits": 64
+        },
+        "value": 4294967296
+      },
+      {
+        "owner": "rspyts-static-acceptance",
+        "rustName": "PROTOCOL_VERSION",
+        "hostName": "PROTOCOL_VERSION",
+        "docs": null,
+        "target": "static",
+        "ty": {
+          "kind": "int",
+          "signed": false,
+          "bits": 32
+        },
+        "value": 4
+      },
+      {
+        "owner": "rspyts-static-acceptance",
+        "rustName": "REQUIRED_HEADERS",
+        "hostName": "REQUIRED_HEADERS",
+        "docs": null,
+        "target": "static",
+        "ty": {
+          "kind": "list",
+          "item": {
+            "kind": "string"
+          }
+        },
+        "value": [
+          "x-event-id",
+          "x-clinic-id",
+          "x-recorded-at"
+        ]
+      },
+      {
+        "owner": "rspyts-static-acceptance",
+        "rustName": "SUPPORTED_EVENTS",
+        "hostName": "SUPPORTED_EVENTS",
+        "docs": null,
+        "target": "static",
+        "ty": {
+          "kind": "list",
+          "item": {
+            "kind": "named",
+            "identity": {
+              "owner": "rspyts-static-acceptance",
+              "id": "rspyts_static_acceptance::PlatformEvent"
+            }
+          }
+        },
+        "value": [
+          "portal_heartbeat",
+          "study_opened",
+          "session_closed"
+        ]
+      }
+    ]
+  }
+}

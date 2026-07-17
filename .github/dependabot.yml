@@ -1,58 +1,16 @@
-# Weekly dependency update PRs for every ecosystem in the repository.
-# Cargo resolves from the workspace root; the Python and npm runtime packages
-# each live under runtimes/ with their own manifests. The example packages
-# depend on the local runtimes by path, so they need no separate entries.
-# Cooldowns apply only to routine version updates; Dependabot security updates
-# remain immediate.
-
 version: 2
 updates:
-  # Rust workspace (crates/* and examples/*, one Cargo.lock at the root).
-  - package-ecosystem: "cargo"
-    directory: "/"
+  - package-ecosystem: cargo
+    directory: /
     schedule:
-      interval: "weekly"
-    cooldown:
-      default-days: 7
-    ignore:
-      # libloading 0.9 raises its MSRV to Rust 1.88; rspyts supports 1.85.
-      - dependency-name: "libloading"
-        versions: [">=0.9.0"]
-
-  # Python runtime package (pyproject.toml).
-  - package-ecosystem: "uv"
-    directory: "/runtimes/python"
-    schedule:
-      interval: "weekly"
-    cooldown:
-      default-days: 7
-
-  # TypeScript runtime package (package.json).
-  - package-ecosystem: "npm"
-    directory: "/runtimes/typescript"
-    schedule:
-      interval: "weekly"
-    cooldown:
-      default-days: 7
+      interval: weekly
     groups:
-      vitest:
-        patterns:
-          - "vitest"
-          - "@vitest/*"
-    ignore:
-      # Node typings track the deliberately supported runtime floor.
-      - dependency-name: "@types/node"
-        update-types:
-          - "version-update:semver-major"
-
-  # Action versions used by validation.yml and deploy.yml.
-  - package-ecosystem: "github-actions"
-    directory: "/"
+      cargo:
+        patterns: ["*"]
+  - package-ecosystem: github-actions
+    directory: /
     schedule:
-      interval: "weekly"
-    cooldown:
-      default-days: 7
+      interval: weekly
     groups:
       actions:
-        patterns:
-          - "*"
+        patterns: ["*"]

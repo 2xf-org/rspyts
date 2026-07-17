@@ -1,61 +1,49 @@
 # rspyts
 
-Define a bridge once in Rust, then generate typed Python and TypeScript clients plus JSON Schema. `rspyts` is the public Rust facade: it exports `#[bridge]`, bridge data types, error support, and `export!()` for a `cdylib`.
+`rspyts` is the public Rust crate for compiling one curated Rust API into
+Python and TypeScript consumer packages. It provides the `Type` and `Error`
+derives, the `export` attribute, `module!`, semantic contract types, and the
+target-gated PyO3/wasm-bindgen boundary support used by generated packages.
 
-## Install
+Version 0.4 is a clean-slate API. It has no compatibility layer for 0.3, no
+generic application-call C ABI, and no installed Python or npm runtime.
 
 ```toml
-[lib]
-crate-type = ["cdylib"]
-
 [dependencies]
-rspyts = "=0.3.2"
+rspyts = { version = "0.4.0", default-features = false }
+serde = { version = "1", features = ["derive"] }
+wasm-bindgen = { version = "0.2.126", optional = true }
+
+[features]
+default = []
+python = ["rspyts/python-extension"]
+wasm = ["rspyts/wasm", "dep:wasm-bindgen"]
 ```
 
-Install the matching generator separately with
-`cargo install rspyts-cli --version 0.3.2 --locked`.
-Add `rlib` to `crate-type` only when another Rust crate must link this crate.
-The default bridge macros use the facade's Serde re-export; add Serde directly
-only when your own code names or derives it, such as with `#[bridge(serde)]`.
-
-## Minimal bridge
+`python-extension` selects the PyO3 ABI and extension link mode for consumer
+cdylibs. wasm-bindgen remains an optional direct dependency because its
+attributes must resolve in the consumer crate. See the
+[workspace quickstart](https://github.com/2xf-org/rspyts/blob/main/docs/quickstart.md)
+for the complete feature wiring.
 
 ```rust
-use rspyts::{bridge, Buf};
-
-#[bridge]
-pub struct Summary {
-    pub item_count: u32,
-    pub average: f64,
+#[derive(serde::Serialize, serde::Deserialize, rspyts::Type)]
+pub struct Greeting {
+    pub message: String,
 }
 
-#[bridge]
-pub fn summarize(values: &[f64]) -> Summary {
-    let total: f64 = values.iter().sum();
-    Summary {
-        item_count: values.len() as u32,
-        average: total / values.len() as f64,
+#[rspyts::export]
+pub fn greet(name: String) -> Greeting {
+    Greeting {
+        message: format!("Hello, {name}!"),
     }
 }
 
-#[bridge]
-pub fn scale(values: &[f64], factor: f64) -> Buf<f64> {
-    values.iter().map(|value| value * factor).collect::<Vec<_>>().into()
-}
-
-rspyts::export!();
+rspyts::module!(native);
 ```
 
-Run `rspyts init`, set the output directories in `rspyts.toml`, then run
-`rspyts generate` for client source and `rspyts build` for the configured
-runnable artifacts. Supported data includes structs, transparent newtypes,
-string and tagged enums (including mixed unit/data variants), typed errors,
-exact `i64`/`u64` values, tuples of arity 2–12, options, lists, string-keyed
-maps, `#[bridge(required)] Option<T>` fields, null-valued `()` data,
-`serde_json::Value`, constants, opaque `Bytes`, numeric slices and owned
-`Buf<T>` values, and handle-backed classes. Use `#[bridge(serde)]` to adopt an
-existing supported derived Serde contract.
-
-Start with the [quickstart](https://github.com/2xf-org/rspyts/blob/main/docs/introduction/quickstart.md). The [type-system](https://github.com/2xf-org/rspyts/blob/main/docs/design/type-system.md), [ABI](https://github.com/2xf-org/rspyts/blob/main/docs/design/abi.md), and [code generation](https://github.com/2xf-org/rspyts/blob/main/docs/design/codegen.md) documents are normative.
+Generated staging output belongs below `.rspyts/` and is ignored. Commit the
+deterministic, pretty-printed semantic `rspyts.lock` produced by `rspyts-cli`
+instead.
 
 Licensed under MIT.

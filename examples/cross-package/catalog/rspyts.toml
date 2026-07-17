@@ -1,0 +1,10 @@
+[crate]
+path = "rust"
+features = ["bindings"]
+
+[python]
+package = "example.catalog"
+
+[typescript]
+package = "@example/catalog"
+mode = "static"

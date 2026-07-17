@@ -1,335 +1,537 @@
-//! `rspyts.toml` parsing and path resolution (codegen.md §1).
-//!
-//! All relative paths in the file resolve against the file's own
-//! directory. Unknown keys are rejected so typos surface as errors
-//! instead of silently disabling an emitter.
-
-use crate::build::ContractOptions;
-use anyhow::{Context, Result, ensure};
-use serde::Deserialize;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
+use std::fs;
 use std::path::{Path, PathBuf};
 
-/// Raw deserialization target mirroring the TOML layout exactly.
-#[derive(Debug, Deserialize)]
+use anyhow::{Context, Result, bail};
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct RawConfig {
-    #[serde(rename = "crate", default)]
-    krate: RawCrate,
-    python: Option<RawPython>,
-    typescript: Option<RawTypescript>,
-    schema: Option<RawSchema>,
+struct Config {
+    #[serde(rename = "crate")]
+    rust_crate: CrateConfig,
+    python: Option<PythonConfig>,
+    typescript: Option<TypeScriptConfig>,
+    #[serde(default)]
+    dependencies: BTreeMap<String, RawDependencyConfig>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct RawCrate {
-    #[serde(default = "default_crate_path")]
-    path: String,
+struct CrateConfig {
+    path: PathBuf,
     #[serde(default)]
     features: Vec<String>,
-    #[serde(default, rename = "no-default-features")]
-    no_default_features: bool,
+    #[serde(rename = "probe-features")]
+    probe_features: Option<Vec<String>>,
+    #[serde(rename = "default-features", default)]
+    default_features: bool,
 }
 
-impl Default for RawCrate {
-    fn default() -> Self {
-        Self {
-            path: default_crate_path(),
-            features: Vec::new(),
-            no_default_features: false,
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PythonConfig {
+    pub package: String,
+    pub source: Option<PathBuf>,
+    #[serde(default)]
+    pub mode: PythonMode,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PythonMode {
+    #[default]
+    Standalone,
+    Source,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TypeScriptConfig {
+    pub package: String,
+    pub mode: TypeScriptMode,
+    pub source: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TypeScriptMode {
+    Static,
+    Wasm,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawDependencyConfig {
+    #[serde(rename = "crate")]
+    owner: String,
+    lock: PathBuf,
+    python: Option<String>,
+    typescript: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct DependencyConfig {
+    pub owner: rspyts::ir::CargoPackageId,
+    pub lock: PathBuf,
+    pub python: Option<String>,
+    pub typescript: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct Project {
+    root: PathBuf,
+    cargo_manifest: PathBuf,
+    features: Vec<String>,
+    probe_features: Vec<String>,
+    default_features: bool,
+    pub python: Option<PythonConfig>,
+    pub typescript: Option<TypeScriptConfig>,
+    dependencies: BTreeMap<String, DependencyConfig>,
+}
+
+impl Project {
+    pub fn read(path: &Path) -> Result<Self> {
+        let config_path = path
+            .canonicalize()
+            .with_context(|| format!("failed to resolve config {}", path.display()))?;
+        let source = fs::read_to_string(&config_path)
+            .with_context(|| format!("failed to read {}", config_path.display()))?;
+        let config: Config = toml::from_str(&source)
+            .with_context(|| format!("invalid config {}", config_path.display()))?;
+        if config.python.is_none() && config.typescript.is_none() {
+            bail!("rspyts.toml must configure at least one of [python] or [typescript]");
         }
+
+        let root = config_path
+            .parent()
+            .context("rspyts.toml has no parent directory")?
+            .to_path_buf();
+        let crate_path = root.join(&config.rust_crate.path);
+        let cargo_manifest = if crate_path
+            .file_name()
+            .is_some_and(|name| name == "Cargo.toml")
+        {
+            crate_path
+        } else {
+            crate_path.join("Cargo.toml")
+        };
+        if !cargo_manifest.is_file() {
+            bail!(
+                "configured Rust crate has no Cargo manifest at {}",
+                cargo_manifest.display()
+            );
+        }
+
+        validate_python_package(config.python.as_ref())?;
+        validate_typescript_package(config.typescript.as_ref())?;
+        validate_features("features", &config.rust_crate.features)?;
+        if let Some(features) = config.rust_crate.probe_features.as_deref() {
+            validate_features("probe-features", features)?;
+        }
+
+        let mut python = config.python;
+        if let Some(config) = python.as_mut() {
+            config.source = resolve_source(&root, config.source.as_deref(), "python")?;
+        }
+        let mut typescript = config.typescript;
+        if let Some(config) = typescript.as_mut() {
+            config.source = resolve_source(&root, config.source.as_deref(), "typescript")?;
+        }
+        let dependencies = resolve_dependencies(&root, config.dependencies)?;
+
+        let probe_features = config
+            .rust_crate
+            .probe_features
+            .unwrap_or_else(|| config.rust_crate.features.clone());
+        Ok(Self {
+            root,
+            cargo_manifest,
+            features: config.rust_crate.features,
+            probe_features,
+            default_features: config.rust_crate.default_features,
+            python,
+            typescript,
+            dependencies,
+        })
+    }
+
+    pub fn cargo_manifest(&self) -> &Path {
+        &self.cargo_manifest
+    }
+
+    pub fn features(&self) -> &[String] {
+        &self.features
+    }
+
+    pub fn default_features(&self) -> bool {
+        self.default_features
+    }
+
+    pub fn probe_features(&self) -> &[String] {
+        &self.probe_features
+    }
+
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
+    pub fn dependencies(&self) -> &BTreeMap<String, DependencyConfig> {
+        &self.dependencies
+    }
+
+    pub fn output_dir(&self) -> PathBuf {
+        self.root.join(".rspyts")
+    }
+
+    pub fn lock_path(&self) -> PathBuf {
+        self.root.join("rspyts.lock")
     }
 }
 
-fn default_crate_path() -> String {
-    ".".to_string()
+fn resolve_dependencies(
+    root: &Path,
+    dependencies: BTreeMap<String, RawDependencyConfig>,
+) -> Result<BTreeMap<String, DependencyConfig>> {
+    let mut owners = BTreeSet::new();
+    dependencies
+        .into_iter()
+        .map(|(alias, dependency)| {
+            if !is_identifier(&alias) {
+                bail!("dependency alias `{alias}` must be an identifier");
+            }
+            if !is_cargo_package_name(&dependency.owner) {
+                bail!("dependency `{alias}` has an invalid Cargo package owner");
+            }
+            if !owners.insert(dependency.owner.clone()) {
+                bail!(
+                    "Cargo package owner `{}` is mapped by more than one dependency alias",
+                    dependency.owner
+                );
+            }
+            if dependency.lock.as_os_str().is_empty() || dependency.lock.is_absolute() {
+                bail!("dependency `{alias}` lock must be a non-empty relative path");
+            }
+            if let Some(package) = dependency.python.as_deref() {
+                validate_python_name(package)?;
+            }
+            if let Some(package) = dependency.typescript.as_deref() {
+                validate_typescript_name(package)?;
+            }
+            Ok((
+                alias,
+                DependencyConfig {
+                    owner: rspyts::ir::CargoPackageId::new(dependency.owner),
+                    lock: root.join(dependency.lock),
+                    python: dependency.python,
+                    typescript: dependency.typescript,
+                },
+            ))
+        })
+        .collect()
 }
 
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct RawPython {
-    out: String,
-    #[serde(default)]
-    imports: BTreeMap<String, String>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct RawTypescript {
-    out: String,
-    #[serde(default)]
-    imports: BTreeMap<String, String>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct RawSchema {
-    out: String,
-}
-
-/// A parsed configuration with every path already resolved to an
-/// absolute path. Disabled or omitted sections are `None`.
-#[derive(Debug)]
-pub struct Config {
-    /// Directory containing the bridged crate's `Cargo.toml`.
-    pub crate_dir: PathBuf,
-    pub python: Option<PythonConfig>,
-    pub typescript: Option<TypescriptConfig>,
-    pub schema: Option<SchemaConfig>,
-    /// Cargo feature selection that defines the compiled contract.
-    pub contract: ContractOptions,
-}
-
-#[derive(Debug)]
-pub struct PythonConfig {
-    /// The wholly-owned generated package directory.
-    pub out: PathBuf,
-    /// Origin crate name → Python import path. Bridged types whose
-    /// origin appears here are imported from that package instead of
-    /// re-emitted locally (codegen.md §9).
-    pub imports: BTreeMap<String, String>,
-}
-
-#[derive(Debug)]
-pub struct TypescriptConfig {
-    pub out: PathBuf,
-    /// Origin crate name → TypeScript module specifier. Bridged types
-    /// whose origin appears here are imported from that module instead
-    /// of re-emitted locally (codegen.md §9).
-    pub imports: BTreeMap<String, String>,
-}
-
-#[derive(Debug)]
-pub struct SchemaConfig {
-    pub out: PathBuf,
-}
-
-/// Load and resolve the configuration at `path`.
-pub fn load(path: &Path) -> Result<Config> {
-    let text = std::fs::read_to_string(path).with_context(|| {
-        format!(
-            "cannot read config `{}` (run `rspyts init` to create one)",
-            path.display()
-        )
-    })?;
-    let raw: RawConfig =
-        toml::from_str(&text).with_context(|| format!("invalid config `{}`", path.display()))?;
-    let base = std::path::absolute(path)
-        .with_context(|| format!("cannot make config path `{}` absolute", path.display()))?;
-    let base = base
-        .parent()
-        .context("config path has no parent directory")?;
-    resolve(raw, base)
-}
-
-fn resolve(raw: RawConfig, base: &Path) -> Result<Config> {
-    let join = |p: &str| -> PathBuf {
-        let p = Path::new(p);
-        if p.is_absolute() {
-            p.to_path_buf()
-        } else {
-            base.join(p)
-        }
+fn resolve_source(root: &Path, source: Option<&Path>, host: &str) -> Result<Option<PathBuf>> {
+    let Some(source) = source else {
+        return Ok(None);
     };
-    let contract = ContractOptions::new(raw.krate.features, raw.krate.no_default_features)?;
-    Ok(Config {
-        crate_dir: join(&raw.krate.path),
-        python: raw.python.map(|s| PythonConfig {
-            out: join(&s.out),
-            imports: s.imports,
-        }),
-        typescript: raw.typescript.map(|s| TypescriptConfig {
-            out: join(&s.out),
-            imports: s.imports,
-        }),
-        schema: raw.schema.map(|s| SchemaConfig { out: join(&s.out) }),
-        contract,
-    })
+    if source.as_os_str().is_empty() || source.is_absolute() {
+        bail!("[{host}].source must be a non-empty path relative to rspyts.toml");
+    }
+
+    let mut candidate = root.to_path_buf();
+    for component in source.components() {
+        use std::path::Component;
+        match component {
+            Component::Normal(part) => {
+                candidate.push(part);
+                let metadata = fs::symlink_metadata(&candidate).with_context(|| {
+                    format!(
+                        "[{host}].source component does not exist: {}",
+                        candidate.display()
+                    )
+                })?;
+                if metadata.file_type().is_symlink() {
+                    bail!(
+                        "[{host}].source may not traverse symlink {}",
+                        candidate.display()
+                    );
+                }
+            }
+            Component::CurDir => {}
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
+                bail!("[{host}].source may not contain parent or rooted components");
+            }
+        }
+    }
+
+    let resolved = candidate
+        .canonicalize()
+        .with_context(|| format!("failed to resolve [{host}].source {}", candidate.display()))?;
+    if !resolved.starts_with(root) {
+        bail!("[{host}].source resolves outside the rspyts project");
+    }
+    if resolved == root {
+        bail!("[{host}].source may not be the rspyts project root");
+    }
+    if !resolved.is_dir() {
+        bail!("[{host}].source must resolve to a directory");
+    }
+    Ok(Some(resolved))
 }
 
-/// The commented starter configuration written by `rspyts init`.
-pub const INIT_TEMPLATE: &str = r#"# rspyts configuration. All relative paths resolve against this file's
-# own directory. See docs/design/codegen.md in the rspyts repository.
+fn validate_python_package(config: Option<&PythonConfig>) -> Result<()> {
+    let Some(config) = config else {
+        return Ok(());
+    };
+    validate_python_name(&config.package)
+}
 
-[crate]
-# Directory containing the bridged crate's Cargo.toml.
-path = "."
-# Cargo feature selection is part of the generated contract.
-features = []
-no-default-features = false
+fn validate_python_name(package: &str) -> Result<()> {
+    if package.is_empty()
+        || package
+            .split('.')
+            .any(|part| !is_identifier(part) || is_python_keyword(part))
+    {
+        bail!("Python package `{package}` must contain only dot-separated identifiers");
+    }
+    Ok(())
+}
 
-[python]
-out = "../python/src/my_package/generated"
-# `rspyts build` stages the host cdylib in `<out>/lib` by default.
+fn validate_typescript_package(config: Option<&TypeScriptConfig>) -> Result<()> {
+    let Some(config) = config else {
+        return Ok(());
+    };
+    validate_typescript_name(&config.package)
+}
 
-# Bridged types defined in a dependency crate can be imported from that
-# crate's own generated package instead of re-emitted here:
-# [python.imports]
-# "other-crate" = "other_package.generated"
+fn validate_typescript_name(package: &str) -> Result<()> {
+    let name = package.strip_prefix('@').unwrap_or(package);
+    let parts = name.split('/').collect::<Vec<_>>();
+    let expected_parts = usize::from(package.starts_with('@')) + 1;
+    if package.is_empty()
+        || package.len() > 214
+        || parts.len() != expected_parts
+        || parts.iter().any(|part| {
+            part.is_empty()
+                || part.starts_with(['.', '_'])
+                || !part.chars().all(|character| {
+                    character.is_ascii_lowercase()
+                        || character.is_ascii_digit()
+                        || "-_.".contains(character)
+                })
+        })
+    {
+        bail!("invalid TypeScript package `{package}`");
+    }
+    Ok(())
+}
 
-[typescript]
-out = "../typescript/src/generated"
+fn validate_features(label: &str, features: &[String]) -> Result<()> {
+    let mut seen = BTreeSet::new();
+    for feature in features {
+        if feature.trim().is_empty()
+            || feature.contains(char::is_whitespace)
+            || feature.contains(',')
+        {
+            bail!("invalid Cargo feature `{feature}` in [crate].{label}");
+        }
+        if matches!(feature.as_str(), "python" | "wasm") {
+            bail!(
+                "[crate].{label} must be backend-neutral; rspyts adds `{feature}` for its target build"
+            );
+        }
+        if !seen.insert(feature) {
+            bail!("duplicate Cargo feature `{feature}` in [crate].{label}");
+        }
+    }
+    Ok(())
+}
 
-# Same idea for TypeScript, mapping to a module specifier:
-# [typescript.imports]
-# "other-crate" = "@scope/other/generated"
+fn is_cargo_package_name(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 64
+        && value
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || matches!(character, '-' | '_'))
+}
 
-[schema]
-out = "../schema"
-"#;
+fn is_python_keyword(value: &str) -> bool {
+    matches!(
+        value,
+        "False"
+            | "None"
+            | "True"
+            | "and"
+            | "as"
+            | "assert"
+            | "async"
+            | "await"
+            | "break"
+            | "class"
+            | "continue"
+            | "def"
+            | "del"
+            | "elif"
+            | "else"
+            | "except"
+            | "finally"
+            | "for"
+            | "from"
+            | "global"
+            | "if"
+            | "import"
+            | "in"
+            | "is"
+            | "lambda"
+            | "nonlocal"
+            | "not"
+            | "or"
+            | "pass"
+            | "raise"
+            | "return"
+            | "try"
+            | "while"
+            | "with"
+            | "yield"
+    )
+}
 
-/// Write the starter config into `dir`, refusing to overwrite.
-pub fn init(dir: &Path) -> Result<PathBuf> {
-    std::fs::create_dir_all(dir)
-        .with_context(|| format!("cannot create directory `{}`", dir.display()))?;
-    let path = dir.join("rspyts.toml");
-    ensure!(
-        !path.exists(),
-        "`{}` already exists; refusing to overwrite",
-        path.display()
-    );
-    std::fs::write(&path, INIT_TEMPLATE)
-        .with_context(|| format!("cannot write `{}`", path.display()))?;
-    Ok(path)
+fn is_identifier(value: &str) -> bool {
+    let mut characters = value.chars();
+    characters
+        .next()
+        .is_some_and(|character| character == '_' || character.is_ascii_alphabetic())
+        && characters.all(|character| character == '_' || character.is_ascii_alphanumeric())
 }
 
 #[cfg(test)]
 mod tests {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
     use super::*;
 
-    fn parse(text: &str) -> Config {
-        let raw: RawConfig = toml::from_str(text).expect("config parses");
-        resolve(raw, Path::new("/project")).expect("config resolves")
-    }
-
     #[test]
-    fn full_config_resolves_relative_paths() {
-        let cfg = parse(
-            r#"
-            [crate]
-            path = "rust"
-            features = ["serde", "fast-path"]
-            no-default-features = true
-
-            [python]
-            out = "python/generated"
-
-            [typescript]
-            out = "ts/generated"
-
-            [schema]
-            out = "schema"
-            "#,
-        );
-        assert_eq!(cfg.crate_dir, Path::new("/project/rust"));
-        assert_eq!(cfg.contract.features, vec!["serde", "fast-path"]);
-        assert!(cfg.contract.no_default_features);
-        assert_eq!(
-            cfg.python.as_ref().unwrap().out,
-            Path::new("/project/python/generated")
-        );
-        assert_eq!(
-            cfg.typescript.unwrap().out,
-            Path::new("/project/ts/generated")
-        );
-        assert_eq!(cfg.schema.unwrap().out, Path::new("/project/schema"));
-    }
-
-    #[test]
-    fn imports_tables_round_trip() {
-        let cfg = parse(
-            r#"
-            [python]
-            out = "py"
-
-            [python.imports]
-            "shared-types" = "shared_types.generated"
-            "other-crate" = "other_package.generated"
-
-            [typescript]
-            out = "ts"
-
-            [typescript.imports]
-            "shared-types" = "shared-types-example"
-            "#,
-        );
-        let py = cfg.python.unwrap();
-        assert_eq!(
-            py.imports.get("shared-types").map(String::as_str),
-            Some("shared_types.generated")
-        );
-        assert_eq!(
-            py.imports.get("other-crate").map(String::as_str),
-            Some("other_package.generated")
-        );
-        let ts = cfg.typescript.unwrap();
-        assert_eq!(
-            ts.imports.get("shared-types").map(String::as_str),
-            Some("shared-types-example")
-        );
-    }
-
-    #[test]
-    fn imports_default_to_empty() {
-        let cfg = parse("[python]\nout = \"py\"\n\n[typescript]\nout = \"ts\"\n");
-        let python = cfg.python.unwrap();
-        assert!(python.imports.is_empty());
-        assert!(cfg.typescript.unwrap().imports.is_empty());
-    }
-
-    #[test]
-    fn sections_default_to_absent_and_crate_path_defaults_to_dot() {
-        let cfg = parse("");
-        assert_eq!(cfg.crate_dir, Path::new("/project/."));
-        assert!(cfg.python.is_none());
-        assert!(cfg.typescript.is_none());
-        assert!(cfg.schema.is_none());
-        assert_eq!(cfg.contract, ContractOptions::default());
-    }
-
-    #[test]
-    fn removed_output_knobs_are_rejected() {
-        for text in [
-            "[python]\nout = \"x\"\nenabled = false\n",
-            "[python]\nout = \"x\"\nlibrary_search = [\"fallback\"]\n",
-            "[python]\nout = \"x\"\nexclude = [\"foo\"]\n",
-            "[typescript]\nout = \"x\"\nenabled = false\n",
-            "[typescript]\nout = \"x\"\nexclude = [\"foo\"]\n",
-            "[schema]\nout = \"x\"\nenabled = false\n",
-            "[build]\nfeatures = []\n",
-            "[crate]\nprofile = \"release\"\n",
-            "[crate]\nlocked = true\n",
-        ] {
-            assert!(toml::from_str::<RawConfig>(text).is_err(), "{text}");
-        }
-    }
-
-    #[test]
-    fn unknown_keys_are_rejected() {
-        let err = toml::from_str::<RawConfig>("[python]\nout = \"x\"\ntypo = 1\n").unwrap_err();
+    fn accepts_host_package_names() {
         assert!(
-            err.to_string().contains("typo"),
-            "unexpected message: {err}"
+            validate_python_package(Some(&PythonConfig {
+                package: "example.catalog".into(),
+                source: None,
+                mode: PythonMode::Standalone,
+            }))
+            .is_ok()
+        );
+        assert!(
+            validate_typescript_package(Some(&TypeScriptConfig {
+                package: "@example/catalog".into(),
+                mode: TypeScriptMode::Static,
+                source: None,
+            }))
+            .is_ok()
         );
     }
 
     #[test]
-    fn invalid_contract_features_are_rejected() {
-        let text = "[crate]\nfeatures = [\"bad feature\"]\n";
-        let raw: RawConfig = toml::from_str(text).unwrap();
-        assert!(resolve(raw, Path::new("/project")).is_err(), "{text}");
+    fn rejects_ambiguous_package_names() {
+        assert!(
+            validate_python_package(Some(&PythonConfig {
+                package: "example/catalog".into(),
+                source: None,
+                mode: PythonMode::Standalone,
+            }))
+            .is_err()
+        );
+        assert!(
+            validate_typescript_package(Some(&TypeScriptConfig {
+                package: "@example".into(),
+                mode: TypeScriptMode::Wasm,
+                source: None,
+            }))
+            .is_err()
+        );
+        assert!(validate_python_name("example.class").is_err());
+        assert!(validate_typescript_name("@Example/Catalog").is_err());
     }
 
     #[test]
-    fn unknown_top_level_section_is_rejected() {
-        assert!(toml::from_str::<RawConfig>("[pyhton]\nout = \"x\"\n").is_err());
+    fn rejects_ambiguous_cargo_feature_configuration() {
+        assert!(validate_features("features", &["domain".into(), "domain".into()]).is_err());
+        assert!(validate_features("features", &["python".into()]).is_err());
+        assert!(validate_features("probe-features", &["wasm".into()]).is_err());
+        assert!(validate_features("features", &["one,two".into()]).is_err());
+        assert!(validate_features("features", &["formats/native".into()]).is_ok());
     }
 
     #[test]
-    fn init_template_parses() {
-        let raw: RawConfig = toml::from_str(INIT_TEMPLATE).expect("template parses");
-        let cfg = resolve(raw, Path::new("/p")).expect("template resolves");
-        assert!(cfg.python.is_some() && cfg.typescript.is_some() && cfg.schema.is_some());
+    fn resolves_authored_sources_relative_to_the_configuration() {
+        let root = std::env::temp_dir().join(format!(
+            "rspyts-config-source-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(root.join("rust/src")).unwrap();
+        fs::create_dir_all(root.join("python-src")).unwrap();
+        fs::write(
+            root.join("rust/Cargo.toml"),
+            "[package]\nname = \"fixture\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+        )
+        .unwrap();
+        fs::write(root.join("rust/src/lib.rs"), "").unwrap();
+        fs::write(
+            root.join("rspyts.toml"),
+            "[crate]\npath = \"rust\"\n\n[python]\npackage = \"fixture\"\nsource = \"python-src\"\n",
+        )
+        .unwrap();
+
+        let project = Project::read(&root.join("rspyts.toml")).unwrap();
+        assert_eq!(
+            project.python.unwrap().source.unwrap(),
+            root.join("python-src").canonicalize().unwrap()
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn crate_default_features_are_opt_in() {
+        let root = std::env::temp_dir().join(format!(
+            "rspyts-config-default-features-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(root.join("rust/src")).unwrap();
+        fs::write(
+            root.join("rust/Cargo.toml"),
+            "[package]\nname = \"fixture\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+        )
+        .unwrap();
+        fs::write(root.join("rust/src/lib.rs"), "").unwrap();
+        fs::write(
+            root.join("rspyts.toml"),
+            "[crate]\npath = \"rust\"\n\n[typescript]\npackage = \"fixture\"\nmode = \"static\"\n",
+        )
+        .unwrap();
+        assert!(
+            !Project::read(&root.join("rspyts.toml"))
+                .unwrap()
+                .default_features()
+        );
+
+        fs::write(
+            root.join("rspyts.toml"),
+            "[crate]\npath = \"rust\"\ndefault-features = true\n\n[typescript]\npackage = \"fixture\"\nmode = \"static\"\n",
+        )
+        .unwrap();
+        assert!(
+            Project::read(&root.join("rspyts.toml"))
+                .unwrap()
+                .default_features()
+        );
+        fs::remove_dir_all(root).unwrap();
     }
 }
