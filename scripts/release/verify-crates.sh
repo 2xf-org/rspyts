@@ -7,9 +7,9 @@ usage() {
   exit 2
 }
 
-allow_dirty=()
+allow_dirty=false
 if [[ ${1:-} == "--allow-dirty" ]]; then
-  allow_dirty=(--allow-dirty)
+  allow_dirty=true
   shift
 fi
 [[ $# -le 1 ]] || usage
@@ -52,7 +52,12 @@ for crate in "${crates[@]}"; do
   fi
 done
 
-cargo package --locked --no-verify "${allow_dirty[@]}" \
+if [[ "$allow_dirty" == false ]] && [[ -n $(git status --porcelain --untracked-files=normal) ]]; then
+  echo "working tree must be clean; pass --allow-dirty only for local candidate checks" >&2
+  exit 1
+fi
+package_args=(--locked --no-verify --allow-dirty)
+cargo package "${package_args[@]}" \
   -p rspyts-macros \
   -p rspyts \
   -p rspyts-cli
