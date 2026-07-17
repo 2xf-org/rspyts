@@ -208,6 +208,9 @@ jobs:
           ref: ${{ needs.release-source.outputs.tooling_sha }}
           path: .release-tooling
           persist-credentials: false
+      - name: Test trusted release tooling
+        working-directory: .release-tooling
+        run: python3 -m unittest scripts.release.test_compare_crate_archives
       - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
         with:
           toolchain: 1.88.0
