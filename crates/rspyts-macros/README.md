@@ -8,7 +8,7 @@ release, which exposes `Type`, `Error`, `export`, and `module!`:
 
 ```toml
 [dependencies]
-rspyts = { version = "=0.4.2", default-features = false }
+rspyts = { version = "=0.4.3", default-features = false }
 ```
 
 Each contract crate declares exactly one `rspyts::module!`. See the

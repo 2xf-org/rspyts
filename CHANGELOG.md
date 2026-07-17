@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.4.3
+
+- Keep repository fixtures product-neutral so protected release scans can
+  verify the complete source tree without matching consumer-specific terms.
+- Describe rspyts solely as a Cargo-installed build tool and remove historical
+  package-registry guidance that is not part of the supported product.
+- Run the protected privacy scan on every push to `main`, before an immutable
+  release tag can be created.
+
 ## 0.4.2
 
 - Scope native contract-discovery symbols to their Cargo package. A contract
@@ -66,5 +75,5 @@
   package surface.
 - Repair the crate README links to the project documentation.
 
-Install 0.4.2, inspect the current contract, review the reported drift, then
+Install 0.4.3, inspect the current contract, review the reported drift, then
 run `rspyts lock`. Update dependency owners before their consumers.

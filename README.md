@@ -18,8 +18,8 @@ The three supported package shapes are:
 | Static consumer | Generated source for one Maturin abi3 wheel | Static ESM importing an owner's `./wire` | One direct WASM leaf |
 
 Commit `rspyts.toml` and `rspyts.lock`. Ignore the fixed `.rspyts/` output.
-rspyts is installed from Cargo; generated Python and npm packages do not depend
-on a PyPI or npm package named `rspyts`.
+rspyts is a Cargo-installed build tool; generated packages contain no rspyts
+runtime dependency.
 
 Unsupported configurations include standalone Python extensions, custom output
 directories, absolute or out-of-workspace package paths, transitive contract
@@ -34,7 +34,7 @@ The repository pins Rust and Cargo in `rust-toolchain.toml`. Pin the CLI and
 runtime crates to the same exact release:
 
 ```sh
-cargo install rspyts-cli --version '=0.4.2' --locked
+cargo install rspyts-cli --version '=0.4.3' --locked
 ```
 
 Executable TypeScript also requires the pinned WebAssembly tool:
@@ -53,7 +53,7 @@ Use a workspace member whose library emits both an `rlib` and `cdylib`:
 crate-type = ["rlib", "cdylib"]
 
 [dependencies]
-rspyts = { version = "=0.4.2", default-features = false }
+rspyts = { version = "=0.4.3", default-features = false }
 serde = { version = "1", features = ["derive"] }
 wasm-bindgen = { version = "=0.2.126", optional = true }
 
