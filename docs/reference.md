@@ -1,394 +1,340 @@
 # Reference
 
-## Cargo packages
+This is the compact lookup for the supported rspyts 0.4.1 surface.
 
-| Package | Purpose |
+## Packages and requirements
+
+| Cargo package | Purpose |
 | --- | --- |
-| `rspyts` | Public macros, semantic IR, contract registry, and target-gated boundary support |
-| `rspyts-macros` | Proc-macro implementation; consumed through `rspyts` |
-| `rspyts-cli` | Contract compiler, emitters, lock handling, and build orchestration |
+| `rspyts` | Macros, contract IR, and target support |
+| `rspyts-macros` | Proc-macro implementation, re-exported by `rspyts` |
+| `rspyts-cli` | The `rspyts` compiler |
 
-Only these three Cargo packages are released. There is no `rspyts-core`, PyPI
-distribution, npm package, or separately installed host runtime in 0.4.
+There is no rspyts package on PyPI or npm, and generated consumer packages do
+not require one. The Rust MSRV is 1.88. Python wheels target CPython 3.11+
+through `abi3-py311`. Executable TypeScript targets browser WebAssembly.
 
-## Configuration
+```sh
+cargo install rspyts-cli --version '=0.4.1' --locked
+```
 
-`rspyts.toml` is strict: unknown keys are errors.
+## `rspyts.toml`
+
+Unknown keys are errors. Paths are relative to `rspyts.toml`.
 
 ```toml
 [crate]
-path = "rust/Cargo.toml" # or the containing directory
-features = ["native"]    # optional features common to every Cargo invocation
-probe-features = ["native", "formats"] # optional; defaults to features
-default-features = false # default; true is an explicit opt-in
+path = "rust"                 # crate directory or Cargo.toml
+features = ["domain"]         # optional; host artifact builds
+probe-features = ["domain"]   # optional; semantic inventory build
+default-features = false      # optional; defaults to false
 
-[python]                 # optional
+[python]                      # optional
 package = "example.contract"
-mode = "source"         # "source" or "standalone"
-source = "python/src"    # optional authored source directory
+mode = "source"               # source or standalone; default: standalone
+source = "python/src"         # optional authored source
 
-[typescript]             # optional
+[typescript]                  # optional
 package = "@example/contract"
-mode = "wasm"            # "wasm" or "static"
-source = "typescript/src" # optional authored source directory
+mode = "wasm"                 # required: wasm or static
+source = "typescript/src"     # optional authored source
 
-[dependencies.hardware]  # optional imported Rust contract owner
-crate = "neurovirtual-hardware"
+[dependencies.hardware]       # optional cross-package contract
+crate = "example-hardware"
 lock = "../hardware/rspyts.lock"
-python = "neurovirtual.hardware"
-typescript = "@neurovirtual/hardware"
+python = "example.hardware"
+typescript = "@example/hardware"
 ```
 
-At least one host section is required. Relative paths resolve from the
-directory containing `rspyts.toml`.
+At least one host is required.
 
-`[crate].features` is the common feature set for every selected host build.
-`probe-features` defaults to that common set; when specified, it is the complete
-feature set used only for target-independent native inventory extraction. Keep
-it backend-neutral. In particular, do not put a PyO3 or wasm-bindgen boundary
-feature in `probe-features`.
+### Crate settings
 
-The CLI automatically adds the consumer's Cargo feature named `python` when it
-compiles a standalone Python extension, and `wasm` when it compiles executable
-TypeScript. Those two names are the fixed v0.4 convention; there are no
-per-host `features` keys in `rspyts.toml`. Cargo default features are disabled
-unless the configuration explicitly sets `default-features = true`.
+| Key | Rule |
+| --- | --- |
+| `path` | Must resolve to an existing Cargo manifest. |
+| `features` | Common features added when rspyts compiles a Python or WASM artifact. |
+| `probe-features` | Complete feature set for the native semantic-inventory build. Defaults to `features`. |
+| `default-features` | Cargo defaults are off unless explicitly enabled. |
 
-`source` is resolved relative to `rspyts.toml` and copied into that host's
-temporary staging tree before generated files are written. It must be a real
-in-project directory with no symlink traversal. A generated/authored path
-collision is a hard error; rspyts never overwrites authored source.
+The inventory build uses `probe-features` alone, not the union of
+`probe-features` and `features`. Keep both lists backend-neutral. `python` and
+`wasm` are reserved names: rspyts adds the fixed `python` feature to a
+standalone extension build and `wasm` to an executable TypeScript build.
+Python source mode and static TypeScript do not make those backend builds.
 
-Each `[dependencies.ALIAS]` table maps one foreign Cargo package owner to its
-committed semantic lock and host package names. The alias is only a stable local
-configuration key. `crate` must exactly match the owner recorded by the macros,
-and `lock` resolves relative to `rspyts.toml`. A host mapping is required when
-the consuming output references that dependency in the host. Lock schema 2
-records and fingerprints these mappings. Missing owners, stale fingerprints,
-shape mismatches, duplicate owner aliases, undeclared transitive types, and
-dependency cycles are errors. A dependency never points at another package's
-`.rspyts/` staging directory.
+### Host settings
 
-If `mode` is omitted, Python defaults to `standalone`. Python
-`mode = "source"` stages generated and optional authored Python source,
-but never compiles or copies a native extension. This is the Maturin mode:
-Maturin enables the fixed `python` feature and produces the package's sole
-ABI-tagged extension. `mode = "standalone"` tells rspyts to compile and stage
-the consumer crate's PyO3 extension itself. Do not combine standalone mode with
-a second Maturin-built extension in the same wheel.
+| Host mode | Output | Extra toolchain |
+| --- | --- | --- |
+| Python `source` | Generated Python source for a Maturin build | Maturin compiles the extension |
+| Python `standalone` | Generated Python plus a compiled PyO3 extension | Native Rust toolchain |
+| TypeScript `static` | Types, enums, constants, and tables | None |
+| TypeScript `wasm` | TypeScript wrappers, wasm-bindgen glue, and `.wasm` | `wasm32-unknown-unknown` and wasm-bindgen CLI |
 
-In source mode, Maturin's module name must append the identifier passed to
-`rspyts::module!` to the configured Python package:
+An authored `source` must be a real directory inside the project. It cannot
+traverse symlinks, contain the staging directory, or collide with generated
+paths. Copying skips the directories `__pycache__`, `.pytest_cache`,
+`.mypy_cache`, and `.ruff_cache`, plus `.DS_Store`, `*.pyc`, and `*.pyo`
+files.
+
+For Python source mode, Maturin owns the package's only native extension:
 
 ```toml
 [tool.maturin]
 manifest-path = "rust/Cargo.toml"
 python-source = ".rspyts/python"
 module-name = "example.contract.native"
-features = ["python"]
+features = ["domain", "python"]
 ```
 
-Python consumer cdylibs enable rspyts's extension feature:
+The final module segment is the identifier passed to `rspyts::module!`.
+External packagers do not read rspyts's Cargo settings: repeat any required
+`features` and default-feature policy alongside `python`.
+
+Consumer features:
 
 ```toml
 [dependencies]
 rspyts = { version = "0.4.1", default-features = false }
+wasm-bindgen = { version = "=0.2.126", optional = true }
 
 [features]
 python = ["rspyts/python-extension"]
-```
-
-`rspyts/python-extension` includes the `abi3-py311` PyO3 boundary and
-extension-module link mode. Use the lower-level `rspyts/python` feature only in
-non-extension Rust tests. The consumer does not need a direct PyO3 dependency
-solely for rspyts, and neither feature creates an installed Python dependency.
-
-WASM consumers also declare wasm-bindgen directly and enable it with the fixed
-feature:
-
-```toml
-[dependencies]
-rspyts = { version = "0.4.1", default-features = false }
-wasm-bindgen = { version = "0.2.126", optional = true }
-
-[features]
 wasm = ["rspyts/wasm", "dep:wasm-bindgen"]
 ```
 
-This is required because wasm-bindgen's expanded code resolves its own crate in
-the consumer; unlike PyO3, it offers no supported crate-path override. The
-dependency is compile-time Rust support and does not add an npm rspyts or
-wasm-bindgen runtime dependency.
+`rspyts/python` is only the lower-level boundary used by Rust tests;
+extensions use `rspyts/python-extension`. wasm-bindgen must be a direct
+optional dependency because its macro expansion resolves the consumer crate.
+The matching CLI is read from `WASM_BINDGEN` or `PATH` and should be installed
+with `cargo install wasm-bindgen-cli --version '=0.2.126' --locked`.
 
-For `mode = "wasm"`, the build environment also needs a wasm-bindgen CLI
-compatible with the Rust dependency and the `wasm32-unknown-unknown` Rust
-target. `rspyts build` invokes `wasm-bindgen` from `PATH`, or the executable
-named by `WASM_BINDGEN`. Static mode needs neither the target, CLI, nor direct
-dependency.
+### Contract dependencies
 
-The generated executable package's default `init()` is idempotent. Concurrent
-and repeated calls share the first in-flight or successful promise, and the
-first call's input wins. A rejection clears the cache so a later call can
-retry.
+Each `[dependencies.ALIAS]` maps one foreign Cargo package owner to its
+committed semantic lock. `crate` must match the owner in that lock. Every
+dependency needs `python` when `[python]` is configured and `typescript` when
+`[typescript]` is configured, even during a target-selected build.
+
+Aliases must be unique identifiers, owners cannot be duplicated, and locks
+must be relative regular files. Stale fingerprints, mismatched definitions,
+undeclared transitive types, and dependency cycles are errors. Depend on
+`rspyts.lock`, never another package's `.rspyts/` directory.
+
+### Versions and fingerprints
+
+The Cargo package version becomes `manifest.crateVersion`, is retained in
+`rspyts.lock`, and becomes the generated npm package version. rspyts does not
+set a Python distribution version; that comes from the consumer's Python
+packager configuration, such as `[project].version` in `pyproject.toml`.
+
+Package versions and Rust documentation are recorded but excluded from the
+semantic SHA-256 fingerprint. The fingerprint covers the root contract,
+configured host identities and TypeScript mode, and dependency mappings. The
+lock and generated `contract.json` contain one top-level fingerprint plus each
+imported package's lock fingerprint under `dependencies`; changing an imported
+contract therefore changes the consumer fingerprint. Generated
+`CONTRACT_FINGERPRINT` is the top-level value; imported host packages retain
+their own fingerprint constants.
 
 ## Commands
 
-All commands accept `--config PATH`; the default is `rspyts.toml`.
+Every command accepts `--config PATH` (default: `rspyts.toml`).
 
-| Command | Effect |
+| Command | Result |
 | --- | --- |
-| `rspyts build` | Compile and validate the contract, then replace `.rspyts/` atomically |
-| `rspyts build --staging PATH` | Write package staging output to an explicit build directory |
-| `rspyts build --target python` | Stage only the configured Python package |
-| `rspyts build --target typescript` | Stage only the configured TypeScript package |
-| `rspyts check` | Build and validate the current contract |
-| `rspyts check --target HOST` | Check and stage only `python` or `typescript` |
-| `rspyts check --locked` | Also require an exact match with `rspyts.lock` |
-| `rspyts lock` | Replace `rspyts.lock` with the current semantic contract |
-| `rspyts inspect` | Print the resolved manifest and SHA-256 fingerprint |
-| `rspyts clean` | Remove `.rspyts/` |
+| `rspyts build` | Validate and atomically replace `.rspyts/`. |
+| `rspyts build --target python` | Build only the configured Python host. |
+| `rspyts build --target typescript` | Build only the configured TypeScript host. |
+| `rspyts build --staging PATH` | Replace an explicit staging directory. |
+| `rspyts check` | Build and validate the contract. |
+| `rspyts check --locked` | Also require exact semantic agreement with `rspyts.lock`. |
+| `rspyts check --target HOST` | Check only `python` or `typescript`. |
+| `rspyts inspect` | Print the resolved manifest and fingerprint. |
+| `rspyts lock` | Atomically replace `rspyts.lock`. |
+| `rspyts clean` | Remove the project's default `.rspyts/` directory. |
 
-Machine-readable command output is JSON. Diagnostics and a non-zero exit code
-report invalid configuration, unsupported contracts, build failures, or lock
-drift.
+Commands print JSON reports to stdout and diagnostics to stderr. `--target`
+defaults to `all`. Every target build first extracts the same native semantic
+inventory, so Python and TypeScript share one fingerprint without enabling
+their backend features together. Target selection does not relax configured
+dependency mappings.
 
-`--target` defaults to `all` and controls host compilation and staging only.
-Before any selected host is emitted, the CLI extracts one semantic manifest
-from the backend-neutral native probe configured by `[crate].features` and
-`probe-features`. This ensures a Python build, a TypeScript build, and an
-all-host build share the same fingerprint and lock without enabling their
-backend features together. Target selection never invokes the unselected
-host's compiler or wasm-bindgen CLI.
+A build replaces its whole staging directory; target builds do not merge.
+Parallel jobs need distinct paths:
 
-Each invocation atomically replaces its complete staging directory. Do not run
-two target-selected jobs against the same output and expect their files to be
-merged. Use `--staging .rspyts/python-job` and
-`--staging .rspyts/typescript-job`, or let one `--target all` build own the
-default `.rspyts/` directory.
+```sh
+rspyts build --target python --staging .rspyts/python-job
+rspyts build --target typescript --staging .rspyts/typescript-job
+```
 
-## Public Rust surface
+## Rust contract surface
 
 ### `#[derive(rspyts::Type)]`
 
-Registers the existing struct, enum, or newtype as a contract type. It does not
-create another Rust type. Supported Serde naming is reflected in the semantic
-manifest rather than guessed from generated text.
+Registers the existing Rust type. Supported shapes:
 
-The derive accepts named structs, single-field tuple newtypes marked
-`#[serde(transparent)]`, unit-variant string enums, and internally tagged enums
-whose variants use named fields. Generic types, unit structs, unions, ordinary
-tuple structs, tuple enum variants, and ambiguous enum representations are
-rejected.
+- named-field structs;
+- one-field tuple newtypes with `#[serde(transparent)]`;
+- unit-variant string enums;
+- internally tagged enums with named fields;
+- an explicit serialized alias through `#[rspyts(wire = T)]`.
+
+Host shapes recognize Serde `rename`, `rename_all`, `rename_all_fields`, `tag`,
+and `transparent`. `deny_unknown_fields`, field/variant `alias`,
+`skip_serializing_if`, and `default` are accepted where applicable, but do not
+independently widen the generated host shape. rspyts rejects ambiguous or
+unsupported Serde representations.
 
 ### `#[derive(rspyts::Error)]`
 
-Registers an existing error enum or error struct. Host exceptions retain the
-error type, stable code, and display message. Enum codes identify variants. A
-struct error has one code derived from its type name (or supported rename) and
-does not expose its fields as a host payload. Error enum variants may carry
-fields for Rust's internal behavior, but those fields are not registered or
-exposed through generated host exceptions. Structured error payloads are not a
-0.4 feature.
+Registers an error struct or enum as typed host exceptions. The stable code is
+derived from the error type or enum variant, and the Rust type must implement
+`Display`. Error fields remain Rust implementation detail; structured host
+error payloads are not supported.
 
 ### `#[rspyts::export]`
 
-Exports an existing public function, `const`, `static`, or inherent impl.
-`#[rspyts::export(python)]` limits a native-only function to Python;
-`#[rspyts::export(typescript)]` limits it to executable TypeScript. Use
-`#[rspyts::export(static)]` on static TypeScript vocabulary. Constants and
-statics are static-output data; static mode never translates function bodies.
+Exports a public function, `const`, `static`, or inherent `impl`.
 
-For a normal `Result<T, E>`, rspyts reads the error type directly. A domain
-alias with only one visible type parameter must name its fixed error explicitly:
+Functions and resources use these targets:
 
-```rust
-type DomainResult<T> = Result<T, DomainError>;
+| Form | Function/resource target |
+| --- | --- |
+| `#[rspyts::export]` | Python and executable TypeScript |
+| `#[rspyts::export(python)]` | Python only |
+| `#[rspyts::export(typescript)]` or `#[rspyts::export(wasm)]` | Executable TypeScript only |
+| `#[rspyts::export(static)]` | Rejected |
 
-#[rspyts::export]
-#[rspyts(error = crate::DomainError)]
-pub fn evaluate() -> DomainResult<Summary> { /* ... */ }
-```
+Functions must be concrete, synchronous, safe, non-variadic public functions
+with simple identifier parameters. For a one-parameter result alias such as
+`DomainResult<T>`, add `#[rspyts(error = crate::DomainError)]`. Ordinary
+`Result<T, E>` already carries its error type.
 
-The same `error = path::Type` helper is available on exported resource
-constructors and methods. It is required only when the return syntax does not
-contain the error type; it must not contradict an ordinary two-parameter
-`Result<T, E>`.
+An exported inherent `impl` defines an opaque resource:
 
-### `#[rspyts::export]` on an inherent `impl`
+- at least one public method has `#[rspyts(constructor)]`;
+- public `&self` and `&mut self` methods are exported;
+- `#[rspyts(skip)]` omits a public method;
+- `#[rspyts(python)]`, `#[rspyts(typescript)]`, and `#[rspyts(wasm)]` scope members;
+- consuming-`self` methods are rejected;
+- `close` and `free` are reserved lifecycle names.
 
-Declares an opaque resource backed by the real Rust value. The curated impl must
-contain at least one public `#[rspyts(constructor)]`; `new` is the primary host
-constructor when present, otherwise the first declared constructor is primary.
-Additional constructors become named class/static factories. Public `&self`
-and `&mut self` methods are exported, `#[rspyts(skip)]` omits a public method,
-and methods that consume `self` are rejected.
+Every exported host must retain a constructor after filtering. Generated
+Python resources have idempotent `close()` and context-manager cleanup.
+TypeScript resources have idempotent `free()` and `Symbol.dispose`. Calls
+after disposal fail.
 
-Constructors and methods may add `python` or `typescript` in the same helper
-attribute to limit genuinely host-specific operations:
+Constants and statics use a different target rule:
 
-```rust
-#[rspyts::export]
-impl Recording {
-    #[rspyts(constructor, python)]
-    pub fn open_path(path: String) -> Result<Self, OpenError> { /* ... */ }
+| Form | Constant/static target |
+| --- | --- |
+| `#[rspyts::export]` | Python and either TypeScript mode |
+| `#[rspyts::export(python)]` | Python only |
+| `#[rspyts::export(typescript)]` or `#[rspyts::export(wasm)]` | Either TypeScript mode |
+| `#[rspyts::export(static)]` | Static TypeScript mode only |
 
-    #[rspyts(constructor)]
-    pub fn open_bytes(#[rspyts(bytes)] bytes: &[u8]) -> Result<Self, OpenError> {
-        /* ... */
-    }
-
-    #[rspyts(python)]
-    pub fn native_path(&self) -> String { /* ... */ }
-}
-```
-
-Every backend included by the resource's `#[rspyts::export(...)]` target must
-retain at least one constructor after member target filtering. Selecting one
-host in `rspyts.toml` or with `--target` does not relax that compile-time rule.
-Constructors and methods are compiled into target-native wrappers. Host wrappers
-own their resource and expose deterministic disposal:
-
-- Python: idempotent `close()` and context-manager cleanup;
-- TypeScript: idempotent `free()` and `Symbol.dispose`.
-
-Using a disposed resource is an error. Finalization is a leak backstop, not the
-normal lifetime mechanism and is not a portability guarantee. `close` and
-`free` are host lifecycle names and cannot also be exported as domain resource
-methods.
+Static mode emits types and selected constants; it never translates function
+bodies.
 
 ### `rspyts::module!`
 
-Appears once in the exporting crate and names the private native module. It
-exports the build-time semantic manifest and registers only the selected target
-wrappers. The manifest inspection symbol is not an application call ABI.
+Declare exactly one generated native module:
 
 ```rust
-rspyts::module!(native);             // Python and TypeScript/WASM wrappers
-rspyts::module!(native, python);     // Python wrappers only
-rspyts::module!(native, typescript); // TypeScript/WASM wrappers only
+rspyts::module!(native);
+rspyts::module!(native, python);
+rspyts::module!(native, typescript);
 ```
 
-The qualifier selects the module wrapper only. In a single-host crate, scope
-its exported functions and resources to the same host as well; an unqualified
-`#[rspyts::export]` still declares both backend wrappers under their Cargo
-feature predicates. The compiler probe remains available in every module form.
+The qualifier scopes wrappers, not the semantic probe. Scope the exports too
+when a crate is intentionally single-host.
 
-## Contract types
-
-The core type vocabulary is deliberately closed:
+## Types and annotations
 
 | Rust | Python | TypeScript |
 | --- | --- | --- |
 | `()` | `None` | `void` |
 | `bool` | `bool` | `boolean` |
-| `i8`–`i32`, `u8`–`u32` | `int` with checked range | `number` with checked range |
+| `i8..i32`, `u8..u32` | checked `int` | checked `number` |
 | `i64`, `u64` | `int` | `bigint` |
 | `f32`, `f64` | `float` | `number` |
 | `String`, `&str` | `str` | `string` |
-| `Option<T>` | `T | None` | `T | null` |
+| `Option<T>` | `T \| None` | `T \| null` |
 | `Vec<T>`, slices | sequence | `ReadonlyArray<T>` |
-| `BTreeMap<String, T>`, `HashMap<String, T>` | mapping | readonly string-keyed object |
-| tuples of 2–8 values | tuple | readonly tuple |
-| `serde_json::Value` | recursive JSON value | recursive `JsonValue` |
-| `chrono::DateTime<Utc>` or `DateTime<FixedOffset>` | Pydantic `AwareDatetime` | aware RFC 3339 `string` |
-| derived named types | generated model/enum | generated interface/union |
+| string-keyed `BTreeMap`/`HashMap` | mapping | readonly object |
+| tuples of 2–8 items | tuple | readonly tuple |
+| `serde_json::Value` | recursive JSON | `JsonValue` |
+| aware `chrono::DateTime` | Pydantic `AwareDatetime` | RFC 3339 string |
+| derived types | generated model/enum | generated interface/enum/union |
 
-`usize` and `isize` are intentionally absent. Public contracts use fixed-width
-integers and perform checked conversion at internal indexing sites.
+`usize` and `isize` are not contract types.
 
-### Bytes and numeric buffers
-
-`#[rspyts(bytes)]` preserves a byte value as Python `bytes` and TypeScript
-`Uint8Array`. `#[rspyts(buffer)]` preserves the exact numeric dtype and maps to
-an owned NumPy array or JavaScript typed array.
-
-Use `bytes` with `Vec<u8>`, `&[u8]`, or a custom serializer whose real wire
-value is bytes or an unsigned-byte sequence. The macro does not currently prove
-the Rust carrier type. Numeric buffers preserve dtype and element count, not
-shape or strides: multidimensional Python input is made contiguous and
-flattened, and generated buffer outputs are one-dimensional.
-
-Use the annotation directly on a field or parameter. For a function or
-resource-method return, declare the policy on the callable:
-
-```rust
-#[rspyts::export]
-#[rspyts(returns(buffer))]
-pub fn samples() -> Vec<f32> { /* ... */ }
-
-#[rspyts::export]
-impl Blob {
-    #[rspyts(returns(bytes))]
-    pub fn encode(&self) -> Vec<u8> { /* ... */ }
-}
-```
-
-Every boundary value is owned or copied before the call completes. rspyts 0.4
-does not expose borrowed Rust memory and does not promise zero-copy transport.
-Structured floats must be finite; numeric buffers retain IEEE NaN and infinity.
-Generated TypeScript value objects, ordinary arrays, tuples, and maps are
-recursively frozen on Rust output and declared deeply readonly. Owned typed
-arrays remain mutable and unfrozen because JavaScript cannot freeze a non-empty
-typed array; their memory is not borrowed from Rust.
-
-### Defaults and constraints
-
-Field annotations preserve a small, exact validation vocabulary across Rust,
-Python, and TypeScript:
-
-| Annotation | Applies to | Meaning |
-| --- | --- | --- |
-| `#[rspyts(literal = VALUE)]` | bool, integer, string | the value must equal the declared scalar |
-| `#[rspyts(min_length = N)]` | string, list | minimum Unicode-scalar or element count |
-| `#[rspyts(max_length = N)]` | string, list | maximum Unicode-scalar or element count |
-| `#[rspyts(ge = N)]` | integer | inclusive minimum |
-| `#[rspyts(default = VALUE)]` | bool, integer, string | insert this value when the field is absent |
-
-`VALUE` is a boolean, signed 64-bit integer, or string literal and must match
-the Rust field kind. A literal/default pair must contain the same value, a
-default cannot be combined with `required`, and a default or literal must also
-satisfy `ge`. Length bounds must be ordered. Constraints and defaults are part
-of the semantic fingerprint and lock.
-
-Generated Python models express these rules with Pydantic `Literal`, `Field`,
-and `AwareDatetime`. Generated TypeScript uses readonly properties, literal
-types, optional properties for defaulted fields, and RFC 3339 strings. Runtime
-normalization applies defaults and validates inputs before calling Rust, then
-validates Rust output as well. Datetimes must include a UTC offset; naive
-timestamps are rejected.
-
-### Declared wire shapes
-
-`#[rspyts(wire = T)]` describes the existing serialized shape of a validated or
-custom-Serde type. The type's own Serialize/Deserialize implementation remains
-the conversion and validation boundary. A compile-time derive cannot prove
-arbitrary serializer behavior, so each declared wire shape needs a Rust
-round-trip test in the consuming crate.
-
-### Requiredness
-
-Non-optional fields are required by default. `Option<T>` is optional unless
-`#[rspyts(required)]` says the key must be present; requiredness and
-nullability are separate, so a required `Option<T>` may still contain null.
-
-A non-optional Serde default must be paired with an explicit scalar
-`#[rspyts(default = ...)]`. rspyts cannot execute or infer the result of an
-arbitrary Rust default function during host model generation, so that scalar
-must match the function or `Default` implementation used by Serde. The field is
-then optional in both hosts and the compiler inserts the declared value when it
-is absent. An `Option<T>` may use Serde's null/default behavior without an
-explicit scalar default.
-
-## Generated and tracked files
-
-| Path | Policy |
+| Annotation | Use |
 | --- | --- |
-| `.rspyts/**` | Generated staging output; ignore it |
-| `.rspyts.tmp-*`, `.rspyts.old-*` | Transient atomic replacement siblings; ignore them |
-| `.rspyts.lock.tmp-*`, `.rspyts.lock.old-*` | Transient semantic-lock replacement siblings; ignore them |
-| `rspyts.lock` | Semantic public-contract review; commit it |
-| `rspyts.toml` | Authored configuration; commit it |
-| generated Python/TypeScript copied into artifacts | Publish it inside the consumer artifact; do not commit it as source |
+| `#[rspyts(bytes)]` | Byte wire policy: Python `bytes`, TypeScript `Uint8Array` |
+| `#[rspyts(buffer)]` | Numeric storage as NumPy/JavaScript typed arrays |
+| `#[rspyts(returns(bytes))]` | Bytes return policy on a function or method |
+| `#[rspyts(returns(buffer))]` | Numeric-buffer return policy |
+| `#[rspyts(required)]` | Require an `Option<T>` key while still allowing null |
+| `#[rspyts(literal = V)]` | Exact bool, signed-64-bit integer, or string |
+| `#[rspyts(default = V)]` | Host default for a bool, integer, or string |
+| `#[rspyts(min_length = N)]` | String scalar-count or list length minimum |
+| `#[rspyts(max_length = N)]` | String scalar-count or list length maximum |
+| `#[rspyts(ge = N)]` | Inclusive integer minimum |
+| `#[rspyts(wire = T)]` | Declared serialized shape for custom Serde |
 
-Generated implementation can be large. It is compiler-owned build output, not
-a second application-maintained contract.
+Non-optional fields are required. `Option<T>` is optional unless marked
+`required`. A non-optional Serde default needs the matching explicit rspyts
+default. Literal/default values must agree and satisfy constraints.
+
+The intended byte carrier convention is `Vec<u8>` or `&[u8]`, but the macro
+currently records the byte policy without statically proving the Rust carrier.
+Its actual serialization must match bytes or an unsigned-byte sequence. Bytes
+and buffers are owned at the boundary. Buffers preserve dtype and count, but
+not dimensions or strides. Structured floats must be finite; buffers may
+contain IEEE NaN and infinity. TypeScript values are deeply readonly and
+frozen, except non-empty typed arrays, which JavaScript cannot freeze.
+
+## Generated files
+
+| Path | Source-control policy |
+| --- | --- |
+| `rspyts.toml` | Commit |
+| `rspyts.lock` | Commit and review as the semantic API |
+| `.rspyts/**` | Ignore; generated staging |
+| `.rspyts.tmp-*`, `.rspyts.old-*` | Ignore; atomic directory siblings |
+| `.rspyts.lock.tmp-*`, `.rspyts.lock.old-*` | Ignore; atomic lock siblings |
+
+Generated Python, TypeScript, JavaScript, and WASM belong inside built consumer
+artifacts, not the source tree. `rspyts.lock` schema 2 is deterministic,
+pretty-printed JSON.
+
+## Deliberate limits
+
+rspyts 0.4 does not support generics, async functions, callbacks, iterators,
+streams, `impl Trait`, borrowed host lifetimes, zero-copy Rust memory, arbitrary
+custom Serde without `wire`, untagged/flattened shapes, a generic C ABI, Node
+native bindings, or body translation to static TypeScript.
+
+Native file APIs should be Python-only. Browser APIs should accept owned,
+portable data. A declared `wire` shape requires a consumer-owned Rust
+serialization round-trip test.
+
+## Troubleshooting
+
+| Symptom | Check |
+| --- | --- |
+| Config rejected | Unknown key, invalid package name, missing host, backend feature in crate lists, or unsafe `source` path. |
+| Cargo manifest missing | `crate.path` is relative to `rspyts.toml` and may name a directory or manifest. |
+| `check --locked` fails | Run `rspyts inspect`, review the Rust API and lock diff, then run `rspyts lock` only if intentional. |
+| Generated files are tracked | Remove them and add all five `.rspyts*` ignore patterns above. |
+| Python has unresolved symbols | Use `rspyts/python-extension`, not `rspyts/python`, for a wheel extension. |
+| Wheel contains two extensions | Use Python `source` mode when Maturin compiles the extension. |
+| Installed Python import fails | Test the built wheel in a clean environment; verify Maturin's `python-source` and `module-name`. |
+| WASM build cannot start | Install the target and matching wasm-bindgen CLI, or set `WASM_BINDGEN`. |
+| Browser cannot load `.wasm` | Test the packed npm artifact and verify its exports/files include the generated asset. |
+| Host shape is wrong | Correct Serde metadata or declare the real `wire` shape; do not add a mirror DTO. |
+| Wrong buffer dtype | Use `buffer` for numeric arrays and `bytes` for binary data; annotate returns separately. |
+| Targets produce different expectations | Keep `probe-features` complete and backend-neutral; target selection is packaging, not a separate contract. |
