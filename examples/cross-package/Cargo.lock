@@ -268,7 +268,7 @@ dependencies = [
 
 [[package]]
 name = "rspyts"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "chrono",
  "inventory",
@@ -284,7 +284,7 @@ dependencies = [
 
 [[package]]
 name = "rspyts-macros"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "heck",
  "proc-macro2",

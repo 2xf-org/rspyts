@@ -318,23 +318,12 @@ fn temporary_sibling(output: &Path) -> Result<PathBuf> {
         .parent()
         .with_context(|| format!("output {} has no parent", output.display()))?;
     fs::create_dir_all(parent)?;
-    let name = output
-        .file_name()
-        .and_then(|value| value.to_str())
-        .context("staging output name is not valid UTF-8")?;
     let id = BUILD_ID.fetch_add(1, Ordering::Relaxed);
-    Ok(parent.join(format!(".{name}.tmp-{}-{id}", std::process::id())))
+    crate::atomic_sibling(output, &format!("tmp-{}-{id}", std::process::id()))
 }
 
 fn replace_directory(temporary: &Path, output: &Path) -> Result<()> {
-    let backup = output.with_file_name(format!(
-        ".{}.old-{}",
-        output
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or("rspyts"),
-        std::process::id()
-    ));
+    let backup = crate::atomic_sibling(output, &format!("old-{}", std::process::id()))?;
     remove_any(&backup)?;
     let had_output = output.exists() || output.is_symlink();
     if had_output {
@@ -370,7 +359,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn replaces_staging_as_one_directory() {
+    fn hidden_staging_uses_single_dot_siblings_and_replaces_as_one_directory() {
         let root = std::env::temp_dir().join(format!(
             "rspyts-atomic-{}-{}",
             std::process::id(),
@@ -383,12 +372,44 @@ mod tests {
         let output = root.join(".rspyts");
         fs::create_dir_all(&output).unwrap();
         fs::write(output.join("old"), "old").unwrap();
-        let temporary = root.join(".rspyts.tmp");
+        let temporary = temporary_sibling(&output).unwrap();
+        assert!(
+            temporary
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with(".rspyts.tmp-")
+        );
+        assert!(
+            !temporary
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("..")
+        );
+        let backup =
+            crate::atomic_sibling(&output, &format!("old-{}", std::process::id())).unwrap();
+        assert!(
+            backup
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with(".rspyts.old-")
+        );
+        assert!(
+            !backup
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("..")
+        );
         fs::create_dir_all(&temporary).unwrap();
         fs::write(temporary.join("new"), "new").unwrap();
         replace_directory(&temporary, &output).unwrap();
         assert!(!output.join("old").exists());
         assert_eq!(fs::read_to_string(output.join("new")).unwrap(), "new");
+        assert!(!temporary.exists());
+        assert!(!backup.exists());
         fs::remove_dir_all(root).unwrap();
     }
 

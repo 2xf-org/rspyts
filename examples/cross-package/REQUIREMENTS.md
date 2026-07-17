@@ -71,7 +71,8 @@ staging directories.
 6. Include that sorted dependency data in the consuming package fingerprint so
    a dependency update cannot silently diverge.
 
-The lock is source-controlled. `.rspyts/` remains ignored.
+The lock is source-controlled. `.rspyts/`, `.rspyts.tmp-*`, `.rspyts.old-*`,
+`.rspyts.lock.tmp-*`, and `.rspyts.lock.old-*` remain ignored.
 
 ## Python emitter/runtime
 
