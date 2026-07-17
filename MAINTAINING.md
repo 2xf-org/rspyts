@@ -75,8 +75,15 @@ git push origin "refs/tags/v$version"
 [The deploy workflow](.github/workflows/deploy.yml) verifies that the tag is
 annotated and contained in `main`, reruns validation, preserves exact archives
 and checksums, publishes the crates in dependency order with trusted
-publishing, installs the published CLI, compiles a clean consumer, and creates
-the GitHub release.
+publishing, preserves the archives crates.io actually received, installs the
+published CLI, compiles a clean consumer, and creates the GitHub release.
+
+Sequential publication can add crates.io `source` and `checksum` fields to the
+packaged `Cargo.lock` after an internal dependency becomes public. The workflow
+repackages each crate immediately before publication and accepts only that
+exact provenance for the already verified internal crate version and checksum.
+Every other archive change fails the release. GitHub release assets are the
+actual published archives; the original candidates remain workflow evidence.
 
 The three crates.io trusted publishers must name organization `2xf-org`,
 repository `rspyts`, workflow `deploy.yml`, and environment `crates-io`. Normal
@@ -89,6 +96,10 @@ invalid, or matched. Pushes to `main` run the same protected tree scan before a
 release tag is created. Keep the plaintext patterns outside the public
 repository.
 
-Do not publish manually, move or reuse a release tag, or overwrite a published
-version. If a published checksum differs from the preserved candidate, stop and
-release a corrected patch version.
+Do not publish manually, move a release tag, or overwrite a published version.
+If a tag run fails after publishing only part of the workspace, dispatch the
+Deploy workflow from `main` with that existing tag. The recovery path rechecks
+the annotated tag, its ancestry from current `main`, exact workspace versions,
+the complete validation suite, archive semantics, and registry checksums. Never
+retag the release. If source content differs or a published checksum cannot be
+verified, stop and release a corrected patch version.
