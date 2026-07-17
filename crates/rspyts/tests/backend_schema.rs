@@ -133,17 +133,58 @@ fn json_rejects_non_json_wire_categories_at_any_depth() {
 }
 
 #[test]
+fn json_numbers_are_finite_and_safe_at_every_depth() {
+    let safe = WireValue::Object(BTreeMap::from([(
+        "nested".to_owned(),
+        WireValue::Sequence(vec![
+            WireValue::I64(-9_007_199_254_740_991),
+            WireValue::U64(9_007_199_254_740_991),
+            WireValue::F64(1.25),
+            WireValue::F64(9_007_199_254_740_991.0),
+        ]),
+    )]));
+    assert_eq!(normalize_wire(&safe, &TypeRef::Json, &[]).unwrap(), safe);
+
+    for (value, path_is_preserved) in [
+        (WireValue::I64(-9_007_199_254_740_992), true),
+        (WireValue::U64(9_007_199_254_740_992), true),
+        (WireValue::F64(9_007_199_254_740_992.0), true),
+        (WireValue::F64(f64::INFINITY), false),
+        (WireValue::F64(f64::NAN), false),
+    ] {
+        let nested = WireValue::Object(BTreeMap::from([(
+            "nested".to_owned(),
+            WireValue::Sequence(vec![WireValue::Null, value]),
+        )]));
+        let error = normalize_wire(&nested, &TypeRef::Json, &[]).unwrap_err();
+        if path_is_preserved {
+            assert!(
+                error.to_string().contains("$.nested[1]"),
+                "unexpected error: {error}"
+            );
+        } else {
+            assert!(
+                error
+                    .to_string()
+                    .contains("structured floating-point values must be finite"),
+                "unexpected error: {error}"
+            );
+        }
+    }
+}
+
+#[test]
 fn tagged_enums_are_strict_and_keep_the_declared_tag() {
     let types = vec![TypeDef {
         owner: owner(),
-        id: "Event".to_owned(),
-        name: "Event".to_owned(),
+        id: "Selection".to_owned(),
+        name: "Selection".to_owned(),
         docs: None,
         shape: TypeShape::TaggedEnum {
             tag: "kind".to_owned(),
             variants: vec![EnumVariantDef {
-                rust_name: "Started".to_owned(),
-                wire_name: "started".to_owned(),
+                rust_name: "Included".to_owned(),
+                wire_name: "included".to_owned(),
                 docs: None,
                 fields: vec![field(
                     "sequence",
@@ -157,15 +198,15 @@ fn tagged_enums_are_strict_and_keep_the_declared_tag() {
         },
     }];
     let value = WireValue::Object(BTreeMap::from([
-        ("kind".to_owned(), WireValue::String("started".to_owned())),
+        ("kind".to_owned(), WireValue::String("included".to_owned())),
         ("sequence".to_owned(), WireValue::I64(4)),
     ]));
 
-    let normalized = normalize_wire(&value, &named("Event"), &types).unwrap();
+    let normalized = normalize_wire(&value, &named("Selection"), &types).unwrap();
     assert_eq!(
         normalized,
         WireValue::Object(BTreeMap::from([
-            ("kind".to_owned(), WireValue::String("started".to_owned()),),
+            ("kind".to_owned(), WireValue::String("included".to_owned()),),
             ("sequence".to_owned(), WireValue::U64(4)),
         ]))
     );
@@ -173,29 +214,60 @@ fn tagged_enums_are_strict_and_keep_the_declared_tag() {
 
 #[test]
 fn optional_null_skips_constraints_for_the_non_null_item() {
-    let types = vec![TypeDef {
-        owner: owner(),
-        id: "OptionalLabel".to_owned(),
-        name: "OptionalLabel".to_owned(),
-        docs: None,
-        shape: TypeShape::Struct {
-            fields: vec![FieldDef {
-                rust_name: "label".to_owned(),
-                wire_name: "label".to_owned(),
-                docs: None,
-                ty: TypeRef::Option {
+    let types = vec![
+        TypeDef {
+            owner: owner(),
+            id: "OptionalString".to_owned(),
+            name: "OptionalString".to_owned(),
+            docs: None,
+            shape: TypeShape::Alias {
+                target: TypeRef::Option {
                     item: Box::new(TypeRef::String),
                 },
-                required: false,
-                default: None,
-                constraints: FieldConstraints {
-                    min_length: Some(1),
-                    ..Default::default()
-                },
-            }],
+            },
         },
-    }];
-    let value = WireValue::Object(BTreeMap::from([("label".to_owned(), WireValue::Null)]));
+        TypeDef {
+            owner: owner(),
+            id: "OptionalLabel".to_owned(),
+            name: "OptionalLabel".to_owned(),
+            docs: None,
+            shape: TypeShape::Struct {
+                fields: vec![
+                    FieldDef {
+                        rust_name: "label".to_owned(),
+                        wire_name: "label".to_owned(),
+                        docs: None,
+                        ty: TypeRef::Option {
+                            item: Box::new(TypeRef::String),
+                        },
+                        required: false,
+                        default: None,
+                        constraints: FieldConstraints {
+                            min_length: Some(1),
+                            ..Default::default()
+                        },
+                    },
+                    FieldDef {
+                        rust_name: "aliased_label".to_owned(),
+                        wire_name: "aliasedLabel".to_owned(),
+                        docs: None,
+                        ty: named("OptionalString"),
+                        required: false,
+                        default: None,
+                        constraints: FieldConstraints {
+                            literal: Some(ScalarValue::String("ready".to_owned())),
+                            min_length: Some(1),
+                            ..Default::default()
+                        },
+                    },
+                ],
+            },
+        },
+    ];
+    let value = WireValue::Object(BTreeMap::from([
+        ("label".to_owned(), WireValue::Null),
+        ("aliasedLabel".to_owned(), WireValue::Null),
+    ]));
 
     assert_eq!(
         normalize_wire(&value, &named("OptionalLabel"), &types).unwrap(),
@@ -263,4 +335,93 @@ fn datetime_requires_an_aware_rfc3339_value() {
     )
     .unwrap_err();
     assert!(error.to_string().contains("aware RFC3339 datetime"));
+}
+
+#[test]
+fn fixed_bytes_are_enforced_recursively_with_the_field_path() {
+    let ty = TypeRef::FixedBytes { length: 4 };
+    let exact = WireValue::Bytes(vec![1, 2, 3, 4]);
+    assert_eq!(normalize_wire(&exact, &ty, &[]).unwrap(), exact);
+
+    for invalid in [
+        WireValue::Bytes(vec![1, 2, 3]),
+        WireValue::Bytes(vec![1, 2, 3, 4, 5]),
+    ] {
+        let error = normalize_wire(&invalid, &ty, &[]).unwrap_err();
+        assert!(error.to_string().contains("expected 4-byte array"));
+    }
+
+    let types = vec![TypeDef {
+        owner: owner(),
+        id: "Envelope".to_owned(),
+        name: "Envelope".to_owned(),
+        docs: None,
+        shape: TypeShape::Struct {
+            fields: vec![field("digest", ty, true)],
+        },
+    }];
+    let invalid = WireValue::Object(BTreeMap::from([(
+        "digest".to_owned(),
+        WireValue::Bytes(vec![1, 2, 3]),
+    )]));
+    let error = normalize_wire(&invalid, &named("Envelope"), &types).unwrap_err();
+    assert!(error.to_string().contains("$.digest"));
+    assert!(error.to_string().contains("expected 4-byte array"));
+}
+
+#[test]
+fn fixed_bytes_field_constraints_support_direct_and_named_aliases() {
+    let mut direct = field("direct", TypeRef::FixedBytes { length: 4 }, true);
+    direct.constraints.min_length = Some(3);
+    direct.constraints.max_length = Some(4);
+    let mut aliased = field("aliased", named("Digest"), true);
+    aliased.constraints.min_length = Some(4);
+    aliased.constraints.max_length = Some(5);
+    let types = vec![
+        TypeDef {
+            owner: owner(),
+            id: "Digest".to_owned(),
+            name: "Digest".to_owned(),
+            docs: None,
+            shape: TypeShape::Alias {
+                target: TypeRef::FixedBytes { length: 4 },
+            },
+        },
+        TypeDef {
+            owner: owner(),
+            id: "Envelope".to_owned(),
+            name: "Envelope".to_owned(),
+            docs: None,
+            shape: TypeShape::Struct {
+                fields: vec![direct, aliased],
+            },
+        },
+    ];
+    let value = WireValue::Object(BTreeMap::from([
+        ("direct".to_owned(), WireValue::Bytes(vec![1, 2, 3, 4])),
+        ("aliased".to_owned(), WireValue::Bytes(vec![5, 6, 7, 8])),
+    ]));
+
+    assert_eq!(
+        normalize_wire(&value, &named("Envelope"), &types).unwrap(),
+        value
+    );
+
+    let mut direct_too_short = types.clone();
+    let TypeShape::Struct { fields } = &mut direct_too_short[1].shape else {
+        panic!("expected Envelope struct");
+    };
+    fields[0].constraints.min_length = Some(5);
+    let error = normalize_wire(&value, &named("Envelope"), &direct_too_short).unwrap_err();
+    assert!(error.to_string().contains("$.direct"));
+    assert!(error.to_string().contains("length >= 5"));
+
+    let mut alias_too_long = types;
+    let TypeShape::Struct { fields } = &mut alias_too_long[1].shape else {
+        panic!("expected Envelope struct");
+    };
+    fields[1].constraints.max_length = Some(3);
+    let error = normalize_wire(&value, &named("Envelope"), &alias_too_long).unwrap_err();
+    assert!(error.to_string().contains("$.aliased"));
+    assert!(error.to_string().contains("length <= 3"));
 }

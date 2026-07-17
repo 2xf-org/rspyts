@@ -1,35 +1,59 @@
 # rspyts
 
-Compile one Rust API into self-contained Python and TypeScript packages.
+Compile one Rust contract into Python source and TypeScript packages without
+maintaining host-specific mirror models.
 
-rspyts keeps the public types and behavior in Rust, generates the host
-boundaries, and records one reviewable semantic contract for both languages.
-There is no rspyts runtime to install from PyPI or npm.
+## Supported scope
+
+rspyts 0.4 supports one `rspyts::module!` contract crate in one Cargo workspace
+pinned to one Rust/Cargo toolchain. A contract graph resolves each Cargo package
+name to one exact version and may import at most one direct leaf contract.
+
+The three supported package shapes are:
+
+| Shape | Python | TypeScript | Dependency |
+| --- | --- | --- | --- |
+| Executable owner | Generated source for one Maturin abi3 wheel | Browser WASM plus `./wire` | None |
+| Static leaf | Generated source for one Maturin abi3 wheel | Static ESM and declarations | None |
+| Static consumer | Generated source for one Maturin abi3 wheel | Static ESM importing an owner's `./wire` | One direct WASM leaf |
+
+Commit `rspyts.toml` and `rspyts.lock`. Ignore the fixed `.rspyts/` output.
+rspyts is installed from Cargo; generated Python and npm packages do not depend
+on a PyPI or npm package named `rspyts`.
+
+Unsupported configurations include standalone Python extensions, custom output
+directories, absolute or out-of-workspace package paths, transitive contract
+graphs, multiple versions of one package name, and custom Cargo toolchains,
+configuration graphs, or compiler wrappers. Public names must already be valid
+for each enabled host and must not collide with Pydantic or generated runtime
+members.
 
 ## Install
 
+The repository pins Rust and Cargo in `rust-toolchain.toml`. Pin the CLI and
+runtime crates to the same exact release:
+
 ```sh
-cargo install rspyts-cli --version '=0.4.1' --locked
+cargo install rspyts-cli --version '=0.4.2' --locked
 ```
 
-Executable TypeScript packages also need the WebAssembly target and the
-matching wasm-bindgen CLI:
+Executable TypeScript also requires the pinned WebAssembly tool:
 
 ```sh
-rustup target add wasm32-unknown-unknown
+rustup target add wasm32-unknown-unknown --toolchain 1.88.0
 cargo install wasm-bindgen-cli --version '=0.2.126' --locked
 ```
 
-## Define the Rust API
+## Minimal executable contract
 
-Add the library and its host features:
+Use a workspace member whose library emits both an `rlib` and `cdylib`:
 
 ```toml
 [lib]
 crate-type = ["rlib", "cdylib"]
 
 [dependencies]
-rspyts = { version = "=0.4.1", default-features = false }
+rspyts = { version = "=0.4.2", default-features = false }
 serde = { version = "1", features = ["derive"] }
 wasm-bindgen = { version = "=0.2.126", optional = true }
 
@@ -39,8 +63,7 @@ python = ["rspyts/python-extension"]
 wasm = ["rspyts/wasm", "dep:wasm-bindgen"]
 ```
 
-Export the real domain type and function—no bridge model or duplicate
-implementation:
+The Rust type and behavior remain canonical:
 
 ```rust
 #[derive(serde::Serialize, serde::Deserialize, rspyts::Type)]
@@ -59,95 +82,54 @@ pub fn greet(name: String) -> Greeting {
 rspyts::module!(native);
 ```
 
-## Configure and build
-
-Create `rspyts.toml` beside the Rust and host package directories:
+Configure the workspace-relative crate, generated Python package, and WASM
+package. `python.source` is an optional authored source tree copied into the
+fixed generated output before rspyts writes its modules.
 
 ```toml
 [crate]
 path = "rust"
-features = []
 
 [python]
 package = "example_contract"
-mode = "source"
+source = "python/src"
 
 [typescript]
 package = "@example/contract"
 mode = "wasm"
 ```
 
-Then compile both packages and accept the first semantic contract:
+Build, inspect, and accept the semantic contract:
 
 ```sh
 rspyts build
+rspyts inspect
 rspyts lock
-git add rspyts.toml rspyts.lock
+rspyts check --locked
 ```
 
-Python source mode is designed for Maturin; TypeScript WASM mode produces an
-npm-ready staging package. The complete packaging setup is in
-[Python and TypeScript](docs/python-and-typescript.md).
-
-Once those artifacts are installed, both languages call the same Rust
-implementation:
-
-```python
-from example_contract import greet
-
-result = greet("Ada")
-assert result.message == "Hello, Ada!"
-```
-
-```typescript
-import init, { greet } from "@example/contract";
-
-await init();
-const result = greet("Ada");
-console.log(result.message); // Hello, Ada!
-```
-
-## Keep contracts from drifting
-
-rspyts separates the semantic contract from generated build output:
-
-- Commit `rspyts.toml` and `rspyts.lock`.
-- Review lock changes as public API changes.
-- Ignore `.rspyts/` and every atomic staging sibling.
-- Run `rspyts check --locked` in CI.
-- Run `rspyts lock` only when intentionally accepting a contract change.
+`rspyts build` replaces only `.rspyts/`. Package `.rspyts/python` with Maturin
+and `.rspyts/typescript` with npm; do not publish the generated directory from
+the source tree.
 
 ```gitignore
 .rspyts/
 .rspyts.tmp-*
 .rspyts.old-*
+.rspyts.build.lock
 .rspyts.lock.tmp-*
-.rspyts.lock.old-*
 ```
-
-The rule is simple: `rspyts.lock` is tracked; generated Python, TypeScript,
-JavaScript, WebAssembly, and native artifacts are not. If Rust and the lock
-diverge, the locked check fails with a semantic diff.
-
-## Choose the right output
-
-- Use Python `source` mode with Maturin for an abi3 wheel.
-- Use TypeScript `wasm` mode when JavaScript must execute Rust.
-- Use TypeScript `static` mode for types, enums, constants, and tables.
-- Import another Rust-owned contract through its tracked lock, never its
-  generated directory.
 
 ## Documentation
 
-- [Python and TypeScript end to end](docs/python-and-typescript.md)
-- [Static output and contract dependencies](docs/static-and-dependencies.md)
-- [Configuration, commands, and supported Rust](docs/reference.md)
+- [Build the executable Python/WASM shape](docs/python-and-typescript.md)
+- [Build static leaves and direct consumers](docs/static-and-dependencies.md)
+- [Read the exact configuration and contract reference](docs/reference.md)
+- [Maintain and release rspyts](MAINTAINING.md)
 
-Contributing or preparing a release? See [Maintaining rspyts](MAINTAINING.md).
-
-The repository also contains runnable
-[contract](examples/contract/),
-[static](examples/static/), and
-[cross-package](examples/cross-package/) examples.
+Runnable neutral fixtures are the executable
+[`owner`](examples/cross-package/owner/), static
+[`consumer`](examples/cross-package/consumer/), and independent
+[`static`](examples/static/) packages.
 
 Licensed under [MIT](LICENSE).

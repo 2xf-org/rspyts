@@ -8,6 +8,9 @@ use crate::wire::{BufferDtype, WireValue};
 
 use super::BackendError;
 
+const JSON_MAX_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
+const JSON_MIN_SAFE_INTEGER: i64 = -9_007_199_254_740_991;
+
 /// Validates and canonicalizes a wire value against an exact contract type.
 ///
 /// Host runtimes are less precise than Rust. This recursive pass restores the
@@ -98,6 +101,21 @@ fn normalize_at(
         TypeRef::Bytes => match value {
             WireValue::Bytes(value) => Ok(WireValue::Bytes(value.clone())),
             _ => Err(type_error(&path, "bytes", wire_kind(value))),
+        },
+        TypeRef::FixedBytes { length } => match value {
+            WireValue::Bytes(value) if u64::try_from(value.len()).ok().as_ref() == Some(length) => {
+                Ok(WireValue::Bytes(value.clone()))
+            }
+            WireValue::Bytes(value) => Err(type_error(
+                &path,
+                &format!("{length}-byte array"),
+                &format!("{} bytes", value.len()),
+            )),
+            _ => Err(type_error(
+                &path,
+                &format!("{length}-byte array"),
+                wire_kind(value),
+            )),
         },
         TypeRef::Buffer { element } => match value {
             WireValue::Buffer(value) if value.dtype() == element_dtype(*element) => {
@@ -199,12 +217,24 @@ fn normalize_datetime(value: &WireValue, path: &str) -> Result<WireValue, Backen
 
 fn normalize_json(value: &WireValue, path: String) -> Result<WireValue, BackendError> {
     match value {
-        WireValue::Null
-        | WireValue::Bool(_)
-        | WireValue::I64(_)
-        | WireValue::U64(_)
-        | WireValue::String(_) => Ok(value.clone()),
-        WireValue::F64(value) if value.is_finite() => Ok(WireValue::F64(*value)),
+        WireValue::Null | WireValue::Bool(_) | WireValue::String(_) => Ok(value.clone()),
+        WireValue::I64(value)
+            if *value >= JSON_MIN_SAFE_INTEGER && *value <= JSON_MAX_SAFE_INTEGER as i64 =>
+        {
+            Ok(WireValue::I64(*value))
+        }
+        WireValue::U64(value) if *value <= JSON_MAX_SAFE_INTEGER => Ok(WireValue::U64(*value)),
+        WireValue::I64(value) => Err(json_integer_out_of_range(&path, *value)),
+        WireValue::U64(value) => Err(json_integer_out_of_range(&path, *value)),
+        WireValue::F64(value)
+            if value.is_finite()
+                && (value.fract() != 0.0
+                    || (*value >= JSON_MIN_SAFE_INTEGER as f64
+                        && *value <= JSON_MAX_SAFE_INTEGER as f64)) =>
+        {
+            Ok(WireValue::F64(*value))
+        }
+        WireValue::F64(value) if value.is_finite() => Err(json_integer_out_of_range(&path, *value)),
         WireValue::F64(_) => Err(BackendError::NonFiniteStructuredFloat),
         WireValue::Sequence(values) => values
             .iter()
@@ -223,6 +253,14 @@ fn normalize_json(value: &WireValue, path: String) -> Result<WireValue, BackendE
             Err(type_error(&path, "JSON value", wire_kind(value)))
         }
     }
+}
+
+fn json_integer_out_of_range(path: &str, value: impl std::fmt::Display) -> BackendError {
+    type_error(
+        path,
+        "integer-valued JSON number within JavaScript's safe integer range",
+        &value.to_string(),
+    )
 }
 
 fn normalize_named(
@@ -345,7 +383,7 @@ fn validate_constraints(
     types: &[TypeDef],
     path: &str,
 ) -> Result<(), BackendError> {
-    if matches!(value, WireValue::Null) && matches!(ty, TypeRef::Option { .. }) {
+    if matches!(value, WireValue::Null) && type_allows_null(ty, types, &mut BTreeSet::new()) {
         return Ok(());
     }
 
@@ -360,10 +398,11 @@ fn validate_constraints(
         let length = match value {
             WireValue::String(value) => value.chars().count() as u64,
             WireValue::Sequence(value) => value.len() as u64,
+            WireValue::Bytes(value) => value.len() as u64,
             _ => {
                 return Err(type_error(
                     path,
-                    "string or list for length constraint",
+                    "string, list, or bytes for length constraint",
                     wire_kind(value),
                 ));
             }
@@ -410,6 +449,24 @@ fn validate_constraints(
         }
     }
     Ok(())
+}
+
+fn type_allows_null(
+    reference: &TypeRef,
+    types: &[TypeDef],
+    visited: &mut BTreeSet<DefinitionId>,
+) -> bool {
+    match reference {
+        TypeRef::Option { .. } => true,
+        TypeRef::Named { identity } if visited.insert(identity.clone()) => types
+            .iter()
+            .find(|definition| definition.owner == identity.owner && definition.id == identity.id)
+            .is_some_and(|definition| match &definition.shape {
+                TypeShape::Alias { target } => type_allows_null(target, types, visited),
+                _ => false,
+            }),
+        _ => false,
+    }
 }
 
 const fn signed_range(bits: u16) -> (i64, i64) {

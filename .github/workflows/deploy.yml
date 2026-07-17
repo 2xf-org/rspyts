@@ -109,10 +109,23 @@ jobs:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
         with:
-          toolchain: 1.94.0
+          toolchain: 1.88.0
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           key: release-candidates
+      - name: Load protected release patterns
+        shell: bash
+        env:
+          RELEASE_PRIVATE_PATTERNS_B64: ${{ secrets.RELEASE_PRIVATE_PATTERNS_B64 }}
+        run: |
+          set -euo pipefail
+          test -n "$RELEASE_PRIVATE_PATTERNS_B64"
+          patterns="$RUNNER_TEMP/release-private-patterns"
+          printf '%s' "$RELEASE_PRIVATE_PATTERNS_B64" | base64 --decode > "$patterns"
+          test -s "$patterns"
+          echo "RSPYTS_PRIVATE_PATTERNS_FILE=$patterns" >> "$GITHUB_ENV"
+      - name: Verify the protected release tree
+        run: git ls-files -z | xargs -0 scripts/release/verify-private-data.sh
       - name: Package and test exact source archives
         env:
           RELEASE_VERSION: ${{ needs.release-source.outputs.version }}
@@ -153,7 +166,7 @@ jobs:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
         with:
-          toolchain: 1.94.0
+          toolchain: 1.88.0
       - uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18 # v1
         id: auth
       - uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
@@ -322,6 +335,17 @@ jobs:
         with:
           name: release-crates-${{ needs.release-source.outputs.sha }}
           path: release-artifacts
+      - name: Load protected release patterns
+        shell: bash
+        env:
+          RELEASE_PRIVATE_PATTERNS_B64: ${{ secrets.RELEASE_PRIVATE_PATTERNS_B64 }}
+        run: |
+          set -euo pipefail
+          test -n "$RELEASE_PRIVATE_PATTERNS_B64"
+          patterns="$RUNNER_TEMP/release-private-patterns"
+          printf '%s' "$RELEASE_PRIVATE_PATTERNS_B64" | base64 --decode > "$patterns"
+          test -s "$patterns"
+          echo "RSPYTS_PRIVATE_PATTERNS_FILE=$patterns" >> "$GITHUB_ENV"
       - name: Verify preserved candidates
         working-directory: release-artifacts
         run: sha256sum --check SHA256SUMS
@@ -334,12 +358,21 @@ jobs:
         run: |
           set -euo pipefail
 
+          version=${RELEASE_TAG#v}
+          awk -v heading="## $version" '
+            $0 == heading { capture = 1; next }
+            capture && /^## / { exit }
+            capture { print }
+          ' CHANGELOG.md > release-notes.md
+          test -s release-notes.md
+          scripts/release/verify-private-data.sh release-notes.md
+
           if ! gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
             gh release create "$RELEASE_TAG" release-artifacts/* \
               --verify-tag \
               --target "$RELEASE_SHA" \
               --title "rspyts $RELEASE_TAG" \
-              --generate-notes
+              --notes-file release-notes.md
             exit 0
           fi
 
@@ -370,4 +403,5 @@ jobs:
           gh release edit "$RELEASE_TAG" \
             --draft=false \
             --prerelease=false \
-            --title "rspyts $RELEASE_TAG"
+            --title "rspyts $RELEASE_TAG" \
+            --notes-file release-notes.md

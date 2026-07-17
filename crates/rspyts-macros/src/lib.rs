@@ -8,6 +8,7 @@ use syn::{
     Attribute, Data, DataEnum, DataStruct, DeriveInput, Expr, Fields, FnArg, GenericArgument,
     Ident, ImplItem, ImplItemFn, Item, ItemConst, ItemFn, ItemImpl, ItemStatic, Lit, LitStr, Meta,
     Pat, PathArguments, ReturnType, Token, Type as SynType, TypePath, UnOp,
+    ext::IdentExt,
     parse::{Parse, ParseStream},
     parse_macro_input,
     punctuated::Punctuated,
@@ -135,8 +136,9 @@ fn expand_type(input: DeriveInput) -> syn::Result<TokenStream2> {
     let id = quote!(concat!(module_path!(), "::", stringify!(#ident)).to_owned());
     let wire = rspyts_type_override(&input.attrs)?;
     let shape = if let Some(wire) = wire {
+        let target = type_ref_tokens(&wire, None)?;
         quote!(::rspyts::ir::TypeShape::Alias {
-            target: <#wire as ::rspyts::ContractType>::type_ref(),
+            target: #target,
         })
     } else {
         match input.data {
@@ -182,6 +184,12 @@ fn expand_type(input: DeriveInput) -> syn::Result<TokenStream2> {
 
 fn struct_shape(attrs: &[Attribute], ident: &Ident, data: DataStruct) -> syn::Result<TokenStream2> {
     let serde = serde_container(attrs)?;
+    if serde.rename_all_fields.is_some() {
+        return Err(syn::Error::new(
+            ident.span(),
+            "`#[serde(rename_all_fields = ...)]` is supported only on enums",
+        ));
+    }
     match data.fields {
         Fields::Named(fields) => {
             if serde.transparent {
@@ -193,16 +201,18 @@ fn struct_shape(attrs: &[Attribute], ident: &Ident, data: DataStruct) -> syn::Re
             let fields = fields
                 .named
                 .iter()
-                .map(|field| field_tokens(field, serde.rename_all.as_deref()))
+                .map(|field| field_tokens(field, serde.rename_all))
                 .collect::<syn::Result<Vec<_>>>()?;
             Ok(quote!(::rspyts::ir::TypeShape::Struct {
                 fields: vec![#(#fields),*],
             }))
         }
         Fields::Unnamed(fields) if fields.unnamed.len() == 1 && serde.transparent => {
-            let ty = &fields.unnamed.first().expect("one field").ty;
+            let field = fields.unnamed.first().expect("one field");
+            let options = field_options(&field.attrs)?;
+            let target = type_ref_tokens(&field.ty, options.boundary.as_deref())?;
             Ok(quote!(::rspyts::ir::TypeShape::Alias {
-                target: <#ty as ::rspyts::ContractType>::type_ref(),
+                target: #target,
             }))
         }
         Fields::Unnamed(fields) => Err(syn::Error::new(
@@ -222,16 +232,16 @@ fn enum_shape(attrs: &[Attribute], data: DataEnum) -> syn::Result<TokenStream2> 
         .variants
         .iter()
         .map(|variant| {
-            let rust_name = variant.ident.to_string();
+            let rust_name = variant.ident.unraw().to_string();
             let wire_name = serde_rename(&variant.attrs)?
-                .unwrap_or_else(|| apply_case(&rust_name, serde.rename_all.as_deref()));
+                .unwrap_or_else(|| apply_serde_variant_case(&rust_name, serde.rename_all));
             let docs = docs_tokens(&variant.attrs);
             let fields = match &variant.fields {
                 Fields::Unit => Vec::new(),
                 Fields::Named(fields) if serde.tag.is_some() => fields
                     .named
                     .iter()
-                    .map(|field| field_tokens(field, serde.rename_all_fields.as_deref()))
+                    .map(|field| field_tokens(field, serde.rename_all_fields))
                     .collect::<syn::Result<Vec<_>>>()?,
                 other => {
                     return Err(syn::Error::new(
@@ -442,13 +452,13 @@ fn python_function_wrapper(
         #[::rspyts::__private::pyo3::pyfunction(name = #host_name)]
         #[pyo3(crate = "::rspyts::__private::pyo3")]
         fn #wrapper_ident<'py>(
-            py: ::rspyts::__private::pyo3::Python<'py>,
+            __rspyts_py: ::rspyts::__private::pyo3::Python<'py>,
             #(#declarations),*
         ) -> ::rspyts::__private::pyo3::PyResult<
             ::rspyts::__private::pyo3::Py<::rspyts::__private::pyo3::PyAny>
         > {
-            let __rspyts_types = ::rspyts::registry::type_definitions().map_err(|error| {
-                ::rspyts::__private::pyo3::exceptions::PyRuntimeError::new_err(error.to_string())
+            let __rspyts_types = ::rspyts::registry::type_definitions().map_err(|__rspyts_error| {
+                ::rspyts::__private::pyo3::exceptions::PyRuntimeError::new_err(__rspyts_error.to_string())
             })?;
             #(#decodes)*
             #body
@@ -456,11 +466,11 @@ fn python_function_wrapper(
 
         #[cfg(all(feature = "python", not(target_arch = "wasm32")))]
         fn #register_ident(
-            module: &::rspyts::__private::pyo3::Bound<'_, ::rspyts::__private::pyo3::types::PyModule>,
+            __rspyts_module: &::rspyts::__private::pyo3::Bound<'_, ::rspyts::__private::pyo3::types::PyModule>,
         ) -> ::rspyts::__private::pyo3::PyResult<()> {
             ::rspyts::__private::pyo3::types::PyModuleMethods::add_function(
-                module,
-                ::rspyts::__private::pyo3::wrap_pyfunction!(#wrapper_ident, module)?,
+                __rspyts_module,
+                ::rspyts::__private::pyo3::wrap_pyfunction!(#wrapper_ident, __rspyts_module)?,
             )?;
             Ok(())
         }
@@ -483,6 +493,7 @@ fn wasm_function_wrapper(
     let function_ident = &function.sig.ident;
     let wrapper_ident = format_ident!("__rspyts_wasm_{}", function_ident);
     let host_name = apply_case(&function_ident.to_string(), Some("camelCase"));
+    let native_host_name = wasm_native_host_name(&host_name);
     let params = wrapper_params(&function.sig.inputs, HostBackend::Wasm)?;
     let declarations = params.iter().map(|param| &param.declaration);
     let decodes = params.iter().map(|param| &param.decode);
@@ -499,15 +510,15 @@ fn wasm_function_wrapper(
         #[cfg(all(feature = "wasm", target_arch = "wasm32"))]
         #[doc(hidden)]
         #[allow(missing_docs)]
-        #[wasm_bindgen::prelude::wasm_bindgen(js_name = #host_name)]
+        #[wasm_bindgen::prelude::wasm_bindgen(js_name = #native_host_name)]
         pub fn #wrapper_ident(
             #(#declarations),*
         ) -> ::std::result::Result<
             ::rspyts::__private::wasm_bindgen::JsValue,
             ::rspyts::__private::wasm_bindgen::JsValue
         > {
-            let __rspyts_types = ::rspyts::registry::type_definitions().map_err(|error| {
-                ::rspyts::__private::wasm_bindgen::JsValue::from_str(&error.to_string())
+            let __rspyts_types = ::rspyts::registry::type_definitions().map_err(|__rspyts_error| {
+                ::rspyts::__private::wasm_bindgen::JsValue::from_str(&__rspyts_error.to_string())
             })?;
             #(#decodes)*
             #body
@@ -568,8 +579,8 @@ fn wrapper_params(
                         __rspyts_wire,
                         &__rspyts_type,
                         &__rspyts_types,
-                    ).map_err(|error| {
-                        ::rspyts::__private::pyo3::exceptions::PyValueError::new_err(error.to_string())
+                    ).map_err(|__rspyts_error| {
+                        ::rspyts::__private::pyo3::exceptions::PyValueError::new_err(__rspyts_error.to_string())
                     })?;
                 },
                 HostBackend::Wasm => quote! {
@@ -583,8 +594,8 @@ fn wrapper_params(
                         __rspyts_wire,
                         &__rspyts_type,
                         &__rspyts_types,
-                    ).map_err(|error| {
-                        ::rspyts::__private::wasm_bindgen::JsValue::from_str(&error.to_string())
+                    ).map_err(|__rspyts_error| {
+                        ::rspyts::__private::wasm_bindgen::JsValue::from_str(&__rspyts_error.to_string())
                     })?;
                 },
             };
@@ -631,40 +642,40 @@ fn host_return_body(
     match (backend, result) {
         (HostBackend::Python, true) => Ok(quote! {
             match #invocation {
-                Ok(value) => {
+                Ok(__rspyts_value) => {
                     let __rspyts_type = #ty;
                     let __rspyts_wire = ::rspyts::codec::encode(
-                        &value,
+                        &__rspyts_value,
                         &__rspyts_type,
                         &__rspyts_types,
-                    ).map_err(|error| {
-                        ::rspyts::__private::pyo3::exceptions::PyValueError::new_err(error.to_string())
+                    ).map_err(|__rspyts_error| {
+                        ::rspyts::__private::pyo3::exceptions::PyValueError::new_err(__rspyts_error.to_string())
                     })?;
                     ::rspyts::backend::python::encode_typed(
-                        py,
+                        __rspyts_py,
                         &__rspyts_wire,
                         &__rspyts_type,
                         &__rspyts_types,
                     )
                 },
-                Err(error) => Err(::rspyts::__private::pyo3::exceptions::PyRuntimeError::new_err((
-                    ::rspyts::runtime::ContractError::code(&error),
-                    error.to_string(),
+                Err(__rspyts_error) => Err(::rspyts::__private::pyo3::exceptions::PyRuntimeError::new_err((
+                    ::rspyts::runtime::ContractError::code(&__rspyts_error),
+                    __rspyts_error.to_string(),
                 ))),
             }
         }),
         (HostBackend::Python, false) => Ok(quote! {
-            let value = #invocation;
+            let __rspyts_value = #invocation;
             let __rspyts_type = #ty;
             let __rspyts_wire = ::rspyts::codec::encode(
-                &value,
+                &__rspyts_value,
                 &__rspyts_type,
                 &__rspyts_types,
-            ).map_err(|error| {
-                ::rspyts::__private::pyo3::exceptions::PyValueError::new_err(error.to_string())
+            ).map_err(|__rspyts_error| {
+                ::rspyts::__private::pyo3::exceptions::PyValueError::new_err(__rspyts_error.to_string())
             })?;
             ::rspyts::backend::python::encode_typed(
-                py,
+                __rspyts_py,
                 &__rspyts_wire,
                 &__rspyts_type,
                 &__rspyts_types,
@@ -672,14 +683,14 @@ fn host_return_body(
         }),
         (HostBackend::Wasm, true) => Ok(quote! {
             match #invocation {
-                Ok(value) => {
+                Ok(__rspyts_value) => {
                     let __rspyts_type = #ty;
                     let __rspyts_wire = ::rspyts::codec::encode(
-                        &value,
+                        &__rspyts_value,
                         &__rspyts_type,
                         &__rspyts_types,
-                    ).map_err(|error| {
-                        ::rspyts::__private::wasm_bindgen::JsValue::from_str(&error.to_string())
+                    ).map_err(|__rspyts_error| {
+                        ::rspyts::__private::wasm_bindgen::JsValue::from_str(&__rspyts_error.to_string())
                     })?;
                     ::rspyts::backend::typescript::encode_typed(
                         &__rspyts_wire,
@@ -687,20 +698,20 @@ fn host_return_body(
                         &__rspyts_types,
                     ).map_err(::rspyts::__private::wasm_bindgen::JsValue::from)
                 },
-                Err(error) => Err(::rspyts::__private::wasm_bindgen::JsValue::from_str(
-                    &format!("{}\n{}", ::rspyts::runtime::ContractError::code(&error), error),
+                Err(__rspyts_error) => Err(::rspyts::__private::wasm_bindgen::JsValue::from_str(
+                    &format!("{}\n{}", ::rspyts::runtime::ContractError::code(&__rspyts_error), __rspyts_error),
                 )),
             }
         }),
         (HostBackend::Wasm, false) => Ok(quote! {
-            let value = #invocation;
+            let __rspyts_value = #invocation;
             let __rspyts_type = #ty;
             let __rspyts_wire = ::rspyts::codec::encode(
-                &value,
+                &__rspyts_value,
                 &__rspyts_type,
                 &__rspyts_types,
-            ).map_err(|error| {
-                ::rspyts::__private::wasm_bindgen::JsValue::from_str(&error.to_string())
+            ).map_err(|__rspyts_error| {
+                ::rspyts::__private::wasm_bindgen::JsValue::from_str(&__rspyts_error.to_string())
             })?;
             ::rspyts::backend::typescript::encode_typed(
                 &__rspyts_wire,
@@ -734,12 +745,14 @@ fn return_value_type_tokens(
 
 fn expand_const(target: ExportTarget, item: ItemConst) -> syn::Result<TokenStream2> {
     ensure_public(&item.vis, item.ident.span())?;
-    constant_tokens(target, quote!(#item), &item.ident, &item.ty)
+    let docs = docs_tokens(&item.attrs);
+    constant_tokens(target, quote!(#item), &item.ident, &item.ty, docs)
 }
 
 fn expand_static(target: ExportTarget, item: ItemStatic) -> syn::Result<TokenStream2> {
     ensure_public(&item.vis, item.ident.span())?;
-    constant_tokens(target, quote!(#item), &item.ident, &item.ty)
+    let docs = docs_tokens(&item.attrs);
+    constant_tokens(target, quote!(#item), &item.ident, &item.ty, docs)
 }
 
 fn constant_tokens(
@@ -747,27 +760,44 @@ fn constant_tokens(
     item: TokenStream2,
     ident: &Ident,
     ty: &SynType,
+    docs: TokenStream2,
 ) -> syn::Result<TokenStream2> {
     let rust_name = ident.to_string();
     let host_name = rust_name.clone();
     let target = target.tokens();
+    let ty_ref = type_ref_tokens(ty, None)?;
     Ok(quote! {
         #item
         const _: () = {
-            fn __rspyts_constant_registration() -> ::rspyts::ir::ConstantDef {
-                ::rspyts::ir::ConstantDef {
+            fn __rspyts_constant_registration() -> ::std::result::Result<
+                ::rspyts::ir::ConstantDef,
+                ::std::string::String,
+            > {
+                let __rspyts_type = #ty_ref;
+                let __rspyts_types = ::rspyts::registry::type_definitions().map_err(|__rspyts_error| {
+                    ::std::format!("constant `{}` could not load its type graph: {__rspyts_error}", #host_name)
+                })?;
+                ::rspyts::codec::encode(&self::#ident, &__rspyts_type, &__rspyts_types).map_err(|__rspyts_error| {
+                    ::std::format!("constant `{}` does not match its declared type: {__rspyts_error}", #host_name)
+                })?;
+                let __rspyts_value = ::rspyts::__private::serde_json::to_value(&self::#ident).map_err(|__rspyts_error| {
+                    ::std::format!("constant `{}` could not serialize as JSON: {__rspyts_error}", #host_name)
+                })?;
+                ::std::result::Result::Ok(::rspyts::ir::ConstantDef {
                     owner: ::rspyts::ir::CargoPackageId::new(env!("CARGO_PKG_NAME")),
                     rust_name: #rust_name.to_owned(),
                     host_name: #host_name.to_owned(),
-                    docs: None,
+                    docs: #docs,
                     target: #target,
-                    ty: <#ty as ::rspyts::ContractType>::type_ref(),
-                    value: ::rspyts::__private::serde_json::to_value(&#ident)
-                        .expect("an exported rspyts constant must serialize"),
-                }
+                    ty: __rspyts_type,
+                    value: __rspyts_value,
+                })
             }
             ::rspyts::__private::inventory::submit! {
-                ::rspyts::registry::ConstantRegistration(__rspyts_constant_registration)
+                ::rspyts::registry::ConstantRegistration {
+                    owner: env!("CARGO_PKG_NAME"),
+                    build: __rspyts_constant_registration,
+                }
             }
         };
     })
@@ -787,6 +817,7 @@ fn expand_resource(target: ExportTarget, mut item: ItemImpl) -> syn::Result<Toke
         ));
     }
     reject_generics(&item.generics, item.impl_token.span)?;
+    let docs = docs_tokens(&item.attrs);
     let wrapper_source = item.clone();
     let resource_ty = (*item.self_ty).clone();
     let resource_name = type_last_ident(&resource_ty)?.to_string();
@@ -860,7 +891,7 @@ fn expand_resource(target: ExportTarget, mut item: ItemImpl) -> syn::Result<Toke
                     owner: ::rspyts::ir::CargoPackageId::new(env!("CARGO_PKG_NAME")),
                     id: #resource_id,
                     name: #resource_name.to_owned(),
-                    docs: None,
+                    docs: #docs,
                     target: #target,
                     constructors: vec![#(#constructors),*],
                     methods: vec![#(#methods),*],
@@ -896,16 +927,16 @@ fn python_resource_wrapper(
     let constructor_body =
         if return_result(&constructor.sig.output, constructor_options.error.as_ref())? {
             quote! {
-                let inner = match #constructor_call {
-                    Ok(value) => value,
-                    Err(error) => return Err(
+                let __rspyts_inner = match #constructor_call {
+                    Ok(__rspyts_value) => __rspyts_value,
+                    Err(__rspyts_error) => return Err(
                         ::rspyts::__private::pyo3::exceptions::PyRuntimeError::new_err((
-                            ::rspyts::runtime::ContractError::code(&error),
-                            error.to_string(),
+                            ::rspyts::runtime::ContractError::code(&__rspyts_error),
+                            __rspyts_error.to_string(),
                         )),
                     ),
                 };
-                Ok(#wrapper_ident { inner: Some(inner) })
+                Ok(#wrapper_ident { inner: Some(__rspyts_inner) })
             }
         } else {
             quote! {
@@ -948,8 +979,8 @@ fn python_resource_wrapper(
         impl #wrapper_ident {
             #[new]
             fn new<'py>(#(#constructor_declarations),*) -> ::rspyts::__private::pyo3::PyResult<Self> {
-                let __rspyts_types = ::rspyts::registry::type_definitions().map_err(|error| {
-                    ::rspyts::__private::pyo3::exceptions::PyRuntimeError::new_err(error.to_string())
+                let __rspyts_types = ::rspyts::registry::type_definitions().map_err(|__rspyts_error| {
+                    ::rspyts::__private::pyo3::exceptions::PyRuntimeError::new_err(__rspyts_error.to_string())
                 })?;
                 #(#constructor_decodes)*
                 #constructor_body
@@ -965,9 +996,9 @@ fn python_resource_wrapper(
 
         #[cfg(all(feature = "python", not(target_arch = "wasm32")))]
         fn #register_ident(
-            module: &::rspyts::__private::pyo3::Bound<'_, ::rspyts::__private::pyo3::types::PyModule>,
+            __rspyts_module: &::rspyts::__private::pyo3::Bound<'_, ::rspyts::__private::pyo3::types::PyModule>,
         ) -> ::rspyts::__private::pyo3::PyResult<()> {
-            ::rspyts::__private::pyo3::types::PyModuleMethods::add_class::<#wrapper_ident>(module)
+            ::rspyts::__private::pyo3::types::PyModuleMethods::add_class::<#wrapper_ident>(__rspyts_module)
         }
 
         #[cfg(all(feature = "python", not(target_arch = "wasm32")))]
@@ -994,16 +1025,16 @@ fn python_resource_factory(
     let options = method_options(&constructor.attrs)?;
     let body = if return_result(&constructor.sig.output, options.error.as_ref())? {
         quote! {
-            let inner = match #call {
-                Ok(value) => value,
-                Err(error) => return Err(
+            let __rspyts_inner = match #call {
+                Ok(__rspyts_value) => __rspyts_value,
+                Err(__rspyts_error) => return Err(
                     ::rspyts::__private::pyo3::exceptions::PyRuntimeError::new_err((
-                        ::rspyts::runtime::ContractError::code(&error),
-                        error.to_string(),
+                        ::rspyts::runtime::ContractError::code(&__rspyts_error),
+                        __rspyts_error.to_string(),
                     )),
                 ),
             };
-            Ok(Self { inner: Some(inner) })
+            Ok(Self { inner: Some(__rspyts_inner) })
         }
     } else {
         quote!(Ok(Self { inner: Some(#call) }))
@@ -1012,8 +1043,8 @@ fn python_resource_factory(
         #[staticmethod]
         #[pyo3(name = #host_name)]
         fn #method_ident<'py>(#(#declarations),*) -> ::rspyts::__private::pyo3::PyResult<Self> {
-            let __rspyts_types = ::rspyts::registry::type_definitions().map_err(|error| {
-                ::rspyts::__private::pyo3::exceptions::PyRuntimeError::new_err(error.to_string())
+            let __rspyts_types = ::rspyts::registry::type_definitions().map_err(|__rspyts_error| {
+                ::rspyts::__private::pyo3::exceptions::PyRuntimeError::new_err(__rspyts_error.to_string())
             })?;
             #(#decodes)*
             #body
@@ -1028,7 +1059,7 @@ fn python_resource_method(resource_ty: &SynType, method: &ImplItemFn) -> syn::Re
     let declarations = params.iter().map(|param| &param.declaration);
     let decodes = params.iter().map(|param| &param.decode);
     let calls = params.iter().map(|param| &param.call);
-    let invocation = quote!(inner.#method_ident(#(#calls),*));
+    let invocation = quote!(__rspyts_inner.#method_ident(#(#calls),*));
     let options = method_options(&method.attrs)?;
     let body = host_return_body(
         &method.sig.output,
@@ -1041,16 +1072,16 @@ fn python_resource_method(resource_ty: &SynType, method: &ImplItemFn) -> syn::Re
         #[pyo3(name = #host_name)]
         fn #method_ident<'py>(
             &mut self,
-            py: ::rspyts::__private::pyo3::Python<'py>,
+            __rspyts_py: ::rspyts::__private::pyo3::Python<'py>,
             #(#declarations),*
         ) -> ::rspyts::__private::pyo3::PyResult<
             ::rspyts::__private::pyo3::Py<::rspyts::__private::pyo3::PyAny>
         > {
-            let inner: &mut #resource_ty = self.inner.as_mut().ok_or_else(|| {
+            let __rspyts_inner: &mut #resource_ty = self.inner.as_mut().ok_or_else(|| {
                 ::rspyts::__private::pyo3::exceptions::PyRuntimeError::new_err("resource is closed")
             })?;
-            let __rspyts_types = ::rspyts::registry::type_definitions().map_err(|error| {
-                ::rspyts::__private::pyo3::exceptions::PyRuntimeError::new_err(error.to_string())
+            let __rspyts_types = ::rspyts::registry::type_definitions().map_err(|__rspyts_error| {
+                ::rspyts::__private::pyo3::exceptions::PyRuntimeError::new_err(__rspyts_error.to_string())
             })?;
             #(#decodes)*
             #body
@@ -1079,15 +1110,15 @@ fn wasm_resource_wrapper(
         constructor_options.error.as_ref(),
     )? {
         quote! {
-            let inner = match #constructor_call {
-                Ok(value) => value,
-                Err(error) => return Err(
+            let __rspyts_inner = match #constructor_call {
+                Ok(__rspyts_value) => __rspyts_value,
+                Err(__rspyts_error) => return Err(
                     ::rspyts::__private::wasm_bindgen::JsValue::from_str(
-                        &format!("{}\n{}", ::rspyts::runtime::ContractError::code(&error), error),
+                        &format!("{}\n{}", ::rspyts::runtime::ContractError::code(&__rspyts_error), __rspyts_error),
                     ),
                 ),
             };
-            Ok(#wrapper_ident { inner: Some(inner) })
+            Ok(#wrapper_ident { inner: Some(__rspyts_inner) })
         }
     } else {
         quote!(Ok(#wrapper_ident { inner: Some(#constructor_call) }))
@@ -1133,8 +1164,8 @@ fn wasm_resource_wrapper(
                 Self,
                 ::rspyts::__private::wasm_bindgen::JsValue
             > {
-                let __rspyts_types = ::rspyts::registry::type_definitions().map_err(|error| {
-                    ::rspyts::__private::wasm_bindgen::JsValue::from_str(&error.to_string())
+                let __rspyts_types = ::rspyts::registry::type_definitions().map_err(|__rspyts_error| {
+                    ::rspyts::__private::wasm_bindgen::JsValue::from_str(&__rspyts_error.to_string())
                 })?;
                 #(#constructor_decodes)*
                 #constructor_body
@@ -1156,6 +1187,7 @@ fn wasm_resource_factory(
 ) -> syn::Result<TokenStream2> {
     let method_ident = &constructor.sig.ident;
     let host_name = apply_case(&method_ident.to_string(), Some("camelCase"));
+    let native_host_name = wasm_native_host_name(&host_name);
     let params = wrapper_params(&constructor.sig.inputs, HostBackend::Wasm)?;
     let declarations = params.iter().map(|param| &param.declaration);
     let decodes = params.iter().map(|param| &param.decode);
@@ -1164,26 +1196,26 @@ fn wasm_resource_factory(
     let options = method_options(&constructor.attrs)?;
     let body = if return_result(&constructor.sig.output, options.error.as_ref())? {
         quote! {
-            let inner = match #call {
-                Ok(value) => value,
-                Err(error) => return Err(
+            let __rspyts_inner = match #call {
+                Ok(__rspyts_value) => __rspyts_value,
+                Err(__rspyts_error) => return Err(
                     ::rspyts::__private::wasm_bindgen::JsValue::from_str(
-                        &format!("{}\n{}", ::rspyts::runtime::ContractError::code(&error), error),
+                        &format!("{}\n{}", ::rspyts::runtime::ContractError::code(&__rspyts_error), __rspyts_error),
                     ),
                 ),
             };
-            Ok(Self { inner: Some(inner) })
+            Ok(Self { inner: Some(__rspyts_inner) })
         }
     } else {
         quote!(Ok(Self { inner: Some(#call) }))
     };
     Ok(quote! {
-        #[wasm_bindgen(js_name = #host_name)]
+        #[wasm_bindgen(js_name = #native_host_name)]
         pub fn #method_ident(
             #(#declarations),*
         ) -> ::std::result::Result<Self, ::rspyts::__private::wasm_bindgen::JsValue> {
-            let __rspyts_types = ::rspyts::registry::type_definitions().map_err(|error| {
-                ::rspyts::__private::wasm_bindgen::JsValue::from_str(&error.to_string())
+            let __rspyts_types = ::rspyts::registry::type_definitions().map_err(|__rspyts_error| {
+                ::rspyts::__private::wasm_bindgen::JsValue::from_str(&__rspyts_error.to_string())
             })?;
             #(#decodes)*
             #body
@@ -1194,11 +1226,12 @@ fn wasm_resource_factory(
 fn wasm_resource_method(resource_ty: &SynType, method: &ImplItemFn) -> syn::Result<TokenStream2> {
     let method_ident = &method.sig.ident;
     let host_name = apply_case(&method_ident.to_string(), Some("camelCase"));
+    let native_host_name = wasm_native_host_name(&host_name);
     let params = wrapper_params(&method.sig.inputs, HostBackend::Wasm)?;
     let declarations = params.iter().map(|param| &param.declaration);
     let decodes = params.iter().map(|param| &param.decode);
     let calls = params.iter().map(|param| &param.call);
-    let invocation = quote!(inner.#method_ident(#(#calls),*));
+    let invocation = quote!(__rspyts_inner.#method_ident(#(#calls),*));
     let options = method_options(&method.attrs)?;
     let body = host_return_body(
         &method.sig.output,
@@ -1208,7 +1241,7 @@ fn wasm_resource_method(resource_ty: &SynType, method: &ImplItemFn) -> syn::Resu
         options.error.as_ref(),
     )?;
     Ok(quote! {
-        #[wasm_bindgen(js_name = #host_name)]
+        #[wasm_bindgen(js_name = #native_host_name)]
         pub fn #method_ident(
             &mut self,
             #(#declarations),*
@@ -1216,11 +1249,11 @@ fn wasm_resource_method(resource_ty: &SynType, method: &ImplItemFn) -> syn::Resu
             ::rspyts::__private::wasm_bindgen::JsValue,
             ::rspyts::__private::wasm_bindgen::JsValue
         > {
-            let inner: &mut #resource_ty = self.inner.as_mut().ok_or_else(|| {
+            let __rspyts_inner: &mut #resource_ty = self.inner.as_mut().ok_or_else(|| {
                 ::rspyts::__private::wasm_bindgen::JsValue::from_str("resource is closed")
             })?;
-            let __rspyts_types = ::rspyts::registry::type_definitions().map_err(|error| {
-                ::rspyts::__private::wasm_bindgen::JsValue::from_str(&error.to_string())
+            let __rspyts_types = ::rspyts::registry::type_definitions().map_err(|__rspyts_error| {
+                ::rspyts::__private::wasm_bindgen::JsValue::from_str(&__rspyts_error.to_string())
             })?;
             #(#decodes)*
             #body
@@ -1335,15 +1368,22 @@ fn resource_method_tokens(
 
 fn expand_module(input: ModuleInput) -> TokenStream2 {
     let module = input.module;
+    let discovery_capabilities = match input.target {
+        ModuleTarget::Both => quote!(
+            ::rspyts::__private::DISCOVERY_PYTHON | ::rspyts::__private::DISCOVERY_TYPESCRIPT
+        ),
+        ModuleTarget::Python => quote!(::rspyts::__private::DISCOVERY_PYTHON),
+        ModuleTarget::Typescript => quote!(::rspyts::__private::DISCOVERY_TYPESCRIPT),
+    };
     let python = if matches!(input.target, ModuleTarget::Both | ModuleTarget::Python) {
         quote! {
             #[cfg(all(feature = "python", not(target_arch = "wasm32")))]
             #[::rspyts::__private::pyo3::pymodule]
             #[pyo3(crate = "::rspyts::__private::pyo3")]
             fn #module(
-                module: &::rspyts::__private::pyo3::Bound<'_, ::rspyts::__private::pyo3::types::PyModule>,
+                __rspyts_module: &::rspyts::__private::pyo3::Bound<'_, ::rspyts::__private::pyo3::types::PyModule>,
             ) -> ::rspyts::__private::pyo3::PyResult<()> {
-                ::rspyts::runtime::python::register(env!("CARGO_PKG_NAME"), module)
+                ::rspyts::runtime::python::register(env!("CARGO_PKG_NAME"), __rspyts_module)
             }
         }
     } else {
@@ -1354,12 +1394,12 @@ fn expand_module(input: ModuleInput) -> TokenStream2 {
             #[cfg(all(feature = "wasm", target_arch = "wasm32"))]
             #[wasm_bindgen::prelude::wasm_bindgen]
             pub fn rspyts_contract_json() -> String {
-                let manifest = ::rspyts::registry::manifest(
+                let __rspyts_manifest = ::rspyts::registry::manifest(
                     env!("CARGO_PKG_NAME"),
                     env!("CARGO_PKG_VERSION"),
                     stringify!(#module),
                 ).expect("invalid rspyts registry");
-                ::rspyts::__private::serde_json::to_string(&manifest)
+                ::rspyts::__private::serde_json::to_string(&__rspyts_manifest)
                     .expect("rspyts manifest serialization failed")
             }
         }
@@ -1368,26 +1408,23 @@ fn expand_module(input: ModuleInput) -> TokenStream2 {
     };
     quote! {
         #[cfg(not(target_arch = "wasm32"))]
-        #[unsafe(no_mangle)]
-        pub extern "C" fn rspyts_contract() -> *mut ::std::ffi::c_char {
-            let manifest = ::rspyts::registry::manifest(
-                env!("CARGO_PKG_NAME"),
-                env!("CARGO_PKG_VERSION"),
-                stringify!(#module),
-            ).expect("invalid rspyts registry");
-            let json = ::rspyts::__private::serde_json::to_string(&manifest)
-                .expect("rspyts manifest serialization failed");
-            ::std::ffi::CString::new(json)
-                .expect("rspyts manifest contained a NUL byte")
-                .into_raw()
+        #[unsafe(export_name = concat!("rspyts_discovery_v1_contract__", env!("CARGO_PKG_NAME")))]
+        pub extern "C" fn rspyts_contract() -> ::rspyts::__private::DiscoveryResult {
+            ::rspyts::__private::discovery_contract(#discovery_capabilities, || {
+                let __rspyts_manifest = ::rspyts::registry::manifest(
+                    env!("CARGO_PKG_NAME"),
+                    env!("CARGO_PKG_VERSION"),
+                    stringify!(#module),
+                ).map_err(|__rspyts_error| format!("invalid rspyts registry: {__rspyts_error}"))?;
+                ::rspyts::__private::serde_json::to_string(&__rspyts_manifest)
+                    .map_err(|__rspyts_error| format!("rspyts manifest serialization failed: {__rspyts_error}"))
+            })
         }
 
         #[cfg(not(target_arch = "wasm32"))]
-        #[unsafe(no_mangle)]
+        #[unsafe(export_name = concat!("rspyts_discovery_v1_contract_free__", env!("CARGO_PKG_NAME")))]
         pub unsafe extern "C" fn rspyts_contract_free(pointer: *mut ::std::ffi::c_char) {
-            if !pointer.is_null() {
-                drop(unsafe { ::std::ffi::CString::from_raw(pointer) });
-            }
+            unsafe { ::rspyts::__private::discovery_free(pointer) }
         }
 
         #python
@@ -1446,18 +1483,22 @@ fn return_tokens(
     Ok((type_ref_tokens(ty, return_boundary)?, quote!(None)))
 }
 
-fn field_tokens(field: &syn::Field, rename_all: Option<&str>) -> syn::Result<TokenStream2> {
+fn field_tokens(
+    field: &syn::Field,
+    rename_all: Option<SerdeRenameRule>,
+) -> syn::Result<TokenStream2> {
     let ident = field.ident.as_ref().expect("named field");
-    let rust_name = ident.to_string();
-    let wire_name =
-        serde_rename(&field.attrs)?.unwrap_or_else(|| apply_case(&rust_name, rename_all));
+    let rust_name = ident.unraw().to_string();
+    let serde = serde_field(&field.attrs)?;
     let docs = docs_tokens(&field.attrs);
     let options = field_options(&field.attrs)?;
-    validate_field_options(field, &options)?;
+    validate_field_options(field, &options, &serde)?;
+    let wire_name = serde
+        .rename
+        .unwrap_or_else(|| apply_serde_field_case(&rust_name, rename_all));
     let ty = type_ref_tokens(&field.ty, options.boundary.as_deref())?;
-    let has_serde_default = serde_has_flag(&field.attrs, "default")?;
-    let required = options.required
-        || (!is_option(&field.ty) && !has_serde_default && options.default.is_none());
+    let required =
+        options.required || (!is_option(&field.ty) && !serde.default && options.default.is_none());
     let default = scalar_option_tokens(options.default.as_ref());
     let literal = scalar_option_tokens(options.literal.as_ref());
     let min_length = option_u64_tokens(options.min_length);
@@ -1684,19 +1725,114 @@ fn field_kind(ty: &SynType, boundary: Option<&str>) -> FieldKind {
     }
 }
 
-fn validate_field_options(field: &syn::Field, options: &FieldOptions) -> syn::Result<()> {
-    let has_serde_default = serde_has_flag(&field.attrs, "default")?;
+fn rust_default_scalar(ty: &SynType) -> Option<ScalarValue> {
+    let SynType::Path(path) = ty else {
+        return None;
+    };
+    if path.qself.is_some()
+        || path
+            .path
+            .segments
+            .iter()
+            .any(|segment| !matches!(segment.arguments, PathArguments::None))
+    {
+        return None;
+    }
+    let segments = path
+        .path
+        .segments
+        .iter()
+        .map(|segment| segment.ident.to_string())
+        .collect::<Vec<_>>();
+    let primitive = match segments.as_slice() {
+        [primitive] => Some(primitive.as_str()),
+        [root, module, primitive]
+            if matches!(root.as_str(), "core" | "std") && module == "primitive" =>
+        {
+            Some(primitive.as_str())
+        }
+        _ => None,
+    };
+    match primitive {
+        Some("bool") => return Some(ScalarValue::Bool(false)),
+        Some("u8" | "i8" | "u16" | "i16" | "u32" | "i32" | "u64" | "i64") => {
+            return Some(ScalarValue::I64(0));
+        }
+        _ => {}
+    }
+    if matches!(segments.as_slice(), [name] if name == "String")
+        || matches!(
+            segments.as_slice(),
+            [root, module, name]
+                if matches!(root.as_str(), "alloc" | "std")
+                    && module == "string"
+                    && name == "String"
+        )
+    {
+        return Some(ScalarValue::String(String::new()));
+    }
+    None
+}
+
+fn validate_field_options(
+    field: &syn::Field,
+    options: &FieldOptions,
+    serde: &SerdeField,
+) -> syn::Result<()> {
+    let required =
+        options.required || (!is_option(&field.ty) && !serde.default && options.default.is_none());
+    if let Some(skip) = serde.skip_serializing_if.as_ref() {
+        if required {
+            return Err(syn::Error::new(
+                skip.span(),
+                "`#[serde(skip_serializing_if = ...)]` cannot be used on a required rspyts field",
+            ));
+        }
+        if !is_option(&field.ty) {
+            return Err(syn::Error::new(
+                skip.span(),
+                "`skip_serializing_if` is supported only on `Option<T>` rspyts fields",
+            ));
+        }
+        if !matches!(
+            skip.value().as_str(),
+            "Option::is_none"
+                | "std::option::Option::is_none"
+                | "core::option::Option::is_none"
+                | "::std::option::Option::is_none"
+                | "::core::option::Option::is_none"
+        ) {
+            return Err(syn::Error::new(
+                skip.span(),
+                "rspyts supports only `Option::is_none` for `skip_serializing_if`",
+            ));
+        }
+    }
     if let (true, Some(default)) = (options.required, options.default.as_ref()) {
         return Err(syn::Error::new(
             default.span,
             "`required` and an explicit rspyts default cannot be combined",
         ));
     }
-    if has_serde_default && !is_option(&field.ty) && options.default.is_none() {
-        return Err(syn::Error::new(
-            field.span(),
-            "`#[serde(default)]` on a non-Option rspyts field requires `#[rspyts(default = ...)]`",
-        ));
+    if serde.default {
+        let Some(default) = options.default.as_ref() else {
+            return Err(syn::Error::new(
+                field.span(),
+                "`#[serde(default)]` requires an explicit scalar `#[rspyts(default = ...)]` that exactly matches the Rust `Default` value",
+            ));
+        };
+        let Some(rust_default) = rust_default_scalar(&field.ty) else {
+            return Err(syn::Error::new(
+                field.ty.span(),
+                "`#[serde(default)]` is supported only for direct bool, integer, and String carriers; defaults such as `Option::None` cannot be represented",
+            ));
+        };
+        if default.value != rust_default {
+            return Err(syn::Error::new(
+                default.span,
+                "`#[rspyts(default = ...)]` must exactly match the carrier's Rust `Default` value when `#[serde(default)]` is present",
+            ));
+        }
     }
     if let (Some(minimum), Some(maximum)) = (options.min_length, options.max_length)
         && minimum > maximum
@@ -1801,8 +1937,21 @@ fn option_i64_tokens(value: Option<i64>) -> TokenStream2 {
 }
 
 fn type_ref_tokens(ty: &SynType, boundary: Option<&str>) -> syn::Result<TokenStream2> {
+    let fixed_bytes = fixed_byte_array_length(ty)?;
     match boundary {
-        Some("bytes") => Ok(quote!(::rspyts::ir::TypeRef::Bytes)),
+        Some("bytes") if fixed_bytes.is_some() => {
+            let length = fixed_bytes.expect("checked fixed byte array");
+            Ok(quote!(::rspyts::ir::TypeRef::FixedBytes {
+                length: <::core::primitive::u64 as ::core::convert::TryFrom<
+                    ::core::primitive::usize
+                >>::try_from(::core::mem::size_of::<[::core::primitive::u8; #length]>())
+                    .expect("fixed byte length must fit in the rspyts IR"),
+            }))
+        }
+        Some("bytes") => {
+            validate_bytes_type(ty)?;
+            Ok(quote!(::rspyts::ir::TypeRef::Bytes))
+        }
         Some("buffer") => {
             let scalar = sequence_scalar(ty).ok_or_else(|| {
                 syn::Error::new(
@@ -1836,8 +1985,111 @@ fn type_ref_tokens(ty: &SynType, boundary: Option<&str>) -> syn::Result<TokenStr
             ty.span(),
             format!("unknown boundary attribute `{other}`"),
         )),
+        None if fixed_bytes.is_some() => Err(syn::Error::new(
+            ty.span(),
+            "fixed byte arrays require `#[rspyts(bytes)]` or `#[rspyts(returns(bytes))]`",
+        )),
         None => Ok(quote!(<#ty as ::rspyts::ContractType>::type_ref())),
     }
+}
+
+fn validate_bytes_type(ty: &SynType) -> syn::Result<()> {
+    if fixed_byte_array_length(ty)?.is_some() || is_owned_bytes(ty) || is_borrowed_byte_slice(ty) {
+        Ok(())
+    } else {
+        Err(syn::Error::new(
+            ty.span(),
+            "`bytes` requires exactly `Vec<u8>`, `[u8; N]`, `&[u8]`, or `&[u8; N]`",
+        ))
+    }
+}
+
+fn is_owned_bytes(ty: &SynType) -> bool {
+    let SynType::Path(path) = ty else {
+        return false;
+    };
+    if path.qself.is_some() || !is_vec_path(&path.path) {
+        return false;
+    }
+    let Some(segment) = path.path.segments.last() else {
+        return false;
+    };
+    let PathArguments::AngleBracketed(arguments) = &segment.arguments else {
+        return false;
+    };
+    let mut arguments = arguments.args.iter();
+    matches!(arguments.next(), Some(GenericArgument::Type(ty)) if is_u8(ty))
+        && arguments.next().is_none()
+}
+
+fn is_borrowed_byte_slice(ty: &SynType) -> bool {
+    let SynType::Reference(reference) = ty else {
+        return false;
+    };
+    if reference.mutability.is_some() {
+        return false;
+    }
+    matches!(reference.elem.as_ref(), SynType::Slice(slice) if is_u8(&slice.elem))
+}
+
+fn fixed_byte_array_length(ty: &SynType) -> syn::Result<Option<&Expr>> {
+    let ty = match ty {
+        SynType::Reference(reference) if reference.mutability.is_none() => reference.elem.as_ref(),
+        ty => ty,
+    };
+    let SynType::Array(array) = ty else {
+        return Ok(None);
+    };
+    if !is_u8(&array.elem) {
+        return Err(syn::Error::new(
+            array.elem.span(),
+            "fixed rspyts arrays support only the byte element type `u8`",
+        ));
+    }
+    Ok(Some(&array.len))
+}
+
+fn is_vec_path(path: &syn::Path) -> bool {
+    let segments = path
+        .segments
+        .iter()
+        .map(|segment| segment.ident.to_string())
+        .collect::<Vec<_>>();
+    match segments.as_slice() {
+        [name] => name == "Vec",
+        [root, module, name] => {
+            (root == "std" || root == "alloc") && module == "vec" && name == "Vec"
+        }
+        _ => false,
+    }
+}
+
+fn is_u8(ty: &SynType) -> bool {
+    let SynType::Path(path) = ty else {
+        return false;
+    };
+    if path.qself.is_some() {
+        return false;
+    }
+    let segments = path
+        .path
+        .segments
+        .iter()
+        .map(|segment| segment.ident.to_string())
+        .collect::<Vec<_>>();
+    let is_primitive = match segments.as_slice() {
+        [name] => name == "u8",
+        [root, module, name] => {
+            (root == "std" || root == "core") && module == "primitive" && name == "u8"
+        }
+        _ => false,
+    };
+    is_primitive
+        && path
+            .path
+            .segments
+            .iter()
+            .all(|segment| matches!(segment.arguments, PathArguments::None))
 }
 
 fn sequence_scalar(ty: &SynType) -> Option<&SynType> {
@@ -1952,6 +2204,23 @@ fn reject_generics(generics: &syn::Generics, span: Span) -> syn::Result<()> {
 
 fn reject_signature(signature: &syn::Signature) -> syn::Result<()> {
     reject_generics(&signature.generics, signature.ident.span())?;
+    for argument in &signature.inputs {
+        let FnArg::Typed(argument) = argument else {
+            continue;
+        };
+        let Pat::Ident(pattern) = argument.pat.as_ref() else {
+            continue;
+        };
+        let name = pattern.ident.unraw().to_string();
+        if name.starts_with("__rspyts_") {
+            return Err(syn::Error::new(
+                pattern.ident.span(),
+                format!(
+                    "parameter `{name}` uses the reserved `__rspyts_` prefix; rename it because that namespace belongs to generated rspyts wrapper bindings"
+                ),
+            ));
+        }
+    }
     if signature.asyncness.is_some() {
         return Err(syn::Error::new(
             signature.span(),
@@ -1978,10 +2247,110 @@ fn reject_reserved_resource_method(method: &ImplItemFn) -> syn::Result<()> {
     Ok(())
 }
 
+fn wasm_native_host_name(host_name: &str) -> String {
+    format!("__rspyts_export_{host_name}")
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SerdeRenameRule {
+    Lower,
+    Upper,
+    Pascal,
+    Camel,
+    Snake,
+    ScreamingSnake,
+    Kebab,
+    ScreamingKebab,
+}
+
+impl SerdeRenameRule {
+    fn parse(value: &LitStr) -> syn::Result<Self> {
+        match value.value().as_str() {
+            "lowercase" => Ok(Self::Lower),
+            "UPPERCASE" => Ok(Self::Upper),
+            "PascalCase" => Ok(Self::Pascal),
+            "camelCase" => Ok(Self::Camel),
+            "snake_case" => Ok(Self::Snake),
+            "SCREAMING_SNAKE_CASE" => Ok(Self::ScreamingSnake),
+            "kebab-case" => Ok(Self::Kebab),
+            "SCREAMING-KEBAB-CASE" => Ok(Self::ScreamingKebab),
+            other => Err(syn::Error::new(
+                value.span(),
+                format!(
+                    "unknown serde rename rule `{other}`; expected lowercase, UPPERCASE, PascalCase, camelCase, snake_case, SCREAMING_SNAKE_CASE, kebab-case, or SCREAMING-KEBAB-CASE"
+                ),
+            )),
+        }
+    }
+}
+
+fn apply_serde_variant_case(value: &str, rule: Option<SerdeRenameRule>) -> String {
+    let Some(rule) = rule else {
+        return value.to_owned();
+    };
+    match rule {
+        SerdeRenameRule::Lower => value.to_ascii_lowercase(),
+        SerdeRenameRule::Upper => value.to_ascii_uppercase(),
+        SerdeRenameRule::Pascal => value.to_owned(),
+        SerdeRenameRule::Camel => value[..1].to_ascii_lowercase() + &value[1..],
+        SerdeRenameRule::Snake => {
+            let mut snake = String::new();
+            for (index, character) in value.char_indices() {
+                if index > 0 && character.is_uppercase() {
+                    snake.push('_');
+                }
+                snake.push(character.to_ascii_lowercase());
+            }
+            snake
+        }
+        SerdeRenameRule::ScreamingSnake => {
+            apply_serde_variant_case(value, Some(SerdeRenameRule::Snake)).to_ascii_uppercase()
+        }
+        SerdeRenameRule::Kebab => {
+            apply_serde_variant_case(value, Some(SerdeRenameRule::Snake)).replace('_', "-")
+        }
+        SerdeRenameRule::ScreamingKebab => {
+            apply_serde_variant_case(value, Some(SerdeRenameRule::ScreamingSnake)).replace('_', "-")
+        }
+    }
+}
+
+fn apply_serde_field_case(value: &str, rule: Option<SerdeRenameRule>) -> String {
+    let Some(rule) = rule else {
+        return value.to_owned();
+    };
+    match rule {
+        SerdeRenameRule::Lower | SerdeRenameRule::Snake => value.to_owned(),
+        SerdeRenameRule::Upper => value.to_ascii_uppercase(),
+        SerdeRenameRule::Pascal => {
+            let mut pascal = String::new();
+            let mut capitalize = true;
+            for character in value.chars() {
+                if character == '_' {
+                    capitalize = true;
+                } else if capitalize {
+                    pascal.push(character.to_ascii_uppercase());
+                    capitalize = false;
+                } else {
+                    pascal.push(character);
+                }
+            }
+            pascal
+        }
+        SerdeRenameRule::Camel => {
+            let pascal = apply_serde_field_case(value, Some(SerdeRenameRule::Pascal));
+            pascal[..1].to_ascii_lowercase() + &pascal[1..]
+        }
+        SerdeRenameRule::ScreamingSnake => value.to_ascii_uppercase(),
+        SerdeRenameRule::Kebab => value.replace('_', "-"),
+        SerdeRenameRule::ScreamingKebab => value.to_ascii_uppercase().replace('_', "-"),
+    }
+}
+
 #[derive(Default)]
 struct SerdeContainer {
-    rename_all: Option<String>,
-    rename_all_fields: Option<String>,
+    rename_all: Option<SerdeRenameRule>,
+    rename_all_fields: Option<SerdeRenameRule>,
     tag: Option<String>,
     transparent: bool,
 }
@@ -1991,9 +2360,27 @@ fn serde_container(attrs: &[Attribute]) -> syn::Result<SerdeContainer> {
     for attr in attrs.iter().filter(|attr| attr.path().is_ident("serde")) {
         attr.parse_nested_meta(|meta| {
             if meta.path.is_ident("rename_all") {
-                result.rename_all = Some(meta.value()?.parse::<LitStr>()?.value());
+                if result.rename_all.is_some() {
+                    return Err(meta.error("`rename_all` may be declared only once"));
+                }
+                if !meta.input.peek(Token![=]) {
+                    return Err(meta.error(
+                        "directional `rename_all(serialize = ..., deserialize = ...)` is not supported because rspyts requires one canonical wire name",
+                    ));
+                }
+                result.rename_all =
+                    Some(SerdeRenameRule::parse(&meta.value()?.parse::<LitStr>()?)?);
             } else if meta.path.is_ident("rename_all_fields") {
-                result.rename_all_fields = Some(meta.value()?.parse::<LitStr>()?.value());
+                if result.rename_all_fields.is_some() {
+                    return Err(meta.error("`rename_all_fields` may be declared only once"));
+                }
+                if !meta.input.peek(Token![=]) {
+                    return Err(meta.error(
+                        "directional `rename_all_fields(serialize = ..., deserialize = ...)` is not supported because rspyts requires one canonical wire name",
+                    ));
+                }
+                result.rename_all_fields =
+                    Some(SerdeRenameRule::parse(&meta.value()?.parse::<LitStr>()?)?);
             } else if meta.path.is_ident("tag") {
                 result.tag = Some(meta.value()?.parse::<LitStr>()?.value());
             } else if meta.path.is_ident("transparent") {
@@ -2001,6 +2388,11 @@ fn serde_container(attrs: &[Attribute]) -> syn::Result<SerdeContainer> {
             } else if meta.path.is_ident("deny_unknown_fields") {
                 // The generated hosts are closed by default; this is accepted metadata.
             } else if meta.path.is_ident("rename") {
+                if !meta.input.peek(Token![=]) {
+                    return Err(meta.error(
+                        "directional `rename(serialize = ..., deserialize = ...)` is not supported because rspyts requires one canonical wire name",
+                    ));
+                }
                 let _ = meta.value()?.parse::<LitStr>()?;
             } else {
                 return Err(
@@ -2018,14 +2410,23 @@ fn serde_rename(attrs: &[Attribute]) -> syn::Result<Option<String>> {
     for attr in attrs.iter().filter(|attr| attr.path().is_ident("serde")) {
         attr.parse_nested_meta(|meta| {
             if meta.path.is_ident("rename") {
-                value = Some(meta.value()?.parse::<LitStr>()?.value());
-            } else if meta.path.is_ident("skip_serializing_if")
-                || meta.path.is_ident("default")
-                || meta.path.is_ident("alias")
-            {
-                if meta.input.peek(syn::Token![=]) {
-                    let _ = meta.value()?.parse::<Expr>()?;
+                if value.is_some() {
+                    return Err(meta.error("`rename` may be declared only once"));
                 }
+                if !meta.input.peek(Token![=]) {
+                    return Err(meta.error(
+                        "directional `rename(serialize = ..., deserialize = ...)` is not supported because rspyts requires one canonical wire name",
+                    ));
+                }
+                value = Some(meta.value()?.parse::<LitStr>()?.value());
+            } else if meta.path.is_ident("rename_all") {
+                return Err(meta.error(
+                    "variant-level `rename_all` is not supported; use container `rename_all_fields`",
+                ));
+            } else if meta.path.is_ident("alias") {
+                return Err(meta.error(
+                    "`#[serde(alias = ...)]` is not supported because rspyts exposes one canonical wire name",
+                ));
             } else {
                 return Err(meta.error("unsupported serde field or variant attribute"));
             }
@@ -2035,30 +2436,54 @@ fn serde_rename(attrs: &[Attribute]) -> syn::Result<Option<String>> {
     Ok(value)
 }
 
-fn serde_has_flag(attrs: &[Attribute], name: &str) -> syn::Result<bool> {
-    let mut found = false;
+#[derive(Default)]
+struct SerdeField {
+    rename: Option<String>,
+    default: bool,
+    skip_serializing_if: Option<LitStr>,
+}
+
+fn serde_field(attrs: &[Attribute]) -> syn::Result<SerdeField> {
+    let mut result = SerdeField::default();
     for attr in attrs.iter().filter(|attr| attr.path().is_ident("serde")) {
         attr.parse_nested_meta(|meta| {
-            if meta.path.is_ident(name) {
-                found = true;
-                if meta.input.peek(syn::Token![=]) {
-                    let _ = meta.value()?.parse::<Expr>()?;
+            if meta.path.is_ident("rename") {
+                if result.rename.is_some() {
+                    return Err(meta.error("`rename` may be declared only once"));
                 }
-            } else if meta.path.is_ident("rename")
-                || meta.path.is_ident("skip_serializing_if")
-                || meta.path.is_ident("default")
-                || meta.path.is_ident("alias")
-            {
-                if meta.input.peek(syn::Token![=]) {
-                    let _ = meta.value()?.parse::<Expr>()?;
+                if !meta.input.peek(Token![=]) {
+                    return Err(meta.error(
+                        "directional `rename(serialize = ..., deserialize = ...)` is not supported because rspyts requires one canonical wire name",
+                    ));
                 }
+                result.rename = Some(meta.value()?.parse::<LitStr>()?.value());
+            } else if meta.path.is_ident("default") {
+                if result.default {
+                    return Err(meta.error("`default` may be declared only once"));
+                }
+                if meta.input.peek(syn::Token![=]) {
+                    let _ = meta.value()?.parse::<LitStr>()?;
+                    return Err(meta.error(
+                        "`#[serde(default = \"path\")]` is not supported because function-provided defaults cannot be represented by rspyts",
+                    ));
+                }
+                result.default = true;
+            } else if meta.path.is_ident("skip_serializing_if") {
+                if result.skip_serializing_if.is_some() {
+                    return Err(meta.error("`skip_serializing_if` may be declared only once"));
+                }
+                result.skip_serializing_if = Some(meta.value()?.parse::<LitStr>()?);
+            } else if meta.path.is_ident("alias") {
+                return Err(meta.error(
+                    "`#[serde(alias = ...)]` is not supported because rspyts exposes one canonical wire name",
+                ));
             } else {
                 return Err(meta.error("unsupported serde field attribute"));
             }
             Ok(())
         })?;
     }
-    Ok(found)
+    Ok(result)
 }
 
 fn rspyts_type_override(attrs: &[Attribute]) -> syn::Result<Option<SynType>> {
@@ -2081,12 +2506,12 @@ fn boundary_attr(attrs: &[Attribute]) -> syn::Result<Option<String>> {
     for attr in attrs.iter().filter(|attr| attr.path().is_ident("rspyts")) {
         attr.parse_nested_meta(|meta| {
             if meta.path.is_ident("buffer") || meta.path.is_ident("bytes") {
-                result = Some(meta.path.get_ident().expect("ident").to_string());
-            } else if meta.path.is_ident("required") {
+                let boundary = meta.path.get_ident().expect("ident").to_string();
+                if result.replace(boundary).is_some() {
+                    return Err(meta.error("only one parameter boundary may be declared"));
+                }
             } else {
-                return Err(
-                    meta.error("supported field attributes are buffer, bytes, and required")
-                );
+                return Err(meta.error("parameter attributes are buffer or bytes"));
             }
             Ok(())
         })?;
@@ -2296,6 +2721,499 @@ mod tests {
     use super::*;
 
     #[test]
+    fn serde_rename_rules_match_serde_for_fields_and_variants() {
+        let cases = [
+            (
+                "lowercase",
+                "http2_server",
+                "http2server",
+                SerdeRenameRule::Lower,
+            ),
+            (
+                "UPPERCASE",
+                "HTTP2_SERVER",
+                "HTTP2SERVER",
+                SerdeRenameRule::Upper,
+            ),
+            (
+                "PascalCase",
+                "Http2Server",
+                "HTTP2Server",
+                SerdeRenameRule::Pascal,
+            ),
+            (
+                "camelCase",
+                "http2Server",
+                "hTTP2Server",
+                SerdeRenameRule::Camel,
+            ),
+            (
+                "snake_case",
+                "http2_server",
+                "h_t_t_p2_server",
+                SerdeRenameRule::Snake,
+            ),
+            (
+                "SCREAMING_SNAKE_CASE",
+                "HTTP2_SERVER",
+                "H_T_T_P2_SERVER",
+                SerdeRenameRule::ScreamingSnake,
+            ),
+            (
+                "kebab-case",
+                "http2-server",
+                "h-t-t-p2-server",
+                SerdeRenameRule::Kebab,
+            ),
+            (
+                "SCREAMING-KEBAB-CASE",
+                "HTTP2-SERVER",
+                "H-T-T-P2-SERVER",
+                SerdeRenameRule::ScreamingKebab,
+            ),
+        ];
+
+        for (name, expected_field, expected_variant, rule) in cases {
+            let literal = LitStr::new(name, Span::call_site());
+            assert_eq!(SerdeRenameRule::parse(&literal).unwrap(), rule);
+            assert_eq!(
+                apply_serde_field_case("http2_server", Some(rule)),
+                expected_field
+            );
+            assert_eq!(
+                apply_serde_variant_case("HTTP2Server", Some(rule)),
+                expected_variant
+            );
+        }
+
+        assert_eq!(
+            apply_serde_field_case("http2Server", Some(SerdeRenameRule::Snake)),
+            "http2Server"
+        );
+        assert_eq!(
+            apply_serde_field_case("http2Server", Some(SerdeRenameRule::Kebab)),
+            "http2Server"
+        );
+        assert_eq!(
+            apply_serde_field_case("http2Server", Some(SerdeRenameRule::ScreamingSnake)),
+            "HTTP2SERVER"
+        );
+    }
+
+    #[test]
+    fn serde_rename_rules_are_applied_at_struct_and_enum_call_sites() {
+        let structure: DeriveInput = syn::parse_quote! {
+            #[serde(rename_all = "SCREAMING-KEBAB-CASE")]
+            struct Example {
+                r#type: String,
+                http2_server: String,
+            }
+        };
+        let Data::Struct(structure_data) = structure.data else {
+            unreachable!();
+        };
+        let shape = struct_shape(&structure.attrs, &structure.ident, structure_data)
+            .unwrap()
+            .to_string();
+        assert!(shape.contains("rust_name : \"type\""));
+        assert!(!shape.contains("r#type"));
+        assert!(shape.contains("\"TYPE\""));
+        assert!(shape.contains("\"HTTP2-SERVER\""));
+
+        let enumeration: DeriveInput = syn::parse_quote! {
+            #[serde(rename_all = "snake_case")]
+            enum Example {
+                HTTP2Server,
+            }
+        };
+        let Data::Enum(enumeration_data) = enumeration.data else {
+            unreachable!();
+        };
+        let shape = enum_shape(&enumeration.attrs, enumeration_data)
+            .unwrap()
+            .to_string();
+        assert!(shape.contains("\"h_t_t_p2_server\""));
+    }
+
+    #[test]
+    fn unknown_serde_rename_rules_fail_at_macro_expansion_time() {
+        let attrs: Vec<Attribute> = vec![syn::parse_quote! {
+            #[serde(rename_all = "title-case")]
+        }];
+        let error = serde_container(&attrs).err().unwrap();
+        assert!(error.to_string().contains("unknown serde rename rule"));
+    }
+
+    #[test]
+    fn ambiguous_serde_rename_rules_fail_deliberately() {
+        let duplicate: Vec<Attribute> = vec![
+            syn::parse_quote! {
+                #[serde(rename_all = "snake_case")]
+            },
+            syn::parse_quote! {
+                #[serde(rename_all = "camelCase")]
+            },
+        ];
+        let error = serde_container(&duplicate).err().unwrap();
+        assert!(error.to_string().contains("declared only once"));
+
+        let directional: Vec<Attribute> = vec![syn::parse_quote! {
+            #[serde(rename_all(
+                serialize = "snake_case",
+                deserialize = "camelCase"
+            ))]
+        }];
+        let error = serde_container(&directional).err().unwrap();
+        assert!(error.to_string().contains("one canonical wire name"));
+
+        let directional_field: syn::Field = syn::parse_quote! {
+            #[serde(rename(serialize = "output", deserialize = "input"))]
+            value: String
+        };
+        let error = field_tokens(&directional_field, None).unwrap_err();
+        assert!(error.to_string().contains("one canonical wire name"));
+
+        let variant_rule: Vec<Attribute> = vec![syn::parse_quote! {
+            #[serde(rename_all = "camelCase")]
+        }];
+        let error = serde_rename(&variant_rule).unwrap_err();
+        assert!(error.to_string().contains("variant-level `rename_all`"));
+
+        let structure: DeriveInput = syn::parse_quote! {
+            #[serde(rename_all_fields = "camelCase")]
+            struct Example {
+                value: String,
+            }
+        };
+        let Data::Struct(structure_data) = structure.data else {
+            unreachable!();
+        };
+        let error = struct_shape(&structure.attrs, &structure.ident, structure_data).unwrap_err();
+        assert!(error.to_string().contains("supported only on enums"));
+    }
+
+    #[test]
+    fn bytes_accept_only_exact_owned_fixed_or_borrowed_byte_carriers() {
+        for accepted in [
+            "Vec<u8>",
+            "std::vec::Vec<std::primitive::u8>",
+            "alloc::vec::Vec<u8>",
+            "[u8; 8]",
+            "&[u8]",
+            "&'static [core::primitive::u8]",
+            "&[u8; 8]",
+            "&'static [core::primitive::u8; 16]",
+        ] {
+            let ty = syn::parse_str::<SynType>(accepted).unwrap();
+            validate_bytes_type(&ty).unwrap();
+        }
+
+        for rejected in [
+            "String",
+            "Vec<i8>",
+            "Vec<Vec<u8>>",
+            "Option<Vec<u8>>",
+            "Box<[u8]>",
+            "&Vec<u8>",
+            "&mut [u8]",
+            "&mut [u8; 8]",
+            "&[i8]",
+        ] {
+            let ty = syn::parse_str::<SynType>(rejected).unwrap();
+            let error = validate_bytes_type(&ty).unwrap_err();
+            assert!(
+                error.to_string().contains("requires exactly `Vec<u8>`"),
+                "{rejected}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn fixed_byte_arrays_require_an_explicit_bytes_boundary() {
+        let error = type_ref_tokens(&syn::parse_quote!([u8; 8]), None).unwrap_err();
+        assert!(error.to_string().contains("require"));
+
+        let attributed = type_ref_tokens(&syn::parse_quote!(&[u8; LENGTH]), Some("bytes"))
+            .unwrap()
+            .to_string();
+        assert!(attributed.contains("FixedBytes"));
+        assert!(attributed.contains("size_of"));
+        assert!(attributed.contains("LENGTH"));
+        assert!(
+            fixed_byte_array_length(&syn::parse_quote!([u8; 4 + 4]))
+                .unwrap()
+                .is_some()
+        );
+
+        let dynamic = type_ref_tokens(&syn::parse_quote!(Vec<u8>), Some("bytes"))
+            .unwrap()
+            .to_string();
+        assert!(dynamic.ends_with("TypeRef :: Bytes"));
+        let slice = type_ref_tokens(&syn::parse_quote!(&[u8]), Some("bytes"))
+            .unwrap()
+            .to_string();
+        assert!(slice.ends_with("TypeRef :: Bytes"));
+
+        let wrong_element = syn::parse_str::<SynType>("[i8; 8]").unwrap();
+        let error = type_ref_tokens(&wrong_element, None).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("only the byte element type `u8`")
+        );
+    }
+
+    #[test]
+    fn fixed_bytes_survive_alias_and_constant_expansion() {
+        let transparent: DeriveInput = syn::parse_quote! {
+            #[serde(transparent)]
+            struct Fingerprint(#[rspyts(bytes)] [u8; LENGTH]);
+        };
+        let expanded = expand_type(transparent).unwrap().to_string();
+        assert!(expanded.contains("FixedBytes"));
+        assert!(expanded.contains("LENGTH"));
+
+        let unannotated: DeriveInput = syn::parse_quote! {
+            #[serde(transparent)]
+            struct ImplicitFingerprint([u8; 8]);
+        };
+        let error = expand_type(unannotated).unwrap_err();
+        assert!(error.to_string().contains("require"));
+
+        let constant: ItemConst = syn::parse_quote! {
+            pub const FINGERPRINT: [u8; 4] = [1, 2, 3, 4];
+        };
+        let error = expand_const(ExportTarget::Static, constant).unwrap_err();
+        assert!(error.to_string().contains("require"));
+    }
+
+    #[test]
+    fn bytes_are_checked_on_fields_parameters_and_returns() {
+        let field: syn::Field = syn::parse_quote! {
+            #[rspyts(bytes)]
+            value: String
+        };
+        let error = field_tokens(&field, None).unwrap_err();
+        assert!(error.to_string().contains("requires exactly `Vec<u8>`"));
+
+        let parameter: ItemFn = syn::parse_quote! {
+            pub fn consume(#[rspyts(bytes)] value: String) {}
+        };
+        let error = expand_function(ExportTarget::Both, parameter).unwrap_err();
+        assert!(error.to_string().contains("requires exactly `Vec<u8>`"));
+
+        let returns: ItemFn = syn::parse_quote! {
+            #[rspyts(returns(bytes))]
+            pub fn produce() -> String {
+                String::new()
+            }
+        };
+        let error = expand_function(ExportTarget::Both, returns).unwrap_err();
+        assert!(error.to_string().contains("requires exactly `Vec<u8>`"));
+
+        let result: ItemFn = syn::parse_quote! {
+            #[rspyts(returns(bytes))]
+            pub fn try_produce() -> Result<String, Failure> {
+                unreachable!()
+            }
+        };
+        let error = expand_function(ExportTarget::Both, result).unwrap_err();
+        assert!(error.to_string().contains("requires exactly `Vec<u8>`"));
+
+        let accepted: ItemFn = syn::parse_quote! {
+            #[rspyts(returns(bytes))]
+            pub fn copy(#[rspyts(bytes)] value: &[u8]) -> Vec<u8> {
+                value.to_vec()
+            }
+        };
+        expand_function(ExportTarget::Both, accepted).unwrap();
+
+        let fixed: ItemFn = syn::parse_quote! {
+            #[rspyts(returns(bytes))]
+            pub fn copy_fixed(#[rspyts(bytes)] value: &[u8; 4]) -> [u8; 4] {
+                *value
+            }
+        };
+        let expanded = expand_function(ExportTarget::Both, fixed)
+            .unwrap()
+            .to_string();
+        assert!(expanded.matches("FixedBytes").count() >= 2);
+        assert!(expanded.contains("size_of"));
+    }
+
+    #[test]
+    fn unsupported_or_lying_serde_field_attributes_are_rejected() {
+        let alias: syn::Field = syn::parse_quote! {
+            #[serde(alias = "oldName")]
+            value: String
+        };
+        let error = field_tokens(&alias, None).unwrap_err();
+        assert!(error.to_string().contains("one canonical wire name"));
+
+        let variant_attrs: Vec<Attribute> = vec![syn::parse_quote! {
+            #[serde(alias = "OldVariant")]
+        }];
+        let error = serde_rename(&variant_attrs).unwrap_err();
+        assert!(error.to_string().contains("one canonical wire name"));
+
+        for required in [
+            syn::parse_quote! {
+                #[serde(skip_serializing_if = "String::is_empty")]
+                value: String
+            },
+            syn::parse_quote! {
+                #[serde(skip_serializing_if = "Option::is_none")]
+                #[rspyts(required)]
+                value: Option<String>
+            },
+        ] {
+            let error = field_tokens(&required, None).unwrap_err();
+            assert!(error.to_string().contains("required rspyts field"));
+        }
+
+        let optional: syn::Field = syn::parse_quote! {
+            #[serde(skip_serializing_if = "Option::is_none")]
+            value: Option<String>
+        };
+        field_tokens(&optional, None).unwrap();
+
+        let qualified_optional: syn::Field = syn::parse_quote! {
+            #[serde(skip_serializing_if = "::std::option::Option::is_none")]
+            value: Option<String>
+        };
+        field_tokens(&qualified_optional, None).unwrap();
+
+        let custom_optional: syn::Field = syn::parse_quote! {
+            #[serde(default, skip_serializing_if = "custom_predicate")]
+            value: Option<String>
+        };
+        let error = field_tokens(&custom_optional, None).unwrap_err();
+        assert!(error.to_string().contains("only `Option::is_none`"));
+
+        let missing_predicate: syn::Field = syn::parse_quote! {
+            #[serde(default, skip_serializing_if)]
+            value: Option<String>
+        };
+        assert!(field_tokens(&missing_predicate, None).is_err());
+
+        let variant_skip: Vec<Attribute> = vec![syn::parse_quote! {
+            #[serde(skip_serializing_if = "Option::is_none")]
+        }];
+        let error = serde_rename(&variant_skip).unwrap_err();
+        assert!(error.to_string().contains("unsupported serde"));
+    }
+
+    #[test]
+    fn serde_defaults_must_have_an_exact_representable_value() {
+        let custom_default: syn::Field = syn::parse_quote! {
+            #[serde(default = "default_quantity")]
+            quantity: u64
+        };
+        let error = field_tokens(&custom_default, None).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("function-provided defaults cannot be represented")
+        );
+
+        let implicit_option_default: syn::Field = syn::parse_quote! {
+            #[serde(default)]
+            #[rspyts(default = "fallback")]
+            value: Option<String>
+        };
+        let error = field_tokens(&implicit_option_default, None).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("defaults such as `Option::None` cannot be represented")
+        );
+
+        let implicit_scalar_default: syn::Field = syn::parse_quote! {
+            #[serde(default)]
+            quantity: u64
+        };
+        let error = field_tokens(&implicit_scalar_default, None).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("requires an explicit scalar `#[rspyts(default = ...)]`")
+        );
+
+        for representable in [
+            syn::parse_quote! {
+                #[serde(default)]
+                #[rspyts(default = false)]
+                enabled: bool
+            },
+            syn::parse_quote! {
+                #[serde(default)]
+                #[rspyts(default = 0)]
+                quantity: u64
+            },
+            syn::parse_quote! {
+                #[serde(default)]
+                #[rspyts(default = "")]
+                value: String
+            },
+        ] {
+            field_tokens(&representable, None).unwrap();
+        }
+
+        for mismatched in [
+            syn::parse_quote! {
+                #[serde(default)]
+                #[rspyts(default = true)]
+                enabled: bool
+            },
+            syn::parse_quote! {
+                #[serde(default)]
+                #[rspyts(default = 1)]
+                quantity: u32
+            },
+            syn::parse_quote! {
+                #[serde(default)]
+                #[rspyts(default = "fallback")]
+                value: String
+            },
+        ] {
+            let error = field_tokens(&mismatched, None).unwrap_err();
+            assert!(error.to_string().contains("exactly match"));
+        }
+    }
+
+    #[test]
+    fn parameter_boundaries_are_unambiguous() {
+        let duplicate: ItemFn = syn::parse_quote! {
+            pub fn consume(#[rspyts(bytes, buffer)] value: Vec<u8>) {}
+        };
+        let error = expand_function(ExportTarget::Both, duplicate).unwrap_err();
+        assert!(error.to_string().contains("only one parameter boundary"));
+
+        let ignored_required: ItemFn = syn::parse_quote! {
+            pub fn consume(#[rspyts(required)] value: Vec<u8>) {}
+        };
+        let error = expand_function(ExportTarget::Both, ignored_required).unwrap_err();
+        assert!(error.to_string().contains("parameter attributes"));
+    }
+
+    #[test]
+    fn generated_wrapper_parameter_namespace_is_reserved() {
+        let function: ItemFn = syn::parse_quote! {
+            pub fn invalid(__rspyts_type: u32) {}
+        };
+        let error = reject_signature(&function.sig).unwrap_err();
+        assert!(error.to_string().contains("parameter `__rspyts_type`"));
+        assert!(error.to_string().contains("reserved `__rspyts_` prefix"));
+
+        let method: ImplItemFn = syn::parse_quote! {
+            pub fn invalid(&self, __rspyts_types: u32) {}
+        };
+        let error = reject_signature(&method.sig).unwrap_err();
+        assert!(error.to_string().contains("parameter `__rspyts_types`"));
+        assert!(error.to_string().contains("reserved `__rspyts_` prefix"));
+    }
+
+    #[test]
     fn generated_resource_lifecycle_names_are_reserved() {
         for name in ["close", "free"] {
             let method: ImplItemFn = syn::parse_str(&format!("pub fn {name}(&self) {{}}")).unwrap();
@@ -2316,7 +3234,8 @@ mod tests {
             values: Vec<String>
         };
         let options = field_options(&field.attrs).unwrap();
-        let error = validate_field_options(&field, &options).unwrap_err();
+        let serde = serde_field(&field.attrs).unwrap();
+        let error = validate_field_options(&field, &options, &serde).unwrap_err();
         assert!(error.to_string().contains("cannot exceed"));
     }
 
@@ -2336,5 +3255,38 @@ mod tests {
         };
         let error = expand_resource(ExportTarget::Static, resource).unwrap_err();
         assert!(error.to_string().contains("resources cannot target static"));
+    }
+
+    #[test]
+    fn discovery_exports_are_scoped_to_the_cargo_package() {
+        let both = expand_module(ModuleInput {
+            module: syn::parse_quote!(native),
+            target: ModuleTarget::Both,
+        })
+        .to_string();
+        let python = expand_module(ModuleInput {
+            module: syn::parse_quote!(native),
+            target: ModuleTarget::Python,
+        })
+        .to_string();
+        let typescript = expand_module(ModuleInput {
+            module: syn::parse_quote!(native),
+            target: ModuleTarget::Typescript,
+        })
+        .to_string();
+
+        for expanded in [&both, &python, &typescript] {
+            assert!(expanded.contains("rspyts_discovery_v1_contract__"));
+            assert!(expanded.contains("rspyts_discovery_v1_contract_free__"));
+            assert!(expanded.contains("CARGO_PKG_NAME"));
+            assert!(expanded.contains("discovery_contract"));
+            assert!(!expanded.contains("no_mangle"));
+        }
+        assert!(both.contains("DISCOVERY_PYTHON"));
+        assert!(both.contains("DISCOVERY_TYPESCRIPT"));
+        assert!(python.contains("DISCOVERY_PYTHON"));
+        assert!(!python.contains("DISCOVERY_TYPESCRIPT"));
+        assert!(!typescript.contains("DISCOVERY_PYTHON"));
+        assert!(typescript.contains("DISCOVERY_TYPESCRIPT"));
     }
 }

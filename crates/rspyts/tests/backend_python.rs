@@ -3,7 +3,7 @@
 use std::collections::BTreeMap;
 
 use pyo3::prelude::*;
-use pyo3::types::{PyBytes, PyDict, PyInt, PyModule};
+use pyo3::types::{PyBytes, PyDict, PyFloat, PyInt, PyList, PyModule};
 use rspyts::__private::{BufferValue, WireValue};
 use rspyts::backend::python::{decode, decode_typed, encode, encode_typed, register};
 use rspyts::ir::{BufferElement, TypeRef};
@@ -141,5 +141,64 @@ fn python_ints_are_accepted_for_float_contracts() {
             decode_typed(value.as_any(), &TypeRef::Float { bits: 32 }, &[]).unwrap(),
             WireValue::F64(42.0),
         );
+    });
+}
+
+#[test]
+fn python_json_numbers_are_recursively_finite_and_javascript_safe() {
+    with_python(|py| {
+        let safe = PyDict::new(py);
+        let safe_items = PyList::empty(py);
+        safe_items.append(-9_007_199_254_740_991_i64).unwrap();
+        safe_items.append(9_007_199_254_740_991_u64).unwrap();
+        safe_items.append(1.25_f64).unwrap();
+        safe.set_item("items", &safe_items).unwrap();
+        assert!(
+            decode_typed(safe.as_any(), &TypeRef::Json, &[]).is_ok(),
+            "safe nested JSON should pass"
+        );
+
+        for value in [
+            PyInt::new(py, 9_007_199_254_740_992_u64)
+                .into_any()
+                .unbind(),
+            PyInt::new(py, -9_007_199_254_740_992_i64)
+                .into_any()
+                .unbind(),
+            PyFloat::new(py, 9_007_199_254_740_992.0)
+                .into_any()
+                .unbind(),
+            PyFloat::new(py, f64::INFINITY).into_any().unbind(),
+        ] {
+            let nested = PyDict::new(py);
+            let items = PyList::empty(py);
+            items.append(py.None()).unwrap();
+            items.append(value.bind(py)).unwrap();
+            nested.set_item("items", items).unwrap();
+            assert!(
+                decode_typed(nested.as_any(), &TypeRef::Json, &[]).is_err(),
+                "invalid nested JSON number should fail"
+            );
+        }
+    });
+}
+
+#[test]
+fn python_bytes_obey_fixed_contract_lengths() {
+    with_python(|py| {
+        let ty = TypeRef::FixedBytes { length: 4 };
+        let exact = PyBytes::new(py, &[1, 2, 3, 4]);
+        assert_eq!(
+            decode_typed(exact.as_any(), &ty, &[]).unwrap(),
+            WireValue::Bytes(vec![1, 2, 3, 4])
+        );
+
+        for invalid in [
+            PyBytes::new(py, &[1, 2, 3]),
+            PyBytes::new(py, &[1, 2, 3, 4, 5]),
+        ] {
+            let error = decode_typed(invalid.as_any(), &ty, &[]).unwrap_err();
+            assert!(error.to_string().contains("expected 4-byte array"));
+        }
     });
 }

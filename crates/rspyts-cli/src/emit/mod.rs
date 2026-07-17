@@ -1,6 +1,6 @@
 mod python;
 mod typescript;
-mod util;
+pub(crate) mod util;
 
 use std::fs::{self, OpenOptions};
 use std::io::Write;
@@ -48,9 +48,8 @@ pub fn python(
     config: &PythonConfig,
     contract: &ResolvedContract,
     fingerprint: &str,
-    native_library: Option<&Path>,
 ) -> Result<()> {
-    python::emit(root, config, contract, fingerprint, native_library)
+    python::emit(root, config, contract, fingerprint)
 }
 
 pub fn typescript(
@@ -60,6 +59,27 @@ pub fn typescript(
     fingerprint: &str,
 ) -> Result<()> {
     typescript::emit(root, config, contract, fingerprint)
+}
+
+pub fn validate_static_typescript(contract: &ResolvedContract) -> Result<()> {
+    typescript::validate_static_contract(contract)
+}
+
+pub(crate) fn static_typescript_type_ids(
+    contract: &ResolvedContract,
+) -> std::collections::BTreeSet<rspyts::ir::DefinitionId> {
+    typescript::static_surface_type_ids(contract)
+}
+
+pub(crate) fn wire_typescript_surface(
+    contract: &ResolvedContract,
+) -> (
+    std::collections::BTreeSet<rspyts::ir::DefinitionId>,
+    std::collections::BTreeSet<usize>,
+) {
+    let constants = typescript::wire_constant_indices(contract);
+    let types = typescript::wire_type_ids(contract, &constants);
+    (types, constants)
 }
 
 pub(crate) fn write(path: &Path, source: &str) -> Result<()> {

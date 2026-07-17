@@ -6,8 +6,8 @@
 /.rspyts.old-*
 **/.rspyts.tmp-*
 **/.rspyts.old-*
+**/.rspyts.build.lock
 **/.rspyts.lock.tmp-*
-**/.rspyts.lock.old-*
 **/dist/
 **/.venv/
 **/node_modules/

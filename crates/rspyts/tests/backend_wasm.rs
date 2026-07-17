@@ -91,6 +91,24 @@ fn bytes_and_u8_buffers_share_a_host_view_but_not_contract_semantics() {
 }
 
 #[wasm_bindgen_test]
+fn typed_arrays_obey_fixed_byte_contract_lengths() {
+    let ty = TypeRef::FixedBytes { length: 4 };
+    let exact: JsValue = Uint8Array::from(&[1, 2, 3, 4][..]).into();
+    assert_eq!(
+        decode_typed(&exact, &ty, &[]).unwrap(),
+        WireValue::Bytes(vec![1, 2, 3, 4]),
+    );
+
+    for invalid in [
+        Uint8Array::from(&[1, 2, 3][..]),
+        Uint8Array::from(&[1, 2, 3, 4, 5][..]),
+    ] {
+        let error = decode_typed(invalid.as_ref(), &ty, &[]).unwrap_err();
+        assert!(error.to_string().contains("expected 4-byte array"));
+    }
+}
+
+#[wasm_bindgen_test]
 fn every_numeric_buffer_uses_the_matching_owned_typed_array() {
     macro_rules! check {
         ($buffer:expr, $array:ty, $element:ident) => {{
@@ -142,8 +160,24 @@ fn json_is_stringifiable_and_rejects_unsafe_integer_precision() {
     assert!(js_sys::JSON::stringify(&host).is_ok());
     assert_eq!(decode_json(&host).unwrap(), json);
 
-    assert!(encode_json(&WireValue::U64(u64::MAX)).is_err());
+    for value in [
+        WireValue::I64(-9_007_199_254_740_992),
+        WireValue::U64(9_007_199_254_740_992),
+        WireValue::F64(9_007_199_254_740_992.0),
+        WireValue::F64(f64::INFINITY),
+    ] {
+        let nested = WireValue::Object(BTreeMap::from([(
+            "items".to_owned(),
+            WireValue::Sequence(vec![WireValue::Null, value]),
+        )]));
+        assert!(encode_json(&nested).is_err());
+    }
     assert!(decode_json(&js_sys::BigInt::from(1_u32).into()).is_err());
+
+    let nested = js_sys::Object::new();
+    let items = js_sys::Array::of2(&JsValue::NULL, &JsValue::from_f64(9_007_199_254_740_992.0));
+    Reflect::set(&nested, &JsValue::from_str("items"), &items).unwrap();
+    assert!(decode_json(&nested.into()).is_err());
 }
 
 #[wasm_bindgen_test]
@@ -221,8 +255,8 @@ fn typed_contract_applies_defaults_and_constraints() {
 fn optional_undefined_members_are_absent_but_required_members_still_reject() {
     let types = [TypeDef {
         owner: CargoPackageId::new("wasm-tests"),
-        id: "Event".to_owned(),
-        name: "Event".to_owned(),
+        id: "Selection".to_owned(),
+        name: "Selection".to_owned(),
         docs: None,
         shape: TypeShape::Struct {
             fields: vec![
@@ -236,8 +270,8 @@ fn optional_undefined_members_are_absent_but_required_members_still_reject() {
                     constraints: FieldConstraints::default(),
                 },
                 FieldDef {
-                    rust_name: "confidence".to_owned(),
-                    wire_name: "confidence".to_owned(),
+                    rust_name: "weight".to_owned(),
+                    wire_name: "weight".to_owned(),
                     docs: None,
                     ty: TypeRef::Option {
                         item: Box::new(TypeRef::Float { bits: 64 }),
@@ -250,19 +284,19 @@ fn optional_undefined_members_are_absent_but_required_members_still_reject() {
         },
     }];
     let ty = TypeRef::Named {
-        identity: DefinitionId::new("wasm-tests", "Event"),
+        identity: DefinitionId::new("wasm-tests", "Selection"),
     };
 
     let optional_undefined = Object::new();
     Reflect::set(
         &optional_undefined,
         &JsValue::from_str("label"),
-        &JsValue::from_str("sleep"),
+        &JsValue::from_str("primary"),
     )
     .unwrap();
     Reflect::set(
         &optional_undefined,
-        &JsValue::from_str("confidence"),
+        &JsValue::from_str("weight"),
         &JsValue::UNDEFINED,
     )
     .unwrap();
@@ -270,7 +304,7 @@ fn optional_undefined_members_are_absent_but_required_members_still_reject() {
         decode_typed(optional_undefined.as_ref(), &ty, &types).unwrap(),
         WireValue::Object(BTreeMap::from([(
             "label".to_owned(),
-            WireValue::String("sleep".to_owned()),
+            WireValue::String("primary".to_owned()),
         )])),
     );
 
