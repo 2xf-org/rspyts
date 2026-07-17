@@ -8,6 +8,7 @@ repository.workspace = true
 homepage.workspace = true
 authors.workspace = true
 description = "Proc macros for rspyts"
+include = ["src/**", "README.md", "LICENSE"]
 
 [lib]
 proc-macro = true

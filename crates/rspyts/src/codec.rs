@@ -735,7 +735,7 @@ fn raw_to_wire(
                 .map(WireValue::Sequence)
         }
         TypeRef::Named { identity } => raw_named(value, identity, types, path),
-        TypeRef::Bytes => raw_bytes(value, path).map(WireValue::Bytes),
+        TypeRef::Bytes | TypeRef::FixedBytes { .. } => raw_bytes(value, path).map(WireValue::Bytes),
         TypeRef::Buffer { element } => raw_buffer(value, *element, path).map(WireValue::Buffer),
     }
 }
@@ -1341,10 +1341,22 @@ impl<'de> de::Deserializer<'de> for RawValue {
     ) -> Result<V::Value, Self::Error> {
         match &self {
             Self::Sequence(values) if values.len() == length => self.deserialize_seq(visitor),
+            Self::Bytes(values) if values.len() == length => self.deserialize_seq(visitor),
+            Self::Buffer(values) if values.len() == length => self.deserialize_seq(visitor),
             Self::Sequence(values) => Err(CodecError::schema(
                 "$",
                 &format!("{length}-item tuple"),
                 &format!("{}-item sequence", values.len()),
+            )),
+            Self::Bytes(values) => Err(CodecError::schema(
+                "$",
+                &format!("{length}-item byte array"),
+                &format!("{} bytes", values.len()),
+            )),
+            Self::Buffer(values) => Err(CodecError::schema(
+                "$",
+                &format!("{length}-item numeric array"),
+                &format!("{} values", values.len()),
             )),
             value => Err(CodecError::schema("$", "tuple", raw_kind(value))),
         }

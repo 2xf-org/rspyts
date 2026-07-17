@@ -57,10 +57,12 @@ if [[ "$allow_dirty" == false ]] && [[ -n $(git status --porcelain --untracked-f
   exit 1
 fi
 package_args=(--locked --no-verify --allow-dirty)
-cargo package "${package_args[@]}" \
-  -p rspyts-macros \
-  -p rspyts \
-  -p rspyts-cli
+cargo package "${package_args[@]}" -p rspyts-macros
+cargo package "${package_args[@]}" -p rspyts \
+  --config "patch.crates-io.rspyts-macros.path='$repository_root/crates/rspyts-macros'"
+cargo package "${package_args[@]}" -p rspyts-cli \
+  --config "patch.crates-io.rspyts-macros.path='$repository_root/crates/rspyts-macros'" \
+  --config "patch.crates-io.rspyts.path='$repository_root/crates/rspyts'"
 
 verify_root=$(mktemp -d "${TMPDIR:-/tmp}/rspyts-crates.XXXXXX")
 trap 'rm -rf "$verify_root"' EXIT
@@ -80,6 +82,83 @@ cat >"$verify_root/.cargo/config.toml" <<EOF
 rspyts-macros = { path = "rspyts-macros-${version}" }
 rspyts = { path = "rspyts-${version}" }
 EOF
+
+require_exact_manifest_dependency() {
+  local manifest=$1
+  local package=$2
+  local dependency=$3
+  local expected=$4
+  local requirements
+  requirements=$(
+    cd "$verify_root"
+    cargo metadata --offline --no-deps --format-version 1 \
+      --manifest-path "$manifest" \
+      | jq -er --arg package "$package" --arg dependency "$dependency" '
+          [
+            .packages[]
+            | select(.name == $package)
+            | .dependencies[]
+            | select(.name == $dependency)
+            | .req
+          ] as $requirements
+          | if ($requirements | length) > 0
+            then $requirements[]
+            else error("missing dependency `" + $dependency + "`")
+            end
+        '
+  )
+  local requirement
+  while IFS= read -r requirement; do
+    if [[ "$requirement" != "=$expected" ]]; then
+      echo "$package packaged dependency $dependency is $requirement, expected =$expected" >&2
+      return 1
+    fi
+  done <<<"$requirements"
+}
+
+require_exact_packaged_dependency() {
+  local crate=$1
+  local dependency=$2
+  local expected=$3
+  require_exact_manifest_dependency \
+    "$verify_root/${crate}-${version}/Cargo.toml" \
+    "$crate" \
+    "$dependency" \
+    "$expected"
+}
+
+# Cargo publishes the normalized Cargo.toml, not the workspace-authored source
+# manifest. Verify the exact requirements that prevent mutually generated Rust
+# crates and wasm-bindgen tooling from resolving incompatible releases.
+require_exact_packaged_dependency rspyts rspyts-macros "$version"
+require_exact_packaged_dependency rspyts js-sys 0.3.103
+require_exact_packaged_dependency rspyts wasm-bindgen 0.2.126
+require_exact_packaged_dependency rspyts wasm-bindgen-test 0.3.76
+require_exact_packaged_dependency rspyts-cli rspyts "$version"
+
+# Prove the guard is semantic rather than a check that happens to accept the
+# current archive. A bare Cargo version normalizes to a caret requirement and
+# must be rejected without mutating any authored or packaged candidate file.
+mutation="$verify_root/rspyts-non-exact-mutation"
+cp -R "$verify_root/rspyts-${version}" "$mutation"
+sed 's/version = "=0\.2\.126"/version = "0.2.126"/' \
+  "$mutation/Cargo.toml" >"$mutation/Cargo.toml.mutated"
+if cmp -s "$mutation/Cargo.toml" "$mutation/Cargo.toml.mutated"; then
+  echo "failed to create non-exact packaged-manifest mutation" >&2
+  exit 1
+fi
+mv "$mutation/Cargo.toml.mutated" "$mutation/Cargo.toml"
+if require_exact_manifest_dependency \
+  "$mutation/Cargo.toml" rspyts wasm-bindgen 0.2.126 \
+  >/dev/null 2>&1; then
+  echo "packaged-manifest verifier accepted a caret wasm-bindgen requirement" >&2
+  exit 1
+fi
+
+"$repository_root/scripts/release/verify-private-data.sh" \
+  "$verify_root/rspyts-macros-${version}" \
+  "$verify_root/rspyts-${version}" \
+  "$verify_root/rspyts-cli-${version}"
 
 for crate in "${crates[@]}"; do
   (

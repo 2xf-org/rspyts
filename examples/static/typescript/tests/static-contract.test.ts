@@ -1,107 +1,112 @@
 import { describe, expect, expectTypeOf, it } from "vitest";
 
 import {
+  FEATURES,
+  FEATURE_TABLE,
+  FORMAT_EPOCH,
+  FORMAT_MAGIC,
+  FORMAT_VERSION,
   IDENTITY,
-  METER_DEFINITIONS,
-  METER_TABLE,
-  PLATFORM_TOPIC,
-  PROTOCOL_EPOCH,
-  PROTOCOL_VERSION,
-  PlatformEvent,
-  REQUIRED_HEADERS,
-  SUPPORTED_EVENTS,
-  type MeterDefinition,
-  type ProtocolIdentity,
+  MEDIA_TYPE,
+  RELEASE_CHANNELS,
+  REQUIRED_SECTIONS,
+  ReleaseChannel,
+  type FeatureDefinition,
+  type FormatIdentity,
 } from "../../.rspyts/typescript/index.js";
+import * as contract from "../../.rspyts/typescript/index.js";
 
 describe("generated static TypeScript contract", () => {
-  it("emits exact Rust enum values and protocol constants", () => {
-    expect(PlatformEvent).toEqual({
-      PortalHeartbeat: "portal_heartbeat",
-      StudyOpened: "study_opened",
-      SessionClosed: "session_closed",
+  it("omits Python-only behavior", () => {
+    expect("releaseChannelLabel" in contract).toBe(false);
+  });
+
+  it("emits exact Rust enum values and format constants", () => {
+    expect(ReleaseChannel).toEqual({
+      Stable: "stable",
+      Beta: "beta",
+      Nightly: "nightly",
     });
-    expect(PROTOCOL_VERSION).toBe(4);
-    expect(PROTOCOL_EPOCH).toBe(4_294_967_296n);
-    expect(PLATFORM_TOPIC).toBe("example.platform.v4");
-    expect(SUPPORTED_EVENTS).toEqual([
-      PlatformEvent.PortalHeartbeat,
-      PlatformEvent.StudyOpened,
-      PlatformEvent.SessionClosed,
+    expect(FORMAT_VERSION).toBe(4);
+    expect(FORMAT_EPOCH).toBe(4_294_967_296);
+    expect(MEDIA_TYPE).toBe("application/x-example-archive");
+    expect(FORMAT_MAGIC).toEqual([82, 83, 80, 89]);
+    expect(RELEASE_CHANNELS).toEqual([
+      ReleaseChannel.Stable,
+      ReleaseChannel.Beta,
+      ReleaseChannel.Nightly,
     ]);
   });
 
   it("emits string slices, tuple tables, and nested structs", () => {
-    expect(REQUIRED_HEADERS).toEqual([
-      "x-event-id",
-      "x-clinic-id",
-      "x-recorded-at",
+    expect(REQUIRED_SECTIONS).toEqual(["manifest", "entries", "checksum"]);
+    expect(FEATURE_TABLE).toEqual([
+      ["stable", "checksums"],
+      ["beta", "compression_v2"],
+      ["nightly", "delta_index"],
     ]);
-    expect(METER_TABLE).toEqual([
-      ["portal_heartbeat", "portal.active_seconds"],
-      ["study_opened", "study.opens"],
-      ["session_closed", "session.seconds"],
-    ]);
-    expect(IDENTITY).toEqual({ service: "sample", protocolVersion: 4 });
-    expect(METER_DEFINITIONS).toEqual([
+    expect(IDENTITY).toEqual({ name: "example_archive", formatVersion: 4 });
+    expect(FEATURES).toEqual([
       {
-        event: PlatformEvent.PortalHeartbeat,
-        meter: "portal.active_seconds",
-        unit: "second",
-        billable: false,
+        channel: ReleaseChannel.Stable,
+        key: "checksums",
+        introducedIn: "1.0",
+        enabledByDefault: true,
       },
       {
-        event: PlatformEvent.StudyOpened,
-        meter: "study.opens",
-        unit: "event",
-        billable: true,
+        channel: ReleaseChannel.Beta,
+        key: "compression_v2",
+        introducedIn: "1.4",
+        enabledByDefault: false,
       },
       {
-        event: PlatformEvent.SessionClosed,
-        meter: "session.seconds",
-        unit: "second",
-        billable: true,
+        channel: ReleaseChannel.Nightly,
+        key: "delta_index",
+        introducedIn: "1.5",
+        enabledByDefault: false,
       },
     ]);
   });
 
   it("publishes exact generated TypeScript types", () => {
-    expectTypeOf(PROTOCOL_VERSION).toEqualTypeOf<4>();
-    expectTypeOf(PROTOCOL_EPOCH).toEqualTypeOf<4_294_967_296n>();
-    expectTypeOf(PLATFORM_TOPIC).toEqualTypeOf<"example.platform.v4">();
+    expectTypeOf(FORMAT_VERSION).toEqualTypeOf<4>();
+    expectTypeOf(FORMAT_EPOCH).toEqualTypeOf<4_294_967_296>();
+    expectTypeOf(MEDIA_TYPE).toEqualTypeOf<"application/x-example-archive">();
+    expectTypeOf(FORMAT_MAGIC).toEqualTypeOf<readonly [82, 83, 80, 89]>();
     expectTypeOf(IDENTITY).toEqualTypeOf<{
-      readonly protocolVersion: 4;
-      readonly service: "sample";
+      readonly formatVersion: 4;
+      readonly name: "example_archive";
     }>();
-    expectTypeOf(SUPPORTED_EVENTS).toEqualTypeOf<
+    expectTypeOf(RELEASE_CHANNELS).toEqualTypeOf<
       readonly [
-        PlatformEvent.PortalHeartbeat,
-        PlatformEvent.StudyOpened,
-        PlatformEvent.SessionClosed,
+        ReleaseChannel.Stable,
+        ReleaseChannel.Beta,
+        ReleaseChannel.Nightly,
       ]
     >();
-    expectTypeOf(REQUIRED_HEADERS).toEqualTypeOf<
-      readonly ["x-event-id", "x-clinic-id", "x-recorded-at"]
+    expectTypeOf(REQUIRED_SECTIONS).toEqualTypeOf<
+      readonly ["manifest", "entries", "checksum"]
     >();
-    expectTypeOf(METER_TABLE).toEqualTypeOf<
+    expectTypeOf(FEATURE_TABLE).toEqualTypeOf<
       readonly [
-        readonly ["portal_heartbeat", "portal.active_seconds"],
-        readonly ["study_opened", "study.opens"],
-        readonly ["session_closed", "session.seconds"],
+        readonly ["stable", "checksums"],
+        readonly ["beta", "compression_v2"],
+        readonly ["nightly", "delta_index"],
       ]
     >();
-    expectTypeOf(METER_DEFINITIONS).toMatchTypeOf<
-      readonly Readonly<MeterDefinition>[]
+    expectTypeOf(FEATURES).toMatchTypeOf<
+      readonly Readonly<FeatureDefinition>[]
     >();
-    expectTypeOf(IDENTITY).toMatchTypeOf<Readonly<ProtocolIdentity>>();
+    expectTypeOf(IDENTITY).toMatchTypeOf<Readonly<FormatIdentity>>();
   });
 
   it("deeply freezes generated value graphs", () => {
     expect(Object.isFrozen(IDENTITY)).toBe(true);
-    expect(Object.isFrozen(SUPPORTED_EVENTS)).toBe(true);
-    expect(Object.isFrozen(METER_TABLE)).toBe(true);
-    expect(Object.isFrozen(METER_TABLE[0])).toBe(true);
-    expect(Object.isFrozen(METER_DEFINITIONS)).toBe(true);
-    expect(Object.isFrozen(METER_DEFINITIONS[0])).toBe(true);
+    expect(Object.isFrozen(FORMAT_MAGIC)).toBe(true);
+    expect(Object.isFrozen(RELEASE_CHANNELS)).toBe(true);
+    expect(Object.isFrozen(FEATURE_TABLE)).toBe(true);
+    expect(Object.isFrozen(FEATURE_TABLE[0])).toBe(true);
+    expect(Object.isFrozen(FEATURES)).toBe(true);
+    expect(Object.isFrozen(FEATURES[0])).toBe(true);
   });
 });

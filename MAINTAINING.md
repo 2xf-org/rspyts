@@ -1,70 +1,65 @@
 # Maintaining rspyts
 
-rspyts publishes three Cargo crates from one versioned workspace:
-`rspyts-macros`, `rspyts`, and `rspyts-cli`. It does not publish to PyPI or npm.
+rspyts publishes `rspyts-macros`, `rspyts`, and `rspyts-cli` from one Cargo
+workspace. All three crates always have the same version.
 
-## Development contract
+## Product boundary
 
-- Keep the 0.4 contract language deliberately closed. Reject unsupported Rust
-  instead of guessing a host shape or adding consumer-authored bridge models.
-- Change the semantic IR, validation, emitters, macros, fixtures, and docs
-  together.
-- Keep generated `.rspyts/` output untracked. Commit example and consumer
-  `rspyts.lock` files when their semantic API changes.
-- Preserve Rust 1.88 compatibility.
-- Test built consumer artifacts, not only generated source directories.
+Keep the supported surface small:
 
-## Local validation
+- one workspace pinned to Rust and Cargo 1.88.0;
+- one contract module per crate;
+- one exact rspyts version throughout a contract graph;
+- generated Python source for a Maturin abi3 wheel;
+- either static TypeScript or browser WASM with a canonical `./wire` export;
+- at most one direct dependency, which must be a leaf; and
+- fixed ignored `.rspyts/` output with a committed semantic `rspyts.lock`.
 
-The fast workspace gate is:
+Reject unsupported input instead of inventing another build mode. Update the
+semantic IR, validation, emitters, macros, fixtures, and documentation together.
+Generated npm packages must retain fingerprint checks as import-time side
+effects.
 
-```sh
-cargo fmt --all --check
-cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
-cargo test --workspace --locked
-RUSTDOCFLAGS="-D warnings" cargo doc --workspace --all-features --no-deps --locked
-```
+## Validation
 
-Do not maintain a second hand-copied acceptance script. The complete,
-authoritative commands are the jobs in
-[`validation.yml`](.github/workflows/validation.yml): isolated Python and WASM
-features, an installed Python 3.11 wheel, a packed browser/WASM package in
-Chromium, static TypeScript, cross-package identity and stale-lock rejection,
-Rust 1.88, Linux/macOS/Windows, rustdoc, link checking, and exact crate
-archives. Compiler, macro, emitter, or packaging changes require that complete
-workflow, not only the fast gate above.
+The complete gate is [the validation workflow](.github/workflows/validation.yml).
+It covers Rust formatting, linting, tests, isolated target features, installed
+Python wheels, packed browser/WASM packages, static TypeScript, direct-owner
+identity and stale-lock rejection, supported operating systems, rustdoc, local
+documentation links, privacy scans, and exact crate archives.
 
-## Testing a release candidate
+Compiler, macro, emitter, discovery ABI, lock, or packaging changes require the
+complete workflow. Test built and installed consumer artifacts, not only files
+inside `.rspyts/`.
 
-Use Rust/Cargo 1.94 for reproducible package candidates and install `jq`:
+## Prepare a release
+
+Use the repository toolchain from `rust-toolchain.toml`. From a clean checkout,
+build and test the exact Cargo archives:
 
 ```sh
 version=0.4.2
 scripts/release/verify-crates.sh "$version"
 ```
 
-The script requires a clean worktree, confirms that exactly the three expected
-crates are publishable at one version, creates their `.crate` archives, unpacks
-them, patches dependencies to the unpacked sources, and tests those exact
-sources. During an unfinished local change only, use:
+The script requires exactly the three expected publishable crates at one
+version. It creates their archives, unpacks them, redirects their rspyts
+dependencies to those unpacked sources, and tests the result. During local
+development only, `--allow-dirty` can inspect unfinished work; it is not a
+release procedure.
 
-```sh
-scripts/release/verify-crates.sh --allow-dirty "$version"
-```
+Before releasing a new version:
 
-`--allow-dirty` is not a release procedure. A candidate is not a published
-artifact until the registry workflow succeeds.
+1. Update the workspace version and exact internal dependency pins.
+2. Regenerate `Cargo.lock`.
+3. Update exact-version install examples and the changelog.
+4. Run the complete validation workflow and archive verification.
+5. Merge the release commit to `main`.
 
-## Releasing
+## Publish
 
-1. Choose a stable `MAJOR.MINOR.PATCH` version.
-2. Update the workspace version in `Cargo.toml`, regenerate `Cargo.lock`, and
-   update exact-version install examples and versioned documentation together.
-3. Run the full validation workflow and exact candidate script.
-4. Merge the release commit to `main`; releases cannot originate from an
-   unmerged branch.
-5. From a clean checkout exactly matching `origin/main`, push one annotated
-   tag:
+From a clean checkout exactly matching `origin/main`, push one annotated stable
+version tag:
 
 ```sh
 git fetch origin
@@ -77,30 +72,21 @@ git tag -a "v$version" -m "rspyts v$version"
 git push origin "refs/tags/v$version"
 ```
 
-The tag starts [`.github/workflows/deploy.yml`](.github/workflows/deploy.yml).
-It:
+[The deploy workflow](.github/workflows/deploy.yml) verifies that the tag is
+annotated and contained in `main`, reruns validation, preserves exact archives
+and checksums, publishes the crates in dependency order with trusted
+publishing, installs the published CLI, compiles a clean consumer, and creates
+the GitHub release.
 
-1. proves the tag is annotated, stable, and contained in `origin/main`;
-2. reruns the complete validation workflow;
-3. builds and preserves the three exact archives plus `SHA256SUMS`;
-4. publishes `rspyts-macros`, `rspyts`, then `rspyts-cli` through crates.io
-   trusted publishing;
-5. installs the exact CLI from crates.io and compiles a fresh consumer;
-6. creates or verifies the GitHub release and its preserved assets.
+The three crates.io trusted publishers must name organization `2xf-org`,
+repository `rspyts`, workflow `deploy.yml`, and environment `crates-io`. Normal
+releases use GitHub OIDC and need neither `cargo login` nor a long-lived token.
 
-The crates.io publishers for all three crates must name organization `2xf-org`,
-repository `rspyts`, workflow `deploy.yml`, and environment `crates-io`. The
-workflow uses GitHub OIDC; normal releases need no long-lived crates.io token
-and no `cargo login`.
+The `RELEASE_PRIVATE_PATTERNS_B64` repository secret contains a base64-encoded,
+newline-delimited set of protected extended regular expressions. Candidate
+archives and release notes fail closed if that list is unavailable, empty,
+invalid, or matched. Keep the plaintext patterns outside the public repository.
 
-Do not run `cargo publish` manually, publish rspyts to PyPI/npm, move or reuse a
-release tag, or overwrite a published version.
-
-## Failure handling
-
-Rerun failed jobs against the same immutable tag. The deploy workflow treats an
-already-published crate as complete only when its crates.io checksum matches
-the preserved candidate.
-
-A checksum mismatch is terminal for that version. Do not continue publishing
-and do not replace the tag; fix the cause and release a new patch version.
+Do not publish manually, move or reuse a release tag, or overwrite a published
+version. If a published checksum differs from the preserved candidate, stop and
+release a corrected patch version.
