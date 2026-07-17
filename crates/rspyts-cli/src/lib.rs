@@ -9,7 +9,7 @@ mod validate;
 use std::collections::BTreeMap;
 use std::fs;
 use std::fs::OpenOptions;
-use std::io::Write;
+use std::io::{ErrorKind, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -570,12 +570,33 @@ fn write_atomic_file(path: &Path, bytes: &[u8]) -> Result<()> {
         let _ = fs::remove_file(&temporary);
         return Err(error);
     }
-    if let Err(error) = replace_atomic(&temporary, path) {
+    if let Err(error) = replace_atomic_with_retry(&temporary, path) {
         let _ = fs::remove_file(&temporary);
         return Err(error)
             .with_context(|| format!("failed to commit atomic output {}", path.display()));
     }
     Ok(())
+}
+
+fn replace_atomic_with_retry(source: &Path, destination: &Path) -> std::io::Result<()> {
+    let mut retries = 0;
+    loop {
+        match replace_atomic(source, destination) {
+            Ok(()) => return Ok(()),
+            Err(error)
+                if cfg!(windows)
+                    && retries < 250
+                    && matches!(
+                        error.kind(),
+                        ErrorKind::PermissionDenied | ErrorKind::AlreadyExists
+                    ) =>
+            {
+                retries += 1;
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            Err(error) => return Err(error),
+        }
+    }
 }
 
 fn create_atomic_sibling_file(path: &Path) -> Result<(PathBuf, fs::File)> {
