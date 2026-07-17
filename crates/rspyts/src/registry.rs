@@ -597,46 +597,46 @@ mod tests {
         }
     }
 
-    fn evaluation_constant() -> Result<ConstantDef, String> {
-        let value = serde_json::to_value("evaluation")
-            .map_err(|error| format!("could not serialize evaluation constant: {error}"))?;
+    fn consumer_constant() -> Result<ConstantDef, String> {
+        let value = serde_json::to_value("consumer")
+            .map_err(|error| format!("could not serialize consumer constant: {error}"))?;
         let mut definition = constant(
-            "evaluation",
-            "EVALUATION_POLICY",
-            "EVALUATION_POLICY",
+            "consumer",
+            "CONSUMER_POLICY",
+            "CONSUMER_POLICY",
             Target::Both,
         );
         definition.value = value;
         Ok(definition)
     }
 
-    fn invalid_hardware_constant() -> Result<ConstantDef, String> {
-        Err("constant `HARDWARE_LIMIT` must contain only finite values".to_owned())
+    fn invalid_owner_constant() -> Result<ConstantDef, String> {
+        Err("constant `OWNER_LIMIT` must contain only finite values".to_owned())
     }
 
     #[test]
-    fn dependency_constant_builders_are_filtered_before_evaluation() {
+    fn dependency_constant_builders_are_filtered_before_building() {
         let registrations = [
             ConstantRegistration {
-                owner: "hardware",
-                build: invalid_hardware_constant,
+                owner: "owner",
+                build: invalid_owner_constant,
             },
             ConstantRegistration {
-                owner: "evaluation",
-                build: evaluation_constant,
+                owner: "consumer",
+                build: consumer_constant,
             },
         ];
 
-        let evaluation = constants_for_owner("evaluation", registrations.iter()).unwrap();
-        assert_eq!(evaluation.len(), 1);
-        assert_eq!(evaluation[0].owner, owner("evaluation"));
-        assert_eq!(evaluation[0].host_name, "EVALUATION_POLICY");
+        let consumer = constants_for_owner("consumer", registrations.iter()).unwrap();
+        assert_eq!(consumer.len(), 1);
+        assert_eq!(consumer[0].owner, owner("consumer"));
+        assert_eq!(consumer[0].host_name, "CONSUMER_POLICY");
 
-        let error = constants_for_owner("hardware", registrations.iter()).unwrap_err();
+        let error = constants_for_owner("owner", registrations.iter()).unwrap_err();
         assert!(matches!(
             error,
             RegistryError::InvalidConstant { message }
-                if message == "constant `HARDWARE_LIMIT` must contain only finite values"
+                if message == "constant `OWNER_LIMIT` must contain only finite values"
         ));
     }
 
