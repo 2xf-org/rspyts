@@ -66,7 +66,7 @@ rust-version = "1.88"
 crate-type = ["rlib", "cdylib"]
 
 [dependencies]
-rspyts = { version = "=0.4.3", default-features = false }
+rspyts = { version = "=0.4.4", default-features = false }
 serde = { version = "1", features = ["derive"] }
 thiserror = "2"
 wasm-bindgen = { version = "=0.2.126", optional = true }
@@ -158,7 +158,7 @@ or traverse symlinks.
 Install the matching tools, then build and lock:
 
 ```sh
-cargo install rspyts-cli --version '=0.4.3' --locked
+cargo install rspyts-cli --version '=0.4.4' --locked
 rustup target add wasm32-unknown-unknown --toolchain 1.88.0
 cargo install wasm-bindgen-cli --version '=0.2.126' --locked
 rspyts build

@@ -567,7 +567,21 @@ fn wrapper_params(
             };
             let boundary = boundary_attr(&argument.attrs)?;
             let ty_ref = type_ref_tokens(&argument.ty, boundary.as_deref())?;
-            let decode = match backend {
+            let decode = if boundary.as_deref() == Some("bytes")
+                && (is_owned_bytes(&argument.ty) || is_borrowed_byte_slice(&argument.ty))
+            {
+                match backend {
+                    HostBackend::Python => quote! {
+                        let #ident: #owned = ::rspyts::backend::python::decode_bytes(#ident)
+                            .map_err(::rspyts::__private::pyo3::PyErr::from)?;
+                    },
+                    HostBackend::Wasm => quote! {
+                        let #ident: #owned = ::rspyts::backend::typescript::decode_bytes(&#ident)
+                            .map_err(::rspyts::__private::wasm_bindgen::JsValue::from)?;
+                    },
+                }
+            } else {
+                match backend {
                 HostBackend::Python => quote! {
                     let __rspyts_type = #ty_ref;
                     let __rspyts_wire = ::rspyts::backend::python::decode_typed(
@@ -598,6 +612,7 @@ fn wrapper_params(
                         ::rspyts::__private::wasm_bindgen::JsValue::from_str(&__rspyts_error.to_string())
                     })?;
                 },
+                }
             };
             Ok(WrapperParam {
                 declaration,
@@ -3026,7 +3041,11 @@ mod tests {
                 value.to_vec()
             }
         };
-        expand_function(ExportTarget::Both, accepted).unwrap();
+        let expanded = expand_function(ExportTarget::Both, accepted)
+            .unwrap()
+            .to_string();
+        assert!(expanded.contains("backend :: python :: decode_bytes"));
+        assert!(expanded.contains("backend :: typescript :: decode_bytes"));
 
         let fixed: ItemFn = syn::parse_quote! {
             #[rspyts(returns(bytes))]

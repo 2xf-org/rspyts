@@ -34,7 +34,7 @@ The repository pins Rust and Cargo in `rust-toolchain.toml`. Pin the CLI and
 runtime crates to the same exact release:
 
 ```sh
-cargo install rspyts-cli --version '=0.4.3' --locked
+cargo install rspyts-cli --version '=0.4.4' --locked
 ```
 
 Executable TypeScript also requires the pinned WebAssembly tool:
@@ -53,7 +53,7 @@ Use a workspace member whose library emits both an `rlib` and `cdylib`:
 crate-type = ["rlib", "cdylib"]
 
 [dependencies]
-rspyts = { version = "=0.4.3", default-features = false }
+rspyts = { version = "=0.4.4", default-features = false }
 serde = { version = "1", features = ["derive"] }
 wasm-bindgen = { version = "=0.2.126", optional = true }
 
