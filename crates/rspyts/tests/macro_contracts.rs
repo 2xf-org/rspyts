@@ -21,7 +21,7 @@ pub struct Record {
     pub revision: u16,
     #[rspyts(min_length = 1, max_length = 200)]
     pub items: Vec<String>,
-    #[rspyts(default = 1, ge = 1)]
+    #[rspyts(default = 1, ge = 1, le = 200)]
     pub count: u64,
     #[rspyts(default = "unknown")]
     pub category: String,
@@ -96,7 +96,7 @@ impl Counter {
 
 #[test]
 fn one_parameter_result_aliases_have_explicit_error_identity() {
-    let manifest = rspyts::registry::manifest("rspyts", "0.4.4", "native").unwrap();
+    let manifest = rspyts::registry::manifest("rspyts", "0.4.5", "native").unwrap();
     let function = manifest
         .functions
         .iter()
@@ -124,7 +124,7 @@ fn one_parameter_result_aliases_have_explicit_error_identity() {
 
 #[test]
 fn field_semantics_and_constant_targets_are_registered_exactly() {
-    let manifest = rspyts::registry::manifest("rspyts", "0.4.4", "native").unwrap();
+    let manifest = rspyts::registry::manifest("rspyts", "0.4.5", "native").unwrap();
     let record = manifest
         .types
         .iter()
@@ -138,6 +138,7 @@ fn field_semantics_and_constant_targets_are_registered_exactly() {
     assert_eq!(fields[1].constraints.max_length, Some(200));
     assert_eq!(fields[2].default, Some(ScalarValue::I64(1)));
     assert_eq!(fields[2].constraints.ge, Some(1));
+    assert_eq!(fields[2].constraints.le, Some(200));
     assert!(!fields[2].required);
     assert_eq!(
         fields[3].default,
@@ -189,7 +190,7 @@ fn field_semantics_and_constant_targets_are_registered_exactly() {
 fn registry_allows_macro_exports_to_reuse_names_on_disjoint_host_surfaces() {
     assert_eq!(python_surface::emitter_scoped_name(), 1);
     assert_eq!(typescript_surface::emitter_scoped_name(), 2);
-    let manifest = rspyts::registry::manifest("rspyts", "0.4.4", "native").unwrap();
+    let manifest = rspyts::registry::manifest("rspyts", "0.4.5", "native").unwrap();
     assert_eq!(
         manifest
             .functions
@@ -212,7 +213,7 @@ fn registry_allows_macro_exports_to_reuse_names_on_disjoint_host_surfaces() {
 
 #[test]
 fn fixed_byte_lengths_survive_fields_aliases_containers_and_exports() {
-    let manifest = rspyts::registry::manifest("rspyts", "0.4.4", "native").unwrap();
+    let manifest = rspyts::registry::manifest("rspyts", "0.4.5", "native").unwrap();
     let fixed = manifest
         .types
         .iter()

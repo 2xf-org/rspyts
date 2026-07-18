@@ -7,7 +7,7 @@ This reference describes the intentionally constrained rspyts 0.4 product.
 | Component | Supported value |
 | --- | --- |
 | Rust and Cargo | One workspace pinned to `1.88.0` |
-| rspyts crates and CLI | One exact matching version, currently `0.4.4` |
+| rspyts crates and CLI | One exact matching version, currently `0.4.5` |
 | Python artifact | Generated source packaged as one CPython 3.11+ abi3 wheel |
 | TypeScript runtime | Browser WASM built with wasm-bindgen `0.2.126` |
 | Static TypeScript | ESM, declarations, and JSON-safe values |
@@ -170,6 +170,11 @@ must be finite; integer-valued JSON numbers must fit JavaScript's safe range.
 Host names follow Serde's canonical `rename`, `rename_all`, `tag`, and supported
 default rules. Aliases, flattening, untagged enums, directional names, and
 automatic repair of invalid or colliding names are rejected.
+
+Field contracts support scalar `literal` and `default` values, string/list
+`min_length` and `max_length`, and integer `ge` and `le` bounds. Generated
+Pydantic models are strict, so booleans, strings, and floats are not coerced
+into integer fields.
 
 ### Exports
 

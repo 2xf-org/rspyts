@@ -320,7 +320,7 @@ fn classify_changed(path: &str, old: &Value, new: &Value) -> Compatibility {
     if path.ends_with(".constraints.minLength") || path.ends_with(".constraints.ge") {
         return classify_lower_bound(old, new);
     }
-    if path.ends_with(".constraints.maxLength") {
+    if path.ends_with(".constraints.maxLength") || path.ends_with(".constraints.le") {
         return classify_upper_bound(old, new);
     }
     Compatibility::Breaking
@@ -454,6 +454,45 @@ mod tests {
         let mut tightened_field = string_field();
         tightened_field.constraints.min_length = Some(3);
         tightened_field.constraints.max_length = Some(8);
+        let tightened = ContractDiff::between(&old, &manifest_with_field(tightened_field));
+        assert!(
+            tightened
+                .changes
+                .iter()
+                .all(|change| change.compatibility == Compatibility::Breaking)
+        );
+
+        let mut old_field = string_field();
+        old_field.ty = TypeRef::Int {
+            signed: true,
+            bits: 32,
+        };
+        old_field.constraints.ge = Some(2);
+        old_field.constraints.le = Some(10);
+        let old = manifest_with_field(old_field);
+
+        let mut relaxed_field = string_field();
+        relaxed_field.ty = TypeRef::Int {
+            signed: true,
+            bits: 32,
+        };
+        relaxed_field.constraints.ge = Some(1);
+        relaxed_field.constraints.le = Some(12);
+        let relaxed = ContractDiff::between(&old, &manifest_with_field(relaxed_field));
+        assert!(
+            relaxed
+                .changes
+                .iter()
+                .all(|change| change.compatibility == Compatibility::Additive)
+        );
+
+        let mut tightened_field = string_field();
+        tightened_field.ty = TypeRef::Int {
+            signed: true,
+            bits: 32,
+        };
+        tightened_field.constraints.ge = Some(3);
+        tightened_field.constraints.le = Some(8);
         let tightened = ContractDiff::between(&old, &manifest_with_field(tightened_field));
         assert!(
             tightened

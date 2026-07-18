@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::fmt;
 
-pub const IR_VERSION: u32 = 5;
+pub const IR_VERSION: u32 = 6;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -183,6 +183,7 @@ pub struct FieldConstraints {
     pub min_length: Option<u64>,
     pub max_length: Option<u64>,
     pub ge: Option<i64>,
+    pub le: Option<i64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

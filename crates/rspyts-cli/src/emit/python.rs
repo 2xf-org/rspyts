@@ -159,7 +159,7 @@ fn python_type(item: &TypeDef, names: &TypeNames, contract: &ResolvedContract) -
             output.push_str(&format!("class {}(__rspyts_BaseModel__):\n", item.name));
             output.push_str(&python_doc(item.docs.as_deref(), "    "));
             output.push_str(
-                "    model_config = __rspyts_ConfigDict__(populate_by_name=True, arbitrary_types_allowed=True, extra=\"forbid\", frozen=True, validate_default=True, allow_inf_nan=False)\n",
+                "    model_config = __rspyts_ConfigDict__(populate_by_name=True, arbitrary_types_allowed=True, extra=\"forbid\", frozen=True, validate_default=True, allow_inf_nan=False, strict=True)\n",
             );
             if fields.is_empty() {
                 output.push_str("    pass\n");
@@ -205,7 +205,7 @@ fn python_type(item: &TypeDef, names: &TypeNames, contract: &ResolvedContract) -
                 output.push_str(&format!("class {name}(__rspyts_BaseModel__):\n"));
                 output.push_str(&python_doc(variant.docs.as_deref(), "    "));
                 output.push_str(
-                    "    model_config = __rspyts_ConfigDict__(populate_by_name=True, arbitrary_types_allowed=True, extra=\"forbid\", frozen=True, validate_default=True, allow_inf_nan=False)\n",
+                    "    model_config = __rspyts_ConfigDict__(populate_by_name=True, arbitrary_types_allowed=True, extra=\"forbid\", frozen=True, validate_default=True, allow_inf_nan=False, strict=True)\n",
                 );
                 if tag_field == *tag {
                     let wire_name = python_string_literal(&variant.wire_name);
@@ -252,7 +252,13 @@ fn python_field(field: &FieldDef, names: &TypeNames, contract: &ResolvedContract
                 format!("__rspyts_Literal__[{literal}]")
             }
         }
-        None => python_field_ref(&field.ty, names, contract, field.constraints.ge),
+        None => python_field_ref(
+            &field.ty,
+            names,
+            contract,
+            field.constraints.ge,
+            field.constraints.le,
+        ),
     };
     if !field.required && field.default.is_none() && !matches!(field.ty, TypeRef::Option { .. }) {
         ty = format!("{ty} | None");
@@ -967,39 +973,61 @@ fn python_field_ref(
     names: &TypeNames,
     contract: &ResolvedContract,
     minimum: Option<i64>,
+    maximum: Option<i64>,
 ) -> String {
-    let Some(minimum) = minimum else {
+    if minimum.is_none() && maximum.is_none() {
         return python_ref(reference, names);
-    };
+    }
     match reference {
         TypeRef::Int { signed, bits } => {
-            let (intrinsic_minimum, maximum) = intrinsic_integer_bounds(*signed, *bits);
-            let minimum = i128::from(minimum).max(intrinsic_minimum);
+            let (intrinsic_minimum, intrinsic_maximum) = intrinsic_integer_bounds(*signed, *bits);
+            let minimum = minimum
+                .map(i128::from)
+                .unwrap_or(intrinsic_minimum)
+                .max(intrinsic_minimum);
+            let maximum = maximum
+                .map(i128::from)
+                .unwrap_or(intrinsic_maximum)
+                .min(intrinsic_maximum);
             format!(
                 "__rspyts_Annotated__[__rspyts_builtins__.int, __rspyts_Field__(ge={minimum}, le={maximum})]"
             )
         }
         TypeRef::Float { bits: 32 } => {
-            let minimum = (minimum as f64).max(-3.4028234663852886e38);
+            let minimum = minimum
+                .map(|value| value as f64)
+                .unwrap_or(-3.4028234663852886e38)
+                .max(-3.4028234663852886e38);
+            let maximum = maximum
+                .map(|value| value as f64)
+                .unwrap_or(3.4028234663852886e38)
+                .min(3.4028234663852886e38);
             format!(
-                "__rspyts_Annotated__[__rspyts_builtins__.float, __rspyts_Field__(ge={minimum}, le=3.4028234663852886e38, allow_inf_nan=False)]"
+                "__rspyts_Annotated__[__rspyts_builtins__.float, __rspyts_Field__(ge={minimum}, le={maximum}, allow_inf_nan=False)]"
             )
         }
         TypeRef::Float { bits: 64 } => {
-            let minimum = (minimum as f64).max(-1.7976931348623157e308);
+            let minimum = minimum
+                .map(|value| value as f64)
+                .unwrap_or(-1.7976931348623157e308)
+                .max(-1.7976931348623157e308);
+            let maximum = maximum
+                .map(|value| value as f64)
+                .unwrap_or(1.7976931348623157e308)
+                .min(1.7976931348623157e308);
             format!(
-                "__rspyts_Annotated__[__rspyts_builtins__.float, __rspyts_Field__(ge={minimum}, le=1.7976931348623157e308, allow_inf_nan=False)]"
+                "__rspyts_Annotated__[__rspyts_builtins__.float, __rspyts_Field__(ge={minimum}, le={maximum}, allow_inf_nan=False)]"
             )
         }
         TypeRef::Option { item } => format!(
             "{} | None",
-            python_field_ref(item, names, contract, Some(minimum))
+            python_field_ref(item, names, contract, minimum, maximum)
         ),
         TypeRef::Named { identity } => match type_definition(contract, identity) {
             Some(TypeDef {
                 shape: TypeShape::Alias { target },
                 ..
-            }) => python_field_ref(target, names, contract, Some(minimum)),
+            }) => python_field_ref(target, names, contract, minimum, maximum),
             _ => python_ref(reference, names),
         },
         _ => python_ref(reference, names),
@@ -1808,6 +1836,7 @@ mod tests {
                                 default: Some(ScalarValue::I64(10)),
                                 constraints: rspyts::ir::FieldConstraints {
                                     ge: Some(10),
+                                    le: Some(200),
                                     ..Default::default()
                                 },
                             },
@@ -1889,7 +1918,7 @@ mod tests {
             "u16_value: __rspyts_Annotated__[__rspyts_builtins__.int, __rspyts_Field__(ge=0, le=65535)]",
             "u32_value: __rspyts_Annotated__[__rspyts_builtins__.int, __rspyts_Field__(ge=0, le=4294967295)]",
             "u64_value: __rspyts_Annotated__[__rspyts_builtins__.int, __rspyts_Field__(ge=0, le=18446744073709551615)]",
-            "bounded_u32: __rspyts_Annotated__[__rspyts_builtins__.int, __rspyts_Field__(ge=10, le=4294967295)] = __rspyts_Field__(default=10)",
+            "bounded_u32: __rspyts_Annotated__[__rspyts_builtins__.int, __rspyts_Field__(ge=10, le=200)] = __rspyts_Field__(default=10)",
             "literal_u8: __rspyts_Literal__[7]",
             "default_i16: __rspyts_Annotated__[__rspyts_builtins__.int, __rspyts_Field__(ge=-32768, le=32767)] = __rspyts_Field__(default=-3)",
             "alias_u32: U32Alias",
@@ -4415,7 +4444,7 @@ for value in invalid:
         let generated = models(&contract, &type_names(&contract));
 
         assert!(generated.contains(
-            "__rspyts_ConfigDict__(populate_by_name=True, arbitrary_types_allowed=True, extra=\"forbid\", frozen=True, validate_default=True, allow_inf_nan=False)"
+            "__rspyts_ConfigDict__(populate_by_name=True, arbitrary_types_allowed=True, extra=\"forbid\", frozen=True, validate_default=True, allow_inf_nan=False, strict=True)"
         ));
         assert!(generated.contains("__all__ = [\n    \"JsonValue\",\n    \"Value\",\n]"));
         assert!(!generated.contains("    \"TypeAdapter\","));
@@ -4510,6 +4539,7 @@ for value in invalid:
                                 Some(ScalarValue::I64(1)),
                                 rspyts::ir::FieldConstraints {
                                     ge: Some(1),
+                                    le: Some(200),
                                     ..Default::default()
                                 },
                             ),
@@ -4556,7 +4586,7 @@ for value in invalid:
         assert!(generated.contains("revision: __rspyts_Literal__[2]"));
         assert!(generated.contains("items: __rspyts_builtins__.list[__rspyts_builtins__.str] = __rspyts_Field__(min_length=1, max_length=200)"));
         assert!(
-            generated.contains("count: __rspyts_Annotated__[__rspyts_builtins__.int, __rspyts_Field__(ge=1, le=4294967295)] = __rspyts_Field__(default=1)")
+            generated.contains("count: __rspyts_Annotated__[__rspyts_builtins__.int, __rspyts_Field__(ge=1, le=200)] = __rspyts_Field__(default=1)")
         );
         assert!(!generated.contains("count: __rspyts_builtins__.int | None"));
         assert!(generated.contains("status: Status = __rspyts_Field__(default=\"unknown\")"));

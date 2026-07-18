@@ -102,6 +102,7 @@ describe("generated browser package", () => {
       { ...valid, schemaVersion: 2 } as unknown as BatchOptions,
       { ...valid, label: "" },
       { ...valid, attempts: 0 },
+      { ...valid, attempts: 4 },
       { ...valid, createdAt: "2030-01-02T03:04:05" },
       { ...valid, groups: [] },
     ];

@@ -53,7 +53,7 @@ pub struct BatchOptions {
     pub schema_version: u32,
     #[rspyts(min_length = 1, max_length = 32)]
     pub label: String,
-    #[rspyts(default = 1, ge = 1)]
+    #[rspyts(default = 1, ge = 1, le = 3)]
     pub attempts: u32,
     pub created_at: chrono::DateTime<chrono::Utc>,
     #[rspyts(min_length = 1, max_length = 3)]

@@ -100,6 +100,10 @@ def test_defaults_constraints_and_aware_datetimes() -> None:
         {"schema_version": 2},
         {"label": ""},
         {"attempts": 0},
+        {"attempts": 4},
+        {"attempts": True},
+        {"attempts": "2"},
+        {"attempts": 2.0},
         {"created_at": datetime(2030, 1, 2, 3, 4, 5)},
         {"groups": []},
     )

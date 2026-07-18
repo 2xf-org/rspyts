@@ -13,7 +13,7 @@ fn fixed_bytes_have_an_exact_versioned_ir_shape() {
         })
     );
     assert_eq!(serde_json::from_value::<TypeRef>(json).unwrap(), ty);
-    assert_eq!(IR_VERSION, 5);
+    assert_eq!(IR_VERSION, 6);
 }
 
 #[test]

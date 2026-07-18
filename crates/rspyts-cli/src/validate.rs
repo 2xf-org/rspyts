@@ -654,6 +654,20 @@ fn validate_constant_constraints(
             bail!("{path} expected integer >= {minimum}, found {value}");
         }
     }
+    if let Some(maximum) = constraints.le {
+        let passes = value
+            .as_i64()
+            .map(|value| value <= maximum)
+            .or_else(|| {
+                value
+                    .as_u64()
+                    .map(|value| maximum >= 0 && value <= maximum as u64)
+            })
+            .unwrap_or(false);
+        if !passes {
+            bail!("{path} expected integer <= {maximum}, found {value}");
+        }
+    }
     Ok(())
 }
 
@@ -1733,6 +1747,11 @@ fn validate_field_contract(
     {
         bail!("field `{label}` has minLength greater than maxLength");
     }
+    if let (Some(minimum), Some(maximum)) = (field.constraints.ge, field.constraints.le)
+        && minimum > maximum
+    {
+        bail!("field `{label}` has ge greater than le");
+    }
 
     let kind = field_kind(&field.ty, type_definitions, &mut BTreeSet::new());
     if (field.constraints.min_length.is_some() || field.constraints.max_length.is_some())
@@ -1757,8 +1776,10 @@ fn validate_field_contract(
             "field `{label}` has length constraints incompatible with its fixed byte length {length}"
         );
     }
-    if field.constraints.ge.is_some() && !matches!(kind, FieldKind::Integer { .. }) {
-        bail!("field `{label}` applies ge to a non-integer type");
+    if (field.constraints.ge.is_some() || field.constraints.le.is_some())
+        && !matches!(kind, FieldKind::Integer { .. })
+    {
+        bail!("field `{label}` applies ge or le to a non-integer type");
     }
     for (name, value) in [
         ("literal", field.constraints.literal.as_ref()),
@@ -1924,6 +1945,11 @@ fn validate_scalar_constraints(
         && field.constraints.ge.is_some_and(|minimum| *value < minimum)
     {
         bail!("field `{label}` has a {name} below its ge constraint");
+    }
+    if let ScalarValue::I64(value) = value
+        && field.constraints.le.is_some_and(|maximum| *value > maximum)
+    {
+        bail!("field `{label}` has a {name} above its le constraint");
     }
     Ok(())
 }
@@ -3411,6 +3437,19 @@ mod tests {
                 .unwrap_err()
                 .to_string()
                 .contains("minLength")
+        );
+
+        let mut invalid_bounds = field(TypeRef::Int {
+            signed: true,
+            bits: 32,
+        });
+        invalid_bounds.constraints.ge = Some(3);
+        invalid_bounds.constraints.le = Some(2);
+        assert!(
+            manifest(&contract_with_field(invalid_bounds))
+                .unwrap_err()
+                .to_string()
+                .contains("ge greater than le")
         );
 
         let mut invalid_default = field(TypeRef::Int {

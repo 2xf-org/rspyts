@@ -295,6 +295,7 @@ fn missing_defaults_are_inserted_and_constraints_use_field_paths() {
                 default: Some(ScalarValue::I64(1)),
                 constraints: FieldConstraints {
                     ge: Some(1),
+                    le: Some(2),
                     ..Default::default()
                 },
             }],
@@ -318,6 +319,15 @@ fn missing_defaults_are_inserted_and_constraints_use_field_paths() {
     .unwrap_err();
     assert!(error.to_string().contains("$.quantity"));
     assert!(error.to_string().contains(">= 1"));
+
+    let error = normalize_wire(
+        &WireValue::Object(BTreeMap::from([("quantity".to_owned(), WireValue::U64(3))])),
+        &named("Batch"),
+        &types,
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("$.quantity"));
+    assert!(error.to_string().contains("<= 2"));
 }
 
 #[test]

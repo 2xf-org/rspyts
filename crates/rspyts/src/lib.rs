@@ -107,10 +107,10 @@ mod discovery {
 
         #[test]
         fn success_returns_an_owned_manifest_payload() {
-            let result = contract(PYTHON | TYPESCRIPT, || Ok(r#"{"irVersion":5}"#.to_owned()));
+            let result = contract(PYTHON | TYPESCRIPT, || Ok(r#"{"irVersion":6}"#.to_owned()));
             assert_eq!(result.status, SUCCESS);
             assert_eq!(result.capabilities, PYTHON | TYPESCRIPT);
-            assert_eq!(payload(&result), r#"{"irVersion":5}"#);
+            assert_eq!(payload(&result), r#"{"irVersion":6}"#);
             // SAFETY: the pointer came from `contract` and is released exactly once.
             unsafe { free(result.payload) };
         }
