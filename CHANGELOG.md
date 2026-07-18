@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.4.4
+
+- Decode dynamic `#[rspyts(bytes)]` function and resource parameters directly
+  from Python bytes or JavaScript `Uint8Array` values instead of expanding one
+  Rust intermediate value per byte.
+- Stream byte sequences through the Rust codec so large binary payloads remain
+  bounded by their actual byte size.
+
 ## 0.4.3
 
 - Keep repository fixtures product-neutral so protected release scans can
@@ -75,5 +83,5 @@
   package surface.
 - Repair the crate README links to the project documentation.
 
-Install 0.4.3, inspect the current contract, review the reported drift, then
+Install 0.4.4, inspect the current contract, review the reported drift, then
 run `rspyts lock`. Update dependency owners before their consumers.

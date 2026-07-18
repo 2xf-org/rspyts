@@ -328,6 +328,13 @@ fn fixed_byte_arrays_round_trip_and_enforce_the_rust_length() {
 }
 
 #[test]
+fn large_byte_inputs_decode_without_materializing_one_raw_value_per_byte() {
+    let value = vec![0xa5; 8 * 1024 * 1024];
+    let decoded = decode::<Vec<u8>>(WireValue::Bytes(value.clone()), &TypeRef::Bytes, &[]).unwrap();
+    assert_eq!(decoded, value);
+}
+
+#[test]
 fn aware_datetimes_round_trip_through_the_datetime_contract() {
     let value = chrono::DateTime::parse_from_rfc3339("2026-07-16T12:30:00-04:00").unwrap();
     let wire = encode(&value, &TypeRef::DateTime, &[]).unwrap();

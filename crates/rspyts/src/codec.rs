@@ -1324,12 +1324,7 @@ impl<'de> de::Deserializer<'de> for RawValue {
         match self {
             Self::Sequence(values) => visitor.visit_seq(RawSeqAccess::new(values)),
             Self::Buffer(value) => visitor.visit_seq(RawSeqAccess::new(buffer_values(value))),
-            Self::Bytes(value) => visitor.visit_seq(RawSeqAccess::new(
-                value
-                    .into_iter()
-                    .map(|value| RawValue::U64(value.into()))
-                    .collect(),
-            )),
+            Self::Bytes(value) => visitor.visit_seq(RawByteSeqAccess::new(value)),
             value => Err(CodecError::schema("$", "sequence", raw_kind(&value))),
         }
     }
@@ -1503,6 +1498,36 @@ impl<'de> SeqAccess<'de> for RawSeqAccess {
         self.values
             .next()
             .map(|value| seed.deserialize(value))
+            .transpose()
+    }
+
+    fn size_hint(&self) -> Option<usize> {
+        Some(self.values.len())
+    }
+}
+
+struct RawByteSeqAccess {
+    values: std::vec::IntoIter<u8>,
+}
+
+impl RawByteSeqAccess {
+    fn new(values: Vec<u8>) -> Self {
+        Self {
+            values: values.into_iter(),
+        }
+    }
+}
+
+impl<'de> SeqAccess<'de> for RawByteSeqAccess {
+    type Error = CodecError;
+
+    fn next_element_seed<T: DeserializeSeed<'de>>(
+        &mut self,
+        seed: T,
+    ) -> Result<Option<T::Value>, Self::Error> {
+        self.values
+            .next()
+            .map(|value| seed.deserialize(RawValue::U64(value.into())))
             .transpose()
     }
 
