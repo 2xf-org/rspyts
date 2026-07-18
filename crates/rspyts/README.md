@@ -7,7 +7,7 @@ the target feature needed by the host build:
 
 ```toml
 [dependencies]
-rspyts = { version = "=0.4.4", default-features = false }
+rspyts = { version = "=0.4.5", default-features = false }
 ```
 
 The public surface includes `Type`, `Error`, `export`, and `module!`. The

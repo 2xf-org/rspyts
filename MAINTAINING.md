@@ -38,7 +38,7 @@ Use the repository toolchain from `rust-toolchain.toml`. From a clean checkout,
 build and test the exact Cargo archives:
 
 ```sh
-version=0.4.4
+version=0.4.5
 scripts/release/verify-crates.sh "$version"
 ```
 
@@ -67,7 +67,7 @@ git switch main
 git pull --ff-only origin main
 test "$(git rev-parse HEAD)" = "$(git rev-parse origin/main)"
 test -z "$(git status --porcelain)"
-version=0.4.4
+version=0.4.5
 git tag -a "v$version" -m "rspyts v$version"
 git push origin "refs/tags/v$version"
 ```

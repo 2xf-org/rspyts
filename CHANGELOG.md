@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.4.5
+
+- Add integer `le` field constraints across macro validation, semantic IR,
+  native codecs, generated Python, and static TypeScript.
+- Generate strict Pydantic models so integer fields reject boolean, string,
+  and floating-point coercions.
+- Advance the semantic contract to IR v6 for the new upper-bound metadata.
+
 ## 0.4.4
 
 - Decode dynamic `#[rspyts(bytes)]` function and resource parameters directly
@@ -83,5 +91,5 @@
   package surface.
 - Repair the crate README links to the project documentation.
 
-Install 0.4.4, inspect the current contract, review the reported drift, then
+Install 0.4.5, inspect the current contract, review the reported drift, then
 run `rspyts lock`. Update dependency owners before their consumers.

@@ -448,6 +448,27 @@ fn validate_constraints(
             ));
         }
     }
+    if let Some(maximum) = constraints.le {
+        let passes = match value {
+            WireValue::I64(value) => *value <= maximum,
+            WireValue::U64(value) if maximum >= 0 => *value <= maximum as u64,
+            WireValue::U64(_) => false,
+            _ => {
+                return Err(type_error(
+                    path,
+                    "integer for le constraint",
+                    wire_kind(value),
+                ));
+            }
+        };
+        if !passes {
+            return Err(type_error(
+                path,
+                &format!("integer <= {maximum}"),
+                wire_kind(value),
+            ));
+        }
+    }
     Ok(())
 }
 

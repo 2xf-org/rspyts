@@ -1519,6 +1519,7 @@ fn field_tokens(
     let min_length = option_u64_tokens(options.min_length);
     let max_length = option_u64_tokens(options.max_length);
     let ge = option_i64_tokens(options.ge);
+    let le = option_i64_tokens(options.le);
     Ok(quote!(::rspyts::ir::FieldDef {
         rust_name: #rust_name.to_owned(),
         wire_name: #wire_name.to_owned(),
@@ -1531,6 +1532,7 @@ fn field_tokens(
             min_length: #min_length,
             max_length: #max_length,
             ge: #ge,
+            le: #le,
         },
     }))
 }
@@ -1556,6 +1558,7 @@ struct FieldOptions {
     min_length: Option<u64>,
     max_length: Option<u64>,
     ge: Option<i64>,
+    le: Option<i64>,
     default: Option<SpannedScalar>,
 }
 
@@ -1595,6 +1598,13 @@ fn field_options(attrs: &[Attribute]) -> syn::Result<FieldOptions> {
                 if options.ge.replace(value).is_some() {
                     return Err(syn::Error::new(span, "`ge` may be declared only once"));
                 }
+            } else if meta.path.is_ident("le") {
+                let expression = meta.value()?.parse::<Expr>()?;
+                let span = expression.span();
+                let value = parse_i64(expression, "le")?;
+                if options.le.replace(value).is_some() {
+                    return Err(syn::Error::new(span, "`le` may be declared only once"));
+                }
             } else if meta.path.is_ident("default") {
                 let value = parse_scalar(meta.value()?.parse::<Expr>()?)?;
                 if options.default.replace(value).is_some() {
@@ -1602,7 +1612,7 @@ fn field_options(attrs: &[Attribute]) -> syn::Result<FieldOptions> {
                 }
             } else {
                 return Err(meta.error(
-                    "supported field attributes are buffer, bytes, required, literal, min_length, max_length, ge, and default",
+                    "supported field attributes are buffer, bytes, required, literal, min_length, max_length, ge, le, and default",
                 ));
             }
             Ok(())
@@ -1857,6 +1867,11 @@ fn validate_field_options(
             "`min_length` cannot exceed `max_length`",
         ));
     }
+    if let (Some(minimum), Some(maximum)) = (options.ge, options.le)
+        && minimum > maximum
+    {
+        return Err(syn::Error::new(field.span(), "`ge` cannot exceed `le`"));
+    }
     let kind = field_kind(&field.ty, options.boundary.as_deref());
     if (options.min_length.is_some() || options.max_length.is_some())
         && !matches!(
@@ -1869,10 +1884,12 @@ fn validate_field_options(
             "`min_length` and `max_length` apply only to string or list fields",
         ));
     }
-    if options.ge.is_some() && !matches!(kind, FieldKind::Integer | FieldKind::Unknown) {
+    if (options.ge.is_some() || options.le.is_some())
+        && !matches!(kind, FieldKind::Integer | FieldKind::Unknown)
+    {
         return Err(syn::Error::new(
             field.ty.span(),
-            "`ge` applies only to integer fields",
+            "`ge` and `le` apply only to integer fields",
         ));
     }
     if let Some(literal) = options.literal.as_ref() {
@@ -1903,6 +1920,24 @@ fn validate_field_options(
                 return Err(syn::Error::new(
                     *span,
                     format!("the field's `{label}` value is below its `ge` constraint"),
+                ));
+            }
+        }
+    }
+    if let Some(maximum) = options.le {
+        for (label, scalar) in [
+            ("literal", options.literal.as_ref()),
+            ("default", options.default.as_ref()),
+        ] {
+            if let Some(SpannedScalar {
+                value: ScalarValue::I64(value),
+                span,
+            }) = scalar
+                && *value > maximum
+            {
+                return Err(syn::Error::new(
+                    *span,
+                    format!("the field's `{label}` value is above its `le` constraint"),
                 ));
             }
         }
@@ -3251,6 +3286,15 @@ mod tests {
         let field: syn::Field = syn::parse_quote! {
             #[rspyts(min_length = 3, max_length = 2)]
             values: Vec<String>
+        };
+        let options = field_options(&field.attrs).unwrap();
+        let serde = serde_field(&field.attrs).unwrap();
+        let error = validate_field_options(&field, &options, &serde).unwrap_err();
+        assert!(error.to_string().contains("cannot exceed"));
+
+        let field: syn::Field = syn::parse_quote! {
+            #[rspyts(ge = 3, le = 2)]
+            value: i32
         };
         let options = field_options(&field.attrs).unwrap();
         let serde = serde_field(&field.attrs).unwrap();

@@ -765,6 +765,20 @@ fn validate_field_constraints(
             bail!("{path} expected integer >= {minimum}, found {value}");
         }
     }
+    if let Some(maximum) = constraints.le {
+        let passes = value
+            .as_i64()
+            .map(|value| value <= maximum)
+            .or_else(|| {
+                value
+                    .as_u64()
+                    .map(|value| maximum >= 0 && value <= maximum as u64)
+            })
+            .unwrap_or(false);
+        if !passes {
+            bail!("{path} expected integer <= {maximum}, found {value}");
+        }
+    }
     Ok(())
 }
 
