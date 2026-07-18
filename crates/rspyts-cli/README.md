@@ -4,7 +4,7 @@ The compiler and build command for
 [`rspyts`](https://crates.io/crates/rspyts).
 
 ```sh
-cargo install rspyts-cli --version '=0.4.5' --locked
+cargo install rspyts-cli --version '=0.4.6' --locked
 rspyts build
 rspyts check --locked
 ```

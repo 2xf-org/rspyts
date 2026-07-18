@@ -11,7 +11,10 @@ from example.owner.contracts import (
     BatchOptions,
     CalculationError,
     Calculator,
+    Item,
+    ItemKind,
     Magnitude,
+    Quantity,
     ResourceClosedError,
     VectorSpec,
     calculate,
@@ -96,8 +99,32 @@ def test_defaults_constraints_and_aware_datetimes() -> None:
     assert result.attempts == 1
     assert result.created_at == created_at
 
+    wire_options = BatchOptions.model_validate(
+        {
+            "schema_version": 1,
+            "label": "wire-example",
+            "created_at": created_at.isoformat(),
+            "groups": ["primary"],
+        }
+    )
+    assert wire_options.created_at == created_at
+
+    wire_item = Item.model_validate(
+        {
+            "id": "item-1",
+            "quantity": {"numerator": 1, "denominator": 1},
+            "kind": "standard",
+            "tag": b"wire",
+        }
+    )
+    assert wire_item.quantity == Quantity(numerator=1, denominator=1)
+    assert wire_item.kind is ItemKind.Standard
+
     invalid_values = (
         {"schema_version": 2},
+        {"schema_version": 1.0},
+        {"schema_version": True},
+        {"schema_version": "1"},
         {"label": ""},
         {"attempts": 0},
         {"attempts": 4},
@@ -105,6 +132,7 @@ def test_defaults_constraints_and_aware_datetimes() -> None:
         {"attempts": "2"},
         {"attempts": 2.0},
         {"created_at": datetime(2030, 1, 2, 3, 4, 5)},
+        {"created_at": 0},
         {"groups": []},
     )
     valid = {
@@ -116,3 +144,13 @@ def test_defaults_constraints_and_aware_datetimes() -> None:
     for override in invalid_values:
         with pytest.raises(ValidationError):
             BatchOptions(**(valid | override))
+
+    with pytest.raises(ValidationError):
+        Item.model_validate(
+            {
+                "id": "item-1",
+                "quantity": {"numerator": 1, "denominator": 1},
+                "kind": b"standard",
+                "tag": b"wire",
+            }
+        )
