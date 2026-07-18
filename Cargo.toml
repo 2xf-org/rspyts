@@ -13,7 +13,7 @@ default-members = [
 ]
 
 [workspace.package]
-version = "0.4.3"
+version = "0.4.4"
 edition = "2024"
 rust-version = "1.88"
 license = "MIT"
@@ -22,8 +22,8 @@ homepage = "https://github.com/2xf-org/rspyts"
 authors = ["Felipe Faria", "The rspyts contributors"]
 
 [workspace.dependencies]
-rspyts = { version = "=0.4.3", path = "crates/rspyts" }
-rspyts-macros = { version = "=0.4.3", path = "crates/rspyts-macros" }
+rspyts = { version = "=0.4.4", path = "crates/rspyts" }
+rspyts-macros = { version = "=0.4.4", path = "crates/rspyts-macros" }
 
 anyhow = "1.0"
 atomicwrites = "0.4.4"
