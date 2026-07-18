@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.4.6
+
+- Accept canonical JSON string values for generated Python string enums and
+  aware datetimes while keeping generated Pydantic models strict.
+- Reject coercible literal inputs, enum bytes, and numeric datetime timestamps
+  so Python and FastAPI preserve the Rust wire contract exactly.
+
 ## 0.4.5
 
 - Add integer `le` field constraints across macro validation, semantic IR,
@@ -91,5 +98,5 @@
   package surface.
 - Repair the crate README links to the project documentation.
 
-Install 0.4.5, inspect the current contract, review the reported drift, then
+Install 0.4.6, inspect the current contract, review the reported drift, then
 run `rspyts lock`. Update dependency owners before their consumers.

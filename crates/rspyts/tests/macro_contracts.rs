@@ -96,7 +96,8 @@ impl Counter {
 
 #[test]
 fn one_parameter_result_aliases_have_explicit_error_identity() {
-    let manifest = rspyts::registry::manifest("rspyts", "0.4.5", "native").unwrap();
+    let manifest =
+        rspyts::registry::manifest("rspyts", env!("CARGO_PKG_VERSION"), "native").unwrap();
     let function = manifest
         .functions
         .iter()
@@ -124,7 +125,8 @@ fn one_parameter_result_aliases_have_explicit_error_identity() {
 
 #[test]
 fn field_semantics_and_constant_targets_are_registered_exactly() {
-    let manifest = rspyts::registry::manifest("rspyts", "0.4.5", "native").unwrap();
+    let manifest =
+        rspyts::registry::manifest("rspyts", env!("CARGO_PKG_VERSION"), "native").unwrap();
     let record = manifest
         .types
         .iter()
@@ -190,7 +192,8 @@ fn field_semantics_and_constant_targets_are_registered_exactly() {
 fn registry_allows_macro_exports_to_reuse_names_on_disjoint_host_surfaces() {
     assert_eq!(python_surface::emitter_scoped_name(), 1);
     assert_eq!(typescript_surface::emitter_scoped_name(), 2);
-    let manifest = rspyts::registry::manifest("rspyts", "0.4.5", "native").unwrap();
+    let manifest =
+        rspyts::registry::manifest("rspyts", env!("CARGO_PKG_VERSION"), "native").unwrap();
     assert_eq!(
         manifest
             .functions
@@ -213,7 +216,8 @@ fn registry_allows_macro_exports_to_reuse_names_on_disjoint_host_surfaces() {
 
 #[test]
 fn fixed_byte_lengths_survive_fields_aliases_containers_and_exports() {
-    let manifest = rspyts::registry::manifest("rspyts", "0.4.5", "native").unwrap();
+    let manifest =
+        rspyts::registry::manifest("rspyts", env!("CARGO_PKG_VERSION"), "native").unwrap();
     let fixed = manifest
         .types
         .iter()

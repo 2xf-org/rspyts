@@ -66,7 +66,7 @@ rust-version = "1.88"
 crate-type = ["rlib", "cdylib"]
 
 [dependencies]
-rspyts = { version = "=0.4.5", default-features = false }
+rspyts = { version = "=0.4.6", default-features = false }
 serde = { version = "1", features = ["derive"] }
 thiserror = "2"
 wasm-bindgen = { version = "=0.2.126", optional = true }
@@ -158,7 +158,7 @@ or traverse symlinks.
 Install the matching tools, then build and lock:
 
 ```sh
-cargo install rspyts-cli --version '=0.4.5' --locked
+cargo install rspyts-cli --version '=0.4.6' --locked
 rustup target add wasm32-unknown-unknown --toolchain 1.88.0
 cargo install wasm-bindgen-cli --version '=0.2.126' --locked
 rspyts build
@@ -216,6 +216,12 @@ def calculate(
     checksum: Annotated[bytes, Field(min_length=4, max_length=4)],
 ) -> Calculation: ...
 ```
+
+Generated Python models are strict: integers, floats, booleans, strings, and
+literals are not coerced from other scalar types. At the JSON boundary, string
+enum values and ISO 8601 aware-datetime strings are accepted and converted to
+their typed Python representations. Bytes are not accepted as enum strings,
+and numeric timestamps are not accepted as datetimes.
 
 The executable TypeScript surface preserves typed arrays:
 
