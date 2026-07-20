@@ -11,7 +11,7 @@ pub trait ContractError: std::fmt::Display {
     fn code(&self) -> String;
 }
 
-#[cfg(all(feature = "python", not(target_arch = "wasm32")))]
+#[cfg(not(target_arch = "wasm32"))]
 pub mod python {
     use pyo3::prelude::*;
 

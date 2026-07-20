@@ -5,8 +5,6 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-homepage.workspace = true
-authors.workspace = true
 description = "Compiler and build orchestrator for rspyts"
 keywords = ["ffi", "python", "typescript", "wasm", "codegen"]
 categories = ["command-line-utilities", "development-tools::ffi"]
@@ -15,7 +13,6 @@ include = ["src/**", "README.md", "LICENSE"]
 [[bin]]
 name = "rspyts"
 path = "src/main.rs"
-doc = false
 
 [dependencies]
 rspyts.workspace = true

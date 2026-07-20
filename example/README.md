@@ -20,13 +20,13 @@ The `example-dice` crate owns the models and behavior. The `example` crate
 contains only this application declaration:
 
 ```rust
-rspyts::application!(native; example_dice);
+rspyts::application!(example_dice);
 ```
 
 Build both host packages:
 
 ```sh
-cargo run -p rspyts-cli -- build --manifest-path example/crates/bindings/Cargo.toml
+cargo run -p rspyts-cli -- build
 ```
 
 Then run the authored clients:

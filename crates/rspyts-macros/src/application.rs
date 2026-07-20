@@ -1,31 +1,25 @@
 use super::*;
 
 pub(super) struct ModuleInput {
-    module: Ident,
-    crates: Vec<syn::Path>,
+    crates: Vec<Ident>,
 }
 
 impl Parse for ModuleInput {
     fn parse(input: ParseStream<'_>) -> syn::Result<Self> {
-        let module = input.parse::<Ident>()?;
-        let mut crates = Vec::new();
-        if !input.is_empty() {
-            input.parse::<Token![;]>()?;
-            crates = Punctuated::<syn::Path, Token![,]>::parse_terminated(input)?
+        Ok(Self {
+            crates: Punctuated::<Ident, Token![,]>::parse_terminated(input)?
                 .into_iter()
-                .collect();
-        }
-        Ok(Self { module, crates })
+                .collect(),
+        })
     }
 }
 
 pub(super) fn expand_application(input: ModuleInput) -> TokenStream2 {
-    let module = input.module;
     let crates = input.crates;
     quote! {
         #(extern crate #crates as _;)*
 
-        #[cfg(all(feature = "wasm", target_arch = "wasm32"))]
+        #[cfg(target_arch = "wasm32")]
         use ::rspyts::__private::wasm_bindgen;
 
         #[cfg(not(target_arch = "wasm32"))]
@@ -35,7 +29,7 @@ pub(super) fn expand_application(input: ModuleInput) -> TokenStream2 {
                 let __rspyts_manifest = ::rspyts::registry::manifest(
                     env!("CARGO_PKG_NAME"),
                     env!("CARGO_PKG_VERSION"),
-                    stringify!(#module),
+                    "native",
                 ).map_err(|__rspyts_error| format!("invalid rspyts registry: {__rspyts_error}"))?;
                 ::rspyts::__private::serde_json::to_string(&__rspyts_manifest)
                     .map_err(|__rspyts_error| format!("rspyts manifest serialization failed: {__rspyts_error}"))
@@ -48,22 +42,24 @@ pub(super) fn expand_application(input: ModuleInput) -> TokenStream2 {
             unsafe { ::rspyts::__private::discovery_free(pointer) }
         }
 
-        #[cfg(all(feature = "python", not(target_arch = "wasm32")))]
+        #[cfg(not(target_arch = "wasm32"))]
         #[::rspyts::__private::pyo3::pymodule]
         #[pyo3(crate = "::rspyts::__private::pyo3")]
-        fn #module(
+        fn native(
             __rspyts_module: &::rspyts::__private::pyo3::Bound<'_, ::rspyts::__private::pyo3::types::PyModule>,
         ) -> ::rspyts::__private::pyo3::PyResult<()> {
             ::rspyts::runtime::python::register(__rspyts_module)
         }
 
-        #[cfg(all(feature = "wasm", target_arch = "wasm32"))]
-        #[::rspyts::__private::wasm_bindgen::prelude::wasm_bindgen]
+        #[cfg(target_arch = "wasm32")]
+        #[::rspyts::__private::wasm_bindgen::prelude::wasm_bindgen(
+            wasm_bindgen = ::rspyts::__private::wasm_bindgen
+        )]
         pub fn rspyts_contract_json() -> String {
             let __rspyts_manifest = ::rspyts::registry::manifest(
                 env!("CARGO_PKG_NAME"),
                 env!("CARGO_PKG_VERSION"),
-                stringify!(#module),
+                "native",
             ).expect("invalid rspyts registry");
             ::rspyts::__private::serde_json::to_string(&__rspyts_manifest)
                 .expect("rspyts manifest serialization failed")
@@ -77,8 +73,7 @@ mod tests {
 
     #[test]
     fn parses_one_aggregate_binding() {
-        let input = syn::parse_str::<ModuleInput>("native; catalog, reports::api").unwrap();
-        assert_eq!(input.module, "native");
+        let input = syn::parse_str::<ModuleInput>("catalog, reports").unwrap();
         assert_eq!(input.crates.len(), 2);
     }
 }

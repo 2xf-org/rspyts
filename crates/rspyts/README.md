@@ -8,7 +8,7 @@ TypeScript.
 
 ```toml
 [dependencies]
-rspyts = { version = "=1.0.0", default-features = false }
+rspyts = "=1.0.0"
 ```
 
 Read the [project README](https://github.com/2xf-org/rspyts).

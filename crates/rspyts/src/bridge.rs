@@ -1,6 +1,6 @@
 //! Direct Serde adapters for the Python and WebAssembly boundaries.
 
-#[cfg(all(feature = "python", not(target_arch = "wasm32")))]
+#[cfg(not(target_arch = "wasm32"))]
 pub mod python {
     use pyo3::exceptions::{PyRuntimeError, PyValueError};
     use pyo3::prelude::*;
@@ -25,7 +25,7 @@ pub mod python {
     }
 }
 
-#[cfg(all(feature = "wasm", target_arch = "wasm32"))]
+#[cfg(target_arch = "wasm32")]
 pub mod wasm {
     use serde::{Serialize, de::DeserializeOwned};
     use wasm_bindgen::JsValue;

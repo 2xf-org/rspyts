@@ -67,8 +67,8 @@ pub mod __private {
     pub use serde;
     pub use serde_json;
 
-    #[cfg(all(feature = "python", not(target_arch = "wasm32")))]
+    #[cfg(not(target_arch = "wasm32"))]
     pub use pyo3;
-    #[cfg(all(feature = "wasm", target_arch = "wasm32"))]
+    #[cfg(target_arch = "wasm32")]
     pub use wasm_bindgen;
 }

@@ -1,24 +1,32 @@
-# rspyts
+# 🦀 rspyts
 
-rspyts builds one Rust application API for Python and TypeScript.
+<p align="center">
+  <a href="https://github.com/2xf-org/rspyts/actions/workflows/validation.yml">
+    <img src="https://github.com/2xf-org/rspyts/actions/workflows/validation.yml/badge.svg" alt="Validation">
+  </a>
+  <a href="LICENSE">
+    <img src="https://img.shields.io/badge/License-MIT-yellow.svg" alt="MIT license">
+  </a>
+</p>
 
-You write the API in Rust. rspyts generates these two packages:
+rspyts compiles one Rust application API into installable Python and
+TypeScript packages. Python runs the API through PyO3. TypeScript runs the
+same API through WebAssembly.
 
-- A Python package with Pydantic models and a PyO3 native extension.
-- A TypeScript package with types and a WebAssembly module.
-
-rspyts has one operation model. It always builds both packages. It does not
-use a separate config file, package modes, contract locks, or generated
-package dependencies.
+One build produces Pydantic models, Python type information, TypeScript
+declarations, and the compiled Rust library for each host. rspyts has no
+configuration file and no separate Python or TypeScript mode.
 
 ## Requirements
 
-- Rust 1.88 or later.
-- Python 3.11 or later.
-- `wasm32-unknown-unknown`.
-- `wasm-bindgen-cli` 0.2.126.
+* Rust 1.88 or later.
+* Python 3.11 or later.
+* The `wasm32-unknown-unknown` Rust target.
+* `wasm-bindgen-cli` 0.2.126.
 
-Install the tools:
+## Installing
+
+Install the CLI and its WebAssembly tools:
 
 ```sh
 cargo install rspyts-cli --version '=1.0.0' --locked
@@ -26,42 +34,26 @@ rustup target add wasm32-unknown-unknown
 cargo install wasm-bindgen-cli --version '=0.2.126' --locked
 ```
 
-## Project structure
+## Using
 
-Keep domain code in normal Rust crates. Add one small application crate that
-links all exported crates.
+Create an application and build both packages:
 
-```text
-project/
-├── Cargo.toml
-├── domain/
-│   ├── Cargo.toml
-│   └── src/lib.rs
-└── bindings/
-    ├── Cargo.toml
-    └── src/lib.rs
+```sh
+rspyts init hello-rspyts
+cd hello-rspyts
+rspyts build
 ```
 
-The domain crate owns the API:
+`rspyts init` creates a Cargo workspace. It contains one API crate and one
+binding crate, plus small clients for the generated packages.
 
-```toml
-# domain/Cargo.toml
-[features]
-default = []
-python = ["rspyts/python"]
-wasm = ["rspyts/wasm", "dep:wasm-bindgen"]
-
-[dependencies]
-rspyts = { version = "=1.0.0", default-features = false }
-serde = { version = "1", features = ["derive"] }
-wasm-bindgen = { version = "=0.2.126", optional = true }
-```
+Write the public API in a normal Rust crate:
 
 ```rust
 use rspyts::Model;
 use serde::{Deserialize, Serialize};
 
-#[derive(Clone, Serialize, Deserialize, Model)]
+#[derive(Debug, Clone, Serialize, Deserialize, Model)]
 pub struct Greeting {
     pub message: String,
 }
@@ -74,78 +66,63 @@ pub fn greet(name: String) -> Greeting {
 }
 ```
 
-The application crate creates one binding:
-
-```toml
-# bindings/Cargo.toml
-[lib]
-crate-type = ["cdylib", "rlib"]
-
-[features]
-default = []
-python = ["rspyts/python-extension", "domain/python"]
-wasm = ["rspyts/wasm", "domain/wasm"]
-
-[dependencies]
-domain = { path = "../domain", default-features = false }
-rspyts = { version = "=1.0.0", default-features = false }
-```
+The binding crate links the application's Rust crates into one library:
 
 ```rust
-rspyts::application!(native; domain);
+rspyts::application!(hello_rspyts_api);
 ```
 
-Use Cargo package metadata only when the host package names must differ from
-the application crate name:
+`rspyts build` writes both packages beside the binding crate:
 
-```toml
-[package.metadata.rspyts]
-python = "my_application"
-typescript = "@my-org/my-application"
+```text
+crates/bindings/dist/
+├── python/
+└── typescript/
 ```
 
-## Build
-
-Run one command:
+Install and use the Python package:
 
 ```sh
-rspyts build --manifest-path bindings/Cargo.toml
+python -m pip install ./crates/bindings/dist/python
 ```
-
-rspyts writes `bindings/dist/python` and `bindings/dist/typescript`.
-
-Use the other two commands during development:
-
-```sh
-rspyts watch --manifest-path bindings/Cargo.toml
-rspyts check --manifest-path bindings/Cargo.toml
-```
-
-`watch` rebuilds when a Rust or Cargo file changes. `check` fails when `dist`
-does not match the Rust source.
-
-## Host code
-
-Python imports Pydantic models and Rust functions from one package:
 
 ```python
-from my_application import Greeting, greet
+from hello_rspyts import Greeting, greet
 
 result: Greeting = greet("Ada")
+print(result.message)
+# Hello, Ada!
 ```
 
-TypeScript imports the same API from one package. The package loads its
-WebAssembly module during import.
+Install and use the TypeScript package:
+
+```sh
+npm install ./crates/bindings/dist/typescript
+```
 
 ```typescript
-import { greet, type Greeting } from "@my-org/my-application";
+import { greet, type Greeting } from "hello-rspyts";
 
 const result: Greeting = greet("Ada");
+console.log(result.message);
+// Hello, Ada!
 ```
+
+The TypeScript package loads its WebAssembly module when you import it.
+
+## Commands
+
+* `rspyts init <path>` creates the Cargo workspace and both clients.
+* `rspyts build` builds both packages.
+* `rspyts watch` rebuilds when a Rust or Cargo file changes.
+* `rspyts check` fails when `dist` does not match the Rust source.
+
+Pass `--manifest-path path/to/Cargo.toml` when the workspace contains more
+than one binding crate.
 
 ## Example
 
-The [`example`](example/) directory contains the Rust application, its linked
-domain crate, and Python and TypeScript clients.
+The [`example`](example/) directory contains a Rust dice API, one binding
+crate, and clients in both languages.
 
 Licensed under [MIT](LICENSE).

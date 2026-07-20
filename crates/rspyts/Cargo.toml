@@ -5,18 +5,13 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-homepage.workspace = true
-authors.workspace = true
 description = "Compile one Rust API into Python and TypeScript packages"
 keywords = ["ffi", "python", "typescript", "wasm", "codegen"]
 categories = ["development-tools::ffi", "wasm"]
 include = ["src/**", "README.md", "LICENSE"]
 
 [features]
-default = []
-python = ["dep:pyo3", "dep:serde-pyobject"]
-python-extension = ["python", "pyo3/extension-module"]
-wasm = ["dep:js-sys", "dep:serde-wasm-bindgen", "dep:wasm-bindgen"]
+python-extension = ["pyo3/extension-module"]
 
 [dependencies]
 chrono.workspace = true
@@ -25,11 +20,11 @@ inventory.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
-pyo3 = { workspace = true, optional = true }
-serde-pyobject = { workspace = true, optional = true }
-js-sys = { workspace = true, optional = true }
-serde-wasm-bindgen = { workspace = true, optional = true }
-wasm-bindgen = { workspace = true, optional = true }
 
-[dev-dependencies]
-wasm-bindgen-test.workspace = true
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+pyo3.workspace = true
+serde-pyobject.workspace = true
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+serde-wasm-bindgen.workspace = true
+wasm-bindgen.workspace = true

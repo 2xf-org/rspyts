@@ -4,12 +4,15 @@ This crate provides the `rspyts` build command.
 
 ```sh
 cargo install rspyts-cli --version '=1.0.0' --locked
-rspyts build --manifest-path bindings/Cargo.toml
-rspyts check --manifest-path bindings/Cargo.toml
+rspyts init my-application
+rspyts build
+rspyts watch
+rspyts check
 ```
 
 The CLI always builds one Python package and one TypeScript and WebAssembly
-package. It writes both packages to `dist` next to the binding Cargo manifest.
+package. It finds the one binding crate in the Cargo workspace. It writes both
+packages to `dist` next to that crate.
 
 Read the [project README](https://github.com/2xf-org/rspyts).
 

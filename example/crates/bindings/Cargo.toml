@@ -1,21 +1,13 @@
 [package]
 name = "example"
-version = "1.0.0"
+version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 publish = false
 
 [lib]
-crate-type = ["cdylib", "rlib"]
-
-[features]
-default = []
-python = ["rspyts/python-extension", "example-dice/python"]
-wasm = ["rspyts/wasm", "example-dice/wasm"]
+crate-type = ["cdylib"]
 
 [dependencies]
-example-dice = { path = "../dice", default-features = false }
+example-dice = { path = "../dice" }
 rspyts.workspace = true
-
-[package.metadata.rspyts]
-python = "example"
-typescript = "example"
