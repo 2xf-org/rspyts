@@ -1,6 +1,6 @@
 """Use the package that rspyts generated from the Rust example."""
 
-from example import DEFAULT_SEED, DiceCup, RollResult
+from example.dice.fair.roll import DEFAULT_SEED, DiceCup, RollResult
 
 
 def roll_three_dice() -> RollResult:

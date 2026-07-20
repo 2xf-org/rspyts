@@ -58,6 +58,8 @@ fn expand_function(mut function: ItemFn) -> syn::Result<TokenStream2> {
         const _: () = {
             fn __rspyts_function_registration() -> ::rspyts::ir::FunctionDef {
                 ::rspyts::ir::FunctionDef {
+                    owner: ::rspyts::ir::CargoPackageId::new(env!("CARGO_PKG_NAME")),
+                    rust_module: module_path!().to_owned(),
                     rust_name: #rust_name.to_owned(),
                     host_name: #host_name.to_owned(),
                     docs: #docs,
@@ -332,6 +334,8 @@ fn constant_tokens(
                     ::std::format!("constant `{}` could not serialize as JSON: {__rspyts_error}", #host_name)
                 })?;
                 ::std::result::Result::Ok(::rspyts::ir::ConstantDef {
+                    owner: ::rspyts::ir::CargoPackageId::new(env!("CARGO_PKG_NAME")),
+                    rust_module: module_path!().to_owned(),
                     host_name: #host_name.to_owned(),
                     docs: #docs,
                     ty: __rspyts_type,
@@ -411,6 +415,8 @@ fn expand_resource(mut item: ItemImpl) -> syn::Result<TokenStream2> {
         const _: () = {
             fn __rspyts_resource_registration() -> ::rspyts::ir::ResourceDef {
                 ::rspyts::ir::ResourceDef {
+                    owner: ::rspyts::ir::CargoPackageId::new(env!("CARGO_PKG_NAME")),
+                    rust_module: module_path!().to_owned(),
                     name: #resource_name.to_owned(),
                     docs: #docs,
                     constructors: vec![#(#constructors),*],
@@ -785,6 +791,8 @@ fn resource_constructor_tokens(
     let params = params_tokens(&mut method.sig.inputs)?;
     let (_, error) = return_tokens(&method.sig.output, None, declared_error)?;
     Ok(quote!(::rspyts::ir::FunctionDef {
+        owner: ::rspyts::ir::CargoPackageId::new(env!("CARGO_PKG_NAME")),
+        rust_module: module_path!().to_owned(),
         rust_name: #rust_name.to_owned(),
         host_name: #host_name.to_owned(),
         docs: #docs,

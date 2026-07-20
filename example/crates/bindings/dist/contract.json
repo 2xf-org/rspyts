@@ -1,12 +1,13 @@
 {
-  "irVersion": 1,
+  "irVersion": 2,
   "packageName": "example",
-  "packageVersion": "1.0.0",
+  "packageVersion": "1.0.1",
   "moduleName": "native",
   "types": [
     {
       "owner": "example-dice",
-      "id": "example_dice::RollRequest",
+      "rustModule": "example_dice::fair::roll",
+      "id": "example_dice::fair::roll::RollRequest",
       "name": "RollRequest",
       "docs": "A request to roll one type of die.",
       "shape": {
@@ -55,9 +56,10 @@
     },
     {
       "owner": "example-dice",
-      "id": "example_dice::RollResult",
+      "rustModule": "example_dice::fair::roll",
+      "id": "example_dice::fair::roll::RollResult",
       "name": "RollResult",
-      "docs": "The result of a dice roll.",
+      "docs": "The result of a fair dice roll.",
       "shape": {
         "kind": "struct",
         "fields": [
@@ -104,21 +106,124 @@
           }
         ]
       }
+    },
+    {
+      "owner": "example-dice",
+      "rustModule": "example_dice::loaded::roll",
+      "id": "example_dice::loaded::roll::RollResult",
+      "name": "RollResult",
+      "docs": "The result of one loaded-die roll.",
+      "shape": {
+        "kind": "struct",
+        "fields": [
+          {
+            "rustName": "value",
+            "wireName": "value",
+            "docs": null,
+            "ty": {
+              "kind": "int",
+              "signed": false,
+              "bits": 32
+            },
+            "required": true,
+            "default": null,
+            "constraints": {
+              "literal": null,
+              "minLength": null,
+              "maxLength": null,
+              "ge": null,
+              "le": null
+            }
+          },
+          {
+            "rustName": "favored_value",
+            "wireName": "favoredValue",
+            "docs": null,
+            "ty": {
+              "kind": "int",
+              "signed": false,
+              "bits": 32
+            },
+            "required": true,
+            "default": null,
+            "constraints": {
+              "literal": null,
+              "minLength": null,
+              "maxLength": null,
+              "ge": null,
+              "le": null
+            }
+          }
+        ]
+      }
+    },
+    {
+      "owner": "example-dice",
+      "rustModule": "example_dice::summary",
+      "id": "example_dice::summary::RollSummary",
+      "name": "RollSummary",
+      "docs": "A named summary of one fair roll.",
+      "shape": {
+        "kind": "struct",
+        "fields": [
+          {
+            "rustName": "label",
+            "wireName": "label",
+            "docs": null,
+            "ty": {
+              "kind": "string"
+            },
+            "required": true,
+            "default": null,
+            "constraints": {
+              "literal": null,
+              "minLength": null,
+              "maxLength": null,
+              "ge": null,
+              "le": null
+            }
+          },
+          {
+            "rustName": "result",
+            "wireName": "result",
+            "docs": null,
+            "ty": {
+              "kind": "named",
+              "identity": {
+                "owner": "example-dice",
+                "id": "example_dice::fair::roll::RollResult"
+              }
+            },
+            "required": true,
+            "default": null,
+            "constraints": {
+              "literal": null,
+              "minLength": null,
+              "maxLength": null,
+              "ge": null,
+              "le": null
+            }
+          }
+        ]
+      }
     }
   ],
   "errors": [
     {
       "owner": "example-dice",
-      "id": "example_dice::RollError",
+      "rustModule": "example_dice::fair::roll",
+      "id": "example_dice::fair::roll::RollError",
       "name": "RollError",
-      "docs": "Errors from the example API."
+      "docs": "Errors from the fair dice API."
     }
   ],
   "functions": [
     {
+      "owner": "example-dice",
+      "rustModule": "example_dice::fair::roll",
       "rustName": "roll_dice",
       "hostName": "rollDice",
-      "docs": "Roll dice from a seed.\n\nThe seed makes the example repeatable in Rust, Python, and TypeScript.\n\n# Errors\n\nReturns [`RollError::InvalidRequest`] when the request is outside the supported ranges.",
+      "docs": "Roll dice from a seed.\n\n# Errors\n\nReturns [`RollError::InvalidRequest`] if the request is not valid.",
       "params": [
         {
           "rustName": "request",
@@ -127,7 +232,7 @@
             "kind": "named",
             "identity": {
               "owner": "example-dice",
-              "id": "example_dice::RollRequest"
+              "id": "example_dice::fair::roll::RollRequest"
             }
           }
         },
@@ -145,18 +250,20 @@
         "kind": "named",
         "identity": {
           "owner": "example-dice",
-          "id": "example_dice::RollResult"
+          "id": "example_dice::fair::roll::RollResult"
         }
       },
       "error": {
         "owner": "example-dice",
-        "id": "example_dice::RollError"
+        "id": "example_dice::fair::roll::RollError"
       }
     },
     {
+      "owner": "example-dice",
+      "rustModule": "example_dice::fair::roll",
       "rustName": "roll_values",
       "hostName": "rollValues",
-      "docs": "Roll dice and return a compact numeric buffer.\n\n# Errors\n\nReturns [`RollError::InvalidRequest`] when the request is outside the supported ranges.",
+      "docs": "Roll dice and return a compact numeric buffer.\n\n# Errors\n\nReturns [`RollError::InvalidRequest`] if the request is not valid.",
       "params": [
         {
           "rustName": "request",
@@ -165,7 +272,7 @@
             "kind": "named",
             "identity": {
               "owner": "example-dice",
-              "id": "example_dice::RollRequest"
+              "id": "example_dice::fair::roll::RollRequest"
             }
           }
         },
@@ -185,10 +292,12 @@
       },
       "error": {
         "owner": "example-dice",
-        "id": "example_dice::RollError"
+        "id": "example_dice::fair::roll::RollError"
       }
     },
     {
+      "owner": "example-dice",
+      "rustModule": "example_dice::fair::roll",
       "rustName": "seed_from_bytes",
       "hostName": "seedFromBytes",
       "docs": "Convert bytes to a repeatable seed.",
@@ -207,17 +316,85 @@
         "bits": 64
       },
       "error": null
+    },
+    {
+      "owner": "example-dice",
+      "rustModule": "example_dice::loaded::roll",
+      "rustName": "loaded_roll",
+      "hostName": "loadedRoll",
+      "docs": "Return one loaded-die result.",
+      "params": [
+        {
+          "rustName": "value",
+          "hostName": "value",
+          "ty": {
+            "kind": "int",
+            "signed": false,
+            "bits": 32
+          }
+        }
+      ],
+      "returns": {
+        "kind": "named",
+        "identity": {
+          "owner": "example-dice",
+          "id": "example_dice::loaded::roll::RollResult"
+        }
+      },
+      "error": null
+    },
+    {
+      "owner": "example-dice",
+      "rustModule": "example_dice::summary",
+      "rustName": "summarize_roll",
+      "hostName": "summarizeRoll",
+      "docs": "Add a label to a fair-roll result.\n\n# Errors\n\nReturns [`RollError::EmptyLabel`] if `label` is empty.",
+      "params": [
+        {
+          "rustName": "label",
+          "hostName": "label",
+          "ty": {
+            "kind": "string"
+          }
+        },
+        {
+          "rustName": "result",
+          "hostName": "result",
+          "ty": {
+            "kind": "named",
+            "identity": {
+              "owner": "example-dice",
+              "id": "example_dice::fair::roll::RollResult"
+            }
+          }
+        }
+      ],
+      "returns": {
+        "kind": "named",
+        "identity": {
+          "owner": "example-dice",
+          "id": "example_dice::summary::RollSummary"
+        }
+      },
+      "error": {
+        "owner": "example-dice",
+        "id": "example_dice::fair::roll::RollError"
+      }
     }
   ],
   "resources": [
     {
+      "owner": "example-dice",
+      "rustModule": "example_dice::fair::roll",
       "name": "DiceCup",
       "docs": null,
       "constructors": [
         {
+          "owner": "example-dice",
+          "rustModule": "example_dice::fair::roll",
           "rustName": "new",
           "hostName": "new",
-          "docs": "Create a dice cup.\n\n# Errors\n\nReturns [`RollError::InvalidRequest`] when `sides` is outside 2 through 100.",
+          "docs": "Create a dice cup.\n\n# Errors\n\nReturns [`RollError::InvalidRequest`] if `sides` is not from 2 through 100.",
           "params": [
             {
               "rustName": "sides",
@@ -242,12 +419,12 @@
             "kind": "named",
             "identity": {
               "owner": "example-dice",
-              "id": "example_dice::DiceCup"
+              "id": "example_dice::fair::roll::DiceCup"
             }
           },
           "error": {
             "owner": "example-dice",
-            "id": "example_dice::RollError"
+            "id": "example_dice::fair::roll::RollError"
           }
         }
       ],
@@ -255,7 +432,7 @@
         {
           "rustName": "roll",
           "hostName": "roll",
-          "docs": "Roll the dice in this cup.\n\n# Errors\n\nReturns [`RollError::InvalidRequest`] when `count` is outside 1 through 100.",
+          "docs": "Roll the dice in this cup.\n\n# Errors\n\nReturns [`RollError::InvalidRequest`] if `count` is not from 1 through 100.",
           "params": [
             {
               "rustName": "count",
@@ -271,12 +448,12 @@
             "kind": "named",
             "identity": {
               "owner": "example-dice",
-              "id": "example_dice::RollResult"
+              "id": "example_dice::fair::roll::RollResult"
             }
           },
           "error": {
             "owner": "example-dice",
-            "id": "example_dice::RollError"
+            "id": "example_dice::fair::roll::RollError"
           }
         }
       ]
@@ -284,15 +461,29 @@
   ],
   "constants": [
     {
+      "owner": "example-dice",
+      "rustModule": "example_dice::fair::roll",
       "hostName": "DEFAULT_SEED",
-      "docs": null,
+      "docs": "The default seed for a fair roll.",
       "ty": {
         "kind": "int",
         "signed": false,
         "bits": 64
       },
       "value": 42
+    },
+    {
+      "owner": "example-dice",
+      "rustModule": "example_dice::loaded::roll",
+      "hostName": "DEFAULT_FAVORED_VALUE",
+      "docs": "The default favored value.",
+      "ty": {
+        "kind": "int",
+        "signed": false,
+        "bits": 32
+      },
+      "value": 6
     }
   ],
-  "sourceFingerprint": "570250e433890f8c1260d151819c0a20"
+  "sourceFingerprint": "e0c1ca7b3ed60662e174cdfe93177dc8"
 }

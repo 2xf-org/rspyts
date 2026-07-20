@@ -6,6 +6,11 @@ Use `Model`, `Error`, `export`, and `application!` to define one Rust
 application API. The `rspyts-cli` crate builds the API for Python and
 TypeScript.
 
+The generated package paths follow the Cargo package names and Rust modules.
+The declaration location defines the path. Rust re-exports do not change it.
+All namespaces use one aggregate native extension and one aggregate
+WebAssembly file.
+
 An API crate that defines models normally needs these dependencies:
 
 ```toml

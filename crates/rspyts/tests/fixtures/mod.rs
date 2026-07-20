@@ -6,6 +6,27 @@ use chrono::{DateTime, Utc};
 use rspyts::Model;
 use serde::{Deserialize, Serialize};
 
+mod inline {
+    use rspyts::Model;
+    use serde::{Deserialize, Serialize};
+
+    /// A model declared in an inline Rust module.
+    #[allow(
+        dead_code,
+        reason = "the contract suite inspects this declaration without constructing it"
+    )]
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Model)]
+    pub struct InlineValue {
+        pub value: String,
+    }
+}
+
+#[allow(
+    unused_imports,
+    reason = "the contract suite verifies that a re-export does not change the declaration path"
+)]
+pub use inline::InlineValue;
+
 /// A stable identifier supplied by another system.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Model)]
 #[serde(transparent)]

@@ -6,7 +6,7 @@ The build needs Rust 1.88 or later and the `wasm32-unknown-unknown` target.
 After you install Rust, run:
 
 ```sh
-cargo install rspyts-cli --version '=1.0.0' --locked
+cargo install rspyts-cli --version '=1.0.1' --locked
 rustup target add wasm32-unknown-unknown
 ```
 
@@ -25,6 +25,10 @@ rspyts check
 The CLI always builds one Python package and one TypeScript and WebAssembly
 package. It finds the one binding crate in the Cargo workspace. It writes both
 packages to `dist` next to that crate.
+
+The generated public paths follow the Cargo package names and Rust declaration
+modules. The CLI does not use namespace configuration or namespace attributes.
+Root and parent namespaces do not export items from child namespaces.
 
 Python and Node.js are not build dependencies. The generated Python package
 requires CPython 3.11 or later. Its installer adds Pydantic 2 and adds NumPy 2

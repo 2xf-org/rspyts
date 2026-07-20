@@ -1,16 +1,18 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{CStr, c_char};
 use std::path::{Path, PathBuf};
 use std::process::Command as ProcessCommand;
 
 use anyhow::{Context, Result, bail};
 use libloading::{Library, Symbol};
-use rspyts::ir::Manifest;
+use rspyts::ir::{Manifest, Namespace};
 use serde::Serialize;
 use serde_json::Value;
 use tempfile::TempDir;
 
-use crate::contract::buffer_elements;
+use crate::contract::{
+    named_identities, namespace_refs, namespaces, tagged_variant_name, type_namespace, type_refs,
+};
 use crate::output::{file_tree, project_lock, replace_directory, source_fingerprint, write_json};
 use crate::{python, typescript};
 
@@ -175,6 +177,13 @@ pub(super) fn check(project: &Project) -> Result<()> {
             project.output().display()
         )
     })?;
+    validate_generated_files(&expected, &actual)
+}
+
+fn validate_generated_files(
+    expected: &BTreeMap<PathBuf, Vec<u8>>,
+    actual: &BTreeMap<PathBuf, Vec<u8>>,
+) -> Result<()> {
     let expected_names = expected.keys().cloned().collect::<BTreeSet<_>>();
     let actual_names = actual.keys().cloned().collect::<BTreeSet<_>>();
     let missing = expected_names.difference(&actual_names).collect::<Vec<_>>();
@@ -383,43 +392,209 @@ fn validate_contract(project: &Project, manifest: &Manifest) -> Result<()> {
     if manifest.module_name.is_empty() {
         bail!("the Python module name cannot be empty");
     }
-    let mut python_names = manifest
-        .types
-        .iter()
-        .map(|item| item.name.clone())
-        .chain(manifest.errors.iter().map(|item| item.name.clone()))
-        .chain(manifest.resources.iter().map(|item| item.name.clone()))
-        .chain(manifest.functions.iter().map(|item| item.rust_name.clone()))
-        .chain(manifest.constants.iter().map(|item| item.host_name.clone()))
-        .collect::<Vec<_>>();
-    python_names.extend(
-        buffer_elements(manifest)
-            .into_iter()
-            .map(|element| python::buffer_name(element).to_owned()),
-    );
-    unique_public_names("Python", python_names.into_iter())?;
-    unique_public_names(
-        "TypeScript",
-        manifest
+    validate_namespaces(manifest)?;
+    validate_model_namespace_cycles(manifest)?;
+    Ok(())
+}
+
+fn validate_namespaces(manifest: &Manifest) -> Result<()> {
+    let namespace_map = namespaces(manifest);
+    for (owner, rust_module) in export_origins(manifest) {
+        let namespace = manifest.namespace(owner, rust_module);
+        if let Some(package) = &namespace.package {
+            let segment = package.replace('-', "_");
+            if !is_python_identifier(&segment) {
+                bail!(
+                    "Cargo package `{owner}` derives the invalid Python namespace segment `{segment}`; rename the Cargo package"
+                );
+            }
+        }
+        for segment in rust_module.split("::").skip(1) {
+            if !is_python_identifier(segment) {
+                bail!(
+                    "Rust module `{rust_module}` in Cargo package `{owner}` contains the invalid Python namespace segment `{segment}`; rename the Rust module"
+                );
+            }
+        }
+    }
+    let mut python_paths = BTreeMap::<Vec<String>, Namespace>::new();
+    for namespace in namespace_map.keys() {
+        let path = namespace.python_segments();
+        if let Some(existing) = python_paths.insert(path.clone(), namespace.clone())
+            && existing != *namespace
+        {
+            bail!(
+                "Rust namespaces `{}` and `{}` both derive the Python path `{}`; rename one Cargo package",
+                display_namespace(&existing),
+                display_namespace(namespace),
+                path.join(".")
+            );
+        }
+    }
+    for (namespace, items) in namespace_map {
+        let mut python_names = items
             .types
             .iter()
-            .map(|item| item.name.as_str())
-            .chain(manifest.errors.iter().map(|item| item.name.as_str()))
-            .chain(manifest.resources.iter().map(|item| item.name.as_str()))
-            .chain(
-                manifest
-                    .functions
-                    .iter()
-                    .map(|item| item.host_name.as_str()),
-            )
-            .chain(
-                manifest
-                    .constants
-                    .iter()
-                    .map(|item| item.host_name.as_str()),
-            ),
-    )?;
+            .map(|item| item.name.clone())
+            .chain(items.errors.iter().map(|item| item.name.clone()))
+            .chain(items.resources.iter().map(|item| item.name.clone()))
+            .chain(items.functions.iter().map(|item| item.rust_name.clone()))
+            .chain(items.constants.iter().map(|item| item.host_name.clone()))
+            .collect::<Vec<_>>();
+        for item in &items.types {
+            if let rspyts::ir::TypeShape::TaggedEnum { variants, .. } = &item.shape {
+                python_names.extend(
+                    variants
+                        .iter()
+                        .map(|variant| tagged_variant_name(&item.name, &variant.rust_name)),
+                );
+            }
+        }
+        let mut buffers = BTreeSet::new();
+        for reference in namespace_refs(&items) {
+            crate::contract::collect_buffers(reference, &mut buffers);
+        }
+        python_names.extend(
+            buffers
+                .into_iter()
+                .map(|element| python::buffer_name(element).to_owned()),
+        );
+        unique_public_names("Python", python_names.into_iter())
+            .with_context(|| format!("in namespace `{}`", display_namespace(&namespace)))?;
+
+        let mut typescript_names = items
+            .types
+            .iter()
+            .map(|item| item.name.clone())
+            .chain(items.errors.iter().map(|item| item.name.clone()))
+            .chain(items.resources.iter().map(|item| item.name.clone()))
+            .chain(items.functions.iter().map(|item| item.host_name.clone()))
+            .chain(items.constants.iter().map(|item| item.host_name.clone()))
+            .collect::<Vec<_>>();
+        for item in &items.types {
+            if let rspyts::ir::TypeShape::TaggedEnum { variants, .. } = &item.shape {
+                typescript_names.extend(
+                    variants
+                        .iter()
+                        .map(|variant| tagged_variant_name(&item.name, &variant.rust_name)),
+                );
+            }
+        }
+        unique_public_names("TypeScript", typescript_names.into_iter())
+            .with_context(|| format!("in namespace `{}`", display_namespace(&namespace)))?;
+    }
     Ok(())
+}
+
+fn export_origins(manifest: &Manifest) -> Vec<(&rspyts::ir::CargoPackageId, &str)> {
+    let mut origins = manifest
+        .types
+        .iter()
+        .map(|item| (&item.owner, item.rust_module.as_str()))
+        .chain(
+            manifest
+                .errors
+                .iter()
+                .map(|item| (&item.owner, item.rust_module.as_str())),
+        )
+        .chain(
+            manifest
+                .functions
+                .iter()
+                .map(|item| (&item.owner, item.rust_module.as_str())),
+        )
+        .chain(
+            manifest
+                .resources
+                .iter()
+                .map(|item| (&item.owner, item.rust_module.as_str())),
+        )
+        .chain(
+            manifest
+                .constants
+                .iter()
+                .map(|item| (&item.owner, item.rust_module.as_str())),
+        )
+        .collect::<Vec<_>>();
+    origins.sort();
+    origins.dedup();
+    origins
+}
+
+fn validate_model_namespace_cycles(manifest: &Manifest) -> Result<()> {
+    let mut graph = BTreeMap::<Namespace, BTreeSet<Namespace>>::new();
+    for definition in &manifest.types {
+        let source = manifest.namespace(&definition.owner, &definition.rust_module);
+        graph.entry(source.clone()).or_default();
+        for reference in type_refs(definition) {
+            let mut identities = Vec::new();
+            named_identities(reference, &mut identities);
+            for identity in identities {
+                let target = type_namespace(identity, manifest)?;
+                if target != source {
+                    graph.entry(source.clone()).or_default().insert(target);
+                }
+            }
+        }
+    }
+    let mut complete = BTreeSet::new();
+    let mut active = BTreeSet::new();
+    let mut stack = Vec::new();
+    for namespace in graph.keys() {
+        if let Some(cycle) =
+            namespace_cycle(namespace, &graph, &mut active, &mut complete, &mut stack)
+        {
+            let path = cycle
+                .iter()
+                .map(display_namespace)
+                .collect::<Vec<_>>()
+                .join(" -> ");
+            bail!(
+                "Python model namespaces form a dependency cycle: {path}; move the declarations into one Rust module or remove the cyclic type reference"
+            );
+        }
+    }
+    Ok(())
+}
+
+fn namespace_cycle(
+    namespace: &Namespace,
+    graph: &BTreeMap<Namespace, BTreeSet<Namespace>>,
+    active: &mut BTreeSet<Namespace>,
+    complete: &mut BTreeSet<Namespace>,
+    stack: &mut Vec<Namespace>,
+) -> Option<Vec<Namespace>> {
+    if complete.contains(namespace) {
+        return None;
+    }
+    if active.contains(namespace) {
+        let start = stack.iter().position(|item| item == namespace).unwrap_or(0);
+        let mut cycle = stack[start..].to_vec();
+        cycle.push(namespace.clone());
+        return Some(cycle);
+    }
+    active.insert(namespace.clone());
+    stack.push(namespace.clone());
+    if let Some(targets) = graph.get(namespace) {
+        for target in targets {
+            if let Some(cycle) = namespace_cycle(target, graph, active, complete, stack) {
+                return Some(cycle);
+            }
+        }
+    }
+    stack.pop();
+    active.remove(namespace);
+    complete.insert(namespace.clone());
+    None
+}
+
+fn display_namespace(namespace: &Namespace) -> String {
+    let namespace = namespace.display();
+    if namespace.is_empty() {
+        "<root>".to_owned()
+    } else {
+        namespace
+    }
 }
 
 pub(super) fn unique_public_names<S: AsRef<str>>(
@@ -437,7 +612,7 @@ pub(super) fn unique_public_names<S: AsRef<str>>(
 }
 
 pub(super) fn validate_python_package(value: &str) -> Result<()> {
-    if value.is_empty() || value.split('.').any(|part| !is_identifier(part)) {
+    if value.is_empty() || value.split('.').any(|part| !is_python_identifier(part)) {
         bail!("Python package `{value}` must contain dot-separated identifiers");
     }
     Ok(())
@@ -471,6 +646,48 @@ pub(super) fn is_identifier(value: &str) -> bool {
         && chars.all(|character| character.is_ascii_alphanumeric() || character == '_')
 }
 
+fn is_python_identifier(value: &str) -> bool {
+    is_identifier(value)
+        && !matches!(
+            value,
+            "False"
+                | "None"
+                | "True"
+                | "and"
+                | "as"
+                | "assert"
+                | "async"
+                | "await"
+                | "break"
+                | "class"
+                | "continue"
+                | "def"
+                | "del"
+                | "elif"
+                | "else"
+                | "except"
+                | "finally"
+                | "for"
+                | "from"
+                | "global"
+                | "if"
+                | "import"
+                | "in"
+                | "is"
+                | "lambda"
+                | "nonlocal"
+                | "not"
+                | "or"
+                | "pass"
+                | "raise"
+                | "return"
+                | "try"
+                | "while"
+                | "with"
+                | "yield"
+        )
+}
+
 fn string<'a>(value: &'a Value, key: &str) -> Result<&'a str> {
     value[key]
         .as_str()
@@ -499,4 +716,234 @@ fn is_binding_package(package: &Value) -> bool {
 
 fn cargo() -> std::ffi::OsString {
     std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+    use std::path::PathBuf;
+
+    use rspyts::ir::{
+        CargoPackageId, ErrorDef, FieldConstraints, FieldDef, IR_VERSION, Manifest, TypeDef,
+        TypeRef, TypeShape,
+    };
+
+    use super::{validate_generated_files, validate_model_namespace_cycles, validate_namespaces};
+
+    fn model(owner: &str, module: &str, name: &str, references: Vec<TypeRef>) -> TypeDef {
+        TypeDef {
+            owner: CargoPackageId::new(owner),
+            rust_module: module.to_owned(),
+            id: format!("{module}::{name}"),
+            name: name.to_owned(),
+            docs: None,
+            shape: TypeShape::Struct {
+                fields: references
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, ty)| FieldDef {
+                        rust_name: format!("field_{index}"),
+                        wire_name: format!("field{index}"),
+                        docs: None,
+                        ty,
+                        required: true,
+                        default: None,
+                        constraints: FieldConstraints::default(),
+                    })
+                    .collect(),
+            },
+        }
+    }
+
+    fn manifest(types: Vec<TypeDef>) -> Manifest {
+        Manifest {
+            ir_version: IR_VERSION,
+            package_name: "app".to_owned(),
+            package_version: "1.0.1".to_owned(),
+            module_name: "native".to_owned(),
+            types,
+            errors: Vec::new(),
+            functions: Vec::new(),
+            resources: Vec::new(),
+            constants: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn accepts_an_acyclic_cross_namespace_model_reference() {
+        let target = model("app-domain", "app_domain::target", "Target", Vec::new());
+        let source = model(
+            "app-domain",
+            "app_domain::source",
+            "Source",
+            vec![TypeRef::Named {
+                identity: target.identity(),
+            }],
+        );
+
+        validate_model_namespace_cycles(&manifest(vec![source, target]))
+            .expect("an acyclic reference is valid");
+    }
+
+    #[test]
+    fn permits_a_model_cycle_inside_one_namespace() {
+        let mut first = model("app-domain", "app_domain::shared", "First", Vec::new());
+        let mut second = model("app-domain", "app_domain::shared", "Second", Vec::new());
+        let first_identity = first.identity();
+        let second_identity = second.identity();
+        let TypeShape::Struct { fields } = &mut first.shape else {
+            unreachable!();
+        };
+        fields.push(FieldDef {
+            rust_name: "second".to_owned(),
+            wire_name: "second".to_owned(),
+            docs: None,
+            ty: TypeRef::Named {
+                identity: second_identity,
+            },
+            required: true,
+            default: None,
+            constraints: FieldConstraints::default(),
+        });
+        let TypeShape::Struct { fields } = &mut second.shape else {
+            unreachable!();
+        };
+        fields.push(FieldDef {
+            rust_name: "first".to_owned(),
+            wire_name: "first".to_owned(),
+            docs: None,
+            ty: TypeRef::Named {
+                identity: first_identity,
+            },
+            required: true,
+            default: None,
+            constraints: FieldConstraints::default(),
+        });
+
+        validate_model_namespace_cycles(&manifest(vec![first, second]))
+            .expect("references inside one namespace do not form an import cycle");
+    }
+
+    #[test]
+    fn reports_the_complete_cross_namespace_model_cycle() {
+        let mut first = model("app-domain", "app_domain::first", "First", Vec::new());
+        let mut second = model("app-domain", "app_domain::second", "Second", Vec::new());
+        let first_identity = first.identity();
+        let second_identity = second.identity();
+        let TypeShape::Struct { fields } = &mut first.shape else {
+            unreachable!();
+        };
+        fields.push(FieldDef {
+            rust_name: "second".to_owned(),
+            wire_name: "second".to_owned(),
+            docs: None,
+            ty: TypeRef::Named {
+                identity: second_identity,
+            },
+            required: true,
+            default: None,
+            constraints: FieldConstraints::default(),
+        });
+        let TypeShape::Struct { fields } = &mut second.shape else {
+            unreachable!();
+        };
+        fields.push(FieldDef {
+            rust_name: "first".to_owned(),
+            wire_name: "first".to_owned(),
+            docs: None,
+            ty: TypeRef::Named {
+                identity: first_identity,
+            },
+            required: true,
+            default: None,
+            constraints: FieldConstraints::default(),
+        });
+
+        let error = validate_model_namespace_cycles(&manifest(vec![first, second])).unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "Python model namespaces form a dependency cycle: domain::first -> domain::second -> domain::first; move the declarations into one Rust module or remove the cyclic type reference"
+        );
+    }
+
+    #[test]
+    fn rejects_a_python_keyword_in_a_derived_path() {
+        let keyword = model("app-domain", "app_domain::class", "Value", Vec::new());
+
+        let error = validate_namespaces(&manifest(vec![keyword])).unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "Rust module `app_domain::class` in Cargo package `app-domain` contains the invalid Python namespace segment `class`; rename the Rust module"
+        );
+    }
+
+    #[test]
+    fn identifies_the_cargo_package_that_makes_an_invalid_python_path() {
+        let invalid = model("app-123", "app_123", "Value", Vec::new());
+
+        let error = validate_namespaces(&manifest(vec![invalid])).unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "Cargo package `app-123` derives the invalid Python namespace segment `123`; rename the Cargo package"
+        );
+    }
+
+    #[test]
+    fn rejects_a_cross_kind_name_collision_in_one_namespace() {
+        let item = model("app-domain", "app_domain::shared", "Conflict", Vec::new());
+        let mut contract = manifest(vec![item]);
+        contract.errors.push(ErrorDef {
+            owner: CargoPackageId::new("app-domain"),
+            rust_module: "app_domain::shared".to_owned(),
+            id: "app_domain::shared::ConflictError".to_owned(),
+            name: "Conflict".to_owned(),
+            docs: None,
+        });
+
+        let error = validate_namespaces(&contract).unwrap_err();
+        let diagnostic = format!("{error:#}");
+
+        assert!(diagnostic.contains("in namespace `domain::shared`"));
+        assert!(diagnostic.contains("duplicate Python export name `Conflict`"));
+    }
+
+    #[test]
+    fn rejects_cargo_names_that_collapse_to_one_python_path() {
+        let first = model("app-foo-bar", "app_foo_bar", "First", Vec::new());
+        let second = model("app-foo_bar", "app_foo_bar", "Second", Vec::new());
+
+        let error = validate_namespaces(&manifest(vec![first, second])).unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "Rust namespaces `foo-bar` and `foo_bar` both derive the Python path `foo_bar`; rename one Cargo package"
+        );
+    }
+
+    #[test]
+    fn sync_check_reports_stale_flat_files() {
+        let expected = BTreeMap::from([(
+            PathBuf::from("python/example/domain/api.py"),
+            b"new\n".to_vec(),
+        )]);
+        let actual = BTreeMap::from([
+            (
+                PathBuf::from("python/example/domain/api.py"),
+                b"new\n".to_vec(),
+            ),
+            (PathBuf::from("python/example/api.py"), b"stale\n".to_vec()),
+        ]);
+
+        let error = validate_generated_files(&expected, &actual).unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("extra: [\"python/example/api.py\"]")
+        );
+        assert!(error.to_string().contains("run `rspyts build`"));
+    }
 }

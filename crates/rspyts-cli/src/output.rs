@@ -188,3 +188,30 @@ pub(super) fn write_json(path: &Path, value: &impl Serialize) -> Result<()> {
     source.push('\n');
     write(path, &source)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{replace_directory, write};
+
+    #[test]
+    fn publishing_a_build_removes_stale_flat_files() {
+        let parent = tempfile::tempdir().unwrap();
+        let output = parent.path().join("dist");
+        std::fs::create_dir(&output).unwrap();
+        write(&output.join("api.py"), "stale\n").unwrap();
+        write(&output.join("models.py"), "stale\n").unwrap();
+
+        let generated = tempfile::tempdir_in(parent.path()).unwrap();
+        write(
+            &generated.path().join("domain/model/__init__.py"),
+            "generated\n",
+        )
+        .unwrap();
+
+        replace_directory(&generated, &output).unwrap();
+
+        assert!(!output.join("api.py").exists());
+        assert!(!output.join("models.py").exists());
+        assert!(output.join("domain/model/__init__.py").is_file());
+    }
+}

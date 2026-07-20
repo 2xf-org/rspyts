@@ -51,6 +51,7 @@ pub(super) fn expand_type(input: DeriveInput) -> syn::Result<TokenStream2> {
             fn __rspyts_type_registration() -> ::rspyts::ir::TypeDef {
                 ::rspyts::ir::TypeDef {
                     owner: ::rspyts::ir::CargoPackageId::new(env!("CARGO_PKG_NAME")),
+                    rust_module: module_path!().to_owned(),
                     id: #id,
                     name: stringify!(#ident).to_owned(),
                     docs: #docs,
@@ -202,6 +203,7 @@ pub(super) fn expand_error(input: DeriveInput) -> syn::Result<TokenStream2> {
             fn __rspyts_error_registration() -> ::rspyts::ir::ErrorDef {
                 ::rspyts::ir::ErrorDef {
                     owner: ::rspyts::ir::CargoPackageId::new(env!("CARGO_PKG_NAME")),
+                    rust_module: module_path!().to_owned(),
                     id: #id.to_owned(),
                     name: stringify!(#ident).to_owned(),
                     docs: #docs,

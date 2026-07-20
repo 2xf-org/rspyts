@@ -74,6 +74,27 @@ jobs:
         run: |
           cargo run --locked -p rspyts-cli -- build
           cargo run --locked -p rspyts-cli -- check
+      - name: Check aggregate artifacts
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          root = Path("example/crates/bindings/dist")
+          native = [
+              path
+              for path in (root / "python").rglob("native.*")
+              if path.suffix in {".so", ".pyd"}
+          ]
+          wasm = list((root / "typescript").rglob("*.wasm"))
+
+          assert len(native) == 1, native
+          assert len(wasm) == 1, wasm
+          assert not (root / "python/example/api.py").exists()
+          assert not (root / "python/example/models.py").exists()
+          assert (root / "typescript/index.js").read_text() == ""
+          assert (root / "typescript/index.d.ts").read_text() == ""
+          PY
       - name: Test the Python client
         working-directory: example/clients/python
         run: |
