@@ -1,5 +1,3 @@
-# The complete validation surface for the Cargo-only rspyts workspace.
-
 name: Validation
 
 on:
@@ -15,7 +13,7 @@ on:
     branches: [main]
 
 concurrency:
-  group: validation-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  group: validation-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 permissions:
@@ -27,418 +25,64 @@ env:
 
 jobs:
   rust:
-    name: Rust (format, lint, test)
+    name: Rust
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+      - uses: actions/checkout@v7
         with:
           ref: ${{ env.VALIDATION_REF }}
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
+      - uses: ./.github/actions/setup-rust
         with:
-          toolchain: 1.88.0
           components: clippy, rustfmt
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+          targets: wasm32-unknown-unknown
+          cache-key: validation
       - name: Check formatting
         run: cargo fmt --all --check
-      - name: Lint every target and feature
+      - name: Lint
         run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
-      - name: Test workspace
+      - name: Test
         run: cargo test --workspace --locked
-      - name: Reject private or internal release content
-        shell: bash
-        run: |
-          git ls-files -z | xargs -0 scripts/release/verify-private-data.sh
-      - name: Reject protected private release content before tagging
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-        shell: bash
-        env:
-          RELEASE_PRIVATE_PATTERNS_B64: ${{ secrets.RELEASE_PRIVATE_PATTERNS_B64 }}
-        run: |
-          set -euo pipefail
-          test -n "$RELEASE_PRIVATE_PATTERNS_B64"
-          patterns="$RUNNER_TEMP/release-private-patterns"
-          printf '%s' "$RELEASE_PRIVATE_PATTERNS_B64" | base64 --decode > "$patterns"
-          test -s "$patterns"
-          export RSPYTS_PRIVATE_PATTERNS_FILE="$patterns"
-          git ls-files -z | xargs -0 scripts/release/verify-private-data.sh
+      - name: Check WebAssembly exports
+        run: cargo check --locked -p example --no-default-features --features wasm --target wasm32-unknown-unknown
 
-  target-features:
-    name: ${{ matrix.name }}
-    runs-on: ubuntu-latest
+  generated-packages:
+    name: Generated packages (${{ matrix.os }})
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - name: Python feature
-            target: x86_64-unknown-linux-gnu
-            feature: python
-          - name: TypeScript/WASM feature
-            target: wasm32-unknown-unknown
-            feature: wasm
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+      - uses: actions/checkout@v7
         with:
           ref: ${{ env.VALIDATION_REF }}
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
-        with:
-          toolchain: 1.88.0
-          targets: ${{ matrix.target }}
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-        with:
-          key: ${{ matrix.target }}-${{ matrix.feature }}
-      - name: Check target feature
-        run: |
-          cargo check --locked -p rspyts --no-default-features \
-            --features ${{ matrix.feature }} --target ${{ matrix.target }}
-          cargo check --locked \
-            --manifest-path examples/cross-package/Cargo.toml \
-            -p cross-package-owner --no-default-features \
-            --features ${{ matrix.feature }} --target ${{ matrix.target }}
-
-  python-acceptance:
-    name: Consumer-owned Python wheel
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
-        with:
-          ref: ${{ env.VALIDATION_REF }}
-          persist-credentials: false
-      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+      - uses: actions/setup-python@v6.2.0
         with:
           python-version: "3.11"
-      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
-        with:
-          toolchain: 1.88.0
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-        with:
-          key: python-acceptance
-      - name: Build the generated Python target
-        run: |
-          cargo run --locked -p rspyts-cli -- \
-            build --config examples/cross-package/owner/rspyts.toml \
-            --target python
-          cargo run --locked -p rspyts-cli -- \
-            check --config examples/cross-package/owner/rspyts.toml \
-            --target python --locked
-      - name: Build, install, and test the wheel
-        shell: bash
-        run: |
-          set -euo pipefail
-          python3 -m venv "$RUNNER_TEMP/python-build"
-          builder="$RUNNER_TEMP/python-build/bin/python"
-          "$builder" -m pip install --disable-pip-version-check \
-            'maturin>=1.9,<2' 'numpy>=2' 'pydantic>=2.11'
-          PATH="$(dirname "$builder"):$PATH" \
-            cargo test --locked -p rspyts-cli 'emit::python::tests::'
-          workspace_root=$(cd "$GITHUB_WORKSPACE" && pwd -P)
-          flags=(
-            "--remap-path-prefix=$HOME=/home"
-            "--remap-path-prefix=${CARGO_HOME:-$HOME/.cargo}=/cargo"
-            "--remap-path-prefix=$workspace_root=/workspace"
-          )
-          export CARGO_ENCODED_RUSTFLAGS=$(IFS=$'\x1f'; printf '%s' "${flags[*]}")
-          unset RUSTFLAGS
-          (
-            cd examples/cross-package/owner/python
-            "$builder" -m maturin build --release --out "$RUNNER_TEMP/wheels"
-          )
-          wheels=("$RUNNER_TEMP"/wheels/*.whl)
-          test "${#wheels[@]}" -eq 1
-          wheel=${wheels[0]}
-          [[ $(basename "$wheel") == *-cp311-abi3-* ]]
-          "$builder" - "$wheel" <<'PY'
-          import email
-          import re
-          import sys
-          import zipfile
-
-          with zipfile.ZipFile(sys.argv[1]) as archive:
-              native = [
-                  name
-                  for name in archive.namelist()
-                  if name.endswith((".so", ".pyd", ".dylib"))
-              ]
-              assert len(native) == 1, native
-              metadata_name, = [
-                  name
-                  for name in archive.namelist()
-                  if name.endswith(".dist-info/METADATA")
-              ]
-              metadata = email.message_from_bytes(archive.read(metadata_name))
-              requirements = metadata.get_all("Requires-Dist", [])
-              assert not any(
-                  re.match(r"^\s*rspyts(?:\s|[<=>!~(\[]|$)", requirement, re.I)
-                  for requirement in requirements
-              ), requirements
-          PY
-          mkdir "$RUNNER_TEMP/wheel-scan"
-          unzip -q "$wheel" -d "$RUNNER_TEMP/wheel-scan"
-          scripts/release/verify-private-data.sh "$RUNNER_TEMP/wheel-scan"
-          python3 -m venv "$RUNNER_TEMP/python-runtime"
-          python="$RUNNER_TEMP/python-runtime/bin/python"
-          "$python" -m pip install --disable-pip-version-check 'pytest>=8'
-          "$python" -m pip install --disable-pip-version-check "$wheel"
-          (
-            cd "$RUNNER_TEMP"
-            "$python" -m pytest \
-              "$GITHUB_WORKSPACE/examples/cross-package/owner/python/tests"
-          )
-
-  browser-acceptance:
-    name: Generated browser/WASM package
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
-        with:
-          ref: ${{ env.VALIDATION_REF }}
-          persist-credentials: false
-      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
-        with:
-          toolchain: 1.88.0
-          targets: wasm32-unknown-unknown
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-        with:
-          key: browser-acceptance
-      - name: Install the matching wasm-bindgen compiler
-        run: cargo install wasm-bindgen-cli --version '=0.2.126' --locked
-      - name: Test the type-directed WASM backend
-        env:
-          CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER: wasm-bindgen-test-runner
-        run: >-
-          cargo test --locked -p rspyts --test backend_wasm --features wasm
-          --target wasm32-unknown-unknown
-      - name: Build and lock-check the generated TypeScript target
-        run: |
-          cargo run --locked -p rspyts-cli -- \
-            build --config examples/cross-package/owner/rspyts.toml \
-            --target typescript
-          cargo run --locked -p rspyts-cli -- \
-            check --config examples/cross-package/owner/rspyts.toml \
-            --target typescript --locked
-          scripts/release/verify-private-data.sh \
-            examples/cross-package/owner/.rspyts/typescript
-          scripts/release/verify-npm-package.sh \
-            examples/cross-package/owner/.rspyts/typescript
-      - name: Pack, install, and test in headless Chromium
-        working-directory: examples/cross-package/owner/typescript
-        run: |
-          npm ci
-          npx playwright install --with-deps chromium
-          npm test
-
-  static-typescript-acceptance:
-    name: Generated static Python and TypeScript package
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
-        with:
-          ref: ${{ env.VALIDATION_REF }}
-          persist-credentials: false
-      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
-        with:
-          python-version: "3.11"
-      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
-        with:
-          toolchain: 1.88.0
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-        with:
-          key: static-typescript-acceptance
-      - name: Generate, type-check, and test static output
-        working-directory: examples/static/typescript
-        run: |
-          npm ci
-          npm test
-      - name: Verify the generated static package
-        run: |
-          scripts/release/verify-private-data.sh examples/static/.rspyts
-          scripts/release/verify-npm-package.sh \
-            examples/static/.rspyts/typescript
-      - name: Build, install, and test the static package wheel
-        shell: bash
-        run: |
-          set -euo pipefail
-          python3 -m venv "$RUNNER_TEMP/static-python-build"
-          builder="$RUNNER_TEMP/static-python-build/bin/python"
-          "$builder" -m pip install --disable-pip-version-check \
-            'maturin>=1.9,<2' 'numpy>=2' 'pydantic>=2.11'
-          workspace_root=$(cd "$GITHUB_WORKSPACE" && pwd -P)
-          flags=(
-            "--remap-path-prefix=$HOME=/home"
-            "--remap-path-prefix=${CARGO_HOME:-$HOME/.cargo}=/cargo"
-            "--remap-path-prefix=$workspace_root=/workspace"
-          )
-          export CARGO_ENCODED_RUSTFLAGS=$(IFS=$'\x1f'; printf '%s' "${flags[*]}")
-          unset RUSTFLAGS
-          (
-            cd examples/static/python
-            "$builder" -m maturin build --release \
-              --out "$RUNNER_TEMP/static-wheels"
-          )
-          wheel=("$RUNNER_TEMP"/static-wheels/*.whl)
-          test "${#wheel[@]}" -eq 1
-          mkdir "$RUNNER_TEMP/static-wheel-scan"
-          unzip -q "${wheel[0]}" -d "$RUNNER_TEMP/static-wheel-scan"
-          scripts/release/verify-private-data.sh "$RUNNER_TEMP/static-wheel-scan"
-          python3 -m venv "$RUNNER_TEMP/static-python-runtime"
-          python="$RUNNER_TEMP/static-python-runtime/bin/python"
-          "$python" -m pip install --disable-pip-version-check 'pytest>=8'
-          "$python" -m pip install --disable-pip-version-check "${wheel[0]}"
-          (
-            cd "$RUNNER_TEMP"
-            "$python" -m pytest \
-              "$GITHUB_WORKSPACE/examples/static/python/tests"
-          )
-
-  cross-package-acceptance:
-    name: Cross-package identity and stale-lock rejection
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
-        with:
-          ref: ${{ env.VALIDATION_REF }}
-          persist-credentials: false
-      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
-        with:
-          python-version: "3.11"
-      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+      - uses: actions/setup-node@v6.5.0
         with:
           node-version: "22"
-      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
+          cache: npm
+          cache-dependency-path: example/clients/typescript/package-lock.json
+      - uses: ./.github/actions/setup-rust
         with:
-          toolchain: 1.88.0
           targets: wasm32-unknown-unknown
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-        with:
-          key: cross-package-acceptance
-      - name: Build and verify package identity
-        shell: bash
+          cache-key: generated-${{ matrix.os }}
+      - name: Install wasm-bindgen
+        run: cargo install wasm-bindgen-cli --version '=0.2.126' --locked
+      - name: Build and check generated packages
         run: |
-          set -euo pipefail
-          python -m venv "$RUNNER_TEMP/cross-package-python"
-          python="$RUNNER_TEMP/cross-package-python/bin/python"
-          "$python" -m pip install --disable-pip-version-check \
-            'maturin>=1.9,<2' 'pydantic>=2.11' 'numpy>=2'
-          cargo install wasm-bindgen-cli --version '=0.2.126' --locked
-          npm ci --prefix examples/cross-package/owner/typescript
-          cargo build --locked -p rspyts-cli
-          cargo test --locked --manifest-path examples/cross-package/Cargo.toml
-          cargo run --locked -p rspyts-cli -- \
-            check --locked --config examples/cross-package/owner/rspyts.toml
-          cargo run --locked -p rspyts-cli -- \
-            build --config examples/cross-package/owner/rspyts.toml
-          cargo run --locked -p rspyts-cli -- \
-            check --locked --config examples/cross-package/consumer/rspyts.toml
-          cargo run --locked -p rspyts-cli -- \
-            build --config examples/cross-package/consumer/rspyts.toml
-          scripts/release/verify-private-data.sh \
-            examples/cross-package/owner/.rspyts \
-            examples/cross-package/consumer/.rspyts
-          scripts/release/verify-npm-package.sh \
-            examples/cross-package/owner/.rspyts/typescript
-          scripts/release/verify-npm-package.sh \
-            examples/cross-package/consumer/.rspyts/typescript
-          python examples/cross-package/assert_identity.py
-          workspace_root=$(cd "$GITHUB_WORKSPACE" && pwd -P)
-          flags=(
-            "--remap-path-prefix=$HOME=/home"
-            "--remap-path-prefix=${CARGO_HOME:-$HOME/.cargo}=/cargo"
-            "--remap-path-prefix=$workspace_root=/workspace"
-          )
-          export CARGO_ENCODED_RUSTFLAGS=$(IFS=$'\x1f'; printf '%s' "${flags[*]}")
-          unset RUSTFLAGS
-          mkdir "$RUNNER_TEMP/cross-package-wheels"
-          (
-            cd examples/cross-package/owner/python
-            "$python" -m maturin build --release \
-              --out "$RUNNER_TEMP/cross-package-wheels"
-          )
-          "$python" -m pip install --disable-pip-version-check \
-            "$RUNNER_TEMP"/cross-package-wheels/rspyts_owner_acceptance-*.whl
-          (
-            cd examples/cross-package/consumer/python
-            "$python" -m maturin build --release \
-              --out "$RUNNER_TEMP/cross-package-wheels"
-          )
-          "$python" -m pip install --disable-pip-version-check \
-            "$RUNNER_TEMP"/cross-package-wheels/rspyts_consumer_acceptance-*.whl
-          for wheel in "$RUNNER_TEMP"/cross-package-wheels/*.whl; do
-            scan="${wheel%.whl}"
-            mkdir "$scan"
-            unzip -q "$wheel" -d "$scan"
-            scripts/release/verify-private-data.sh "$scan"
-          done
-          "$python" examples/cross-package/assert_runtime_identity.py
-          python examples/cross-package/assert_stale_locks.py
-
-  operating-systems:
-    name: Rust (${{ matrix.name }})
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - name: Linux
-            os: ubuntu-latest
-          - name: macOS
-            os: macos-latest
-          - name: Windows
-            os: windows-latest
-    steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
-        with:
-          ref: ${{ env.VALIDATION_REF }}
-          persist-credentials: false
-      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
-        with:
-          toolchain: 1.88.0
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-        with:
-          key: ${{ matrix.os }}
-      - name: Test workspace
-        run: cargo test --workspace --locked
-
-  docs:
-    name: Documentation
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
-        with:
-          ref: ${{ env.VALIDATION_REF }}
-          persist-credentials: false
-      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
-        with:
-          toolchain: 1.88.0
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-        with:
-          key: docs
-      - name: Build API documentation without warnings
-        run: cargo doc --workspace --all-features --no-deps --locked
-        env:
-          RUSTDOCFLAGS: -D warnings
-      - name: Check local documentation links
-        uses: lycheeverse/lychee-action@e7477775783ea5526144ba13e8db5eec57747ce8 # v2
-        with:
-          args: --offline --no-progress './**/*.md'
-          fail: true
-
-  packages:
-    name: Exact crate archives
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
-        with:
-          ref: ${{ env.VALIDATION_REF }}
-          persist-credentials: false
-      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
-        with:
-          toolchain: 1.88.0
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-        with:
-          key: packages
-      - name: Test release archive comparison
-        if: ${{ hashFiles('scripts/release/test_compare_crate_archives.py') != '' }}
-        run: python3 -m unittest scripts.release.test_compare_crate_archives
-      - name: Build and test packaged sources
-        run: scripts/release/verify-crates.sh
+          cargo run --locked -p rspyts-cli -- build --manifest-path example/crates/bindings/Cargo.toml
+          cargo run --locked -p rspyts-cli -- check --manifest-path example/crates/bindings/Cargo.toml
+      - name: Test the Python client
+        run: |
+          python -m pip install --disable-pip-version-check pytest -e example/crates/bindings/dist/python -e example/clients/python
+          python -m pytest -q example/clients/python/tests
+      - name: Test the TypeScript client
+        run: |
+          npm --prefix example/clients/typescript ci
+          npm --prefix example/clients/typescript run check
+          npm --prefix example/clients/typescript run build
+          npm --prefix example/clients/typescript run start

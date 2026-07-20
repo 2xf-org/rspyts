@@ -1,20 +1,16 @@
 # rspyts-cli
 
-The compiler and build command for
-[`rspyts`](https://crates.io/crates/rspyts).
+This crate provides the `rspyts` build command.
 
 ```sh
-cargo install rspyts-cli --version '=0.4.6' --locked
-rspyts build
-rspyts check --locked
+cargo install rspyts-cli --version '=1.0.0' --locked
+rspyts build --manifest-path bindings/Cargo.toml
+rspyts check --manifest-path bindings/Cargo.toml
 ```
 
-`rspyts.toml` describes one constrained contract package. Generated Python,
-TypeScript, native, and WASM files always live in the ignored `.rspyts/`
-directory. Commit `rspyts.lock`; run `rspyts lock` only after reviewing an
-intentional semantic change.
+The CLI always builds one Python package and one TypeScript and WebAssembly
+package. It writes both packages to `dist` next to the binding Cargo manifest.
 
-See the [project README](https://github.com/2xf-org/rspyts/blob/main/README.md)
-and [CLI reference](https://github.com/2xf-org/rspyts/blob/main/docs/reference.md).
+Read the [project README](https://github.com/2xf-org/rspyts).
 
 Licensed under MIT.

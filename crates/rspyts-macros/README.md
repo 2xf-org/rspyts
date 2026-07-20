@@ -1,18 +1,10 @@
 # rspyts-macros
 
-Procedural macro implementation for
-[`rspyts`](https://crates.io/crates/rspyts).
+This crate implements the rspyts procedural macros.
 
-Do not depend on this crate directly. Depend on the exact matching `rspyts`
-release, which exposes `Type`, `Error`, `export`, and `module!`:
+Do not depend on this crate directly. Depend on the matching `rspyts` version.
+The `rspyts` crate exports `Model`, `Error`, `export`, and `application!`.
 
-```toml
-[dependencies]
-rspyts = { version = "=0.4.6", default-features = false }
-```
-
-Each contract crate declares exactly one `rspyts::module!`. See the
-[project README](https://github.com/2xf-org/rspyts/blob/main/README.md) and
-[macro reference](https://github.com/2xf-org/rspyts/blob/main/docs/reference.md).
+Read the [project README](https://github.com/2xf-org/rspyts).
 
 Licensed under MIT.
