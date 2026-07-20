@@ -129,6 +129,14 @@ mod tests {
     }
 
     #[test]
+    fn describes_changed_byte_ranges() {
+        assert_eq!(
+            project::byte_difference(b"same--end", b"some++end!"),
+            "expected 9 bytes, found 10 bytes; 4 bytes differ; first ranges: [1..2, 4..6]"
+        );
+    }
+
+    #[test]
     fn uses_bigint_for_wide_types() {
         let manifest = Manifest {
             ir_version: 1,

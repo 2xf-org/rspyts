@@ -172,8 +172,17 @@ pub(super) fn check(project: &Project) -> Result<()> {
         let actual_names = actual.keys().cloned().collect::<BTreeSet<_>>();
         let changed = expected_names
             .intersection(&actual_names)
-            .filter(|path| expected.get(*path) != actual.get(*path))
-            .cloned()
+            .filter_map(|path| {
+                let expected_bytes = expected.get(path)?;
+                let actual_bytes = actual.get(path)?;
+                (expected_bytes != actual_bytes).then(|| {
+                    format!(
+                        "{} ({})",
+                        path.display(),
+                        byte_difference(expected_bytes, actual_bytes)
+                    )
+                })
+            })
             .collect::<Vec<_>>();
         bail!(
             "dist is not in sync (missing: {:?}; extra: {:?}; changed: {:?}); run `rspyts build`",
@@ -183,6 +192,35 @@ pub(super) fn check(project: &Project) -> Result<()> {
         );
     }
     Ok(())
+}
+
+pub(super) fn byte_difference(expected: &[u8], actual: &[u8]) -> String {
+    let mut ranges = Vec::new();
+    let mut different = expected.len().abs_diff(actual.len());
+    let mut range_start = None;
+
+    for (offset, (expected_byte, actual_byte)) in expected.iter().zip(actual).enumerate() {
+        if expected_byte != actual_byte {
+            different += 1;
+            range_start.get_or_insert(offset);
+        } else if let Some(start) = range_start.take() {
+            if ranges.len() < 16 {
+                ranges.push(format!("{start}..{offset}"));
+            }
+        }
+    }
+    if let Some(start) = range_start
+        && ranges.len() < 16
+    {
+        ranges.push(format!("{start}..{}", expected.len().min(actual.len())));
+    }
+
+    format!(
+        "expected {} bytes, found {} bytes; {different} bytes differ; first ranges: [{}]",
+        expected.len(),
+        actual.len(),
+        ranges.join(", ")
+    )
 }
 
 fn generate(project: &Project) -> Result<TempDir> {
