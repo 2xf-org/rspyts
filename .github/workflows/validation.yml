@@ -75,9 +75,10 @@ jobs:
           cargo run --locked -p rspyts-cli -- build
           cargo run --locked -p rspyts-cli -- check
       - name: Test the Python client
+        working-directory: example/clients/python
         run: |
-          python -m pip install --disable-pip-version-check pytest -e example/crates/bindings/dist/python -e example/clients/python
-          python -m pytest -q example/clients/python/tests
+          python -m pip install --disable-pip-version-check pytest -e ../../crates/bindings/dist/python -e .
+          python -m pytest -q tests
       - name: Test the TypeScript client
         run: |
           npm --prefix example/clients/typescript ci
