@@ -11,7 +11,7 @@ use serde_json::Value;
 use tempfile::TempDir;
 
 use crate::contract::buffer_elements;
-use crate::output::{file_tree, project_lock, replace_directory, write_json};
+use crate::output::{file_tree, project_lock, replace_directory, source_fingerprint, write_json};
 use crate::{python, typescript};
 
 const CONTRACT_SYMBOL: &str = "rspyts_discovery_v1_contract";
@@ -145,6 +145,14 @@ pub(super) struct BuildReport {
     typescript_package: String,
 }
 
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct GeneratedContract<'a> {
+    #[serde(flatten)]
+    manifest: &'a Manifest,
+    source_fingerprint: String,
+}
+
 pub(super) fn build(project: &Project) -> Result<BuildReport> {
     let _lock = project_lock(project)?;
     let generated = generate(project)?;
@@ -172,17 +180,8 @@ pub(super) fn check(project: &Project) -> Result<()> {
         let actual_names = actual.keys().cloned().collect::<BTreeSet<_>>();
         let changed = expected_names
             .intersection(&actual_names)
-            .filter_map(|path| {
-                let expected_bytes = expected.get(path)?;
-                let actual_bytes = actual.get(path)?;
-                (expected_bytes != actual_bytes).then(|| {
-                    format!(
-                        "{} ({})",
-                        path.display(),
-                        byte_difference(expected_bytes, actual_bytes)
-                    )
-                })
-            })
+            .filter(|path| !is_binary(path) && expected.get(*path) != actual.get(*path))
+            .cloned()
             .collect::<Vec<_>>();
         bail!(
             "dist is not in sync (missing: {:?}; extra: {:?}; changed: {:?}); run `rspyts build`",
@@ -194,33 +193,9 @@ pub(super) fn check(project: &Project) -> Result<()> {
     Ok(())
 }
 
-pub(super) fn byte_difference(expected: &[u8], actual: &[u8]) -> String {
-    let mut ranges = Vec::new();
-    let mut different = expected.len().abs_diff(actual.len());
-    let mut range_start = None;
-
-    for (offset, (expected_byte, actual_byte)) in expected.iter().zip(actual).enumerate() {
-        if expected_byte != actual_byte {
-            different += 1;
-            range_start.get_or_insert(offset);
-        } else if let Some(start) = range_start.take() {
-            if ranges.len() < 16 {
-                ranges.push(format!("{start}..{offset}"));
-            }
-        }
-    }
-    if let Some(start) = range_start
-        && ranges.len() < 16
-    {
-        ranges.push(format!("{start}..{}", expected.len().min(actual.len())));
-    }
-
-    format!(
-        "expected {} bytes, found {} bytes; {different} bytes differ; first ranges: [{}]",
-        expected.len(),
-        actual.len(),
-        ranges.join(", ")
-    )
+fn is_binary(path: &Path) -> bool {
+    path.extension()
+        .is_some_and(|extension| matches!(extension.to_str(), Some("pyd" | "so" | "wasm")))
 }
 
 fn generate(project: &Project) -> Result<TempDir> {
@@ -232,7 +207,11 @@ fn generate(project: &Project) -> Result<TempDir> {
     validate_contract(project, &manifest)?;
     let wasm = compile(project, CompileKind::Wasm)?;
 
-    write_json(&temporary.path().join("contract.json"), &manifest)?;
+    let contract = GeneratedContract {
+        manifest: &manifest,
+        source_fingerprint: source_fingerprint(&project.workspace_root)?,
+    };
+    write_json(&temporary.path().join("contract.json"), &contract)?;
     python::emit(project, &manifest, &native, temporary.path())?;
     typescript::emit(project, &manifest, &wasm, temporary.path())?;
     Ok(temporary)
@@ -288,11 +267,6 @@ fn compile(project: &Project, kind: CompileKind) -> Result<PathBuf> {
         append_rust_flag(&mut flags, "link-arg=dynamic_lookup");
         append_rust_flag(&mut flags, "-C");
         append_rust_flag(&mut flags, "link-arg=-Wl,-install_name,@rpath/native.so");
-    }
-    if matches!(kind, CompileKind::Native) && cfg!(all(target_os = "windows", target_env = "msvc"))
-    {
-        append_rust_flag(&mut flags, "-C");
-        append_rust_flag(&mut flags, "link-arg=/Brepro");
     }
     command.env("RUSTFLAGS", flags);
     let output = command
