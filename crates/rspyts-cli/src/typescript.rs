@@ -1085,7 +1085,7 @@ mod tests {
         let manifest = Manifest {
             ir_version: rspyts::ir::IR_VERSION,
             package_name: "example".to_owned(),
-            package_version: "1.0.1".to_owned(),
+            package_version: "1.2.3".to_owned(),
             module_name: "native".to_owned(),
             types: Vec::new(),
             errors: Vec::new(),
@@ -1103,7 +1103,7 @@ mod tests {
             constants: Vec::new(),
         };
         let views = namespaces(&manifest);
-        let package = package_manifest("example", "1.0.1", views.keys());
+        let package = package_manifest("example", "1.2.3", views.keys());
 
         for subpath in [
             ".",
@@ -1288,7 +1288,7 @@ mod tests {
         Manifest {
             ir_version: rspyts::ir::IR_VERSION,
             package_name: "example".to_owned(),
-            package_version: "1.0.1".to_owned(),
+            package_version: "1.2.3".to_owned(),
             module_name: "native".to_owned(),
             types: vec![event.clone(), target],
             errors: vec![error.clone()],

@@ -193,7 +193,7 @@ dependencies = [
 
 [[package]]
 name = "example"
-version = "1.0.1"
+version = "1.0.2"
 dependencies = [
  "example-dice",
  "rspyts",
@@ -201,7 +201,7 @@ dependencies = [
 
 [[package]]
 name = "example-dice"
-version = "1.0.1"
+version = "1.0.2"
 dependencies = [
  "rspyts",
  "serde",
@@ -540,7 +540,7 @@ dependencies = [
 
 [[package]]
 name = "rspyts"
-version = "1.0.1"
+version = "1.0.2"
 dependencies = [
  "chrono",
  "inventory",
@@ -556,7 +556,7 @@ dependencies = [
 
 [[package]]
 name = "rspyts-cli"
-version = "1.0.1"
+version = "1.0.2"
 dependencies = [
  "anyhow",
  "clap",
@@ -571,7 +571,7 @@ dependencies = [
 
 [[package]]
 name = "rspyts-macros"
-version = "1.0.1"
+version = "1.0.2"
 dependencies = [
  "heck",
  "proc-macro2",

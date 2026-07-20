@@ -310,7 +310,7 @@ mod tests {
         Manifest {
             ir_version: IR_VERSION,
             package_name: "app".to_owned(),
-            package_version: "1.0.1".to_owned(),
+            package_version: "1.2.3".to_owned(),
             module_name: "native".to_owned(),
             types: Vec::new(),
             errors: Vec::new(),

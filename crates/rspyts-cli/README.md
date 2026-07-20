@@ -6,7 +6,7 @@ The build needs Rust 1.88 or later and the `wasm32-unknown-unknown` target.
 After you install Rust, run:
 
 ```sh
-cargo install rspyts-cli --version '=1.0.1' --locked
+cargo install rspyts-cli --locked
 rustup target add wasm32-unknown-unknown
 ```
 

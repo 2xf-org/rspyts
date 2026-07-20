@@ -1,7 +1,7 @@
 {
   "irVersion": 2,
   "packageName": "example",
-  "packageVersion": "1.0.1",
+  "packageVersion": "1.0.2",
   "moduleName": "native",
   "types": [
     {
@@ -485,5 +485,5 @@
       "value": 6
     }
   ],
-  "sourceFingerprint": "e0c1ca7b3ed60662e174cdfe93177dc8"
+  "sourceFingerprint": "935a3b7d313e1ec15b206a2d22cad57b"
 }

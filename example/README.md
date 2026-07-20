@@ -1,7 +1,7 @@
 # Example application
 
 This example uses one aggregate binding and one linked Rust domain crate. It
-shows the automatic namespace rules in version 1.0.1.
+shows the automatic namespace rules.
 
 ```text
 example/
