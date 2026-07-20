@@ -62,6 +62,8 @@ def native_error(error: RuntimeError, error_type: type[RuntimeError]) -> Runtime
 
 
 native_schemas: dict[str, Any] = {
-    "RollRequest": ("struct", {"sides": None, "count": None}),
-    "RollResult": ("struct", {"values": ("list", None), "total": None}),
+    "example-dice::example_dice::fair::roll::RollRequest": ("struct", {"sides": None, "count": None}),
+    "example-dice::example_dice::fair::roll::RollResult": ("struct", {"values": ("list", None), "total": None}),
+    "example-dice::example_dice::loaded::roll::RollResult": ("struct", {"value": None, "favoredValue": None}),
+    "example-dice::example_dice::summary::RollSummary": ("struct", {"label": None, "result": ("named", "example-dice::example_dice::fair::roll::RollResult")}),
 }

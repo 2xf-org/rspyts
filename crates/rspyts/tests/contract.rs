@@ -58,6 +58,16 @@ fn discovery_returns_the_complete_application_contract() {
     assert_eq!(manifest.package_name, env!("CARGO_PKG_NAME"));
     assert_eq!(manifest.package_version, env!("CARGO_PKG_VERSION"));
     assert_eq!(manifest.module_name, "native");
+    assert!(
+        manifest
+            .types
+            .iter()
+            .all(|item| item.owner.0 == env!("CARGO_PKG_NAME")
+                && item.rust_module.starts_with("contract::fixtures"))
+    );
+    assert!(manifest.functions.iter().all(|item| {
+        item.owner.0 == env!("CARGO_PKG_NAME") && item.rust_module == "contract::fixtures"
+    }));
     assert_eq!(
         manifest
             .types
@@ -71,6 +81,7 @@ fn discovery_returns_the_complete_application_contract() {
             "JobRequest",
             "JobResult",
             "RunMode",
+            "InlineValue",
         ]
     );
     assert_eq!(
@@ -109,6 +120,15 @@ fn discovery_returns_the_complete_application_contract() {
     let encoded = serde_json::to_string(&manifest).expect("manifest must serialize");
     let decoded: Manifest = serde_json::from_str(&encoded).expect("manifest must deserialize");
     assert_eq!(decoded, manifest);
+
+    let inline = type_named(&manifest, "InlineValue");
+    assert_eq!(inline.rust_module, "contract::fixtures::inline");
+    assert_eq!(
+        manifest
+            .namespace(&inline.owner, &inline.rust_module)
+            .python_segments(),
+        ["fixtures", "inline"]
+    );
 }
 
 #[test]

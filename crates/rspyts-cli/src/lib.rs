@@ -131,7 +131,7 @@ mod tests {
     #[test]
     fn uses_bigint_for_wide_types() {
         let manifest = Manifest {
-            ir_version: 1,
+            ir_version: rspyts::ir::IR_VERSION,
             package_name: "fixture".into(),
             package_version: "1.0.0".into(),
             module_name: "native".into(),
@@ -142,7 +142,7 @@ mod tests {
             constants: vec![],
         };
         assert_eq!(
-            typescript::type_ref(
+            typescript::test_type_ref(
                 &TypeRef::Int {
                     signed: false,
                     bits: 64,

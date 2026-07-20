@@ -32,7 +32,7 @@ class RollRequest(BaseModel):
 
 
 class RollResult(BaseModel):
-    """The result of a dice roll."""
+    """The result of a fair dice roll."""
 
     model_config = ConfigDict(
         frozen=True,

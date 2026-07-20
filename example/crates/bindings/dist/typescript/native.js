@@ -40,6 +40,18 @@ export class RspytsWasmDiceCup {
 if (Symbol.dispose) RspytsWasmDiceCup.prototype[Symbol.dispose] = RspytsWasmDiceCup.prototype.free;
 
 /**
+ * @param {any} value
+ * @returns {any}
+ */
+export function __rspyts_export_loadedRoll(value) {
+    const ret = wasm.__rspyts_export_loadedRoll(value);
+    if (ret[2]) {
+        throw takeFromExternrefTable0(ret[1]);
+    }
+    return takeFromExternrefTable0(ret[0]);
+}
+
+/**
  * @param {any} request
  * @param {any} seed
  * @returns {any}
@@ -71,6 +83,19 @@ export function __rspyts_export_rollValues(request, seed) {
  */
 export function __rspyts_export_seedFromBytes(bytes) {
     const ret = wasm.__rspyts_export_seedFromBytes(bytes);
+    if (ret[2]) {
+        throw takeFromExternrefTable0(ret[1]);
+    }
+    return takeFromExternrefTable0(ret[0]);
+}
+
+/**
+ * @param {any} label
+ * @param {any} result
+ * @returns {any}
+ */
+export function __rspyts_export_summarizeRoll(label, result) {
+    const ret = wasm.__rspyts_export_summarizeRoll(label, result);
     if (ret[2]) {
         throw takeFromExternrefTable0(ret[1]);
     }

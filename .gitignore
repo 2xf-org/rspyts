@@ -4,6 +4,8 @@
 **/dist.rspyts-old/
 !/example/crates/bindings/dist/
 !/example/crates/bindings/dist/**
+/example/crates/bindings/dist/python/build/
+/example/crates/bindings/dist/python/*.egg-info/
 **/.rspyts-build.lock
 **/.venv/
 **/node_modules/

@@ -195,7 +195,7 @@ packages = ["__CLIENT_PACKAGE__"]
 dev = ["pytest>=8,<9"]
 "#;
 
-const PYTHON_CLIENT: &str = r#"from __PYTHON_PACKAGE__ import Greeting, greet
+const PYTHON_CLIENT: &str = r#"from __PYTHON_PACKAGE__.api import Greeting, greet
 
 __all__ = ["Greeting", "greet"]
 "#;
@@ -225,7 +225,7 @@ const TYPESCRIPT_PACKAGE: &str = r#"{
 }
 "#;
 
-const TYPESCRIPT_CLIENT: &str = r#"import { greet } from "__PROJECT__";
+const TYPESCRIPT_CLIENT: &str = r#"import { greet } from "__PROJECT__/api";
 
 console.log(greet("World").message);
 "#;
@@ -266,6 +266,13 @@ mod tests {
         }
         let cargo = fs::read_to_string(project.join("Cargo.toml")).unwrap();
         assert!(cargo.contains("rspyts = \"1\""));
+        let python =
+            fs::read_to_string(project.join("clients/python/hello_world_client/__init__.py"))
+                .unwrap();
+        assert!(python.contains("from hello_world.api import Greeting, greet"));
+        let typescript =
+            fs::read_to_string(project.join("clients/typescript/src/index.ts")).unwrap();
+        assert!(typescript.contains("from \"hello-world/api\""));
         assert!(create(&project).is_err());
     }
 

@@ -9,7 +9,7 @@ from .models import (
     RollResult,
     UInt32Buffer,
 )
-from .runtime import (
+from example.runtime import (
     native,
     native_error,
     prepare_host,
@@ -18,7 +18,7 @@ from .runtime import (
 
 
 class RollError(RuntimeError):
-    """Errors from the example API."""
+    """Errors from the fair dice API."""
 
     def __init__(self, code: str, message: str) -> None:
         super().__init__(message)
@@ -28,19 +28,16 @@ class RollError(RuntimeError):
 def roll_dice(request: RollRequest, seed: int) -> RollResult:
     """Roll dice from a seed.
 
-    The seed makes the example repeatable in Rust, Python, and TypeScript.
-
     # Errors
 
-    Returns [`RollError::InvalidRequest`] when the request is outside the supported
-    ranges.
+    Returns [`RollError::InvalidRequest`] if the request is not valid.
     """
     try:
-        result = native.rollDice(prepare_host(request), prepare_host(seed))
+        native_result = native.rollDice(prepare_host(request), prepare_host(seed))
     except RuntimeError as error:
         raise native_error(error, RollError) from None
     return TypeAdapter(RollResult).validate_python(
-        restore_host(result, ("named", "RollResult")),
+        restore_host(native_result, ("named", "example-dice::example_dice::fair::roll::RollResult")),
         strict=False,
     )
 
@@ -50,27 +47,26 @@ def roll_values(request: RollRequest, seed: int) -> UInt32Buffer:
 
     # Errors
 
-    Returns [`RollError::InvalidRequest`] when the request is outside the supported
-    ranges.
+    Returns [`RollError::InvalidRequest`] if the request is not valid.
     """
     try:
-        result = native.rollValues(prepare_host(request), prepare_host(seed))
+        native_result = native.rollValues(prepare_host(request), prepare_host(seed))
     except RuntimeError as error:
         raise native_error(error, RollError) from None
     return TypeAdapter(
         UInt32Buffer,
         config=ConfigDict(arbitrary_types_allowed=True),
     ).validate_python(
-        restore_host(result, ("buffer", "uint32")),
+        restore_host(native_result, ("buffer", "uint32")),
         strict=False,
     )
 
 
 def seed_from_bytes(bytes: bytes) -> int:
     """Convert bytes to a repeatable seed."""
-    result = native.seedFromBytes(prepare_host(bytes))
+    native_result = native.seedFromBytes(prepare_host(bytes))
     return TypeAdapter(int).validate_python(
-        restore_host(result, None),
+        restore_host(native_result, None),
         strict=False,
     )
 
@@ -90,14 +86,14 @@ class DiceCup:
 
         # Errors
 
-        Returns [`RollError::InvalidRequest`] when `count` is outside 1 through 100.
+        Returns [`RollError::InvalidRequest`] if `count` is not from 1 through 100.
         """
         try:
-            result = self.native_resource.roll(prepare_host(count))
+            native_result = self.native_resource.roll(prepare_host(count))
         except RuntimeError as error:
             raise native_error(error, RollError) from None
         return TypeAdapter(RollResult).validate_python(
-            restore_host(result, ("named", "RollResult")),
+            restore_host(native_result, ("named", "example-dice::example_dice::fair::roll::RollResult")),
             strict=False,
         )
 

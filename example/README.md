@@ -1,6 +1,7 @@
 # Example application
 
-This example uses one aggregate binding and one linked Rust domain crate.
+This example uses one aggregate binding and one linked Rust domain crate. It
+shows the automatic namespace rules in version 1.0.1.
 
 ```text
 example/
@@ -10,7 +11,11 @@ example/
 │   │   └── src/lib.rs
 │   └── dice/
 │       ├── Cargo.toml
-│       └── src/lib.rs
+│       └── src/
+│           ├── fair/roll.rs
+│           ├── loaded/roll.rs
+│           ├── lib.rs
+│           └── summary.rs
 └── clients/
     ├── python/
     │   ├── example_client/__init__.py
@@ -30,6 +35,30 @@ contains only this application declaration:
 ```rust
 rspyts::application!(example_dice);
 ```
+
+The binding Cargo package is `example`. The API Cargo package is
+`example-dice`. rspyts removes the shared `example` prefix. It then adds the
+Rust declaration modules.
+
+Use these Python imports:
+
+```python
+from example.dice.fair.roll import DiceCup, RollResult
+from example.dice.loaded.roll import RollResult as LoadedRollResult
+from example.dice.summary import summarize_roll
+```
+
+Use these TypeScript imports:
+
+```typescript
+import { DiceCup, type RollResult } from "example/dice/fair/roll";
+import type { RollResult as LoadedRollResult } from "example/dice/loaded/roll";
+import { summarizeRoll } from "example/dice/summary";
+```
+
+The two `RollResult` models have the same leaf name. They are valid because
+they are in different Rust modules. `RollSummary` contains the fair result.
+This reference crosses a namespace boundary without a second binding.
 
 Build both host packages:
 
@@ -56,4 +85,5 @@ These client commands use `uv`, Python, Node.js, and npm. They are example
 development tools. `rspyts build` does not require them.
 
 Both clients roll three seeded dice. Both clients return `[5, 4, 2]` with a
-total of `11`.
+total of `11`. They also check duplicate model names, a cross-namespace model
+reference, and a cross-namespace error.

@@ -5,16 +5,24 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 use rspyts::ir::{
-    BufferElement, FieldDef, FunctionDef, Manifest, ParamDef, ResourceDef, ScalarValue, TypeDef,
-    TypeRef, TypeShape,
+    BufferElement, FieldDef, FunctionDef, Manifest, Namespace, ParamDef, ResourceDef, ScalarValue,
+    TypeDef, TypeRef, TypeShape,
 };
 use serde_json::Value;
 
 use crate::contract::{
-    buffer_elements, collect_buffers, error_name, tagged_variant_name, type_name, uses_buffer,
+    NamespaceItems, collect_buffers, definition_key, error_definition, named_identities,
+    namespace_refs, namespaces, tagged_variant_name, type_definition, type_namespace, type_refs,
+    uses_buffer,
 };
 use crate::output::write;
 use crate::project::Project;
+
+struct PythonContext<'a> {
+    manifest: &'a Manifest,
+    package: &'a str,
+    namespace: &'a Namespace,
+}
 
 pub(super) fn emit(
     project: &Project,
@@ -43,11 +51,57 @@ pub(super) fn emit(
         package.join(format!("{}.{}", manifest.module_name, extension)),
     )
     .with_context(|| format!("failed to copy Python extension {}", native.display()))?;
-    write(&package.join("models.py"), &python_models(manifest)?)?;
     write(&package.join("runtime.py"), &python_runtime(manifest)?)?;
-    write(&package.join("api.py"), &python_api(manifest)?)?;
-    write(&package.join("__init__.py"), &python_init(manifest))?;
     write(&package.join("py.typed"), "")?;
+
+    let namespace_map = namespaces(manifest);
+    for namespace in namespace_map.keys() {
+        let segments = namespace.python_segments();
+        let mut namespace_package = package.clone();
+        for segment in &segments {
+            namespace_package.push(segment);
+            fs::create_dir_all(&namespace_package)?;
+        }
+    }
+    for (namespace, items) in &namespace_map {
+        let namespace_package = namespace
+            .python_segments()
+            .iter()
+            .fold(package.clone(), |path, segment| path.join(segment));
+        let context = PythonContext {
+            manifest,
+            package: &project.python_package,
+            namespace,
+        };
+        let model_names = python_model_names(items);
+        let has_api = !items.errors.is_empty()
+            || !items.functions.is_empty()
+            || !items.resources.is_empty()
+            || !items.constants.is_empty();
+        if !model_names.is_empty() {
+            write(
+                &namespace_package.join("models.py"),
+                &python_models(items, &context)?,
+            )?;
+        }
+        if has_api {
+            write(
+                &namespace_package.join("api.py"),
+                &python_api(items, &context)?,
+            )?;
+        }
+        write(&namespace_package.join("__init__.py"), &python_init(items))?;
+    }
+    for namespace in namespace_map.keys() {
+        let mut namespace_package = package.clone();
+        for segment in namespace.python_segments() {
+            namespace_package.push(segment);
+            let init = namespace_package.join("__init__.py");
+            if !init.exists() {
+                write(&init, "")?;
+            }
+        }
+    }
 
     let pyproject = python_project_file(
         &project.python_package.replace('.', "-"),
@@ -79,9 +133,9 @@ fn python_project_file(distribution: &str, version: &str, needs_numpy: bool) -> 
     )
 }
 
-fn python_models(manifest: &Manifest) -> Result<String> {
-    let imports = model_imports(manifest);
-    let buffers = buffer_elements(manifest);
+fn python_models(items: &NamespaceItems<'_>, context: &PythonContext<'_>) -> Result<String> {
+    let imports = model_imports(items);
+    let buffers = namespace_buffers(items);
     let mut source = String::from("from __future__ import annotations\n");
     let mut standard_imports = Vec::new();
     if imports.datetime {
@@ -125,6 +179,9 @@ fn python_models(manifest: &Manifest) -> Result<String> {
         source.push_str(&package_imports.join("\n"));
         source.push('\n');
     }
+    for import in python_model_imports(items, context)? {
+        writeln!(source, "\nimport {import}")?;
+    }
     for element in buffers {
         let name = buffer_name(element);
         let scalar = python_numpy_scalar(element);
@@ -135,11 +192,11 @@ fn python_models(manifest: &Manifest) -> Result<String> {
         )?;
     }
 
-    for definition in &manifest.types {
-        emit_python_type(&mut source, definition, manifest)?;
+    for definition in &items.types {
+        emit_python_type(&mut source, definition, context)?;
     }
     let mut rebuilds = Vec::new();
-    for definition in &manifest.types {
+    for definition in &items.types {
         match definition.shape {
             TypeShape::Struct { .. } | TypeShape::Alias { .. } => {
                 rebuilds.push(definition.name.clone());
@@ -169,12 +226,12 @@ struct ModelImports {
     pydantic: BTreeSet<&'static str>,
 }
 
-fn model_imports(manifest: &Manifest) -> ModelImports {
+fn model_imports(items: &NamespaceItems<'_>) -> ModelImports {
     let mut imports = ModelImports::default();
-    if uses_buffer(manifest) {
+    if !namespace_buffers(items).is_empty() {
         imports.typing.extend(["Annotated", "TypeAlias"]);
     }
-    for definition in &manifest.types {
+    for definition in &items.types {
         match &definition.shape {
             TypeShape::Struct { fields } => {
                 imports.pydantic.extend(["BaseModel", "ConfigDict"]);
@@ -256,7 +313,11 @@ fn begin_python_alias(source: &mut String) {
     }
 }
 
-fn emit_python_type(source: &mut String, definition: &TypeDef, manifest: &Manifest) -> Result<()> {
+fn emit_python_type(
+    source: &mut String,
+    definition: &TypeDef,
+    context: &PythonContext<'_>,
+) -> Result<()> {
     match &definition.shape {
         TypeShape::Struct { fields } => {
             begin_python_top_level(source);
@@ -267,7 +328,7 @@ fn emit_python_type(source: &mut String, definition: &TypeDef, manifest: &Manife
             }
             emit_model_config(source);
             for field in fields {
-                emit_python_field(source, field, manifest, "    ")?;
+                emit_python_field(source, field, context, "    ")?;
             }
         }
         TypeShape::StringEnum { variants } => {
@@ -308,7 +369,7 @@ fn emit_python_type(source: &mut String, definition: &TypeDef, manifest: &Manife
                     py_string(tag),
                 )?;
                 for field in &variant.fields {
-                    emit_python_field(source, field, manifest, "    ")?;
+                    emit_python_field(source, field, context, "    ")?;
                 }
             }
             let names = variants
@@ -325,7 +386,7 @@ fn emit_python_type(source: &mut String, definition: &TypeDef, manifest: &Manife
                 source,
                 "class {}(RootModel[{}]):\n    pass",
                 definition.name,
-                python_ref(target, manifest)?
+                python_ref(target, context)?
             )?;
         }
     }
@@ -341,7 +402,7 @@ fn emit_model_config(source: &mut String) {
 fn emit_python_field(
     source: &mut String,
     field: &FieldDef,
-    manifest: &Manifest,
+    context: &PythonContext<'_>,
     indent: &str,
 ) -> Result<()> {
     if let Some(docs) = field.docs.as_deref() {
@@ -350,7 +411,7 @@ fn emit_python_field(
     let annotation = if let Some(literal) = &field.constraints.literal {
         format!("Literal[{}]", python_scalar(literal))
     } else {
-        python_ref(&field.ty, manifest)?
+        python_ref(&field.ty, context)?
     };
     let default = if field.required {
         "...".to_owned()
@@ -384,37 +445,37 @@ fn emit_python_field(
     Ok(())
 }
 
-fn python_api(manifest: &Manifest) -> Result<String> {
-    let has_constants = !manifest.constants.is_empty();
-    let needs_buffer_adapter = manifest
+fn python_api(items: &NamespaceItems<'_>, context: &PythonContext<'_>) -> Result<String> {
+    let has_constants = !items.constants.is_empty();
+    let needs_buffer_adapter = items
         .functions
         .iter()
         .any(|function| reference_uses_buffer(&function.returns))
-        || manifest.resources.iter().any(|resource| {
+        || items.resources.iter().any(|resource| {
             resource
                 .methods
                 .iter()
                 .any(|method| reference_uses_buffer(&method.returns))
         })
-        || manifest
+        || items
             .constants
             .iter()
             .any(|constant| reference_uses_buffer(&constant.ty));
-    let needs_type_adapter = manifest
+    let needs_type_adapter = items
         .functions
         .iter()
         .any(|function| !matches!(function.returns, TypeRef::Unit))
-        || manifest.resources.iter().any(|resource| {
+        || items.resources.iter().any(|resource| {
             resource
                 .methods
                 .iter()
                 .any(|method| !matches!(method.returns, TypeRef::Unit))
         })
-        || manifest
+        || items
             .constants
             .iter()
             .any(|constant| !is_plain_python_constant(&constant.ty));
-    let references = python_api_references(manifest);
+    let references = python_api_references(items);
     let mut source = String::from("from __future__ import annotations\n");
     let uses_datetime = references
         .iter()
@@ -456,8 +517,8 @@ fn python_api(manifest: &Manifest) -> Result<String> {
             pydantic_imports.join(", ")
         )?;
     }
-    let model_names = python_model_names(manifest);
-    let runtime_imports = python_runtime_imports(manifest);
+    let model_names = python_model_names(items);
+    let runtime_imports = python_runtime_imports(items);
     if !model_names.is_empty() || !runtime_imports.is_empty() {
         source.push('\n');
     }
@@ -468,15 +529,21 @@ fn python_api(manifest: &Manifest) -> Result<String> {
         }
         source.push_str(")\n");
     }
+    for import in python_api_model_imports(&references, context)? {
+        writeln!(source, "import {import}")?;
+    }
+    for import in python_error_imports(items, context)? {
+        writeln!(source, "import {import}")?;
+    }
     if !runtime_imports.is_empty() {
-        source.push_str("from .runtime import (\n");
+        writeln!(source, "from {}.runtime import (", context.package)?;
         for name in runtime_imports {
             writeln!(source, "    {name},")?;
         }
         source.push_str(")\n");
     }
 
-    for error in &manifest.errors {
+    for error in &items.errors {
         begin_python_top_level(&mut source);
         writeln!(source, "class {}(RuntimeError):", error.name)?;
         emit_python_doc(&mut source, error.docs.as_deref(), "    ")?;
@@ -485,16 +552,16 @@ fn python_api(manifest: &Manifest) -> Result<String> {
         }
         source.push_str("    def __init__(self, code: str, message: str) -> None:\n        super().__init__(message)\n        self.code = code\n");
     }
-    for function in &manifest.functions {
-        emit_python_function(&mut source, function, manifest, None)?;
+    for function in &items.functions {
+        emit_python_function(&mut source, function, context, None)?;
     }
-    for resource in &manifest.resources {
-        emit_python_resource(&mut source, resource, manifest)?;
+    for resource in &items.resources {
+        emit_python_resource(&mut source, resource, context)?;
     }
-    for constant in &manifest.constants {
+    for constant in &items.constants {
         begin_python_top_level(&mut source);
         let value = python_json(&constant.value);
-        let ty = python_ref(&constant.ty, manifest)?;
+        let ty = python_ref(&constant.ty, context)?;
         if is_plain_python_constant(&constant.ty) {
             writeln!(source, "{}: Final[{ty}] = {value}", constant.host_name)?;
         } else {
@@ -502,11 +569,8 @@ fn python_api(manifest: &Manifest) -> Result<String> {
             emit_python_validation(
                 &mut source,
                 &constant.ty,
-                manifest,
-                &format!(
-                    "restore_host({value}, {})",
-                    python_spec(&constant.ty, manifest)?
-                ),
+                context,
+                &format!("restore_host({value}, {})", python_spec(&constant.ty)?),
                 "",
             )?;
         }
@@ -534,21 +598,21 @@ fn python_runtime(manifest: &Manifest) -> Result<String> {
         writeln!(
             source,
             "    {}: {},",
-            py_string(&definition.name),
-            python_named_spec(definition, manifest)?
+            py_string(&definition_key(&definition.identity())),
+            python_named_spec(definition)?
         )?;
     }
     source.push_str("}\n");
     Ok(source)
 }
 
-fn python_api_references(manifest: &Manifest) -> Vec<&TypeRef> {
+fn python_api_references<'a>(items: &'a NamespaceItems<'a>) -> Vec<&'a TypeRef> {
     let mut references = Vec::new();
-    for function in &manifest.functions {
+    for function in &items.functions {
         references.extend(function.params.iter().map(|param| &param.ty));
         references.push(&function.returns);
     }
-    for resource in &manifest.resources {
+    for resource in &items.resources {
         for constructor in &resource.constructors {
             references.extend(constructor.params.iter().map(|param| &param.ty));
         }
@@ -557,7 +621,7 @@ fn python_api_references(manifest: &Manifest) -> Vec<&TypeRef> {
             references.push(&method.returns);
         }
     }
-    references.extend(manifest.constants.iter().map(|constant| &constant.ty));
+    references.extend(items.constants.iter().map(|constant| &constant.ty));
     references
 }
 
@@ -573,13 +637,13 @@ fn reference_contains(reference: &TypeRef, predicate: &impl Fn(&TypeRef) -> bool
     }
 }
 
-fn python_runtime_imports(manifest: &Manifest) -> Vec<&'static str> {
-    let has_calls = !manifest.functions.is_empty() || !manifest.resources.is_empty();
-    let has_params = manifest
+fn python_runtime_imports(items: &NamespaceItems<'_>) -> Vec<&'static str> {
+    let has_calls = !items.functions.is_empty() || !items.resources.is_empty();
+    let has_params = items
         .functions
         .iter()
         .any(|function| !function.params.is_empty())
-        || manifest.resources.iter().any(|resource| {
+        || items.resources.iter().any(|resource| {
             resource
                 .constructors
                 .iter()
@@ -589,25 +653,25 @@ fn python_runtime_imports(manifest: &Manifest) -> Vec<&'static str> {
                     .iter()
                     .any(|method| !method.params.is_empty())
         });
-    let restores_values = manifest
+    let restores_values = items
         .functions
         .iter()
         .any(|function| !matches!(function.returns, TypeRef::Unit))
-        || manifest.resources.iter().any(|resource| {
+        || items.resources.iter().any(|resource| {
             resource
                 .methods
                 .iter()
                 .any(|method| !matches!(method.returns, TypeRef::Unit))
         })
-        || manifest
+        || items
             .constants
             .iter()
             .any(|constant| !is_plain_python_constant(&constant.ty));
-    let translates_errors = manifest
+    let translates_errors = items
         .functions
         .iter()
         .any(|function| function.error.is_some())
-        || manifest.resources.iter().any(|resource| {
+        || items.resources.iter().any(|resource| {
             resource
                 .constructors
                 .iter()
@@ -707,20 +771,29 @@ def native_error(error: RuntimeError, error_type: type[RuntimeError]) -> Runtime
 fn emit_python_function(
     source: &mut String,
     function: &FunctionDef,
-    manifest: &Manifest,
+    context: &PythonContext<'_>,
     receiver: Option<&str>,
 ) -> Result<()> {
     let params = function
         .params
         .iter()
-        .map(|param| python_param(param, manifest))
+        .map(|param| python_param(param, context))
         .collect::<Result<Vec<_>>>()?;
     let call_params = function
         .params
         .iter()
         .map(|param| format!("prepare_host({})", safe_python_name(&param.rust_name)))
         .collect::<Vec<_>>();
-    let return_type = python_ref(&function.returns, manifest)?;
+    let mut result_name = "native_result".to_owned();
+    let parameter_names = function
+        .params
+        .iter()
+        .map(|param| safe_python_name(&param.rust_name))
+        .collect::<BTreeSet<_>>();
+    while parameter_names.contains(&result_name) {
+        result_name.push_str("_value");
+    }
+    let return_type = python_ref(&function.returns, context)?;
     let (indent, first_param, call) = if receiver.is_some() {
         (
             "    ",
@@ -748,13 +821,13 @@ fn emit_python_function(
         writeln!(source, "{indent}    try:")?;
         emit_python_call(
             source,
-            &format!("{indent}        result = "),
+            &format!("{indent}        {result_name} = "),
             &format!("{indent}        "),
             &call,
             &call_params,
         )?;
         writeln!(source, "{indent}    except RuntimeError as error:")?;
-        let error_name = error_name(function.error.as_ref(), manifest)?;
+        let error_name = python_error_ref(function.error.as_ref(), context)?;
         writeln!(
             source,
             "{indent}        raise native_error(error, {error_name}) from None"
@@ -762,7 +835,7 @@ fn emit_python_function(
     } else {
         emit_python_call(
             source,
-            &format!("{indent}    result = "),
+            &format!("{indent}    {result_name} = "),
             &format!("{indent}    "),
             &call,
             &call_params,
@@ -775,10 +848,10 @@ fn emit_python_function(
         emit_python_validation(
             source,
             &function.returns,
-            manifest,
+            context,
             &format!(
-                "restore_host(result, {})",
-                python_spec(&function.returns, manifest)?
+                "restore_host({result_name}, {})",
+                python_spec(&function.returns)?
             ),
             &format!("{indent}    "),
         )?;
@@ -838,11 +911,11 @@ fn emit_python_call(
 fn emit_python_validation(
     source: &mut String,
     reference: &TypeRef,
-    manifest: &Manifest,
+    context: &PythonContext<'_>,
     value: &str,
     indent: &str,
 ) -> Result<()> {
-    let annotation = python_adapter_type(reference, manifest)?;
+    let annotation = python_adapter_type(reference, context)?;
     let mut buffers = BTreeSet::new();
     collect_buffers(reference, &mut buffers);
     if buffers.is_empty() {
@@ -865,7 +938,7 @@ fn emit_python_validation(
 fn emit_python_resource(
     source: &mut String,
     resource: &ResourceDef,
-    manifest: &Manifest,
+    context: &PythonContext<'_>,
 ) -> Result<()> {
     let constructor = resource
         .constructors
@@ -882,7 +955,7 @@ fn emit_python_resource(
     let params = constructor
         .params
         .iter()
-        .map(|param| python_param(param, manifest))
+        .map(|param| python_param(param, context))
         .collect::<Result<Vec<_>>>()?;
     let calls = constructor
         .params
@@ -904,7 +977,7 @@ fn emit_python_resource(
         writeln!(
             source,
             "            raise native_error(error, {}) from None",
-            error_name(constructor.error.as_ref(), manifest)?
+            python_error_ref(constructor.error.as_ref(), context)?
         )?;
     } else {
         emit_python_call(
@@ -923,7 +996,7 @@ fn emit_python_resource(
         let params = factory
             .params
             .iter()
-            .map(|param| python_param(param, manifest))
+            .map(|param| python_param(param, context))
             .collect::<Result<Vec<_>>>()?;
         let calls = factory
             .params
@@ -954,7 +1027,7 @@ fn emit_python_resource(
             writeln!(
                 source,
                 "            raise native_error(error, {}) from None",
-                error_name(factory.error.as_ref(), manifest)?
+                python_error_ref(factory.error.as_ref(), context)?
             )?;
         } else {
             emit_python_call(
@@ -969,6 +1042,8 @@ fn emit_python_resource(
     }
     for method in &resource.methods {
         let function = FunctionDef {
+            owner: resource.owner.clone(),
+            rust_module: resource.rust_module.clone(),
             rust_name: method.rust_name.clone(),
             host_name: method.host_name.clone(),
             docs: method.docs.clone(),
@@ -976,25 +1051,29 @@ fn emit_python_resource(
             returns: method.returns.clone(),
             error: method.error.clone(),
         };
-        emit_python_function(source, &function, manifest, Some(&resource.name))?;
+        emit_python_function(source, &function, context, Some(&resource.name))?;
     }
     source.push_str("\n    def close(self) -> None:\n        self.native_resource.close()\n");
     Ok(())
 }
 
-fn python_init(manifest: &Manifest) -> String {
-    let mut model_names = python_model_names(manifest);
-    let mut api_names = manifest
+fn python_init(items: &NamespaceItems<'_>) -> String {
+    let mut model_names = python_model_names(items);
+    let mut api_names = items
         .errors
         .iter()
         .map(|item| item.name.clone())
-        .chain(manifest.functions.iter().map(|item| item.rust_name.clone()))
-        .chain(manifest.resources.iter().map(|item| item.name.clone()))
-        .chain(manifest.constants.iter().map(|item| item.host_name.clone()))
+        .chain(items.functions.iter().map(|item| item.rust_name.clone()))
+        .chain(items.resources.iter().map(|item| item.name.clone()))
+        .chain(items.constants.iter().map(|item| item.host_name.clone()))
         .collect::<Vec<_>>();
     model_names.sort();
     api_names.sort();
     let mut source = String::from("\"\"\"Generated from the Rust application API.\"\"\"\n\n");
+    if model_names.is_empty() && api_names.is_empty() {
+        source.push_str("__all__: list[str] = []\n");
+        return source;
+    }
     if !api_names.is_empty() {
         source.push_str("from .api import (\n");
         for name in &api_names {
@@ -1019,7 +1098,7 @@ fn python_init(manifest: &Manifest) -> String {
     source
 }
 
-fn python_ref(reference: &TypeRef, manifest: &Manifest) -> Result<String> {
+fn python_ref(reference: &TypeRef, context: &PythonContext<'_>) -> Result<String> {
     Ok(match reference {
         TypeRef::Unit => "None".into(),
         TypeRef::Bool => "bool".into(),
@@ -1028,54 +1107,54 @@ fn python_ref(reference: &TypeRef, manifest: &Manifest) -> Result<String> {
         TypeRef::String => "str".into(),
         TypeRef::DateTime => "datetime".into(),
         TypeRef::Json => "Any".into(),
-        TypeRef::Option { item } => format!("{} | None", python_ref(item, manifest)?),
-        TypeRef::List { item } => format!("list[{}]", python_ref(item, manifest)?),
-        TypeRef::Map { value } => format!("dict[str, {}]", python_ref(value, manifest)?),
+        TypeRef::Option { item } => format!("{} | None", python_ref(item, context)?),
+        TypeRef::List { item } => format!("list[{}]", python_ref(item, context)?),
+        TypeRef::Map { value } => format!("dict[str, {}]", python_ref(value, context)?),
         TypeRef::Tuple { items } => format!(
             "tuple[{}]",
             items
                 .iter()
-                .map(|item| python_ref(item, manifest))
+                .map(|item| python_ref(item, context))
                 .collect::<Result<Vec<_>>>()?
                 .join(", ")
         ),
-        TypeRef::Named { identity } => type_name(identity, manifest)?.to_owned(),
+        TypeRef::Named { identity } => python_named_ref(identity, context)?,
         TypeRef::Bytes | TypeRef::FixedBytes { .. } => "bytes".into(),
         TypeRef::Buffer { element } => buffer_name(*element).into(),
     })
 }
 
-fn python_adapter_type(reference: &TypeRef, manifest: &Manifest) -> Result<String> {
+fn python_adapter_type(reference: &TypeRef, context: &PythonContext<'_>) -> Result<String> {
     if matches!(reference, TypeRef::Unit) {
         Ok("type(None)".into())
     } else {
-        python_ref(reference, manifest)
+        python_ref(reference, context)
     }
 }
 
-fn python_param(param: &ParamDef, manifest: &Manifest) -> Result<String> {
+fn python_param(param: &ParamDef, context: &PythonContext<'_>) -> Result<String> {
     Ok(format!(
         "{}: {}",
         safe_python_name(&param.rust_name),
-        python_ref(&param.ty, manifest)?
+        python_ref(&param.ty, context)?
     ))
 }
 
-fn python_spec(reference: &TypeRef, manifest: &Manifest) -> Result<String> {
+fn python_spec(reference: &TypeRef) -> Result<String> {
     Ok(match reference {
-        TypeRef::Option { item } => python_spec(item, manifest)?,
-        TypeRef::List { item } => format!("(\"list\", {})", python_spec(item, manifest)?),
-        TypeRef::Map { value } => format!("(\"map\", {})", python_spec(value, manifest)?),
+        TypeRef::Option { item } => python_spec(item)?,
+        TypeRef::List { item } => format!("(\"list\", {})", python_spec(item)?),
+        TypeRef::Map { value } => format!("(\"map\", {})", python_spec(value)?),
         TypeRef::Tuple { items } => format!(
             "(\"tuple\", ({}))",
             items
                 .iter()
-                .map(|item| python_spec(item, manifest))
+                .map(python_spec)
                 .collect::<Result<Vec<_>>>()?
                 .join(", ")
         ),
         TypeRef::Named { identity } => {
-            format!("(\"named\", {})", py_string(type_name(identity, manifest)?))
+            format!("(\"named\", {})", py_string(&definition_key(identity)))
         }
         TypeRef::Bytes | TypeRef::FixedBytes { .. } => "(\"bytes\",)".into(),
         TypeRef::Buffer { element } => {
@@ -1085,7 +1164,7 @@ fn python_spec(reference: &TypeRef, manifest: &Manifest) -> Result<String> {
     })
 }
 
-fn python_named_spec(definition: &TypeDef, manifest: &Manifest) -> Result<String> {
+fn python_named_spec(definition: &TypeDef) -> Result<String> {
     Ok(match &definition.shape {
         TypeShape::Struct { fields } => format!(
             "(\"struct\", {{{}}})",
@@ -1094,7 +1173,7 @@ fn python_named_spec(definition: &TypeDef, manifest: &Manifest) -> Result<String
                 .map(|field| Ok(format!(
                     "{}: {}",
                     py_string(&field.wire_name),
-                    python_spec(&field.ty, manifest)?
+                    python_spec(&field.ty)?
                 )))
                 .collect::<Result<Vec<_>>>()?
                 .join(", ")
@@ -1113,7 +1192,7 @@ fn python_named_spec(definition: &TypeDef, manifest: &Manifest) -> Result<String
                         .map(|field| Ok(format!(
                             "{}: {}",
                             py_string(&field.wire_name),
-                            python_spec(&field.ty, manifest)?
+                            python_spec(&field.ty)?
                         )))
                         .collect::<Result<Vec<_>>>()?
                         .join(", ")
@@ -1122,15 +1201,15 @@ fn python_named_spec(definition: &TypeDef, manifest: &Manifest) -> Result<String
                 .join(", ")
         ),
         TypeShape::Alias { target } => {
-            format!("(\"alias\", {})", python_spec(target, manifest)?)
+            format!("(\"alias\", {})", python_spec(target)?)
         }
         TypeShape::StringEnum { .. } => "None".into(),
     })
 }
 
-fn python_model_names(manifest: &Manifest) -> Vec<String> {
+fn python_model_names(items: &NamespaceItems<'_>) -> Vec<String> {
     let mut names = Vec::new();
-    for definition in &manifest.types {
+    for definition in &items.types {
         names.push(definition.name.clone());
         if let TypeShape::TaggedEnum { variants, .. } = &definition.shape {
             names.extend(
@@ -1141,13 +1220,134 @@ fn python_model_names(manifest: &Manifest) -> Vec<String> {
         }
     }
     names.extend(
-        buffer_elements(manifest)
+        namespace_buffers(items)
             .into_iter()
             .map(|element| buffer_name(element).to_owned()),
     );
     names.sort();
     names.dedup();
     names
+}
+
+fn namespace_buffers(items: &NamespaceItems<'_>) -> BTreeSet<BufferElement> {
+    let mut buffers = BTreeSet::new();
+    for reference in namespace_refs(items) {
+        collect_buffers(reference, &mut buffers);
+    }
+    buffers
+}
+
+fn python_model_imports(
+    items: &NamespaceItems<'_>,
+    context: &PythonContext<'_>,
+) -> Result<BTreeSet<String>> {
+    let references = items
+        .types
+        .iter()
+        .flat_map(|definition| type_refs(definition))
+        .collect::<Vec<_>>();
+    python_api_model_imports(&references, context)
+}
+
+fn python_api_model_imports(
+    references: &[&TypeRef],
+    context: &PythonContext<'_>,
+) -> Result<BTreeSet<String>> {
+    let mut imports = BTreeSet::new();
+    for reference in references {
+        let mut identities = Vec::new();
+        named_identities(reference, &mut identities);
+        for identity in identities {
+            let namespace = type_namespace(identity, context.manifest)?;
+            if namespace != *context.namespace {
+                imports.insert(python_module(context.package, &namespace, "models"));
+            }
+        }
+    }
+    Ok(imports)
+}
+
+fn python_error_imports(
+    items: &NamespaceItems<'_>,
+    context: &PythonContext<'_>,
+) -> Result<BTreeSet<String>> {
+    let mut identities = items
+        .functions
+        .iter()
+        .filter_map(|function| function.error.as_ref())
+        .collect::<Vec<_>>();
+    identities.extend(items.resources.iter().flat_map(|resource| {
+        resource
+            .constructors
+            .iter()
+            .filter_map(|constructor| constructor.error.as_ref())
+            .chain(
+                resource
+                    .methods
+                    .iter()
+                    .filter_map(|method| method.error.as_ref()),
+            )
+    }));
+    let mut imports = BTreeSet::new();
+    for identity in identities {
+        let definition = error_definition(identity, context.manifest)?;
+        let namespace = context
+            .manifest
+            .namespace(&definition.owner, &definition.rust_module);
+        if namespace != *context.namespace {
+            imports.insert(python_module(context.package, &namespace, "api"));
+        }
+    }
+    Ok(imports)
+}
+
+fn python_named_ref(
+    identity: &rspyts::ir::DefinitionId,
+    context: &PythonContext<'_>,
+) -> Result<String> {
+    let definition = type_definition(identity, context.manifest)?;
+    let namespace = context
+        .manifest
+        .namespace(&definition.owner, &definition.rust_module);
+    if namespace == *context.namespace {
+        Ok(definition.name.clone())
+    } else {
+        Ok(format!(
+            "{}.{}",
+            python_module(context.package, &namespace, "models"),
+            definition.name
+        ))
+    }
+}
+
+fn python_error_ref(
+    identity: Option<&rspyts::ir::DefinitionId>,
+    context: &PythonContext<'_>,
+) -> Result<String> {
+    let identity = identity.context("missing error identity")?;
+    let definition = error_definition(identity, context.manifest)?;
+    let namespace = context
+        .manifest
+        .namespace(&definition.owner, &definition.rust_module);
+    if namespace == *context.namespace {
+        Ok(definition.name.clone())
+    } else {
+        Ok(format!(
+            "{}.{}",
+            python_module(context.package, &namespace, "api"),
+            definition.name
+        ))
+    }
+}
+
+fn python_module(package: &str, namespace: &Namespace, leaf: &str) -> String {
+    package
+        .split('.')
+        .map(str::to_owned)
+        .chain(namespace.python_segments())
+        .chain([leaf.to_owned()])
+        .collect::<Vec<_>>()
+        .join(".")
 }
 
 fn python_scalar(value: &ScalarValue) -> String {
@@ -1342,10 +1542,16 @@ fn python_numpy_scalar(element: BufferElement) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use rspyts::ir::{Manifest, TypeRef};
+    use rspyts::ir::{
+        CargoPackageId, ConstantDef, EnumVariantDef, ErrorDef, FieldConstraints, FieldDef,
+        FunctionDef, Manifest, Namespace, ParamDef, TypeDef, TypeRef, TypeShape,
+    };
     use serde_json::json;
 
-    use super::{python_api, python_models, python_project_file, python_runtime};
+    use super::{
+        PythonContext, python_api, python_init, python_models, python_project_file, python_runtime,
+    };
+    use crate::contract::namespaces;
 
     #[test]
     fn generated_project_declares_only_required_python_packages() {
@@ -1361,10 +1567,23 @@ mod tests {
     }
 
     #[test]
+    fn empty_parent_package_does_not_flatten_descendant_exports() {
+        let manifest = manifest_with_types(json!([]));
+        let views = namespaces(&manifest);
+
+        let generated = python_init(views.get(&Namespace::root()).expect("root namespace"));
+
+        assert!(!generated.contains("from .api"));
+        assert!(!generated.contains("from .models"));
+        assert!(generated.contains("__all__: list[str] = []"));
+    }
+
+    #[test]
     fn generated_models_import_only_the_types_they_use() {
         let manifest = manifest_with_types(json!([
             {
                 "owner": "example",
+                "rustModule": "example",
                 "id": "example::Message",
                 "name": "Message",
                 "docs": "A message.",
@@ -1389,7 +1608,7 @@ mod tests {
             }
         ]));
 
-        let generated = python_models(&manifest).expect("models generate");
+        let generated = render_models(&manifest);
         assert!(generated.contains("from pydantic import BaseModel, ConfigDict, Field"));
         assert!(generated.contains("    \"\"\"A message.\"\"\""));
         assert!(!generated.contains("from datetime"));
@@ -1402,6 +1621,8 @@ mod tests {
     fn generated_api_keeps_boundary_code_in_the_runtime_module() {
         let mut manifest = manifest_with_types(json!([]));
         manifest.functions.push(rspyts::ir::FunctionDef {
+            owner: CargoPackageId::new("example"),
+            rust_module: "example".into(),
             rust_name: "ping".into(),
             host_name: "ping".into(),
             docs: None,
@@ -1410,22 +1631,33 @@ mod tests {
             error: None,
         });
 
-        let standard = python_api(&manifest).expect("standard API generates");
+        let standard = render_api(&manifest);
         assert!(!standard.contains("import numpy"));
         assert!(!standard.contains("np."));
         assert!(!standard.contains("TypeAdapter"));
         assert!(!standard.contains("ConfigDict"));
         assert!(!standard.contains("def prepare_host"));
-        assert!(standard.contains("from .runtime import"));
+        assert!(standard.contains("from example.runtime import"));
 
         let standard_runtime = python_runtime(&manifest).expect("standard runtime generates");
         assert!(!standard_runtime.contains("import numpy"));
         assert!(standard_runtime.contains("def prepare_host"));
 
+        manifest.functions[0].params.push(rspyts::ir::ParamDef {
+            rust_name: "native_result".to_owned(),
+            host_name: "nativeResult".to_owned(),
+            ty: TypeRef::String,
+        });
+        manifest.functions[0].returns = TypeRef::String;
+        let collision_safe = render_api(&manifest);
+        assert!(collision_safe.contains("native_result_value = native.ping"));
+        assert!(collision_safe.contains("restore_host(native_result_value"));
+
+        manifest.functions[0].params.clear();
         manifest.functions[0].returns = TypeRef::Buffer {
             element: rspyts::ir::BufferElement::U32,
         };
-        let buffered = python_api(&manifest).expect("buffered API generates");
+        let buffered = render_api(&manifest);
         assert!(!buffered.contains("import numpy as np"));
         assert!(buffered.contains("TypeAdapter"));
         assert!(buffered.contains("ConfigDict"));
@@ -1436,9 +1668,39 @@ mod tests {
         assert!(buffered_runtime.contains("return np.asarray"));
     }
 
+    #[test]
+    fn generated_python_resolves_all_cross_namespace_references() {
+        let manifest = cross_namespace_manifest();
+        let namespace = Namespace {
+            package: Some("one".to_owned()),
+            modules: vec!["service".to_owned()],
+        };
+        let views = namespaces(&manifest);
+        let items = views.get(&namespace).expect("service namespace");
+        let context = PythonContext {
+            manifest: &manifest,
+            package: "example",
+            namespace: &namespace,
+        };
+
+        let models = python_models(items, &context).expect("models generate");
+        let api = python_api(items, &context).expect("API generates");
+        let runtime = python_runtime(&manifest).expect("runtime generates");
+
+        assert!(models.contains("import example.two.model.models"));
+        assert!(models.contains("target: example.two.model.models.Target"));
+        assert!(api.contains("import example.two.model.api"));
+        assert!(api.contains("import example.two.model.models"));
+        assert!(api.contains("target: example.two.model.models.Target"));
+        assert!(api.contains("example.two.model.api.TargetError"));
+        assert!(api.contains("TARGET: Final[example.two.model.models.Target]"));
+        assert!(runtime.contains("example-two::example_two::model::Target"));
+        assert!(runtime.contains("example-one::example_one::service::Event"));
+    }
+
     fn manifest_with_types(types: serde_json::Value) -> Manifest {
         serde_json::from_value(json!({
-            "irVersion": 1,
+            "irVersion": 2,
             "packageName": "example",
             "packageVersion": "1.0.0",
             "moduleName": "native",
@@ -1449,5 +1711,121 @@ mod tests {
             "constants": []
         }))
         .expect("valid test manifest")
+    }
+
+    fn cross_namespace_manifest() -> Manifest {
+        let target = TypeDef {
+            owner: CargoPackageId::new("example-two"),
+            rust_module: "example_two::model".to_owned(),
+            id: "example_two::model::Target".to_owned(),
+            name: "Target".to_owned(),
+            docs: None,
+            shape: TypeShape::Struct {
+                fields: vec![FieldDef {
+                    rust_name: "value".to_owned(),
+                    wire_name: "value".to_owned(),
+                    docs: None,
+                    ty: TypeRef::String,
+                    required: true,
+                    default: None,
+                    constraints: FieldConstraints::default(),
+                }],
+            },
+        };
+        let target_ref = TypeRef::Named {
+            identity: target.identity(),
+        };
+        let event = TypeDef {
+            owner: CargoPackageId::new("example-one"),
+            rust_module: "example_one::service".to_owned(),
+            id: "example_one::service::Event".to_owned(),
+            name: "Event".to_owned(),
+            docs: None,
+            shape: TypeShape::TaggedEnum {
+                tag: "kind".to_owned(),
+                variants: vec![EnumVariantDef {
+                    rust_name: "Found".to_owned(),
+                    wire_name: "found".to_owned(),
+                    docs: None,
+                    fields: vec![FieldDef {
+                        rust_name: "target".to_owned(),
+                        wire_name: "target".to_owned(),
+                        docs: None,
+                        ty: target_ref.clone(),
+                        required: true,
+                        default: None,
+                        constraints: FieldConstraints::default(),
+                    }],
+                }],
+            },
+        };
+        let error = ErrorDef {
+            owner: CargoPackageId::new("example-two"),
+            rust_module: "example_two::model".to_owned(),
+            id: "example_two::model::TargetError".to_owned(),
+            name: "TargetError".to_owned(),
+            docs: None,
+        };
+        Manifest {
+            ir_version: rspyts::ir::IR_VERSION,
+            package_name: "example".to_owned(),
+            package_version: "1.0.1".to_owned(),
+            module_name: "native".to_owned(),
+            types: vec![event.clone(), target],
+            errors: vec![error.clone()],
+            functions: vec![FunctionDef {
+                owner: CargoPackageId::new("example-one"),
+                rust_module: "example_one::service".to_owned(),
+                rust_name: "find".to_owned(),
+                host_name: "find".to_owned(),
+                docs: None,
+                params: vec![ParamDef {
+                    rust_name: "target".to_owned(),
+                    host_name: "target".to_owned(),
+                    ty: target_ref.clone(),
+                }],
+                returns: TypeRef::Named {
+                    identity: event.identity(),
+                },
+                error: Some(error.identity()),
+            }],
+            resources: Vec::new(),
+            constants: vec![ConstantDef {
+                owner: CargoPackageId::new("example-one"),
+                rust_module: "example_one::service".to_owned(),
+                host_name: "TARGET".to_owned(),
+                docs: None,
+                ty: target_ref,
+                value: json!({"value": "default"}),
+            }],
+        }
+    }
+
+    fn render_models(manifest: &Manifest) -> String {
+        let namespace = Namespace::root();
+        let views = namespaces(manifest);
+        python_models(
+            views.get(&namespace).expect("root namespace"),
+            &PythonContext {
+                manifest,
+                package: "example",
+                namespace: &namespace,
+            },
+        )
+        .expect("models generate")
+    }
+
+    fn render_api(manifest: &Manifest) -> String {
+        let namespace = Namespace::root();
+        let views = namespaces(manifest);
+        python_api(
+            views.get(&namespace).expect("root namespace"),
+            &PythonContext {
+                manifest,
+                package: "example",
+                namespace: &namespace,
+            },
+        )
+        .expect("API generates")
     }
 }
