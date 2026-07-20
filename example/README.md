@@ -38,8 +38,9 @@ cargo run -p rspyts-cli -- build
 ```
 
 The build creates the generated Python and TypeScript packages in
-`example/crates/bindings/dist`. Git does not store this directory because the
-Python extension is specific to the operating system that builds it.
+`example/crates/bindings/dist`. Git stores this generated snapshot, including
+the native Python extension and the WebAssembly binary. Run the build again to
+replace the snapshot with binaries for your operating system.
 
 Then run the authored clients:
 

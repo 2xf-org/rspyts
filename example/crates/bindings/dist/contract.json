@@ -1,0 +1,297 @@
+{
+  "irVersion": 1,
+  "packageName": "example",
+  "packageVersion": "1.0.0",
+  "moduleName": "native",
+  "types": [
+    {
+      "owner": "example-dice",
+      "id": "example_dice::RollRequest",
+      "name": "RollRequest",
+      "docs": "A request to roll one type of die.",
+      "shape": {
+        "kind": "struct",
+        "fields": [
+          {
+            "rustName": "sides",
+            "wireName": "sides",
+            "docs": "The number of sides on each die.",
+            "ty": {
+              "kind": "int",
+              "signed": false,
+              "bits": 32
+            },
+            "required": true,
+            "default": null,
+            "constraints": {
+              "literal": null,
+              "minLength": null,
+              "maxLength": null,
+              "ge": 2,
+              "le": 100
+            }
+          },
+          {
+            "rustName": "count",
+            "wireName": "count",
+            "docs": "The number of dice to roll.",
+            "ty": {
+              "kind": "int",
+              "signed": false,
+              "bits": 32
+            },
+            "required": true,
+            "default": null,
+            "constraints": {
+              "literal": null,
+              "minLength": null,
+              "maxLength": null,
+              "ge": 1,
+              "le": 100
+            }
+          }
+        ]
+      }
+    },
+    {
+      "owner": "example-dice",
+      "id": "example_dice::RollResult",
+      "name": "RollResult",
+      "docs": "The result of a dice roll.",
+      "shape": {
+        "kind": "struct",
+        "fields": [
+          {
+            "rustName": "values",
+            "wireName": "values",
+            "docs": null,
+            "ty": {
+              "kind": "list",
+              "item": {
+                "kind": "int",
+                "signed": false,
+                "bits": 32
+              }
+            },
+            "required": true,
+            "default": null,
+            "constraints": {
+              "literal": null,
+              "minLength": null,
+              "maxLength": null,
+              "ge": null,
+              "le": null
+            }
+          },
+          {
+            "rustName": "total",
+            "wireName": "total",
+            "docs": null,
+            "ty": {
+              "kind": "int",
+              "signed": false,
+              "bits": 64
+            },
+            "required": true,
+            "default": null,
+            "constraints": {
+              "literal": null,
+              "minLength": null,
+              "maxLength": null,
+              "ge": null,
+              "le": null
+            }
+          }
+        ]
+      }
+    }
+  ],
+  "errors": [
+    {
+      "owner": "example-dice",
+      "id": "example_dice::RollError",
+      "name": "RollError",
+      "docs": "Errors from the example API."
+    }
+  ],
+  "functions": [
+    {
+      "rustName": "roll_dice",
+      "hostName": "rollDice",
+      "docs": "Roll dice from a seed.\nThe seed makes the example repeatable in Rust, Python, and TypeScript.\n# Errors\nReturns [`RollError::InvalidRequest`] when the request is outside the supported ranges.",
+      "params": [
+        {
+          "rustName": "request",
+          "hostName": "request",
+          "ty": {
+            "kind": "named",
+            "identity": {
+              "owner": "example-dice",
+              "id": "example_dice::RollRequest"
+            }
+          }
+        },
+        {
+          "rustName": "seed",
+          "hostName": "seed",
+          "ty": {
+            "kind": "int",
+            "signed": false,
+            "bits": 64
+          }
+        }
+      ],
+      "returns": {
+        "kind": "named",
+        "identity": {
+          "owner": "example-dice",
+          "id": "example_dice::RollResult"
+        }
+      },
+      "error": {
+        "owner": "example-dice",
+        "id": "example_dice::RollError"
+      }
+    },
+    {
+      "rustName": "roll_values",
+      "hostName": "rollValues",
+      "docs": "Roll dice and return a compact numeric buffer.\n# Errors\nReturns [`RollError::InvalidRequest`] when the request is outside the supported ranges.",
+      "params": [
+        {
+          "rustName": "request",
+          "hostName": "request",
+          "ty": {
+            "kind": "named",
+            "identity": {
+              "owner": "example-dice",
+              "id": "example_dice::RollRequest"
+            }
+          }
+        },
+        {
+          "rustName": "seed",
+          "hostName": "seed",
+          "ty": {
+            "kind": "int",
+            "signed": false,
+            "bits": 64
+          }
+        }
+      ],
+      "returns": {
+        "kind": "buffer",
+        "element": "u32"
+      },
+      "error": {
+        "owner": "example-dice",
+        "id": "example_dice::RollError"
+      }
+    },
+    {
+      "rustName": "seed_from_bytes",
+      "hostName": "seedFromBytes",
+      "docs": "Convert bytes to a repeatable seed.",
+      "params": [
+        {
+          "rustName": "bytes",
+          "hostName": "bytes",
+          "ty": {
+            "kind": "bytes"
+          }
+        }
+      ],
+      "returns": {
+        "kind": "int",
+        "signed": false,
+        "bits": 64
+      },
+      "error": null
+    }
+  ],
+  "resources": [
+    {
+      "name": "DiceCup",
+      "docs": null,
+      "constructors": [
+        {
+          "rustName": "new",
+          "hostName": "new",
+          "docs": "Create a dice cup.\n# Errors\nReturns [`RollError::InvalidRequest`] when `sides` is outside 2 through 100.",
+          "params": [
+            {
+              "rustName": "sides",
+              "hostName": "sides",
+              "ty": {
+                "kind": "int",
+                "signed": false,
+                "bits": 32
+              }
+            },
+            {
+              "rustName": "seed",
+              "hostName": "seed",
+              "ty": {
+                "kind": "int",
+                "signed": false,
+                "bits": 64
+              }
+            }
+          ],
+          "returns": {
+            "kind": "named",
+            "identity": {
+              "owner": "example-dice",
+              "id": "example_dice::DiceCup"
+            }
+          },
+          "error": {
+            "owner": "example-dice",
+            "id": "example_dice::RollError"
+          }
+        }
+      ],
+      "methods": [
+        {
+          "rustName": "roll",
+          "hostName": "roll",
+          "docs": "Roll the dice in this cup.\n# Errors\nReturns [`RollError::InvalidRequest`] when `count` is outside 1 through 100.",
+          "params": [
+            {
+              "rustName": "count",
+              "hostName": "count",
+              "ty": {
+                "kind": "int",
+                "signed": false,
+                "bits": 32
+              }
+            }
+          ],
+          "returns": {
+            "kind": "named",
+            "identity": {
+              "owner": "example-dice",
+              "id": "example_dice::RollResult"
+            }
+          },
+          "error": {
+            "owner": "example-dice",
+            "id": "example_dice::RollError"
+          }
+        }
+      ]
+    }
+  ],
+  "constants": [
+    {
+      "hostName": "DEFAULT_SEED",
+      "docs": null,
+      "ty": {
+        "kind": "int",
+        "signed": false,
+        "bits": 64
+      },
+      "value": 42
+    }
+  ]
+}
