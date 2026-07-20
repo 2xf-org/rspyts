@@ -7,10 +7,15 @@ use crate::ir::{
     TypeRef, TypeShape,
 };
 
+/// A linked type contract produced by [`crate::Model`].
 pub struct TypeRegistration(pub fn() -> TypeDef);
+/// A linked error contract produced by [`crate::Error`].
 pub struct ErrorRegistration(pub fn() -> ErrorDef);
+/// A linked function contract produced by [`crate::export`].
 pub struct FunctionRegistration(pub fn() -> FunctionDef);
+/// A linked resource contract produced by [`crate::export`].
 pub struct ResourceRegistration(pub fn() -> ResourceDef);
+/// A linked constant contract produced by [`crate::export`].
 pub struct ConstantRegistration(pub fn() -> Result<ConstantDef, String>);
 
 inventory::collect!(TypeRegistration);
@@ -19,6 +24,7 @@ inventory::collect!(FunctionRegistration);
 inventory::collect!(ResourceRegistration);
 inventory::collect!(ConstantRegistration);
 
+/// An invalid collection of linked application exports.
 #[derive(Debug, thiserror::Error)]
 pub enum RegistryError {
     #[error("duplicate {kind} name `{name}` in the aggregate binding")]
@@ -36,6 +42,7 @@ pub enum RegistryError {
     InvalidConstant(String),
 }
 
+/// Collect and validate every export linked into an application binding.
 pub fn manifest(
     package_name: &str,
     package_version: &str,
