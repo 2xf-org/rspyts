@@ -251,6 +251,11 @@ fn compile(project: &Project, kind: CompileKind) -> Result<PathBuf> {
         append_rust_flag(&mut flags, "-C");
         append_rust_flag(&mut flags, "link-arg=-Wl,-install_name,@rpath/native.so");
     }
+    if matches!(kind, CompileKind::Native) && cfg!(all(target_os = "windows", target_env = "msvc"))
+    {
+        append_rust_flag(&mut flags, "-C");
+        append_rust_flag(&mut flags, "link-arg=/Brepro");
+    }
     command.env("RUSTFLAGS", flags);
     let output = command
         .output()
