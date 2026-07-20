@@ -44,7 +44,7 @@ jobs:
       - name: Test
         run: cargo test --workspace --locked
       - name: Check WebAssembly exports
-        run: cargo check --locked -p example --no-default-features --features wasm --target wasm32-unknown-unknown
+        run: cargo check --locked -p example --target wasm32-unknown-unknown
 
   generated-packages:
     name: Generated packages (${{ matrix.os }})
@@ -74,8 +74,8 @@ jobs:
         run: cargo install wasm-bindgen-cli --version '=0.2.126' --locked
       - name: Build and check generated packages
         run: |
-          cargo run --locked -p rspyts-cli -- build --manifest-path example/crates/bindings/Cargo.toml
-          cargo run --locked -p rspyts-cli -- check --manifest-path example/crates/bindings/Cargo.toml
+          cargo run --locked -p rspyts-cli -- build
+          cargo run --locked -p rspyts-cli -- check
       - name: Test the Python client
         run: |
           python -m pip install --disable-pip-version-check pytest -e example/crates/bindings/dist/python -e example/clients/python

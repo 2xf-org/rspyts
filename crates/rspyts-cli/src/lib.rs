@@ -7,6 +7,7 @@ use clap::{Args, Parser, Subcommand};
 use serde_json::json;
 
 mod contract;
+mod init;
 mod output;
 mod project;
 mod python;
@@ -28,6 +29,8 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Create a Rust, Python, and TypeScript project.
+    Init(InitArgs),
     /// Build the Python and TypeScript packages.
     Build(ProjectArgs),
     /// Rebuild when Rust or Cargo files change.
@@ -37,8 +40,14 @@ enum Command {
 }
 
 #[derive(Debug, Args)]
+struct InitArgs {
+    /// New project directory. The final path component is the package name.
+    path: PathBuf,
+}
+
+#[derive(Debug, Args)]
 struct ProjectArgs {
-    /// Path to the aggregate binding Cargo.toml.
+    /// Path to a workspace or binding Cargo.toml.
     #[arg(long, default_value = "Cargo.toml")]
     manifest_path: PathBuf,
 }
@@ -50,6 +59,10 @@ pub fn run() -> Result<()> {
 
 fn run_from(cli: Cli) -> Result<()> {
     match cli.command {
+        Command::Init(args) => {
+            let report = init::create(&args.path)?;
+            println!("{}", serde_json::to_string_pretty(&report)?);
+        }
         Command::Build(args) => {
             let project = Project::read(&args.manifest_path)?;
             let report = build(&project)?;

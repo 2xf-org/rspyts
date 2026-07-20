@@ -1,16 +1,11 @@
 [package]
 name = "example-dice"
-version = "1.0.0"
+version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 publish = false
-
-[features]
-default = []
-python = ["rspyts/python"]
-wasm = ["rspyts/wasm", "dep:wasm-bindgen"]
 
 [dependencies]
 rspyts.workspace = true
 serde.workspace = true
 thiserror.workspace = true
-wasm-bindgen = { workspace = true, optional = true }

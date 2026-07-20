@@ -31,7 +31,12 @@ pub(super) struct Project {
 
 impl Project {
     pub(super) fn read(path: &Path) -> Result<Self> {
-        let manifest = path
+        let requested_manifest = if path.is_dir() {
+            path.join("Cargo.toml")
+        } else {
+            path.to_path_buf()
+        };
+        let requested_manifest = requested_manifest
             .canonicalize()
             .with_context(|| format!("cannot find Cargo manifest {}", path.display()))?;
         let output = ProcessCommand::new(cargo())
@@ -42,7 +47,7 @@ impl Project {
                 "--no-deps",
                 "--manifest-path",
             ])
-            .arg(&manifest)
+            .arg(&requested_manifest)
             .output()
             .context("failed to run cargo metadata")?;
         if !output.status.success() {
@@ -52,45 +57,52 @@ impl Project {
             );
         }
         let metadata: Value = serde_json::from_slice(&output.stdout)?;
-        let package = metadata["packages"]
+        let packages = metadata["packages"]
             .as_array()
-            .and_then(|packages| {
-                packages.iter().find(|package| {
-                    package["manifest_path"]
-                        .as_str()
-                        .and_then(|value| Path::new(value).canonicalize().ok())
-                        .as_ref()
-                        == Some(&manifest)
-                })
+            .context("Cargo metadata has no package list")?;
+        let workspace_members = metadata["workspace_members"]
+            .as_array()
+            .context("Cargo metadata has no workspace member list")?;
+        let requested_package = packages.iter().find(|package| {
+            package["manifest_path"]
+                .as_str()
+                .and_then(|value| Path::new(value).canonicalize().ok())
+                .as_ref()
+                == Some(&requested_manifest)
+        });
+        let mut candidates = packages
+            .iter()
+            .filter(|package| {
+                package["id"]
+                    .as_str()
+                    .is_some_and(|id| workspace_members.iter().any(|member| member == id))
+                    && is_binding_package(package)
             })
-            .context("the manifest does not describe a Cargo package")?;
+            .collect::<Vec<_>>();
+        let package = match requested_package.filter(|package| is_binding_package(package)) {
+            Some(package) => package,
+            None => match candidates.len() {
+                1 => candidates.pop().expect("one candidate exists"),
+                0 => bail!(
+                    "no rspyts binding crate found; add one workspace package with a direct `rspyts` dependency and crate-type = [\"cdylib\"]"
+                ),
+                _ => {
+                    let names = candidates
+                        .iter()
+                        .filter_map(|package| package["name"].as_str())
+                        .collect::<Vec<_>>();
+                    bail!(
+                        "multiple rspyts binding crates found: {names:?}; select one with `--manifest-path path/to/Cargo.toml`"
+                    );
+                }
+            },
+        };
+        let manifest = PathBuf::from(string(package, "manifest_path")?)
+            .canonicalize()
+            .context("cannot resolve the binding Cargo manifest")?;
         let package_name = string(package, "name")?.to_owned();
         let package_version = string(package, "version")?.to_owned();
         let package_id = string(package, "id")?.to_owned();
-        let features = package["features"]
-            .as_object()
-            .context("Cargo metadata has no feature table")?;
-        for feature in ["python", "wasm"] {
-            if !features.contains_key(feature) {
-                bail!("aggregate binding `{package_name}` must define a `{feature}` Cargo feature");
-            }
-        }
-        let has_cdylib = package["targets"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .any(|target| {
-                target["crate_types"]
-                    .as_array()
-                    .into_iter()
-                    .flatten()
-                    .any(|kind| kind == "cdylib")
-            });
-        if !has_cdylib {
-            bail!(
-                "aggregate binding `{package_name}` must set crate-type = [\"cdylib\", \"rlib\"]"
-            );
-        }
 
         let settings = package["metadata"]["rspyts"].as_object();
         let python_package = settings
@@ -153,9 +165,8 @@ pub(super) fn check(project: &Project) -> Result<()> {
     let expected = file_tree(generated.path())?;
     let actual = file_tree(&project.output()).with_context(|| {
         format!(
-            "{} does not exist; run `rspyts build --manifest-path {}`",
-            project.output().display(),
-            project.manifest.display()
+            "{} does not exist; run `rspyts build`",
+            project.output().display()
         )
     })?;
     if expected != actual {
@@ -167,11 +178,10 @@ pub(super) fn check(project: &Project) -> Result<()> {
             .cloned()
             .collect::<Vec<_>>();
         bail!(
-            "dist is not in sync (missing: {:?}; extra: {:?}; changed: {:?}); run `rspyts build --manifest-path {}`",
+            "dist is not in sync (missing: {:?}; extra: {:?}; changed: {:?}); run `rspyts build`",
             expected_names.difference(&actual_names).collect::<Vec<_>>(),
             actual_names.difference(&expected_names).collect::<Vec<_>>(),
             changed,
-            project.manifest.display(),
         );
     }
     Ok(())
@@ -181,10 +191,9 @@ fn generate(project: &Project) -> Result<TempDir> {
     let temporary = tempfile::Builder::new()
         .prefix(".rspyts-")
         .tempdir_in(&project.root)?;
-    let probe = compile(project, CompileKind::Probe)?;
-    let manifest = read_contract(&probe, &project.package_name)?;
-    validate_contract(project, &manifest)?;
     let native = compile(project, CompileKind::Native)?;
+    let manifest = read_contract(&native, &project.package_name)?;
+    validate_contract(project, &manifest)?;
     let wasm = compile(project, CompileKind::Wasm)?;
 
     write_json(&temporary.path().join("contract.json"), &manifest)?;
@@ -195,16 +204,14 @@ fn generate(project: &Project) -> Result<TempDir> {
 
 #[derive(Clone, Copy)]
 enum CompileKind {
-    Probe,
     Native,
     Wasm,
 }
 
 fn compile(project: &Project, kind: CompileKind) -> Result<PathBuf> {
-    let feature = match kind {
-        CompileKind::Probe => None,
-        CompileKind::Native => Some("python"),
-        CompileKind::Wasm => Some("wasm"),
+    let (feature, label) = match kind {
+        CompileKind::Native => (Some("rspyts/python-extension"), "Python"),
+        CompileKind::Wasm => (None, "WebAssembly"),
     };
     let mut command = ProcessCommand::new(cargo());
     command
@@ -214,8 +221,6 @@ fn compile(project: &Project, kind: CompileKind) -> Result<PathBuf> {
         .arg("--package")
         .arg(&project.package_name)
         .arg("--release")
-        .arg("--locked")
-        .arg("--no-default-features")
         .arg("--message-format=json-render-diagnostics");
     if let Some(feature) = feature {
         command.arg("--features").arg(feature);
@@ -247,7 +252,6 @@ fn compile(project: &Project, kind: CompileKind) -> Result<PathBuf> {
         append_rust_flag(&mut flags, "link-arg=dynamic_lookup".into());
     }
     command.env("RUSTFLAGS", flags);
-    let label = feature.unwrap_or("contract probe");
     let output = command
         .output()
         .with_context(|| format!("failed to compile {label}"))?;
@@ -291,7 +295,7 @@ fn artifact_from_messages(bytes: &[u8], package_id: &str, kind: CompileKind) -> 
                 .filter_map(Value::as_str)
                 .map(PathBuf::from)
                 .find(|path| match kind {
-                    CompileKind::Probe | CompileKind::Native => path
+                    CompileKind::Native => path
                         .extension()
                         .and_then(|value| value.to_str())
                         .is_some_and(|value| matches!(value, "dylib" | "so" | "dll")),
@@ -321,7 +325,7 @@ fn read_contract(library_path: &Path, package_name: &str) -> Result<Manifest> {
     let contract: Symbol<'_, ContractFn> = unsafe { library.get(contract_name.as_bytes()) }
         .with_context(|| {
             format!(
-                "missing `{}`; add `rspyts::application!(native);`",
+                "missing `{}`; add `rspyts::application!(your_api_crate);`",
                 contract_name.trim_end_matches('\0')
             )
         })?;
@@ -455,6 +459,26 @@ fn string<'a>(value: &'a Value, key: &str) -> Result<&'a str> {
     value[key]
         .as_str()
         .with_context(|| format!("Cargo metadata has no `{key}` string"))
+}
+
+fn is_binding_package(package: &Value) -> bool {
+    let has_cdylib = package["targets"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .any(|target| {
+            target["crate_types"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .any(|kind| kind == "cdylib")
+        });
+    let depends_on_rspyts = package["dependencies"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .any(|dependency| dependency["name"] == "rspyts");
+    has_cdylib && depends_on_rspyts
 }
 
 fn cargo() -> std::ffi::OsString {

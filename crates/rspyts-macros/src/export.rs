@@ -84,7 +84,7 @@ fn python_function_wrapper(
         declared_error,
     )?;
     Ok(quote! {
-        #[cfg(all(feature = "python", not(target_arch = "wasm32")))]
+        #[cfg(not(target_arch = "wasm32"))]
         #[::rspyts::__private::pyo3::pyfunction(name = #host_name)]
         #[pyo3(crate = "::rspyts::__private::pyo3")]
         fn #wrapper_ident<'py>(
@@ -97,7 +97,7 @@ fn python_function_wrapper(
             #body
         }
 
-        #[cfg(all(feature = "python", not(target_arch = "wasm32")))]
+        #[cfg(not(target_arch = "wasm32"))]
         fn #register_ident(
             __rspyts_module: &::rspyts::__private::pyo3::Bound<'_, ::rspyts::__private::pyo3::types::PyModule>,
         ) -> ::rspyts::__private::pyo3::PyResult<()> {
@@ -108,7 +108,7 @@ fn python_function_wrapper(
             Ok(())
         }
 
-        #[cfg(all(feature = "python", not(target_arch = "wasm32")))]
+        #[cfg(not(target_arch = "wasm32"))]
         ::rspyts::__private::inventory::submit! {
             ::rspyts::runtime::python::Registration(#register_ident)
         }
@@ -138,14 +138,17 @@ fn wasm_function_wrapper(
         declared_error,
     )?;
     Ok(quote! {
-        #[cfg(all(feature = "wasm", target_arch = "wasm32"))]
+        #[cfg(target_arch = "wasm32")]
         mod #module_ident {
             use super::*;
-            use wasm_bindgen::prelude::wasm_bindgen;
+            use ::rspyts::__private::wasm_bindgen::{self, prelude::wasm_bindgen};
 
             #[doc(hidden)]
             #[allow(missing_docs)]
-            #[wasm_bindgen(js_name = #native_host_name)]
+            #[wasm_bindgen(
+                js_name = #native_host_name,
+                wasm_bindgen = ::rspyts::__private::wasm_bindgen
+            )]
             pub fn #wrapper_ident(
                 #(#declarations),*
             ) -> ::std::result::Result<
@@ -460,14 +463,14 @@ fn python_resource_wrapper(item: &ItemImpl) -> syn::Result<TokenStream2> {
         .collect::<syn::Result<Vec<_>>>()?;
 
     Ok(quote! {
-        #[cfg(all(feature = "python", not(target_arch = "wasm32")))]
+        #[cfg(not(target_arch = "wasm32"))]
         #[::rspyts::__private::pyo3::pyclass(name = #resource_name)]
         #[pyo3(crate = "::rspyts::__private::pyo3")]
         struct #wrapper_ident {
             inner: Option<#resource_ty>,
         }
 
-        #[cfg(all(feature = "python", not(target_arch = "wasm32")))]
+        #[cfg(not(target_arch = "wasm32"))]
         #[::rspyts::__private::pyo3::pymethods]
         #[pyo3(crate = "::rspyts::__private::pyo3")]
         impl #wrapper_ident {
@@ -485,14 +488,14 @@ fn python_resource_wrapper(item: &ItemImpl) -> syn::Result<TokenStream2> {
             }
         }
 
-        #[cfg(all(feature = "python", not(target_arch = "wasm32")))]
+        #[cfg(not(target_arch = "wasm32"))]
         fn #register_ident(
             __rspyts_module: &::rspyts::__private::pyo3::Bound<'_, ::rspyts::__private::pyo3::types::PyModule>,
         ) -> ::rspyts::__private::pyo3::PyResult<()> {
             ::rspyts::__private::pyo3::types::PyModuleMethods::add_class::<#wrapper_ident>(__rspyts_module)
         }
 
-        #[cfg(all(feature = "python", not(target_arch = "wasm32")))]
+        #[cfg(not(target_arch = "wasm32"))]
         ::rspyts::__private::inventory::submit! {
             ::rspyts::runtime::python::Registration(#register_ident)
         }
@@ -618,21 +621,21 @@ fn wasm_resource_wrapper(item: &ItemImpl) -> syn::Result<TokenStream2> {
         .collect::<syn::Result<Vec<_>>>()?;
 
     Ok(quote! {
-        #[cfg(all(feature = "wasm", target_arch = "wasm32"))]
+        #[cfg(target_arch = "wasm32")]
         mod #module_ident {
             use super::*;
-            use wasm_bindgen::prelude::wasm_bindgen;
+            use ::rspyts::__private::wasm_bindgen::{self, prelude::wasm_bindgen};
 
             #[doc(hidden)]
             #[allow(missing_docs)]
-            #[wasm_bindgen]
+            #[wasm_bindgen(wasm_bindgen = ::rspyts::__private::wasm_bindgen)]
             pub struct #wrapper_ident {
                 inner: Option<#resource_ty>,
             }
 
             #[doc(hidden)]
             #[allow(missing_docs)]
-            #[wasm_bindgen]
+            #[wasm_bindgen(wasm_bindgen = ::rspyts::__private::wasm_bindgen)]
             impl #wrapper_ident {
                 #[wasm_bindgen(constructor)]
                 pub fn new(#(#constructor_declarations),*) -> ::std::result::Result<
