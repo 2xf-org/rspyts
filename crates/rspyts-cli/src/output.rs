@@ -97,14 +97,48 @@ fn collect_files(
 
 pub(super) fn source_state(root: &Path) -> Result<BTreeMap<PathBuf, (u64, Option<SystemTime>)>> {
     let mut result = BTreeMap::new();
-    collect_source_state(root, &mut result)?;
+    for path in source_files(root)? {
+        let metadata = path.metadata()?;
+        result.insert(path, (metadata.len(), metadata.modified().ok()));
+    }
     Ok(result)
 }
 
-fn collect_source_state(
-    current: &Path,
-    result: &mut BTreeMap<PathBuf, (u64, Option<SystemTime>)>,
-) -> Result<()> {
+pub(super) fn source_fingerprint(root: &Path) -> Result<String> {
+    const OFFSET: u128 = 144_066_263_297_769_815_596_495_629_667_062_367_629;
+    const PRIME: u128 = 309_485_009_821_345_068_724_781_371;
+
+    let mut fingerprint = OFFSET;
+    for path in source_files(root)? {
+        let relative = path
+            .strip_prefix(root)?
+            .to_string_lossy()
+            .replace('\\', "/");
+        for byte in relative
+            .bytes()
+            .chain([0])
+            .chain(fs::read(path)?)
+            .chain([0])
+        {
+            fingerprint ^= u128::from(byte);
+            fingerprint = fingerprint.wrapping_mul(PRIME);
+        }
+    }
+    for byte in env!("CARGO_PKG_VERSION").bytes() {
+        fingerprint ^= u128::from(byte);
+        fingerprint = fingerprint.wrapping_mul(PRIME);
+    }
+    Ok(format!("{fingerprint:032x}"))
+}
+
+fn source_files(root: &Path) -> Result<Vec<PathBuf>> {
+    let mut result = Vec::new();
+    collect_source_files(root, &mut result)?;
+    result.sort();
+    Ok(result)
+}
+
+fn collect_source_files(current: &Path, result: &mut Vec<PathBuf>) -> Result<()> {
     let entries = match fs::read_dir(current) {
         Ok(entries) => entries,
         Err(error) if error.kind() == ErrorKind::NotFound => return Ok(()),
@@ -121,17 +155,19 @@ fn collect_source_state(
             ) {
                 continue;
             }
-            collect_source_state(&path, result)?;
-        } else if metadata.is_file()
-            && (path.extension().is_some_and(|value| value == "rs")
-                || path.file_name().is_some_and(|value| {
-                    matches!(value.to_str(), Some("Cargo.toml" | "Cargo.lock"))
-                }))
-        {
-            result.insert(path, (metadata.len(), metadata.modified().ok()));
+            collect_source_files(&path, result)?;
+        } else if metadata.is_file() && is_source_file(&path) {
+            result.push(path);
         }
     }
     Ok(())
+}
+
+fn is_source_file(path: &Path) -> bool {
+    path.extension().is_some_and(|value| value == "rs")
+        || path
+            .file_name()
+            .is_some_and(|value| matches!(value.to_str(), Some("Cargo.toml" | "Cargo.lock")))
 }
 
 pub(super) fn write(path: &Path, source: &str) -> Result<()> {

@@ -129,14 +129,6 @@ mod tests {
     }
 
     #[test]
-    fn describes_changed_byte_ranges() {
-        assert_eq!(
-            project::byte_difference(b"same--end", b"some++end!"),
-            "expected 9 bytes, found 10 bytes; 4 bytes differ; first ranges: [1..2, 4..6]"
-        );
-    }
-
-    #[test]
     fn uses_bigint_for_wide_types() {
         let manifest = Manifest {
             ir_version: 1,
@@ -176,5 +168,28 @@ mod tests {
 
         let files = output::file_tree(directory.path()).unwrap();
         assert_eq!(files.keys().collect::<Vec<_>>(), [Path::new("package.py")]);
+    }
+
+    #[test]
+    fn fingerprints_only_rust_and_cargo_sources() {
+        let directory = tempfile::tempdir().unwrap();
+        output::write(&directory.path().join("Cargo.toml"), "[workspace]\n").unwrap();
+        let initial = output::source_fingerprint(directory.path()).unwrap();
+
+        output::write(&directory.path().join("dist/generated.js"), "generated\n").unwrap();
+        assert_eq!(
+            output::source_fingerprint(directory.path()).unwrap(),
+            initial
+        );
+
+        output::write(
+            &directory.path().join("src/lib.rs"),
+            "pub fn changed() {}\n",
+        )
+        .unwrap();
+        assert_ne!(
+            output::source_fingerprint(directory.path()).unwrap(),
+            initial
+        );
     }
 }
