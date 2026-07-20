@@ -13,7 +13,15 @@ example/
 │       └── src/lib.rs
 └── clients/
     ├── python/
+    │   ├── example_client/__init__.py
+    │   ├── tests/test_client.py
+    │   ├── pyproject.toml
+    │   └── uv.lock
     └── typescript/
+        ├── src/index.ts
+        ├── package-lock.json
+        ├── package.json
+        └── tsconfig.json
 ```
 
 The `example-dice` crate owns the models and behavior. The `example` crate
@@ -29,15 +37,22 @@ Build both host packages:
 cargo run -p rspyts-cli -- build
 ```
 
+The build creates the generated Python and TypeScript packages in
+`example/crates/bindings/dist`. Git does not store this directory because the
+Python extension is specific to the operating system that builds it.
+
 Then run the authored clients:
 
 ```sh
 uv run --project example/clients/python pytest -q example/clients/python/tests
-npm --prefix example/clients/typescript install
+npm --prefix example/clients/typescript ci
 npm --prefix example/clients/typescript run check
 npm --prefix example/clients/typescript run build
 npm --prefix example/clients/typescript run start
 ```
+
+These client commands use `uv`, Python, Node.js, and npm. They are example
+development tools. `rspyts build` does not require them.
 
 Both clients roll three seeded dice. Both clients return `[5, 4, 2]` with a
 total of `11`.

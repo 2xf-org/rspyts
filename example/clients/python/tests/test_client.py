@@ -1,6 +1,6 @@
-from example_client import roll_three_dice
-from example import RollRequest, roll_values, seed_from_bytes
 import numpy as np
+from example import RollRequest, roll_values, seed_from_bytes
+from example_client import roll_three_dice
 
 
 def test_generated_python_package() -> None:
