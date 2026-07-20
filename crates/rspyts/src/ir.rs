@@ -382,23 +382,23 @@ mod tests {
         let manifest = manifest(
             "example-core",
             &[
-                ("example-catalog", "example_catalog::device"),
-                ("example-reports", "example_reports::run"),
+                ("example-catalog", "example_catalog::inventory"),
+                ("example-orders", "example_orders::create"),
             ],
         );
 
         let namespace = manifest.namespace(
             &CargoPackageId::new("example-catalog"),
-            "example_catalog::device::shelf::position",
+            "example_catalog::inventory::shelf::position",
         );
 
         assert_eq!(
             namespace.python_segments(),
-            ["catalog", "device", "shelf", "position"]
+            ["catalog", "inventory", "shelf", "position"]
         );
         assert_eq!(
             namespace.typescript_segments(),
-            ["catalog", "device", "shelf", "position"]
+            ["catalog", "inventory", "shelf", "position"]
         );
     }
 

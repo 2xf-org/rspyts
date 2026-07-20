@@ -24,7 +24,7 @@ Python native extension and one WebAssembly file.
 Install rspyts and the WebAssembly target:
 
 ```sh
-cargo install rspyts-cli --version '=1.0.1' --locked
+cargo install rspyts-cli --locked
 rustup target add wasm32-unknown-unknown
 ```
 
@@ -102,22 +102,22 @@ the package.
 rspyts makes package paths from Cargo package names and Rust module paths. You
 do not add namespace settings.
 
-For this Rust declaration:
+For an `example` binding package and this Rust declaration:
 
 ```text
 Cargo package: example-catalog
-Rust module:   device::shelf::position
+Rust module:   inventory::shelf::position
 Type:          Position
 ```
 
 Use these imports:
 
 ```python
-from example.catalog.device.shelf.position import Position
+from example.catalog.inventory.shelf.position import Position
 ```
 
 ```typescript
-import type { Position } from "@example/core/catalog/device/shelf/position";
+import type { Position } from "example/catalog/inventory/shelf/position";
 ```
 
 rspyts applies these rules:
@@ -158,31 +158,6 @@ and `import.meta.url`.
 
 Use `--manifest-path path/to/Cargo.toml` when a workspace has more than one
 binding crate.
-
-## Moving from v1.0.0
-
-Version 1.0.1 uses Rust-shaped package paths. It does not create the flat
-imports from version 1.0.0.
-
-For an item in the root of `hello-rspyts-api`, change these imports:
-
-```python
-# v1.0.0
-from hello_rspyts import Greeting
-
-# v1.0.1
-from hello_rspyts.api import Greeting
-```
-
-```typescript
-// v1.0.0
-import type { Greeting } from "hello-rspyts";
-
-// v1.0.1
-import type { Greeting } from "hello-rspyts/api";
-```
-
-Run `rspyts build` to remove old generated files. Then run `rspyts check`.
 
 ## Example
 
