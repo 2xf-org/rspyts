@@ -2,7 +2,9 @@ use std::collections::{BTreeMap, HashMap};
 
 use crate::ir::TypeRef;
 
+/// Describe how a Rust type appears in the generated host APIs.
 pub trait ContractType {
+    /// Return the host-neutral reference for this Rust type.
     fn type_ref() -> TypeRef;
 }
 

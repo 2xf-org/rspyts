@@ -5,8 +5,10 @@ use std::fmt;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+/// The serialized contract format produced by this release.
 pub const IR_VERSION: u32 = 1;
 
+/// The complete application contract consumed by the package generators.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Manifest {
@@ -19,12 +21,6 @@ pub struct Manifest {
     pub functions: Vec<FunctionDef>,
     pub resources: Vec<ResourceDef>,
     pub constants: Vec<ConstantDef>,
-}
-
-impl Manifest {
-    pub fn canonical_json(&self) -> Result<String, serde_json::Error> {
-        serde_json::to_string(self)
-    }
 }
 
 /// The Cargo package that declared an item.
@@ -70,6 +66,7 @@ impl fmt::Display for DefinitionId {
     }
 }
 
+/// A type that can cross the generated Python and TypeScript boundaries.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "camelCase", deny_unknown_fields)]
 pub enum TypeRef {
@@ -90,6 +87,7 @@ pub enum TypeRef {
     Buffer { element: BufferElement },
 }
 
+/// A supported element type for a contiguous numeric buffer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum BufferElement {
@@ -105,6 +103,7 @@ pub enum BufferElement {
     F64,
 }
 
+/// A named Rust type in the application contract.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct TypeDef {
@@ -121,6 +120,7 @@ impl TypeDef {
     }
 }
 
+/// The host-visible shape of a named Rust type.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "camelCase", deny_unknown_fields)]
 pub enum TypeShape {
@@ -139,6 +139,7 @@ pub enum TypeShape {
     },
 }
 
+/// A field in a struct or tagged-enum variant.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct FieldDef {
@@ -151,6 +152,7 @@ pub struct FieldDef {
     pub constraints: FieldConstraints,
 }
 
+/// A scalar value supported by field defaults and constraints.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum ScalarValue {
@@ -159,6 +161,7 @@ pub enum ScalarValue {
     String(String),
 }
 
+/// Validation constraints copied to generated host models.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct FieldConstraints {
@@ -169,6 +172,7 @@ pub struct FieldConstraints {
     pub le: Option<i64>,
 }
 
+/// A variant in a string or tagged enum.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct EnumVariantDef {
@@ -178,6 +182,7 @@ pub struct EnumVariantDef {
     pub fields: Vec<FieldDef>,
 }
 
+/// A named Rust error in the application contract.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ErrorDef {
@@ -185,7 +190,6 @@ pub struct ErrorDef {
     pub id: String,
     pub name: String,
     pub docs: Option<String>,
-    pub variants: Vec<ErrorVariantDef>,
 }
 
 impl ErrorDef {
@@ -194,19 +198,10 @@ impl ErrorDef {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct ErrorVariantDef {
-    pub rust_name: String,
-    pub code: String,
-    pub docs: Option<String>,
-    pub fields: Vec<FieldDef>,
-}
-
+/// A free function exposed to Python and TypeScript.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct FunctionDef {
-    pub owner: CargoPackageId,
     pub rust_name: String,
     pub host_name: String,
     pub docs: Option<String>,
@@ -215,6 +210,7 @@ pub struct FunctionDef {
     pub error: Option<DefinitionId>,
 }
 
+/// A parameter in an exported function, constructor, or method.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ParamDef {
@@ -223,34 +219,32 @@ pub struct ParamDef {
     pub ty: TypeRef,
 }
 
+/// An exported Rust type that keeps native state between calls.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ResourceDef {
-    pub owner: CargoPackageId,
-    pub id: String,
     pub name: String,
     pub docs: Option<String>,
     pub constructors: Vec<FunctionDef>,
     pub methods: Vec<MethodDef>,
 }
 
+/// A callable method on an exported resource.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct MethodDef {
     pub rust_name: String,
     pub host_name: String,
     pub docs: Option<String>,
-    pub mutable: bool,
     pub params: Vec<ParamDef>,
     pub returns: TypeRef,
     pub error: Option<DefinitionId>,
 }
 
+/// A Rust constant exposed to Python and TypeScript.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ConstantDef {
-    pub owner: CargoPackageId,
-    pub rust_name: String,
     pub host_name: String,
     pub docs: Option<String>,
     pub ty: TypeRef,
