@@ -175,19 +175,18 @@ pub(super) fn check(project: &Project) -> Result<()> {
             project.output().display()
         )
     })?;
-    if expected != actual {
-        let expected_names = expected.keys().cloned().collect::<BTreeSet<_>>();
-        let actual_names = actual.keys().cloned().collect::<BTreeSet<_>>();
-        let changed = expected_names
-            .intersection(&actual_names)
-            .filter(|path| !is_binary(path) && expected.get(*path) != actual.get(*path))
-            .cloned()
-            .collect::<Vec<_>>();
+    let expected_names = expected.keys().cloned().collect::<BTreeSet<_>>();
+    let actual_names = actual.keys().cloned().collect::<BTreeSet<_>>();
+    let missing = expected_names.difference(&actual_names).collect::<Vec<_>>();
+    let extra = actual_names.difference(&expected_names).collect::<Vec<_>>();
+    let changed = expected_names
+        .intersection(&actual_names)
+        .filter(|path| !is_binary(path) && expected.get(*path) != actual.get(*path))
+        .cloned()
+        .collect::<Vec<_>>();
+    if !missing.is_empty() || !extra.is_empty() || !changed.is_empty() {
         bail!(
-            "dist is not in sync (missing: {:?}; extra: {:?}; changed: {:?}); run `rspyts build`",
-            expected_names.difference(&actual_names).collect::<Vec<_>>(),
-            actual_names.difference(&expected_names).collect::<Vec<_>>(),
-            changed,
+            "dist is not in sync (missing: {missing:?}; extra: {extra:?}; changed: {changed:?}); run `rspyts build`",
         );
     }
     Ok(())
