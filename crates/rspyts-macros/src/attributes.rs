@@ -1,4 +1,9 @@
-use super::*;
+use heck::{ToKebabCase, ToLowerCamelCase, ToShoutySnakeCase, ToSnakeCase, ToUpperCamelCase};
+use proc_macro2::TokenStream as TokenStream2;
+use quote::quote;
+use syn::{
+    Attribute, Expr, Ident, ImplItemFn, LitStr, Meta, Token, Type as SynType, spanned::Spanned,
+};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum SerdeRenameRule {
@@ -70,7 +75,7 @@ pub(super) fn apply_serde_field_case(value: &str, rule: Option<SerdeRenameRule>)
     };
     match rule {
         SerdeRenameRule::Lower | SerdeRenameRule::Snake => value.to_owned(),
-        SerdeRenameRule::Upper => value.to_ascii_uppercase(),
+        SerdeRenameRule::Upper | SerdeRenameRule::ScreamingSnake => value.to_ascii_uppercase(),
         SerdeRenameRule::Pascal => {
             let mut pascal = String::new();
             let mut capitalize = true;
@@ -90,7 +95,6 @@ pub(super) fn apply_serde_field_case(value: &str, rule: Option<SerdeRenameRule>)
             let pascal = apply_serde_field_case(value, Some(SerdeRenameRule::Pascal));
             pascal[..1].to_ascii_lowercase() + &pascal[1..]
         }
-        SerdeRenameRule::ScreamingSnake => value.to_ascii_uppercase(),
         SerdeRenameRule::Kebab => value.replace('_', "-"),
         SerdeRenameRule::ScreamingKebab => value.to_ascii_uppercase().replace('_', "-"),
     }
@@ -396,27 +400,39 @@ pub(super) fn method_exported(method: &ImplItemFn, constructor: bool) -> syn::Re
 }
 
 pub(super) fn docs_tokens(attrs: &[Attribute]) -> TokenStream2 {
+    match docs_text(attrs) {
+        Some(docs) => quote!(Some(#docs.to_owned())),
+        None => quote!(None),
+    }
+}
+
+fn docs_text(attrs: &[Attribute]) -> Option<String> {
     let lines = attrs
         .iter()
         .filter(|attr| attr.path().is_ident("doc"))
         .filter_map(|attr| match &attr.meta {
             Meta::NameValue(value) => match &value.value {
                 Expr::Lit(literal) => match &literal.lit {
-                    syn::Lit::Str(value) => Some(value.value().trim().to_owned()),
+                    syn::Lit::Str(value) => {
+                        let value = value.value();
+                        Some(
+                            value
+                                .strip_prefix(' ')
+                                .unwrap_or(&value)
+                                .trim_end()
+                                .to_owned(),
+                        )
+                    }
                     _ => None,
                 },
                 _ => None,
             },
             _ => None,
         })
-        .filter(|line| !line.is_empty())
         .collect::<Vec<_>>();
-    if lines.is_empty() {
-        quote!(None)
-    } else {
-        let docs = lines.join("\n");
-        quote!(Some(#docs.to_owned()))
-    }
+    let first = lines.iter().position(|line| !line.is_empty())?;
+    let last = lines.iter().rposition(|line| !line.is_empty())?;
+    Some(lines[first..=last].join("\n"))
 }
 
 pub(super) fn apply_case(value: &str, rule: Option<&str>) -> String {
@@ -445,7 +461,11 @@ pub(super) fn type_last_ident(ty: &SynType) -> syn::Result<&Ident> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{
+        SerdeRenameRule, apply_case, apply_serde_variant_case, docs_text, serde_container,
+        serde_rename,
+    };
+    use syn::DeriveInput;
 
     #[test]
     fn reads_supported_serde_container_options() {
@@ -474,6 +494,21 @@ mod tests {
         assert_eq!(
             apply_serde_variant_case("InvalidRequest", Some(SerdeRenameRule::Snake)),
             "invalid_request"
+        );
+    }
+
+    #[test]
+    fn preserves_rustdoc_paragraphs() {
+        let input: DeriveInput = syn::parse_quote! {
+            /// A summary.
+            ///
+            /// More information.
+            struct Example;
+        };
+
+        assert_eq!(
+            docs_text(&input.attrs).as_deref(),
+            Some("A summary.\n\nMore information.")
         );
     }
 }

@@ -108,13 +108,11 @@ impl Project {
         let python_package = settings
             .and_then(|value| value.get("python"))
             .and_then(Value::as_str)
-            .map(str::to_owned)
-            .unwrap_or_else(|| package_name.replace('-', "_"));
+            .map_or_else(|| package_name.replace('-', "_"), str::to_owned);
         let typescript_package = settings
             .and_then(|value| value.get("typescript"))
             .and_then(Value::as_str)
-            .map(str::to_owned)
-            .unwrap_or_else(|| package_name.clone());
+            .map_or_else(|| package_name.clone(), str::to_owned);
         validate_python_package(&python_package)?;
         validate_typescript_package(&typescript_package)?;
 
@@ -231,7 +229,7 @@ fn compile(project: &Project, kind: CompileKind) -> Result<PathBuf> {
     let mut flags = std::env::var("RUSTFLAGS").unwrap_or_default();
     append_rust_flag(
         &mut flags,
-        format!(
+        &format!(
             "--remap-path-prefix={}=/workspace",
             project.workspace_root.display()
         ),
@@ -242,14 +240,16 @@ fn compile(project: &Project, kind: CompileKind) -> Result<PathBuf> {
     {
         append_rust_flag(
             &mut flags,
-            format!("--remap-path-prefix={}=/cargo", cargo_home.display()),
+            &format!("--remap-path-prefix={}=/cargo", cargo_home.display()),
         );
     }
     if matches!(kind, CompileKind::Native) && cfg!(target_os = "macos") {
-        append_rust_flag(&mut flags, "-C".into());
-        append_rust_flag(&mut flags, "link-arg=-undefined".into());
-        append_rust_flag(&mut flags, "-C".into());
-        append_rust_flag(&mut flags, "link-arg=dynamic_lookup".into());
+        append_rust_flag(&mut flags, "-C");
+        append_rust_flag(&mut flags, "link-arg=-undefined");
+        append_rust_flag(&mut flags, "-C");
+        append_rust_flag(&mut flags, "link-arg=dynamic_lookup");
+        append_rust_flag(&mut flags, "-C");
+        append_rust_flag(&mut flags, "link-arg=-Wl,-install_name,@rpath/native.so");
     }
     command.env("RUSTFLAGS", flags);
     let output = command
@@ -270,11 +270,11 @@ fn compile(project: &Project, kind: CompileKind) -> Result<PathBuf> {
     })
 }
 
-fn append_rust_flag(flags: &mut String, value: String) {
+fn append_rust_flag(flags: &mut String, value: &str) {
     if !flags.is_empty() {
         flags.push(' ');
     }
-    flags.push_str(&value);
+    flags.push_str(value);
 }
 
 fn artifact_from_messages(bytes: &[u8], package_id: &str, kind: CompileKind) -> Option<PathBuf> {

@@ -13,9 +13,11 @@ include = ["src/**", "README.md", "LICENSE"]
 [[bin]]
 name = "rspyts"
 path = "src/main.rs"
+doc = false
 
 [dependencies]
 rspyts.workspace = true
+
 anyhow.workspace = true
 clap.workspace = true
 fs4.workspace = true
@@ -23,3 +25,4 @@ libloading.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tempfile.workspace = true
+wasm-bindgen-cli-support.workspace = true

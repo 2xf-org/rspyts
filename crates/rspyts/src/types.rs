@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, HashMap};
+use std::hash::BuildHasher;
 
 use crate::ir::TypeRef;
 
@@ -116,7 +117,7 @@ impl<T: ContractType> ContractType for BTreeMap<String, T> {
     }
 }
 
-impl<T: ContractType> ContractType for HashMap<String, T> {
+impl<T: ContractType, S: BuildHasher> ContractType for HashMap<String, T, S> {
     fn type_ref() -> TypeRef {
         TypeRef::Map {
             value: Box::new(T::type_ref()),

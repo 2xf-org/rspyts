@@ -70,8 +70,6 @@ jobs:
         with:
           targets: wasm32-unknown-unknown
           cache-key: generated-${{ matrix.os }}
-      - name: Install wasm-bindgen
-        run: cargo install wasm-bindgen-cli --version '=0.2.126' --locked
       - name: Build and check generated packages
         run: |
           cargo run --locked -p rspyts-cli -- build

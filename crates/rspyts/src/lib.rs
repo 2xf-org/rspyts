@@ -27,8 +27,8 @@ mod discovery {
 
     pub fn contract(build: impl FnOnce() -> Result<String, String>) -> DiscoveryResult {
         match catch_unwind(AssertUnwindSafe(build)) {
-            Ok(Ok(payload)) => owned(SUCCESS, payload),
-            Ok(Err(error)) => owned(ERROR, error),
+            Ok(Ok(payload)) => owned(SUCCESS, &payload),
+            Ok(Err(error)) => owned(ERROR, &error),
             Err(panic) => {
                 mem::forget(panic);
                 DiscoveryResult {
@@ -39,7 +39,7 @@ mod discovery {
         }
     }
 
-    fn owned(status: u32, payload: String) -> DiscoveryResult {
+    fn owned(status: u32, payload: &str) -> DiscoveryResult {
         let payload = payload.replace('\0', "\\0");
         // SAFETY: the replacement removes all interior NUL bytes.
         let payload = unsafe { CString::from_vec_unchecked(payload.into_bytes()) }.into_raw();

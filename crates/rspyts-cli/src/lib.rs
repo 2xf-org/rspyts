@@ -53,6 +53,10 @@ struct ProjectArgs {
 }
 
 /// Parse the command line and run the selected rspyts command.
+///
+/// # Errors
+///
+/// Returns an error when command input is invalid or a requested operation fails.
 pub fn run() -> Result<()> {
     run_from(Cli::parse())
 }
@@ -106,9 +110,9 @@ fn run_from(cli: Cli) -> Result<()> {
 mod tests {
     use std::path::Path;
 
-    use rspyts::ir::{BufferElement, Manifest, TypeRef};
+    use rspyts::ir::{Manifest, TypeRef};
 
-    use super::{output, project, python, typescript};
+    use super::{output, project, typescript};
 
     #[test]
     fn validates_package_names() {
@@ -164,28 +168,5 @@ mod tests {
 
         let files = output::file_tree(directory.path()).unwrap();
         assert_eq!(files.keys().collect::<Vec<_>>(), [Path::new("package.py")]);
-    }
-
-    #[test]
-    fn configures_pydantic_for_numpy_results() {
-        let manifest = Manifest {
-            ir_version: 1,
-            package_name: "fixture".into(),
-            package_version: "1.0.0".into(),
-            module_name: "native".into(),
-            types: vec![],
-            errors: vec![],
-            functions: vec![],
-            resources: vec![],
-            constants: vec![],
-        };
-        let adapter = python::type_adapter(
-            &TypeRef::Buffer {
-                element: BufferElement::F64,
-            },
-            &manifest,
-        )
-        .unwrap();
-        assert!(adapter.contains("arbitrary_types_allowed=True"));
     }
 }

@@ -1,5 +1,15 @@
-use super::*;
-use crate::attributes::*;
+use proc_macro2::{Span, TokenStream as TokenStream2};
+use quote::quote;
+use syn::{
+    Attribute, Expr, FnArg, GenericArgument, ImplItemFn, Lit, Pat, PathArguments, ReturnType,
+    Type as SynType, TypePath, UnOp, ext::IdentExt, punctuated::Punctuated, spanned::Spanned,
+    token::Comma,
+};
+
+use crate::attributes::{
+    SerdeField, SerdeRenameRule, apply_case, apply_serde_field_case, docs_tokens, serde_field,
+    take_boundary_attr, type_last_ident,
+};
 
 pub(super) fn params_tokens(
     inputs: &mut Punctuated<FnArg, Comma>,
@@ -360,6 +370,17 @@ fn validate_field_options(
     options: &FieldOptions,
     serde: &SerdeField,
 ) -> syn::Result<()> {
+    validate_field_presence(field, options, serde)?;
+    let kind = field_kind(&field.ty, options.boundary.as_deref());
+    validate_constraint_ranges(field, options, kind)?;
+    validate_constraint_values(options, kind)
+}
+
+fn validate_field_presence(
+    field: &syn::Field,
+    options: &FieldOptions,
+    serde: &SerdeField,
+) -> syn::Result<()> {
     let required =
         options.required || (!is_option(&field.ty) && !serde.default && options.default.is_none());
     if let Some(skip) = serde.skip_serializing_if.as_ref() {
@@ -415,6 +436,14 @@ fn validate_field_options(
             ));
         }
     }
+    Ok(())
+}
+
+fn validate_constraint_ranges(
+    field: &syn::Field,
+    options: &FieldOptions,
+    kind: FieldKind,
+) -> syn::Result<()> {
     if let (Some(minimum), Some(maximum)) = (options.min_length, options.max_length)
         && minimum > maximum
     {
@@ -428,7 +457,6 @@ fn validate_field_options(
     {
         return Err(syn::Error::new(field.span(), "`ge` cannot exceed `le`"));
     }
-    let kind = field_kind(&field.ty, options.boundary.as_deref());
     if (options.min_length.is_some() || options.max_length.is_some())
         && !matches!(
             kind,
@@ -448,6 +476,10 @@ fn validate_field_options(
             "`ge` and `le` apply only to integer fields",
         ));
     }
+    Ok(())
+}
+
+fn validate_constraint_values(options: &FieldOptions, kind: FieldKind) -> syn::Result<()> {
     if let Some(literal) = options.literal.as_ref() {
         validate_scalar_kind(literal, kind, "literal")?;
     }
@@ -762,8 +794,7 @@ pub(super) fn resolved_result_types(
         })
         .collect::<Vec<_>>();
     match (types.as_slice(), declared_error) {
-        ([ok, error], None) => Ok(Some((ok.clone(), error.clone()))),
-        ([ok], Some(error)) => Ok(Some((ok.clone(), error.clone()))),
+        ([ok, error], None) | ([ok], Some(error)) => Ok(Some((ok.clone(), error.clone()))),
         ([_, _], Some(_)) => Err(syn::Error::new(
             segment.span(),
             "`error = ...` is only valid for a one-parameter Result<T> alias",
@@ -859,7 +890,8 @@ pub(super) fn wasm_native_host_name(host_name: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{field_options, reject_signature};
+    use syn::ItemFn;
 
     #[test]
     fn reads_field_constraints() {

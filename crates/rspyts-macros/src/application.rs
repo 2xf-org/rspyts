@@ -1,4 +1,10 @@
-use super::*;
+use proc_macro2::TokenStream as TokenStream2;
+use quote::quote;
+use syn::{
+    Ident, Token,
+    parse::{Parse, ParseStream},
+    punctuated::Punctuated,
+};
 
 pub(super) struct ModuleInput {
     crates: Vec<Ident>,
@@ -69,7 +75,7 @@ pub(super) fn expand_application(input: ModuleInput) -> TokenStream2 {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::ModuleInput;
 
     #[test]
     fn parses_one_aggregate_binding() {

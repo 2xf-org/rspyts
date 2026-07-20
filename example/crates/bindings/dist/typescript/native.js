@@ -1,5 +1,3 @@
-/* @ts-self-types="./native.d.ts" */
-
 export class RspytsWasmDiceCup {
     __destroy_into_raw() {
         const ptr = this.__wbg_ptr;

@@ -8,14 +8,15 @@ repository.workspace = true
 description = "Compile one Rust API into Python and TypeScript packages"
 keywords = ["ffi", "python", "typescript", "wasm", "codegen"]
 categories = ["development-tools::ffi", "wasm"]
-include = ["src/**", "README.md", "LICENSE"]
+include = ["src/**", "tests/**", "README.md", "LICENSE"]
 
 [features]
 python-extension = ["pyo3/extension-module"]
 
 [dependencies]
-chrono.workspace = true
 rspyts-macros.workspace = true
+
+chrono.workspace = true
 inventory.workspace = true
 serde.workspace = true
 serde_json.workspace = true

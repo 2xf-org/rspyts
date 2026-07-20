@@ -115,6 +115,7 @@ pub struct TypeDef {
 }
 
 impl TypeDef {
+    #[must_use]
     pub fn identity(&self) -> DefinitionId {
         DefinitionId::new(self.owner.0.clone(), self.id.clone())
     }
@@ -193,6 +194,7 @@ pub struct ErrorDef {
 }
 
 impl ErrorDef {
+    #[must_use]
     pub fn identity(&self) -> DefinitionId {
         DefinitionId::new(self.owner.0.clone(), self.id.clone())
     }
