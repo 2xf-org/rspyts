@@ -37,6 +37,10 @@ pub struct DiceCup {
 #[rspyts::export]
 impl DiceCup {
     /// Create a dice cup.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RollError::InvalidRequest`] when `sides` is outside 2 through 100.
     #[rspyts(constructor)]
     pub fn new(sides: u32, seed: u64) -> Result<Self, RollError> {
         if !(2..=100).contains(&sides) {
@@ -46,6 +50,10 @@ impl DiceCup {
     }
 
     /// Roll the dice in this cup.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RollError::InvalidRequest`] when `count` is outside 1 through 100.
     pub fn roll(&mut self, count: u32) -> Result<RollResult, RollError> {
         if !(1..=100).contains(&count) {
             return Err(RollError::InvalidRequest);
@@ -61,8 +69,12 @@ impl DiceCup {
 /// Roll dice from a seed.
 ///
 /// The seed makes the example repeatable in Rust, Python, and TypeScript.
+///
+/// # Errors
+///
+/// Returns [`RollError::InvalidRequest`] when the request is outside the supported ranges.
 #[rspyts::export]
-pub fn roll_dice(request: RollRequest, seed: u64) -> Result<RollResult, RollError> {
+pub fn roll_dice(request: &RollRequest, seed: u64) -> Result<RollResult, RollError> {
     if !(2..=100).contains(&request.sides) || !(1..=100).contains(&request.count) {
         return Err(RollError::InvalidRequest);
     }
@@ -75,14 +87,19 @@ pub fn roll_dice(request: RollRequest, seed: u64) -> Result<RollResult, RollErro
 }
 
 /// Roll dice and return a compact numeric buffer.
+///
+/// # Errors
+///
+/// Returns [`RollError::InvalidRequest`] when the request is outside the supported ranges.
 #[rspyts::export]
 #[rspyts(returns(buffer))]
-pub fn roll_values(request: RollRequest, seed: u64) -> Result<Vec<u32>, RollError> {
+pub fn roll_values(request: &RollRequest, seed: u64) -> Result<Vec<u32>, RollError> {
     roll_dice(request, seed).map(|result| result.values)
 }
 
 /// Convert bytes to a repeatable seed.
 #[rspyts::export]
+#[must_use]
 pub fn seed_from_bytes(#[rspyts(bytes)] bytes: &[u8]) -> u64 {
     bytes.iter().fold(0_u64, |seed, byte| {
         seed.wrapping_mul(31).wrapping_add(u64::from(*byte))
@@ -106,8 +123,8 @@ mod tests {
     #[test]
     fn seeded_rolls_are_repeatable() {
         let request = RollRequest { sides: 6, count: 3 };
-        let first = roll_dice(request.clone(), DEFAULT_SEED).unwrap();
-        let second = roll_dice(request, DEFAULT_SEED).unwrap();
+        let first = roll_dice(&request, DEFAULT_SEED).unwrap();
+        let second = roll_dice(&request, DEFAULT_SEED).unwrap();
         assert_eq!(first.values, second.values);
     }
 }
