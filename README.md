@@ -1,73 +1,67 @@
 # rspyts
 
-Compile one Rust contract into Python source and TypeScript packages without
-maintaining host-specific mirror models.
+rspyts builds one Rust application API for Python and TypeScript.
 
-## Supported scope
+You write the API in Rust. rspyts generates these two packages:
 
-rspyts 0.4 supports one `rspyts::module!` contract crate in one Cargo workspace
-pinned to one Rust/Cargo toolchain. A contract graph resolves each Cargo package
-name to one exact version and may import at most one direct leaf contract.
+- A Python package with Pydantic models and a PyO3 native extension.
+- A TypeScript package with types and a WebAssembly module.
 
-The three supported package shapes are:
+rspyts has one operation model. It always builds both packages. It does not
+use a separate config file, package modes, contract locks, or generated
+package dependencies.
 
-| Shape | Python | TypeScript | Dependency |
-| --- | --- | --- | --- |
-| Executable owner | Generated source for one Maturin abi3 wheel | Browser WASM plus `./wire` | None |
-| Static leaf | Generated source for one Maturin abi3 wheel | Static ESM and declarations | None |
-| Static consumer | Generated source for one Maturin abi3 wheel | Static ESM importing an owner's `./wire` | One direct WASM leaf |
+## Requirements
 
-Commit `rspyts.toml` and `rspyts.lock`. Ignore the fixed `.rspyts/` output.
-rspyts is a Cargo-installed build tool; generated packages contain no rspyts
-runtime dependency.
+- Rust 1.88 or later.
+- Python 3.11 or later.
+- `wasm32-unknown-unknown`.
+- `wasm-bindgen-cli` 0.2.126.
 
-Unsupported configurations include standalone Python extensions, custom output
-directories, absolute or out-of-workspace package paths, transitive contract
-graphs, multiple versions of one package name, and custom Cargo toolchains,
-configuration graphs, or compiler wrappers. Public names must already be valid
-for each enabled host and must not collide with Pydantic or generated runtime
-members.
-
-## Install
-
-The repository pins Rust and Cargo in `rust-toolchain.toml`. Pin the CLI and
-runtime crates to the same exact release:
+Install the tools:
 
 ```sh
-cargo install rspyts-cli --version '=0.4.6' --locked
-```
-
-Executable TypeScript also requires the pinned WebAssembly tool:
-
-```sh
-rustup target add wasm32-unknown-unknown --toolchain 1.88.0
+cargo install rspyts-cli --version '=1.0.0' --locked
+rustup target add wasm32-unknown-unknown
 cargo install wasm-bindgen-cli --version '=0.2.126' --locked
 ```
 
-## Minimal executable contract
+## Project structure
 
-Use a workspace member whose library emits both an `rlib` and `cdylib`:
+Keep domain code in normal Rust crates. Add one small application crate that
+links all exported crates.
 
-```toml
-[lib]
-crate-type = ["rlib", "cdylib"]
-
-[dependencies]
-rspyts = { version = "=0.4.6", default-features = false }
-serde = { version = "1", features = ["derive"] }
-wasm-bindgen = { version = "=0.2.126", optional = true }
-
-[features]
-default = []
-python = ["rspyts/python-extension"]
-wasm = ["rspyts/wasm", "dep:wasm-bindgen"]
+```text
+project/
+├── Cargo.toml
+├── domain/
+│   ├── Cargo.toml
+│   └── src/lib.rs
+└── bindings/
+    ├── Cargo.toml
+    └── src/lib.rs
 ```
 
-The Rust type and behavior remain canonical:
+The domain crate owns the API:
+
+```toml
+# domain/Cargo.toml
+[features]
+default = []
+python = ["rspyts/python"]
+wasm = ["rspyts/wasm", "dep:wasm-bindgen"]
+
+[dependencies]
+rspyts = { version = "=1.0.0", default-features = false }
+serde = { version = "1", features = ["derive"] }
+wasm-bindgen = { version = "=0.2.126", optional = true }
+```
 
 ```rust
-#[derive(serde::Serialize, serde::Deserialize, rspyts::Type)]
-#[serde(rename_all = "camelCase")]
+use rspyts::Model;
+use serde::{Deserialize, Serialize};
+
+#[derive(Clone, Serialize, Deserialize, Model)]
 pub struct Greeting {
     pub message: String,
 }
@@ -78,58 +72,80 @@ pub fn greet(name: String) -> Greeting {
         message: format!("Hello, {name}!"),
     }
 }
-
-rspyts::module!(native);
 ```
 
-Configure the workspace-relative crate, generated Python package, and WASM
-package. `python.source` is an optional authored source tree copied into the
-fixed generated output before rspyts writes its modules.
+The application crate creates one binding:
 
 ```toml
-[crate]
-path = "rust"
+# bindings/Cargo.toml
+[lib]
+crate-type = ["cdylib", "rlib"]
 
-[python]
-package = "example_contract"
-source = "python/src"
+[features]
+default = []
+python = ["rspyts/python-extension", "domain/python"]
+wasm = ["rspyts/wasm", "domain/wasm"]
 
-[typescript]
-package = "@example/contract"
-mode = "wasm"
+[dependencies]
+domain = { path = "../domain", default-features = false }
+rspyts = { version = "=1.0.0", default-features = false }
 ```
 
-Build, inspect, and accept the semantic contract:
+```rust
+rspyts::application!(native; domain);
+```
+
+Use Cargo package metadata only when the host package names must differ from
+the application crate name:
+
+```toml
+[package.metadata.rspyts]
+python = "my_application"
+typescript = "@my-org/my-application"
+```
+
+## Build
+
+Run one command:
 
 ```sh
-rspyts build
-rspyts inspect
-rspyts lock
-rspyts check --locked
+rspyts build --manifest-path bindings/Cargo.toml
 ```
 
-`rspyts build` replaces only `.rspyts/`. Package `.rspyts/python` with Maturin
-and `.rspyts/typescript` with npm; do not publish the generated directory from
-the source tree.
+rspyts writes `bindings/dist/python` and `bindings/dist/typescript`.
 
-```gitignore
-.rspyts/
-.rspyts.tmp-*
-.rspyts.old-*
-.rspyts.build.lock
-.rspyts.lock.tmp-*
+Use the other two commands during development:
+
+```sh
+rspyts watch --manifest-path bindings/Cargo.toml
+rspyts check --manifest-path bindings/Cargo.toml
 ```
 
-## Documentation
+`watch` rebuilds when a Rust or Cargo file changes. `check` fails when `dist`
+does not match the Rust source.
 
-- [Build the executable Python/WASM shape](docs/python-and-typescript.md)
-- [Build static leaves and direct consumers](docs/static-and-dependencies.md)
-- [Read the exact configuration and contract reference](docs/reference.md)
-- [Maintain and release rspyts](MAINTAINING.md)
+## Host code
 
-Runnable neutral fixtures are the executable
-[`owner`](examples/cross-package/owner/), static
-[`consumer`](examples/cross-package/consumer/), and independent
-[`static`](examples/static/) packages.
+Python imports Pydantic models and Rust functions from one package:
+
+```python
+from my_application import Greeting, greet
+
+result: Greeting = greet("Ada")
+```
+
+TypeScript imports the same API from one package. The package loads its
+WebAssembly module during import.
+
+```typescript
+import { greet, type Greeting } from "@my-org/my-application";
+
+const result: Greeting = greet("Ada");
+```
+
+## Example
+
+The [`example`](example/) directory contains the Rust application, its linked
+domain crate, and Python and TypeScript clients.
 
 Licensed under [MIT](LICENSE).

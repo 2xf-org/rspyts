@@ -1,0 +1,16 @@
+{
+  "name": "example-client",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "tsc",
+    "check": "tsc --noEmit",
+    "start": "node build/index.js"
+  },
+  "dependencies": {
+    "example": "file:../../crates/bindings/dist/typescript"
+  },
+  "devDependencies": {
+    "typescript": "^5.9.0"
+  }
+}

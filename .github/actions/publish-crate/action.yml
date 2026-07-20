@@ -1,0 +1,41 @@
+name: Publish crate
+description: Publish one crate after its dependencies become available.
+
+inputs:
+  crate:
+    description: Cargo package name
+    required: true
+  version:
+    description: Release version
+    required: true
+  token:
+    description: crates.io authentication token
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      env:
+        CARGO_REGISTRY_TOKEN: ${{ inputs.token }}
+        CRATE: ${{ inputs.crate }}
+        VERSION: ${{ inputs.version }}
+      run: |
+        set -euo pipefail
+
+        url="https://crates.io/api/v1/crates/$CRATE/$VERSION"
+        if curl --fail --silent --show-error "$url" > /dev/null; then
+          echo "$CRATE $VERSION is already published"
+          exit 0
+        fi
+
+        for attempt in {1..18}; do
+          if cargo publish --locked -p "$CRATE"; then
+            exit 0
+          fi
+          echo "publish attempt $attempt failed; waiting for the registry"
+          sleep 10
+        done
+
+        echo "could not publish $CRATE $VERSION" >&2
+        exit 1

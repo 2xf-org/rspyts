@@ -1,0 +1,26 @@
+name: Set up Rust
+description: Install the repository Rust toolchain and restore its Cargo cache.
+
+inputs:
+  components:
+    description: Additional Rust components
+    required: false
+    default: ""
+  targets:
+    description: Additional Rust targets
+    required: false
+    default: ""
+  cache-key:
+    description: Cache key suffix
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - uses: dtolnay/rust-toolchain@1.88.0
+      with:
+        components: ${{ inputs.components }}
+        targets: ${{ inputs.targets }}
+    - uses: Swatinem/rust-cache@v2
+      with:
+        key: ${{ inputs.cache-key }}

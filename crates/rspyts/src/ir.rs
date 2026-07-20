@@ -1,22 +1,19 @@
-use serde::{Deserialize, Serialize};
-use serde_json::Value;
+//! The small description that the generators read.
+
 use std::fmt;
 
-pub const IR_VERSION: u32 = 6;
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+
+pub const IR_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Manifest {
     pub ir_version: u32,
-    pub crate_name: String,
-    pub crate_version: String,
+    pub package_name: String,
+    pub package_version: String,
     pub module_name: String,
-    /// Foreign schema identities referenced by this package's public contract.
-    ///
-    /// Their linked definitions appear only as compiler evidence in `imports`,
-    /// never in the local definition vectors. The compiler compares the snapshots
-    /// with dependency locks before emitting external host-package imports.
-    pub imports: Vec<ImportedPackage>,
     pub types: Vec<TypeDef>,
     pub errors: Vec<ErrorDef>,
     pub functions: Vec<FunctionDef>,
@@ -24,11 +21,16 @@ pub struct Manifest {
     pub constants: Vec<ConstantDef>,
 }
 
-/// Stable Cargo package ownership captured in the crate where a macro expands.
+impl Manifest {
+    pub fn canonical_json(&self) -> Result<String, serde_json::Error> {
+        serde_json::to_string(self)
+    }
+}
+
+/// The Cargo package that declared an item.
 ///
-/// This is the exact `CARGO_PKG_NAME`, not the final cdylib package. Cargo may
-/// link registrations from multiple packages into one artifact, so ownership
-/// cannot be inferred after linking.
+/// rspyts keeps this value only to distinguish Rust items in one aggregate
+/// binding. It does not generate a host package for each Cargo package.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct CargoPackageId(pub String);
@@ -36,10 +38,6 @@ pub struct CargoPackageId(pub String);
 impl CargoPackageId {
     pub fn new(value: impl Into<String>) -> Self {
         Self(value.into())
-    }
-
-    pub fn as_str(&self) -> &str {
-        &self.0
     }
 }
 
@@ -49,7 +47,7 @@ impl fmt::Display for CargoPackageId {
     }
 }
 
-/// A definition's globally unambiguous semantic identity.
+/// A Rust item identity inside the aggregate binding.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct DefinitionId {
@@ -69,25 +67,6 @@ impl DefinitionId {
 impl fmt::Display for DefinitionId {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(formatter, "{}::{}", self.owner, self.id)
-    }
-}
-
-/// Foreign identities required to compile this package's host surface.
-///
-/// These linked snapshots are compiler evidence, not locally emitted models.
-/// The compiler compares them byte-for-byte with the declared dependency lock,
-/// then emits normal host-package imports for the dependency-owned identities.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct ImportedPackage {
-    pub owner: CargoPackageId,
-    pub types: Vec<TypeDef>,
-    pub errors: Vec<ErrorDef>,
-}
-
-impl Manifest {
-    pub fn canonical_json(&self) -> Result<String, serde_json::Error> {
-        serde_json::to_string(self)
     }
 }
 
@@ -111,7 +90,7 @@ pub enum TypeRef {
     Buffer { element: BufferElement },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum BufferElement {
     U8,
@@ -134,6 +113,12 @@ pub struct TypeDef {
     pub name: String,
     pub docs: Option<String>,
     pub shape: TypeShape,
+}
+
+impl TypeDef {
+    pub fn identity(&self) -> DefinitionId {
+        DefinitionId::new(self.owner.0.clone(), self.id.clone())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -166,7 +151,6 @@ pub struct FieldDef {
     pub constraints: FieldConstraints,
 }
 
-/// A host-neutral scalar used by explicit field defaults and literal constraints.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum ScalarValue {
@@ -175,7 +159,6 @@ pub enum ScalarValue {
     String(String),
 }
 
-/// Minimal validation rules shared exactly by Rust, Python, and TypeScript.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct FieldConstraints {
@@ -205,6 +188,12 @@ pub struct ErrorDef {
     pub variants: Vec<ErrorVariantDef>,
 }
 
+impl ErrorDef {
+    pub fn identity(&self) -> DefinitionId {
+        DefinitionId::new(self.owner.0.clone(), self.id.clone())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ErrorVariantDef {
@@ -221,7 +210,6 @@ pub struct FunctionDef {
     pub rust_name: String,
     pub host_name: String,
     pub docs: Option<String>,
-    pub target: Target,
     pub params: Vec<ParamDef>,
     pub returns: TypeRef,
     pub error: Option<DefinitionId>,
@@ -235,15 +223,6 @@ pub struct ParamDef {
     pub ty: TypeRef,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum Target {
-    Both,
-    Python,
-    Typescript,
-    Static,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ResourceDef {
@@ -251,7 +230,6 @@ pub struct ResourceDef {
     pub id: String,
     pub name: String,
     pub docs: Option<String>,
-    pub target: Target,
     pub constructors: Vec<FunctionDef>,
     pub methods: Vec<MethodDef>,
 }
@@ -262,7 +240,6 @@ pub struct MethodDef {
     pub rust_name: String,
     pub host_name: String,
     pub docs: Option<String>,
-    pub target: Target,
     pub mutable: bool,
     pub params: Vec<ParamDef>,
     pub returns: TypeRef,
@@ -276,7 +253,6 @@ pub struct ConstantDef {
     pub rust_name: String,
     pub host_name: String,
     pub docs: Option<String>,
-    pub target: Target,
     pub ty: TypeRef,
     pub value: Value,
 }

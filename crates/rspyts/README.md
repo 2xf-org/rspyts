@@ -1,20 +1,16 @@
 # rspyts
 
-The Rust contract API behind rspyts-generated Python and TypeScript packages.
+This crate provides the Rust API for rspyts.
 
-Use one exact version, one `rspyts::module!` per contract crate, and enable only
-the target feature needed by the host build:
+Use `Model`, `Error`, `export`, and `application!` to define one Rust
+application API. The `rspyts-cli` crate builds the API for Python and
+TypeScript.
 
 ```toml
 [dependencies]
-rspyts = { version = "=0.4.6", default-features = false }
+rspyts = { version = "=1.0.0", default-features = false }
 ```
 
-The public surface includes `Type`, `Error`, `export`, and `module!`. The
-[`rspyts-cli`](https://crates.io/crates/rspyts-cli) validates the contract,
-generates the fixed `.rspyts/` tree, and maintains the semantic lock.
-
-See the [project README](https://github.com/2xf-org/rspyts/blob/main/README.md)
-and [contract reference](https://github.com/2xf-org/rspyts/blob/main/docs/reference.md).
+Read the [project README](https://github.com/2xf-org/rspyts).
 
 Licensed under MIT.
