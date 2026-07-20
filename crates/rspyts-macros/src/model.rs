@@ -1,5 +1,15 @@
-use super::*;
-use crate::{attributes::*, types::*};
+use heck::ToSnakeCase;
+use proc_macro2::TokenStream as TokenStream2;
+use quote::quote;
+use syn::{
+    Attribute, Data, DataEnum, DataStruct, DeriveInput, Fields, Ident, ext::IdentExt,
+    spanned::Spanned,
+};
+
+use crate::attributes::{
+    apply_serde_variant_case, docs_tokens, rspyts_host_override, serde_container, serde_rename,
+};
+use crate::types::{field_options, field_tokens, reject_generics, type_ref_tokens};
 
 pub(super) fn expand_type(input: DeriveInput) -> syn::Result<TokenStream2> {
     reject_generics(&input.generics, input.ident.span())?;
@@ -15,7 +25,7 @@ pub(super) fn expand_type(input: DeriveInput) -> syn::Result<TokenStream2> {
     } else {
         match input.data {
             Data::Struct(data) => struct_shape(&input.attrs, &ident, data)?,
-            Data::Enum(data) => enum_shape(&input.attrs, data)?,
+            Data::Enum(data) => enum_shape(&input.attrs, &data)?,
             Data::Union(data) => {
                 return Err(syn::Error::new(
                     data.union_token.span,
@@ -98,7 +108,7 @@ fn struct_shape(attrs: &[Attribute], ident: &Ident, data: DataStruct) -> syn::Re
     }
 }
 
-fn enum_shape(attrs: &[Attribute], data: DataEnum) -> syn::Result<TokenStream2> {
+fn enum_shape(attrs: &[Attribute], data: &DataEnum) -> syn::Result<TokenStream2> {
     let serde = serde_container(attrs)?;
     let variants = data
         .variants
@@ -206,7 +216,8 @@ pub(super) fn expand_error(input: DeriveInput) -> syn::Result<TokenStream2> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::expand_type;
+    use syn::DeriveInput;
 
     #[test]
     fn expands_a_named_model() {

@@ -1,12 +1,26 @@
-use super::*;
-use crate::{attributes::*, types::*};
+use heck::ToSnakeCase;
+use proc_macro2::{Span, TokenStream as TokenStream2};
+use quote::{format_ident, quote};
+use syn::{
+    FnArg, Ident, ImplItem, ImplItemFn, Item, ItemConst, ItemFn, ItemImpl, ItemStatic, Pat,
+    ReturnType, Type as SynType, punctuated::Punctuated, spanned::Spanned, token::Comma,
+};
+
+use crate::attributes::{
+    apply_case, boundary_attr, docs_tokens, method_exported, method_options, take_function_options,
+    take_method_options, type_last_ident,
+};
+use crate::types::{
+    ensure_public, params_tokens, reject_generics, reject_reserved_resource_method,
+    reject_signature, resolved_result_types, return_tokens, type_ref_tokens, wasm_native_host_name,
+};
 
 pub(super) fn expand_export(item: Item) -> syn::Result<TokenStream2> {
     match item {
         Item::Fn(function) => expand_function(function),
         Item::Impl(item_impl) => expand_resource(item_impl),
-        Item::Const(item_const) => expand_const(item_const),
-        Item::Static(item_static) => expand_static(item_static),
+        Item::Const(item_const) => expand_const(&item_const),
+        Item::Static(item_static) => expand_static(&item_static),
         other => Err(syn::Error::new(
             other.span(),
             "`#[rspyts::export]` supports public functions, inherent impl blocks, consts, and statics",
@@ -78,7 +92,7 @@ fn python_function_wrapper(
     let invocation = quote!(#function_ident(#(#calls),*));
     let body = host_return_body(
         &function.sig.output,
-        invocation,
+        &invocation,
         HostBackend::Python,
         return_boundary,
         declared_error,
@@ -132,7 +146,7 @@ fn wasm_function_wrapper(
     let invocation = quote!(#function_ident(#(#calls),*));
     let body = host_return_body(
         &function.sig.output,
-        invocation,
+        &invocation,
         HostBackend::Wasm,
         return_boundary,
         declared_error,
@@ -243,7 +257,7 @@ fn owned_boundary_type(ty: &SynType, ident: &Ident) -> syn::Result<(SynType, Tok
 
 fn host_return_body(
     output: &ReturnType,
-    invocation: TokenStream2,
+    invocation: &TokenStream2,
     backend: HostBackend,
     _return_boundary: Option<&str>,
     declared_error: Option<&SynType>,
@@ -283,23 +297,25 @@ fn host_return_body(
     }
 }
 
-fn expand_const(item: ItemConst) -> syn::Result<TokenStream2> {
+fn expand_const(item: &ItemConst) -> syn::Result<TokenStream2> {
     ensure_public(&item.vis, item.ident.span())?;
     let docs = docs_tokens(&item.attrs);
-    constant_tokens(quote!(#item), &item.ident, &item.ty, docs)
+    let item_tokens = quote!(#item);
+    constant_tokens(&item_tokens, &item.ident, &item.ty, &docs)
 }
 
-fn expand_static(item: ItemStatic) -> syn::Result<TokenStream2> {
+fn expand_static(item: &ItemStatic) -> syn::Result<TokenStream2> {
     ensure_public(&item.vis, item.ident.span())?;
     let docs = docs_tokens(&item.attrs);
-    constant_tokens(quote!(#item), &item.ident, &item.ty, docs)
+    let item_tokens = quote!(#item);
+    constant_tokens(&item_tokens, &item.ident, &item.ty, &docs)
 }
 
 fn constant_tokens(
-    item: TokenStream2,
+    item: &TokenStream2,
     ident: &Ident,
     ty: &SynType,
-    docs: TokenStream2,
+    docs: &TokenStream2,
 ) -> syn::Result<TokenStream2> {
     let rust_name = ident.to_string();
     let host_name = rust_name.clone();
@@ -548,7 +564,7 @@ fn python_resource_method(resource_ty: &SynType, method: &ImplItemFn) -> syn::Re
     let options = method_options(&method.attrs)?;
     let body = host_return_body(
         &method.sig.output,
-        invocation,
+        &invocation,
         HostBackend::Python,
         options.returns.as_deref(),
         options.error.as_ref(),
@@ -704,7 +720,7 @@ fn wasm_resource_method(resource_ty: &SynType, method: &ImplItemFn) -> syn::Resu
     let options = method_options(&method.attrs)?;
     let body = host_return_body(
         &method.sig.output,
-        invocation,
+        &invocation,
         HostBackend::Wasm,
         options.returns.as_deref(),
         options.error.as_ref(),

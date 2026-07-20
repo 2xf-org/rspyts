@@ -17,22 +17,33 @@ One build produces Pydantic models, Python type information, TypeScript
 declarations, and the compiled Rust library for each host. rspyts has no
 configuration file and no separate Python or TypeScript mode.
 
-## Requirements
+## Install
+
+rspyts needs two build tools:
 
 * Rust 1.88 or later.
-* Python 3.11 or later.
 * The `wasm32-unknown-unknown` Rust target.
-* `wasm-bindgen-cli` 0.2.126.
 
-## Installing
-
-Install the CLI and its WebAssembly tools:
+Install rspyts and the WebAssembly target:
 
 ```sh
 cargo install rspyts-cli --version '=1.0.0' --locked
 rustup target add wasm32-unknown-unknown
-cargo install wasm-bindgen-cli --version '=0.2.126' --locked
 ```
+
+The rspyts binary contains the matching WebAssembly binding generator.
+`rspyts build` does not run Python, Node.js, npm, or a TypeScript compiler.
+
+## Generated package requirements
+
+The generated Python package requires CPython 3.11 or later. Its installer
+adds Pydantic 2. It adds NumPy 2 only when the Rust API uses a numeric buffer.
+You do not add PyO3 to the Python project.
+
+The generated TypeScript package is an ES module with WebAssembly. It has no
+runtime npm dependencies. Use a JavaScript runtime that supports ES modules,
+top-level `await`, `import.meta.url`, and WebAssembly. You need Node.js and a
+TypeScript compiler only if your client development workflow uses them.
 
 ## Using
 
@@ -46,6 +57,19 @@ rspyts build
 
 `rspyts init` creates a Cargo workspace. It contains one API crate and one
 binding crate, plus small clients for the generated packages.
+
+A typical API crate needs only rspyts and Serde:
+
+```toml
+[dependencies]
+rspyts = "1"
+serde = { version = "1", features = ["derive"] }
+```
+
+The binding crate needs rspyts and the application crates that it links. Do
+not add `rspyts-macros`, PyO3, or `wasm-bindgen` directly. rspyts owns those
+implementation dependencies. Add `thiserror`, `chrono`, or `serde_json` only
+if your Rust source uses them directly.
 
 Write the public API in a normal Rust crate:
 

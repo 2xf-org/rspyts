@@ -43,6 +43,11 @@ pub enum RegistryError {
 }
 
 /// Collect and validate every export linked into an application binding.
+///
+/// # Errors
+///
+/// Returns [`RegistryError`] when exports conflict, reference an unlinked type
+/// or error, or contain a constant that cannot be serialized.
 pub fn manifest(
     package_name: &str,
     package_version: &str,

@@ -1,14 +1,14 @@
 use std::fmt::Write;
 use std::fs;
 use std::path::Path;
-use std::process::Command as ProcessCommand;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use rspyts::ir::{
-    BufferElement, FieldDef, FunctionDef, Manifest, ParamDef, ResourceDef, TypeDef, TypeRef,
-    TypeShape,
+    BufferElement, FieldConstraints, FieldDef, FunctionDef, Manifest, ParamDef, ResourceDef,
+    TypeDef, TypeRef, TypeShape,
 };
 use serde_json::{Value, json};
+use wasm_bindgen_cli_support::Bindgen;
 
 use crate::contract::{error_name, tagged_variant_name, type_definition, type_name};
 use crate::output::{write, write_json};
@@ -17,38 +17,35 @@ use crate::project::{Project, is_identifier};
 pub(super) fn emit(project: &Project, manifest: &Manifest, wasm: &Path, root: &Path) -> Result<()> {
     let package = root.join("typescript");
     fs::create_dir_all(&package)?;
-    let output = ProcessCommand::new("wasm-bindgen")
-        .arg(wasm)
-        .args(["--target", "web", "--out-name", "native", "--out-dir"])
-        .arg(&package)
-        .output()
-        .context("wasm-bindgen is not installed on PATH")?;
-    if !output.status.success() {
-        bail!(
-            "wasm-bindgen failed\n{}{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
+    let mut bindgen = Bindgen::new();
+    bindgen
+        .input_path(wasm)
+        .web(true)?
+        .typescript(false)
+        .omit_default_module_path(false)
+        .out_name("native")
+        .generate(&package)
+        .context("failed to generate TypeScript WebAssembly bindings")?;
     write(
         &package.join("index.d.ts"),
         &typescript_declarations(manifest)?,
     )?;
-    write(&package.join("index.js"), &typescript_runtime(manifest)?)?;
-    let package_json = json!({
-        "name": project.typescript_package,
-        "version": manifest.package_version,
+    write(&package.join("runtime.js"), &typescript_runtime(manifest)?)?;
+    write(&package.join("index.js"), &typescript_api(manifest)?)?;
+    let package_json = package_manifest(&project.typescript_package, &manifest.package_version);
+    write_json(&package.join("package.json"), &package_json)
+}
+
+fn package_manifest(package_name: &str, package_version: &str) -> Value {
+    json!({
+        "name": package_name,
+        "version": package_version,
         "type": "module",
         "sideEffects": true,
-        "exports": {
-            ".": {
-                "types": "./index.d.ts",
-                "default": "./index.js"
-            }
-        },
-        "files": ["index.js", "index.d.ts", "native.js", "native.d.ts", "native_bg.wasm"]
-    });
-    write_json(&package.join("package.json"), &package_json)
+        "types": "./index.d.ts",
+        "exports": "./index.js",
+        "files": ["index.js", "index.d.ts", "runtime.js", "native.js", "native_bg.wasm"]
+    })
 }
 
 fn typescript_declarations(manifest: &Manifest) -> Result<String> {
@@ -213,22 +210,16 @@ fn emit_typescript_resource_declaration(
     Ok(())
 }
 
-fn typescript_runtime(manifest: &Manifest) -> Result<String> {
-    let mut source = String::from(
-        "import initializeNative, * as native from \"./native.js\";\n\nconst wasmUrl = new URL(\"./native_bg.wasm\", import.meta.url);\nlet wasmInput = wasmUrl;\nif (wasmUrl.protocol === \"file:\" && globalThis.process?.versions?.node) {\n  const nodeModule = \"node:fs/promises\";\n  const { readFile } = await import(nodeModule);\n  wasmInput = await readFile(wasmUrl);\n}\nawait initializeNative({ module_or_path: wasmInput });\n",
-    );
-    source.push_str(TYPESCRIPT_ADAPTERS);
-    source.push_str("\nconst nativeSchemas = {\n");
-    for definition in &manifest.types {
-        writeln!(
-            source,
-            "  {}: {},",
-            ts_property(&definition.name),
-            typescript_named_spec(definition, manifest)?
-        )?;
+fn typescript_api(manifest: &Manifest) -> Result<String> {
+    let runtime_imports = typescript_runtime_imports(manifest);
+    let mut source = String::new();
+    if !runtime_imports.is_empty() {
+        source.push_str("import {\n");
+        for name in runtime_imports {
+            writeln!(source, "  {name},")?;
+        }
+        source.push_str("} from \"./runtime.js\";\n");
     }
-    source.push_str("};\n");
-
     for error in &manifest.errors {
         writeln!(
             source,
@@ -255,8 +246,75 @@ fn typescript_runtime(manifest: &Manifest) -> Result<String> {
     Ok(source)
 }
 
+fn typescript_runtime(manifest: &Manifest) -> Result<String> {
+    let mut source = String::from(
+        "import initializeNative, * as native from \"./native.js\";\n\nconst wasmUrl = new URL(\"./native_bg.wasm\", import.meta.url);\nlet wasmInput = wasmUrl;\nif (wasmUrl.protocol === \"file:\" && globalThis.process?.versions?.node) {\n  const nodeModule = \"node:fs/promises\";\n  const { readFile } = await import(nodeModule);\n  wasmInput = await readFile(wasmUrl);\n}\nawait initializeNative({ module_or_path: wasmInput });\n\nexport { native };\n",
+    );
+    source.push_str(TYPESCRIPT_ADAPTERS);
+    source.push_str("\nconst nativeSchemas = {\n");
+    for definition in &manifest.types {
+        writeln!(
+            source,
+            "  {}: {},",
+            ts_property(&definition.name),
+            typescript_named_spec(definition, manifest)?
+        )?;
+    }
+    source.push_str("};\n");
+    Ok(source)
+}
+
+fn typescript_runtime_imports(manifest: &Manifest) -> Vec<&'static str> {
+    let has_calls = !manifest.functions.is_empty() || !manifest.resources.is_empty();
+    let has_params = manifest
+        .functions
+        .iter()
+        .any(|function| !function.params.is_empty())
+        || manifest.resources.iter().any(|resource| {
+            resource
+                .constructors
+                .iter()
+                .any(|constructor| !constructor.params.is_empty())
+                || resource
+                    .methods
+                    .iter()
+                    .any(|method| !method.params.is_empty())
+        });
+    let restores_values = !manifest.functions.is_empty()
+        || manifest
+            .resources
+            .iter()
+            .any(|resource| !resource.methods.is_empty())
+        || !manifest.constants.is_empty();
+    let translates_errors = manifest
+        .functions
+        .iter()
+        .any(|function| function.error.is_some())
+        || manifest.resources.iter().any(|resource| {
+            resource
+                .constructors
+                .iter()
+                .any(|constructor| constructor.error.is_some())
+                || resource.methods.iter().any(|method| method.error.is_some())
+        });
+    let mut imports = Vec::new();
+    if has_calls {
+        imports.push("native");
+    }
+    if translates_errors {
+        imports.push("nativeError");
+    }
+    if has_params {
+        imports.push("prepareHost");
+    }
+    if restores_values {
+        imports.push("restoreHost");
+    }
+    imports
+}
+
 const TYPESCRIPT_ADAPTERS: &str = r#"
-function prepareHost(value) {
+export function prepareHost(value) {
   if (value instanceof Date) return value.toISOString();
   if (ArrayBuffer.isView(value)) return value;
   if (Array.isArray(value)) return value.map(prepareHost);
@@ -272,7 +330,7 @@ const bufferConstructors = {
   f32: Float32Array, f64: Float64Array,
 };
 
-function restoreHost(value, spec) {
+export function restoreHost(value, spec) {
   if (value == null || spec == null) return value;
   const [kind, detail, variants] = spec;
   if (kind === "bytes") return new Uint8Array(value);
@@ -290,7 +348,7 @@ function restoreHost(value, spec) {
   return value;
 }
 
-function nativeError(error, ErrorType) {
+export function nativeError(error, ErrorType) {
   const text = String(error);
   const line = text.indexOf("\n");
   return line < 0 ? error : new ErrorType(text.slice(0, line), text.slice(line + 1));
@@ -652,7 +710,7 @@ fn typescript_named_value(
                 ty: TypeRef::String,
                 required: true,
                 default: None,
-                constraints: Default::default(),
+                constraints: FieldConstraints::default(),
             });
             typescript_object_value(value, &fields, manifest)
         }
@@ -735,5 +793,65 @@ fn buffer_key(element: BufferElement) -> &'static str {
         BufferElement::I64 => "i64",
         BufferElement::F32 => "f32",
         BufferElement::F64 => "f64",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use rspyts::ir::{FunctionDef, Manifest, TypeRef};
+
+    use super::{package_manifest, typescript_api, typescript_runtime};
+
+    #[test]
+    fn generated_package_has_unambiguous_entry_points() {
+        let package = package_manifest("example", "1.0.0");
+
+        assert_eq!(package["types"], "./index.d.ts");
+        assert_eq!(package["exports"], "./index.js");
+        assert!(
+            !package["files"]
+                .as_array()
+                .expect("files are an array")
+                .iter()
+                .any(|file| file == "native.d.ts")
+        );
+        assert!(
+            package["files"]
+                .as_array()
+                .expect("files are an array")
+                .iter()
+                .any(|file| file == "runtime.js")
+        );
+    }
+
+    #[test]
+    fn generated_api_keeps_boundary_code_in_the_runtime_module() {
+        let manifest = Manifest {
+            ir_version: 1,
+            package_name: "example".into(),
+            package_version: "1.0.0".into(),
+            module_name: "native".into(),
+            types: Vec::new(),
+            errors: Vec::new(),
+            functions: vec![FunctionDef {
+                rust_name: "ping".into(),
+                host_name: "ping".into(),
+                docs: None,
+                params: Vec::new(),
+                returns: TypeRef::Unit,
+                error: None,
+            }],
+            resources: Vec::new(),
+            constants: Vec::new(),
+        };
+
+        let api = typescript_api(&manifest).expect("API generates");
+        assert!(api.contains("from \"./runtime.js\""));
+        assert!(!api.contains("initializeNative"));
+        assert!(!api.contains("function prepareHost"));
+
+        let runtime = typescript_runtime(&manifest).expect("runtime generates");
+        assert!(runtime.contains("initializeNative"));
+        assert!(runtime.contains("export function prepareHost"));
     }
 }

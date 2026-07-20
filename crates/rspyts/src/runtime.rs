@@ -21,6 +21,10 @@ pub mod python {
     inventory::collect!(Registration);
 
     /// Add every linked Python export to an extension module.
+    ///
+    /// # Errors
+    ///
+    /// Returns a Python exception when an export cannot be added to the module.
     pub fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
         for registration in inventory::iter::<Registration> {
             (registration.0)(module)?;

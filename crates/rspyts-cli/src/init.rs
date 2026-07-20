@@ -38,10 +38,7 @@ pub(super) fn create(path: &Path) -> Result<InitReport> {
         .tempdir_in(parent)?;
     let root = temporary.path();
 
-    write(
-        &root.join("Cargo.toml"),
-        &ROOT_CARGO.replace("__RSPYTS_VERSION__", env!("CARGO_PKG_VERSION")),
-    )?;
+    write(&root.join("Cargo.toml"), ROOT_CARGO)?;
     write(&root.join(".gitignore"), GITIGNORE)?;
     write(
         &root.join("crates/api/Cargo.toml"),
@@ -122,18 +119,18 @@ edition = "2024"
 rust-version = "1.88"
 
 [workspace.dependencies]
-rspyts = "=__RSPYTS_VERSION__"
+rspyts = "1"
 serde = { version = "1", features = ["derive"] }
 "#;
 
-const GITIGNORE: &str = r#"/target/
+const GITIGNORE: &str = r"/target/
 **/dist/
 **/.venv/
 **/__pycache__/
 **/.pytest_cache/
 **/node_modules/
 **/build/
-"#;
+";
 
 const API_CARGO: &str = r#"[package]
 name = "__API_PACKAGE__"
@@ -267,6 +264,8 @@ mod tests {
         ] {
             assert!(project.join(path).is_file(), "missing {path}");
         }
+        let cargo = fs::read_to_string(project.join("Cargo.toml")).unwrap();
+        assert!(cargo.contains("rspyts = \"1\""));
         assert!(create(&project).is_err());
     }
 

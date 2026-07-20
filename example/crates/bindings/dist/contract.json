@@ -118,7 +118,7 @@
     {
       "rustName": "roll_dice",
       "hostName": "rollDice",
-      "docs": "Roll dice from a seed.\nThe seed makes the example repeatable in Rust, Python, and TypeScript.\n# Errors\nReturns [`RollError::InvalidRequest`] when the request is outside the supported ranges.",
+      "docs": "Roll dice from a seed.\n\nThe seed makes the example repeatable in Rust, Python, and TypeScript.\n\n# Errors\n\nReturns [`RollError::InvalidRequest`] when the request is outside the supported ranges.",
       "params": [
         {
           "rustName": "request",
@@ -156,7 +156,7 @@
     {
       "rustName": "roll_values",
       "hostName": "rollValues",
-      "docs": "Roll dice and return a compact numeric buffer.\n# Errors\nReturns [`RollError::InvalidRequest`] when the request is outside the supported ranges.",
+      "docs": "Roll dice and return a compact numeric buffer.\n\n# Errors\n\nReturns [`RollError::InvalidRequest`] when the request is outside the supported ranges.",
       "params": [
         {
           "rustName": "request",
@@ -217,7 +217,7 @@
         {
           "rustName": "new",
           "hostName": "new",
-          "docs": "Create a dice cup.\n# Errors\nReturns [`RollError::InvalidRequest`] when `sides` is outside 2 through 100.",
+          "docs": "Create a dice cup.\n\n# Errors\n\nReturns [`RollError::InvalidRequest`] when `sides` is outside 2 through 100.",
           "params": [
             {
               "rustName": "sides",
@@ -255,7 +255,7 @@
         {
           "rustName": "roll",
           "hostName": "roll",
-          "docs": "Roll the dice in this cup.\n# Errors\nReturns [`RollError::InvalidRequest`] when `count` is outside 1 through 100.",
+          "docs": "Roll the dice in this cup.\n\n# Errors\n\nReturns [`RollError::InvalidRequest`] when `count` is outside 1 through 100.",
           "params": [
             {
               "rustName": "count",
