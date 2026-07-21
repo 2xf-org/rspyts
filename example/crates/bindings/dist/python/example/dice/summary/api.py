@@ -26,7 +26,7 @@ def summarize_roll(
     Returns [`RollError::EmptyLabel`] if `label` is empty.
     """
     try:
-        native_result = getattr(native, "__rspyts_function_example_dice_c1857e4fef937ab5")(
+        native_result = getattr(native, "__rspyts_function_example_dice_5e9e146e9f6141a5")(
             prepare_host(label),
             prepare_host(result),
         )

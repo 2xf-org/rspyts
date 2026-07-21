@@ -71,8 +71,6 @@ jobs:
           targets: wasm32-unknown-unknown
           cache-key: generated-${{ matrix.os }}
       - name: Build and check generated packages
-        env:
-          RSPYTS_TRACE_NATIVE_NAMES: "1"
         run: |
           cargo run --locked -p rspyts-cli -- build
           cargo run --locked -p rspyts-cli -- check

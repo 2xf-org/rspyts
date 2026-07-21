@@ -5,13 +5,13 @@ import {
 } from "../../../runtime.js";
 
 export function rollDice(value) {
-  const nativeResult = native["__rspyts_function_example_dice_3af246b4f17bbfac"](prepareHost(value));
+  const nativeResult = native["__rspyts_function_example_dice_9d0dbc0bafe3c85c"](prepareHost(value));
   return restoreHost(nativeResult, ["named", "example-dice::example_dice::loaded::roll::RollResult"]);
 }
 
 export class DiceCup {
   constructor(favoredValue) {
-    this.nativeResource = new native["__rspyts_resource_example_dice_e5e96c8d1c3073b6"](prepareHost(favoredValue));
+    this.nativeResource = new native["__rspyts_resource_example_dice_c66dffb26ab1fc66"](prepareHost(favoredValue));
   }
 
   roll(value) {

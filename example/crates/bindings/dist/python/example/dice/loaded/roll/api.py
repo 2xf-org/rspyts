@@ -16,7 +16,7 @@ from example.runtime import (
 
 def roll_dice(value: int) -> RollResult:
     """Return one loaded-die result."""
-    native_result = getattr(native, "__rspyts_function_example_dice_3af246b4f17bbfac")(
+    native_result = getattr(native, "__rspyts_function_example_dice_9d0dbc0bafe3c85c")(
         prepare_host(value),
     )
     return TypeAdapter(RollResult).validate_python(
@@ -27,7 +27,7 @@ def roll_dice(value: int) -> RollResult:
 
 class DiceCup:
     def __init__(self, favored_value: int) -> None:
-        self.native_resource = getattr(native, "__rspyts_resource_example_dice_e5e96c8d1c3073b6")(
+        self.native_resource = getattr(native, "__rspyts_resource_example_dice_c66dffb26ab1fc66")(
             prepare_host(favored_value),
         )
 

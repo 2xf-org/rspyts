@@ -251,21 +251,6 @@ fn generate(project: &Project) -> Result<TempDir> {
         .tempdir_in(&project.root)?;
     let native = compile(project, CompileKind::Native)?;
     let manifest = read_contract(&native, &project.package_name)?;
-    if std::env::var_os("RSPYTS_TRACE_NATIVE_NAMES").is_some() {
-        eprintln!(
-            "rspyts manifest native names: functions={:?} resources={:?}",
-            manifest
-                .functions
-                .iter()
-                .map(|item| (&item.rust_module, &item.rust_name, &item.native_name))
-                .collect::<Vec<_>>(),
-            manifest
-                .resources
-                .iter()
-                .map(|item| (&item.rust_module, &item.name, &item.native_name))
-                .collect::<Vec<_>>()
-        );
-    }
     validate_contract(project, &manifest)?;
     let wasm = compile(project, CompileKind::Wasm)?;
 
@@ -334,9 +319,6 @@ fn compile(project: &Project, kind: CompileKind) -> Result<PathBuf> {
     let output = command
         .output()
         .with_context(|| format!("failed to compile {label}"))?;
-    if std::env::var_os("RSPYTS_TRACE_NATIVE_NAMES").is_some() && !output.stderr.is_empty() {
-        eprint!("{}", String::from_utf8_lossy(&output.stderr));
-    }
     if !output.status.success() {
         bail!(
             "Cargo failed to compile the {label}\n{}{}",

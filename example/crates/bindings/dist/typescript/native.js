@@ -1,48 +1,35 @@
 /**
- * @param {any} value
- * @returns {any}
- */
-export function __rspyts_function_example_dice_3af246b4f17bbfac(value) {
-    const ret = wasm.__rspyts_function_example_dice_3af246b4f17bbfac(value);
-    if (ret[2]) {
-        throw takeFromExternrefTable0(ret[1]);
-    }
-    return takeFromExternrefTable0(ret[0]);
-}
-
-/**
- * @param {any} request
- * @param {any} seed
- * @returns {any}
- */
-export function __rspyts_function_example_dice_5567623c2f5c7535(request, seed) {
-    const ret = wasm.__rspyts_function_example_dice_5567623c2f5c7535(request, seed);
-    if (ret[2]) {
-        throw takeFromExternrefTable0(ret[1]);
-    }
-    return takeFromExternrefTable0(ret[0]);
-}
-
-/**
- * @param {any} request
- * @param {any} seed
- * @returns {any}
- */
-export function __rspyts_function_example_dice_6c2d689fb497e08d(request, seed) {
-    const ret = wasm.__rspyts_function_example_dice_6c2d689fb497e08d(request, seed);
-    if (ret[2]) {
-        throw takeFromExternrefTable0(ret[1]);
-    }
-    return takeFromExternrefTable0(ret[0]);
-}
-
-/**
  * @param {any} label
  * @param {any} result
  * @returns {any}
  */
-export function __rspyts_function_example_dice_c1857e4fef937ab5(label, result) {
-    const ret = wasm.__rspyts_function_example_dice_c1857e4fef937ab5(label, result);
+export function __rspyts_function_example_dice_5e9e146e9f6141a5(label, result) {
+    const ret = wasm.__rspyts_function_example_dice_5e9e146e9f6141a5(label, result);
+    if (ret[2]) {
+        throw takeFromExternrefTable0(ret[1]);
+    }
+    return takeFromExternrefTable0(ret[0]);
+}
+
+/**
+ * @param {any} request
+ * @param {any} seed
+ * @returns {any}
+ */
+export function __rspyts_function_example_dice_7da6db2d088cd0a5(request, seed) {
+    const ret = wasm.__rspyts_function_example_dice_7da6db2d088cd0a5(request, seed);
+    if (ret[2]) {
+        throw takeFromExternrefTable0(ret[1]);
+    }
+    return takeFromExternrefTable0(ret[0]);
+}
+
+/**
+ * @param {any} value
+ * @returns {any}
+ */
+export function __rspyts_function_example_dice_9d0dbc0bafe3c85c(value) {
+    const ret = wasm.__rspyts_function_example_dice_9d0dbc0bafe3c85c(value);
     if (ret[2]) {
         throw takeFromExternrefTable0(ret[1]);
     }
@@ -53,39 +40,52 @@ export function __rspyts_function_example_dice_c1857e4fef937ab5(label, result) {
  * @param {any} bytes
  * @returns {any}
  */
-export function __rspyts_function_example_dice_c5410f101744fbbd(bytes) {
-    const ret = wasm.__rspyts_function_example_dice_c5410f101744fbbd(bytes);
+export function __rspyts_function_example_dice_d05b90e269d62a6d(bytes) {
+    const ret = wasm.__rspyts_function_example_dice_d05b90e269d62a6d(bytes);
     if (ret[2]) {
         throw takeFromExternrefTable0(ret[1]);
     }
     return takeFromExternrefTable0(ret[0]);
 }
 
-export class __rspyts_resource_example_dice_44a56b40f04605c6 {
+/**
+ * @param {any} request
+ * @param {any} seed
+ * @returns {any}
+ */
+export function __rspyts_function_example_dice_f230a4119ceb9b1d(request, seed) {
+    const ret = wasm.__rspyts_function_example_dice_f230a4119ceb9b1d(request, seed);
+    if (ret[2]) {
+        throw takeFromExternrefTable0(ret[1]);
+    }
+    return takeFromExternrefTable0(ret[0]);
+}
+
+export class __rspyts_resource_example_dice_618e979366d8f5d6 {
     __destroy_into_raw() {
         const ptr = this.__wbg_ptr;
         this.__wbg_ptr = 0;
-        __rspyts_resource_example_dice_44a56b40f04605c6Finalization.unregister(this);
+        __rspyts_resource_example_dice_618e979366d8f5d6Finalization.unregister(this);
         return ptr;
     }
     free() {
         const ptr = this.__destroy_into_raw();
-        wasm.__wbg___rspyts_resource_example_dice_44a56b40f04605c6_free(ptr, 0);
+        wasm.__wbg___rspyts_resource_example_dice_618e979366d8f5d6_free(ptr, 0);
     }
     close() {
-        wasm.__rspyts_resource_example_dice_44a56b40f04605c6_close(this.__wbg_ptr);
+        wasm.__rspyts_resource_example_dice_618e979366d8f5d6_close(this.__wbg_ptr);
     }
     /**
      * @param {any} sides
      * @param {any} seed
      */
     constructor(sides, seed) {
-        const ret = wasm.__rspyts_resource_example_dice_44a56b40f04605c6_new(sides, seed);
+        const ret = wasm.__rspyts_resource_example_dice_618e979366d8f5d6_new(sides, seed);
         if (ret[2]) {
             throw takeFromExternrefTable0(ret[1]);
         }
         this.__wbg_ptr = ret[0];
-        __rspyts_resource_example_dice_44a56b40f04605c6Finalization.register(this, this.__wbg_ptr, this);
+        __rspyts_resource_example_dice_618e979366d8f5d6Finalization.register(this, this.__wbg_ptr, this);
         return this;
     }
     /**
@@ -93,39 +93,39 @@ export class __rspyts_resource_example_dice_44a56b40f04605c6 {
      * @returns {any}
      */
     roll(count) {
-        const ret = wasm.__rspyts_resource_example_dice_44a56b40f04605c6_roll(this.__wbg_ptr, count);
+        const ret = wasm.__rspyts_resource_example_dice_618e979366d8f5d6_roll(this.__wbg_ptr, count);
         if (ret[2]) {
             throw takeFromExternrefTable0(ret[1]);
         }
         return takeFromExternrefTable0(ret[0]);
     }
 }
-if (Symbol.dispose) __rspyts_resource_example_dice_44a56b40f04605c6.prototype[Symbol.dispose] = __rspyts_resource_example_dice_44a56b40f04605c6.prototype.free;
+if (Symbol.dispose) __rspyts_resource_example_dice_618e979366d8f5d6.prototype[Symbol.dispose] = __rspyts_resource_example_dice_618e979366d8f5d6.prototype.free;
 
-export class __rspyts_resource_example_dice_e5e96c8d1c3073b6 {
+export class __rspyts_resource_example_dice_c66dffb26ab1fc66 {
     __destroy_into_raw() {
         const ptr = this.__wbg_ptr;
         this.__wbg_ptr = 0;
-        __rspyts_resource_example_dice_e5e96c8d1c3073b6Finalization.unregister(this);
+        __rspyts_resource_example_dice_c66dffb26ab1fc66Finalization.unregister(this);
         return ptr;
     }
     free() {
         const ptr = this.__destroy_into_raw();
-        wasm.__wbg___rspyts_resource_example_dice_e5e96c8d1c3073b6_free(ptr, 0);
+        wasm.__wbg___rspyts_resource_example_dice_c66dffb26ab1fc66_free(ptr, 0);
     }
     close() {
-        wasm.__rspyts_resource_example_dice_e5e96c8d1c3073b6_close(this.__wbg_ptr);
+        wasm.__rspyts_resource_example_dice_c66dffb26ab1fc66_close(this.__wbg_ptr);
     }
     /**
      * @param {any} favored_value
      */
     constructor(favored_value) {
-        const ret = wasm.__rspyts_resource_example_dice_e5e96c8d1c3073b6_new(favored_value);
+        const ret = wasm.__rspyts_resource_example_dice_c66dffb26ab1fc66_new(favored_value);
         if (ret[2]) {
             throw takeFromExternrefTable0(ret[1]);
         }
         this.__wbg_ptr = ret[0];
-        __rspyts_resource_example_dice_e5e96c8d1c3073b6Finalization.register(this, this.__wbg_ptr, this);
+        __rspyts_resource_example_dice_c66dffb26ab1fc66Finalization.register(this, this.__wbg_ptr, this);
         return this;
     }
     /**
@@ -133,14 +133,14 @@ export class __rspyts_resource_example_dice_e5e96c8d1c3073b6 {
      * @returns {any}
      */
     roll(value) {
-        const ret = wasm.__rspyts_resource_example_dice_e5e96c8d1c3073b6_roll(this.__wbg_ptr, value);
+        const ret = wasm.__rspyts_resource_example_dice_c66dffb26ab1fc66_roll(this.__wbg_ptr, value);
         if (ret[2]) {
             throw takeFromExternrefTable0(ret[1]);
         }
         return takeFromExternrefTable0(ret[0]);
     }
 }
-if (Symbol.dispose) __rspyts_resource_example_dice_e5e96c8d1c3073b6.prototype[Symbol.dispose] = __rspyts_resource_example_dice_e5e96c8d1c3073b6.prototype.free;
+if (Symbol.dispose) __rspyts_resource_example_dice_c66dffb26ab1fc66.prototype[Symbol.dispose] = __rspyts_resource_example_dice_c66dffb26ab1fc66.prototype.free;
 
 /**
  * @returns {string}
@@ -363,12 +363,12 @@ function __wbg_get_imports() {
     };
 }
 
-const __rspyts_resource_example_dice_44a56b40f04605c6Finalization = (typeof FinalizationRegistry === 'undefined')
+const __rspyts_resource_example_dice_618e979366d8f5d6Finalization = (typeof FinalizationRegistry === 'undefined')
     ? { register: () => {}, unregister: () => {} }
-    : new FinalizationRegistry(ptr => wasm.__wbg___rspyts_resource_example_dice_44a56b40f04605c6_free(ptr, 1));
-const __rspyts_resource_example_dice_e5e96c8d1c3073b6Finalization = (typeof FinalizationRegistry === 'undefined')
+    : new FinalizationRegistry(ptr => wasm.__wbg___rspyts_resource_example_dice_618e979366d8f5d6_free(ptr, 1));
+const __rspyts_resource_example_dice_c66dffb26ab1fc66Finalization = (typeof FinalizationRegistry === 'undefined')
     ? { register: () => {}, unregister: () => {} }
-    : new FinalizationRegistry(ptr => wasm.__wbg___rspyts_resource_example_dice_e5e96c8d1c3073b6_free(ptr, 1));
+    : new FinalizationRegistry(ptr => wasm.__wbg___rspyts_resource_example_dice_c66dffb26ab1fc66_free(ptr, 1));
 
 function addToExternrefTable0(obj) {
     const idx = wasm.__externref_table_alloc_command_export();

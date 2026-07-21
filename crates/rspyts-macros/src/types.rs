@@ -887,24 +887,23 @@ pub(super) fn reject_reserved_resource_method(method: &ImplItemFn) -> syn::Resul
 pub(super) fn native_export_name(span: Span, kind: &str, public_name: &str) -> String {
     let span = span.unwrap();
     let package = std::env::var("CARGO_PKG_NAME").unwrap_or_else(|_| "crate".to_owned());
-    let display_file = span.file();
     let local_file = span
         .local_file()
         .map(|path| path.to_string_lossy().into_owned());
     let manifest_dir =
         std::env::var_os("CARGO_MANIFEST_DIR").map(|path| path.to_string_lossy().into_owned());
-    let file = local_file.as_deref().map_or_else(
-        || normalize_source_path(&display_file),
-        |path| relative_source_path(&path, manifest_dir.as_deref()),
+    let current_dir = std::env::current_dir()
+        .ok()
+        .map(|path| path.to_string_lossy().into_owned());
+    let file = local_file.map_or_else(
+        || normalize_source_path(&span.file()),
+        |path| relative_source_path(&path, manifest_dir.as_deref(), current_dir.as_deref()),
     );
-    let line = span.line();
-    let column = span.column();
-    if std::env::var_os("RSPYTS_TRACE_NATIVE_NAMES").is_some() {
-        eprintln!(
-            "rspyts native identity: package={package:?} display_file={display_file:?} local_file={local_file:?} manifest_dir={manifest_dir:?} file={file:?} line={line} column={column} kind={kind:?} public_name={public_name:?}"
-        );
-    }
-    let identity = format!("{package}\0{file}\0{line}\0{column}\0{kind}\0{public_name}",);
+    let identity = format!(
+        "{package}\0{file}\0{}\0{}\0{kind}\0{public_name}",
+        span.line(),
+        span.column()
+    );
     let package = package
         .chars()
         .map(|character| {
@@ -921,8 +920,17 @@ pub(super) fn native_export_name(span: Span, kind: &str, public_name: &str) -> S
     )
 }
 
-fn relative_source_path(file: &str, manifest_dir: Option<&str>) -> String {
-    let file = normalize_source_path(file);
+fn relative_source_path(
+    file: &str,
+    manifest_dir: Option<&str>,
+    current_dir: Option<&str>,
+) -> String {
+    let mut file = normalize_source_path(file);
+    if !is_absolute_source_path(&file)
+        && let Some(current_dir) = current_dir
+    {
+        file = normalize_source_path(&format!("{current_dir}/{file}"));
+    }
     let Some(manifest_dir) = manifest_dir else {
         return file;
     };
@@ -931,6 +939,10 @@ fn relative_source_path(file: &str, manifest_dir: Option<&str>) -> String {
         .and_then(|suffix| suffix.strip_prefix('/'))
         .unwrap_or(&file)
         .to_owned()
+}
+
+fn is_absolute_source_path(path: &str) -> bool {
+    path.starts_with('/') || path.as_bytes().get(1) == Some(&b':')
 }
 
 fn normalize_source_path(path: &str) -> String {
@@ -991,16 +1003,18 @@ mod tests {
 
     #[test]
     fn source_paths_are_stable_across_windows_path_forms() {
-        let manifest = r"D:\a\rspyts\rspyts\example\crates\dice";
-        let regular = r"D:\a\rspyts\rspyts\example\crates\dice\src\loaded\roll.rs";
-        let verbatim = r"\\?\D:\a\rspyts\rspyts\example\crates\dice\src\loaded\roll.rs";
+        let workspace = r"D:\a\rspyts\rspyts";
+        let package = r"D:\a\rspyts\rspyts\example\crates\dice";
+        let verbatim_package = r"\\?\D:\a\rspyts\rspyts\example\crates\dice";
+        let relative = r"example\crates\dice\src\loaded\roll.rs";
+        let absolute = r"D:\a\rspyts\rspyts\example\crates\dice\src\loaded\roll.rs";
 
         assert_eq!(
-            relative_source_path(regular, Some(manifest)),
+            relative_source_path(relative, Some(verbatim_package), Some(workspace)),
             "src/loaded/roll.rs"
         );
         assert_eq!(
-            relative_source_path(verbatim, Some(manifest)),
+            relative_source_path(absolute, Some(package), Some(package)),
             "src/loaded/roll.rs"
         );
     }
