@@ -15,10 +15,6 @@ await initializeNative({ module_or_path: wasmInput });
 
 export { native };
 
-export function freeze(value) {
-  return Object.freeze(value);
-}
-
 export function prepareHost(value) {
   if (value instanceof Date) return value.toISOString();
   if (ArrayBuffer.isView(value)) return value;

@@ -70,10 +70,28 @@ jobs:
         with:
           targets: wasm32-unknown-unknown
           cache-key: generated-${{ matrix.os }}
-      - name: Build and check generated packages
+      - name: Build generated packages
+        run: cargo run --locked -p rspyts-cli -- build
+      - name: Check committed generated sources
+        shell: bash
         run: |
-          cargo run --locked -p rspyts-cli -- build
-          cargo run --locked -p rspyts-cli -- check
+          set -euo pipefail
+
+          git diff --exit-code -- example/crates/bindings/dist \
+            ':(exclude)**/*.so' \
+            ':(exclude)**/*.pyd' \
+            ':(exclude)**/*.wasm'
+
+          untracked=$(git ls-files --others --exclude-standard \
+            example/crates/bindings/dist \
+            | grep -Ev '\.(so|pyd|wasm)$' || true)
+          if [[ -n "$untracked" ]]; then
+            echo "untracked generated sources:" >&2
+            echo "$untracked" >&2
+            exit 1
+          fi
+      - name: Check generated packages
+        run: cargo run --locked -p rspyts-cli -- check
       - name: Check aggregate artifacts
         shell: bash
         run: |

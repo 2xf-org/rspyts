@@ -1,5 +1,5 @@
+import { freeze as $rspytsFreeze } from "../../../values.js";
 import {
-  freeze as $rspytsFreeze,
   native,
   nativeError,
   prepareHost,

@@ -37,6 +37,7 @@ pub(super) fn emit(project: &Project, manifest: &Manifest, wasm: &Path, root: &P
         .generate(&package)
         .context("failed to generate TypeScript WebAssembly bindings")?;
     write(&package.join("runtime.js"), &typescript_runtime(manifest)?)?;
+    write(&package.join("values.js"), TYPESCRIPT_VALUES)?;
     let namespace_map = namespaces(manifest);
     for (namespace, items) in &namespace_map {
         let namespace_package = namespace
@@ -178,15 +179,16 @@ fn emit_typescript_type(
         }
         TypeShape::StringEnum { variants } => {
             emit_ts_doc(source, definition.docs.as_deref(), "")?;
+            let union = variants
+                .iter()
+                .map(|variant| ts_string(&variant.wire_name))
+                .collect::<Vec<_>>()
+                .join(" | ");
             writeln!(
                 source,
                 "export type {} = {};",
                 definition.name,
-                variants
-                    .iter()
-                    .map(|variant| ts_string(&variant.wire_name))
-                    .collect::<Vec<_>>()
-                    .join(" | ")
+                if union.is_empty() { "never" } else { &union }
             )?;
             writeln!(source, "export declare const {}: {{", definition.name)?;
             for variant in variants {
@@ -293,6 +295,17 @@ fn emit_typescript_resource_declaration(
 fn typescript_api(items: &NamespaceItems<'_>, context: &TypeScriptContext<'_>) -> Result<String> {
     let runtime_imports = typescript_runtime_imports(items);
     let mut source = String::new();
+    if items
+        .types
+        .iter()
+        .any(|definition| matches!(&definition.shape, TypeShape::StringEnum { .. }))
+    {
+        writeln!(
+            source,
+            "import {{ freeze as $rspytsFreeze }} from {};",
+            ts_string(&typescript_values_path(context.namespace))
+        )?;
+    }
     if !runtime_imports.is_empty() {
         source.push_str("import {\n");
         for name in runtime_imports {
@@ -376,10 +389,6 @@ fn typescript_runtime(manifest: &Manifest) -> Result<String> {
 }
 
 fn typescript_runtime_imports(items: &NamespaceItems<'_>) -> Vec<&'static str> {
-    let has_string_enums = items
-        .types
-        .iter()
-        .any(|definition| matches!(&definition.shape, TypeShape::StringEnum { .. }));
     let has_calls = !items.functions.is_empty() || !items.resources.is_empty();
     let has_params = items
         .functions
@@ -413,9 +422,6 @@ fn typescript_runtime_imports(items: &NamespaceItems<'_>) -> Vec<&'static str> {
                 || resource.methods.iter().any(|method| method.error.is_some())
         });
     let mut imports = Vec::new();
-    if has_string_enums {
-        imports.push("freeze as $rspytsFreeze");
-    }
     if has_calls {
         imports.push("native");
     }
@@ -431,11 +437,9 @@ fn typescript_runtime_imports(items: &NamespaceItems<'_>) -> Vec<&'static str> {
     imports
 }
 
-const TYPESCRIPT_ADAPTERS: &str = r#"
-export function freeze(value) {
-  return Object.freeze(value);
-}
+const TYPESCRIPT_VALUES: &str = "export const freeze = Object.freeze;\n";
 
+const TYPESCRIPT_ADAPTERS: &str = r#"
 export function prepareHost(value) {
   if (value instanceof Date) return value.toISOString();
   if (ArrayBuffer.isView(value)) return value;
@@ -839,6 +843,15 @@ fn typescript_runtime_path(namespace: &Namespace) -> String {
         "./runtime.js".to_owned()
     } else {
         format!("{}runtime.js", "../".repeat(depth))
+    }
+}
+
+fn typescript_values_path(namespace: &Namespace) -> String {
+    let depth = namespace.typescript_segments().len();
+    if depth == 0 {
+        "./values.js".to_owned()
+    } else {
+        format!("{}values.js", "../".repeat(depth))
     }
 }
 
@@ -1355,6 +1368,8 @@ mod tests {
         assert!(declarations.contains("readonly Fast: \"fast\";"));
         assert!(declarations.contains("readonly Safe: \"safe-mode\";"));
         assert!(api.contains("freeze as $rspytsFreeze"));
+        assert!(api.contains("from \"./values.js\""));
+        assert!(!api.contains("runtime.js"));
         assert!(api.contains("const $rspytsStringEnum0 = $rspytsFreeze({"));
         assert!(api.contains("[\"Fast\"]: \"fast\","));
         assert!(api.contains("[\"Safe\"]: \"safe-mode\","));
@@ -1387,6 +1402,16 @@ mod tests {
                 string_enum("Readonly", "Safe"),
                 string_enum("native", "Safe"),
                 string_enum("Mode", "__proto__"),
+                TypeDef {
+                    owner: CargoPackageId::new("example"),
+                    rust_module: "example".to_owned(),
+                    id: "example::Empty".to_owned(),
+                    name: "Empty".to_owned(),
+                    docs: None,
+                    shape: TypeShape::StringEnum {
+                        variants: Vec::new(),
+                    },
+                },
             ],
             errors: Vec::new(),
             functions: vec![FunctionDef {
@@ -1415,6 +1440,8 @@ mod tests {
         let api = typescript_api(&views[&namespace], &context).expect("API generates");
 
         assert!(api.contains("freeze as $rspytsFreeze"));
+        assert!(api.contains("from \"./values.js\""));
+        assert!(api.contains("from \"./runtime.js\""));
         assert!(api.contains("  native,"));
         assert!(api.contains("export { $rspytsStringEnum0 as Object };"));
         assert!(api.contains("export { $rspytsStringEnum1 as Readonly };"));
@@ -1424,6 +1451,8 @@ mod tests {
         assert!(!api.contains("export const native ="));
         assert!(declarations.contains("export declare const Readonly: {"));
         assert!(!declarations.contains("Readonly<{"));
+        assert!(declarations.contains("export type Empty = never;"));
+        assert!(api.contains("export { $rspytsStringEnum4 as Empty };"));
     }
 
     #[test]

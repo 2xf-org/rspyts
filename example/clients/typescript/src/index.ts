@@ -36,6 +36,9 @@ const mode: RollMode = RollMode.Safe;
 if (mode !== "safe") {
   throw new Error("string enum runtime value is unavailable");
 }
+if (!Object.isFrozen(RollMode)) {
+  throw new Error("string enum runtime value is mutable");
+}
 
 const loaded: LoadedRollResult = loadedRollDice(6);
 const loadedCup = new LoadedDiceCup(6);
