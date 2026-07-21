@@ -58,10 +58,10 @@ jobs:
         with:
           ref: ${{ env.VALIDATION_REF }}
           persist-credentials: false
-      - uses: actions/setup-python@v6.2.0
+      - uses: actions/setup-python@v7.0.0
         with:
           python-version: "3.11"
-      - uses: actions/setup-node@v6.5.0
+      - uses: actions/setup-node@v7.0.0
         with:
           node-version: "22"
           cache: npm
