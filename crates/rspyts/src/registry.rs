@@ -3,8 +3,8 @@
 use std::collections::BTreeSet;
 
 use crate::ir::{
-    CargoPackageId, ConstantDef, DefinitionId, ErrorDef, FunctionDef, IR_VERSION, Manifest,
-    ResourceDef, TypeDef, TypeRef, TypeShape,
+    CargoPackageId, ConstantDef, DefinitionId, ErrorDef, FunctionDef, Manifest, ResourceDef,
+    TypeDef, TypeRef, TypeShape,
 };
 
 /// A linked type contract produced by [`crate::Model`].
@@ -79,10 +79,12 @@ pub fn manifest(
         .collect::<Result<Vec<_>, _>>()?;
 
     unique_global_names(
-        "function",
-        functions.iter().map(|item| item.host_name.as_str()),
+        "native export",
+        functions
+            .iter()
+            .map(|item| item.native_name.as_str())
+            .chain(resources.iter().map(|item| item.native_name.as_str())),
     )?;
-    unique_global_names("resource", resources.iter().map(|item| item.name.as_str()))?;
 
     let type_ids = unique_ids("type", types.iter().map(TypeDef::identity))?;
     let error_ids = unique_ids("error", errors.iter().map(ErrorDef::identity))?;
@@ -111,7 +113,6 @@ pub fn manifest(
     }
 
     let mut manifest = Manifest {
-        ir_version: IR_VERSION,
         package_name: package_name.to_owned(),
         package_version: package_version.to_owned(),
         module_name: module_name.to_owned(),
@@ -180,6 +181,25 @@ pub fn manifest(
                 item.rust_module.as_str(),
             )
         }),
+    )?;
+    unique_scoped_names(
+        &manifest,
+        "function",
+        manifest.functions.iter().map(|item| {
+            (
+                item.host_name.as_str(),
+                &item.owner,
+                item.rust_module.as_str(),
+            )
+        }),
+    )?;
+    unique_scoped_names(
+        &manifest,
+        "resource",
+        manifest
+            .resources
+            .iter()
+            .map(|item| (item.name.as_str(), &item.owner, item.rust_module.as_str())),
     )?;
     Ok(manifest)
 }
@@ -308,7 +328,6 @@ mod tests {
 
     fn empty_manifest() -> Manifest {
         Manifest {
-            ir_version: IR_VERSION,
             package_name: "app".to_owned(),
             package_version: "1.2.3".to_owned(),
             module_name: "native".to_owned(),
@@ -321,39 +340,35 @@ mod tests {
     }
 
     #[test]
-    fn rejects_duplicate_public_names() {
-        let function = unique_global_names("function", ["run", "run"].into_iter()).unwrap_err();
-        let resource =
-            unique_global_names("resource", ["Client", "Client"].into_iter()).unwrap_err();
+    fn rejects_duplicate_native_names() {
+        let error =
+            unique_global_names("native export", ["bridge_1", "bridge_1"].into_iter()).unwrap_err();
 
         assert!(
-            function
+            error
                 .to_string()
-                .contains("duplicate function name `run`")
-        );
-        assert!(
-            resource
-                .to_string()
-                .contains("duplicate resource name `Client`")
+                .contains("duplicate native export name `bridge_1`")
         );
     }
 
     #[test]
-    fn permits_equal_leaf_names_in_separate_namespaces() {
+    fn permits_equal_public_names_in_separate_namespaces() {
         let manifest = empty_manifest();
         let first = CargoPackageId::new("app-first");
         let second = CargoPackageId::new("app-second");
 
-        unique_scoped_names(
-            &manifest,
-            "type",
-            [
-                ("Result", &first, "app_first::model"),
-                ("Result", &second, "app_second::model"),
-            ]
-            .into_iter(),
-        )
-        .expect("separate namespaces can reuse a type name");
+        for kind in ["type", "function", "resource"] {
+            unique_scoped_names(
+                &manifest,
+                kind,
+                [
+                    ("Result", &first, "app_first::model"),
+                    ("Result", &second, "app_second::model"),
+                ]
+                .into_iter(),
+            )
+            .unwrap_or_else(|error| panic!("separate namespaces can reuse {kind} names: {error}"));
+        }
     }
 
     #[test]

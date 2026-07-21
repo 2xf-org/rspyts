@@ -11,7 +11,7 @@ export interface RollResult {
   readonly total: bigint;
 }
 
-export class RollError extends Error {
+export class RollError extends globalThis.Error {
   readonly code: string;
   constructor(code: string, message: string);
 }

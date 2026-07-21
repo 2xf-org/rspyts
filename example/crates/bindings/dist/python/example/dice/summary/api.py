@@ -26,7 +26,10 @@ def summarize_roll(
     Returns [`RollError::EmptyLabel`] if `label` is empty.
     """
     try:
-        native_result = native.summarizeRoll(prepare_host(label), prepare_host(result))
+        native_result = getattr(native, "__rspyts_function_example_dice_c1857e4fef937ab5")(
+            prepare_host(label),
+            prepare_host(result),
+        )
     except RuntimeError as error:
         raise native_error(error, example.dice.fair.roll.api.RollError) from None
     return TypeAdapter(RollSummary).validate_python(

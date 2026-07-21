@@ -2,7 +2,7 @@
 
 mod fixtures;
 
-use std::ffi::CStr;
+use std::{collections::BTreeSet, ffi::CStr};
 
 use rspyts::ir::{BufferElement, FunctionDef, Manifest, ScalarValue, TypeDef, TypeRef, TypeShape};
 use rspyts::runtime::ContractError;
@@ -54,10 +54,24 @@ fn field_named<'a>(shape: &'a TypeShape, name: &str) -> &'a rspyts::ir::FieldDef
 fn discovery_returns_the_complete_application_contract() {
     let manifest = discovered_manifest();
 
-    assert_eq!(manifest.ir_version, rspyts::ir::IR_VERSION);
     assert_eq!(manifest.package_name, env!("CARGO_PKG_NAME"));
     assert_eq!(manifest.package_version, env!("CARGO_PKG_VERSION"));
     assert_eq!(manifest.module_name, "native");
+    let native_names = manifest
+        .functions
+        .iter()
+        .map(|item| item.native_name.as_str())
+        .chain(
+            manifest
+                .resources
+                .iter()
+                .map(|item| item.native_name.as_str()),
+        )
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        native_names.len(),
+        manifest.functions.len() + manifest.resources.len()
+    );
     assert!(
         manifest
             .types
@@ -118,6 +132,7 @@ fn discovery_returns_the_complete_application_contract() {
     );
 
     let encoded = serde_json::to_string(&manifest).expect("manifest must serialize");
+    assert!(!encoded.contains("irVersion"));
     let decoded: Manifest = serde_json::from_str(&encoded).expect("manifest must deserialize");
     assert_eq!(decoded, manifest);
 

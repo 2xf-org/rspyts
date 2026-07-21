@@ -50,6 +50,10 @@ struct ProjectArgs {
     /// Path to a workspace or binding Cargo.toml.
     #[arg(long, default_value = "Cargo.toml")]
     manifest_path: PathBuf,
+
+    /// Generated package directory. Defaults to `dist` beside the binding manifest.
+    #[arg(long)]
+    output: Option<PathBuf>,
 }
 
 /// Parse the command line and run the selected rspyts command.
@@ -68,12 +72,12 @@ fn run_from(cli: Cli) -> Result<()> {
             println!("{}", serde_json::to_string_pretty(&report)?);
         }
         Command::Build(args) => {
-            let project = Project::read(&args.manifest_path)?;
+            let project = Project::read(&args.manifest_path, args.output.as_deref())?;
             let report = build(&project)?;
             println!("{}", serde_json::to_string_pretty(&report)?);
         }
         Command::Check(args) => {
-            let project = Project::read(&args.manifest_path)?;
+            let project = Project::read(&args.manifest_path, args.output.as_deref())?;
             check(&project)?;
             println!(
                 "{}",
@@ -84,7 +88,7 @@ fn run_from(cli: Cli) -> Result<()> {
             );
         }
         Command::Watch(args) => {
-            let project = Project::read(&args.manifest_path)?;
+            let project = Project::read(&args.manifest_path, args.output.as_deref())?;
             build(&project)?;
             println!("rspyts is watching {}", project.workspace_root.display());
             let mut state = source_state(&project.workspace_root)?;
@@ -131,7 +135,6 @@ mod tests {
     #[test]
     fn uses_bigint_for_wide_types() {
         let manifest = Manifest {
-            ir_version: rspyts::ir::IR_VERSION,
             package_name: "fixture".into(),
             package_version: "1.0.0".into(),
             module_name: "native".into(),
@@ -151,6 +154,24 @@ mod tests {
             )
             .unwrap(),
             "bigint"
+        );
+    }
+
+    #[test]
+    fn uses_null_for_unit_values() {
+        let manifest = Manifest {
+            package_name: "fixture".into(),
+            package_version: "1.0.0".into(),
+            module_name: "native".into(),
+            types: vec![],
+            errors: vec![],
+            functions: vec![],
+            resources: vec![],
+            constants: vec![],
+        };
+        assert_eq!(
+            typescript::test_type_ref(&TypeRef::Unit, &manifest).unwrap(),
+            "null"
         );
     }
 

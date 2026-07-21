@@ -29,10 +29,11 @@ pub(super) struct Project {
     package_version: String,
     pub(super) python_package: String,
     pub(super) typescript_package: String,
+    output: PathBuf,
 }
 
 impl Project {
-    pub(super) fn read(path: &Path) -> Result<Self> {
+    pub(super) fn read(path: &Path, requested_output: Option<&Path>) -> Result<Self> {
         let requested_manifest = if path.is_dir() {
             path.join("Cargo.toml")
         } else {
@@ -118,24 +119,62 @@ impl Project {
         validate_python_package(&python_package)?;
         validate_typescript_package(&typescript_package)?;
 
+        let root = manifest
+            .parent()
+            .context("Cargo manifest has no parent")?
+            .to_path_buf();
+        let workspace_root = PathBuf::from(string(&metadata, "workspace_root")?);
+        let output = requested_output.map_or_else(
+            || Ok(root.join("dist")),
+            |path| resolve_output(path, &root, &workspace_root),
+        )?;
+
         Ok(Self {
-            root: manifest
-                .parent()
-                .context("Cargo manifest has no parent")?
-                .to_path_buf(),
-            workspace_root: PathBuf::from(string(&metadata, "workspace_root")?),
+            root,
+            workspace_root,
             manifest,
             package_id,
             package_name,
             package_version,
             python_package,
             typescript_package,
+            output,
         })
     }
 
     pub(super) fn output(&self) -> PathBuf {
-        self.root.join("dist")
+        self.output.clone()
     }
+}
+
+fn resolve_output(path: &Path, project_root: &Path, workspace_root: &Path) -> Result<PathBuf> {
+    let path = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(path)
+    };
+    let output = if path.exists() {
+        path.canonicalize()?
+    } else {
+        let parent = path
+            .parent()
+            .context("generated output path has no parent")?
+            .canonicalize()
+            .with_context(|| {
+                format!(
+                    "generated output parent does not exist: {}",
+                    path.parent().expect("parent exists").display()
+                )
+            })?;
+        parent.join(
+            path.file_name()
+                .context("generated output path has no name")?,
+        )
+    };
+    if output == project_root || output == workspace_root {
+        bail!("generated output cannot replace a project or workspace root");
+    }
+    Ok(output)
 }
 
 #[derive(Debug, Serialize)]
@@ -381,9 +420,6 @@ fn read_contract(library_path: &Path, package_name: &str) -> Result<Manifest> {
 }
 
 fn validate_contract(project: &Project, manifest: &Manifest) -> Result<()> {
-    if manifest.ir_version != rspyts::ir::IR_VERSION {
-        bail!("unsupported contract version {}", manifest.ir_version);
-    }
     if manifest.package_name != project.package_name
         || manifest.package_version != project.package_version
     {
@@ -724,8 +760,7 @@ mod tests {
     use std::path::PathBuf;
 
     use rspyts::ir::{
-        CargoPackageId, ErrorDef, FieldConstraints, FieldDef, IR_VERSION, Manifest, TypeDef,
-        TypeRef, TypeShape,
+        CargoPackageId, ErrorDef, FieldConstraints, FieldDef, Manifest, TypeDef, TypeRef, TypeShape,
     };
 
     use super::{validate_generated_files, validate_model_namespace_cycles, validate_namespaces};
@@ -757,7 +792,6 @@ mod tests {
 
     fn manifest(types: Vec<TypeDef>) -> Manifest {
         Manifest {
-            ir_version: IR_VERSION,
             package_name: "app".to_owned(),
             package_version: "1.2.3".to_owned(),
             module_name: "native".to_owned(),

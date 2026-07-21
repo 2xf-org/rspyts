@@ -219,14 +219,13 @@ pub(super) fn named_identities<'a>(reference: &'a TypeRef, result: &mut Vec<&'a 
 
 #[cfg(test)]
 mod tests {
-    use rspyts::ir::{CargoPackageId, FunctionDef, IR_VERSION, Manifest, Namespace, TypeRef};
+    use rspyts::ir::{CargoPackageId, FunctionDef, Manifest, Namespace, TypeRef};
 
     use super::namespaces;
 
     #[test]
     fn includes_empty_parent_namespaces_without_flattening_children() {
         let manifest = Manifest {
-            ir_version: IR_VERSION,
             package_name: "example".to_owned(),
             package_version: "1.2.3".to_owned(),
             module_name: "native".to_owned(),
@@ -237,6 +236,7 @@ mod tests {
                 rust_module: "example_dice::fair::deep::roll".to_owned(),
                 rust_name: "roll".to_owned(),
                 host_name: "roll".to_owned(),
+                native_name: "__rspyts_function_roll".to_owned(),
                 docs: None,
                 params: Vec::new(),
                 returns: TypeRef::Unit,

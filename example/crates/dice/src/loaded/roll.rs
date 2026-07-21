@@ -14,10 +14,34 @@ pub struct RollResult {
 /// Return one loaded-die result.
 #[rspyts::export]
 #[must_use]
-pub fn loaded_roll(value: u32) -> RollResult {
+pub fn roll_dice(value: u32) -> RollResult {
     RollResult {
         value,
         favored_value: DEFAULT_FAVORED_VALUE,
+    }
+}
+
+/// A repeatable source of loaded-die rolls.
+pub struct DiceCup {
+    favored_value: u32,
+}
+
+#[rspyts::export]
+impl DiceCup {
+    /// Create a loaded dice cup.
+    #[rspyts(constructor)]
+    #[must_use]
+    pub fn new(favored_value: u32) -> Self {
+        Self { favored_value }
+    }
+
+    /// Return one loaded-die result.
+    #[must_use]
+    pub fn roll(&mut self, value: u32) -> RollResult {
+        RollResult {
+            value,
+            favored_value: self.favored_value,
+        }
     }
 }
 

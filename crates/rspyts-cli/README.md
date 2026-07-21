@@ -24,7 +24,9 @@ rspyts check
 
 The CLI always builds one Python package and one TypeScript and WebAssembly
 package. It finds the one binding crate in the Cargo workspace. It writes both
-packages to `dist` next to that crate.
+packages to `dist` next to that crate by default. Pass `--output path` to
+`build`, `watch`, or `check` when generated artifacts belong elsewhere; a
+relative path resolves from the current working directory.
 
 The generated public paths follow the Cargo package names and Rust declaration
 modules. The CLI does not use namespace configuration or namespace attributes.

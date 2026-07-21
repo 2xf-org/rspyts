@@ -128,7 +128,7 @@ fn typescript_declarations(
     for error in &items.errors {
         writeln!(
             source,
-            "\nexport class {} extends Error {{\n  readonly code: string;\n  constructor(code: string, message: string);\n}}",
+            "\nexport class {} extends globalThis.Error {{\n  readonly code: string;\n  constructor(code: string, message: string);\n}}",
             error.name
         )?;
     }
@@ -138,7 +138,7 @@ fn typescript_declarations(
             "\nexport function {}({}): {};",
             function.host_name,
             typescript_params(&function.params, context)?,
-            type_ref(&function.returns, context)?
+            return_type_ref(&function.returns, context)?
         )?;
     }
     for resource in &items.resources {
@@ -273,7 +273,7 @@ fn emit_typescript_resource_declaration(
             "  {}({}): {};",
             method.host_name,
             typescript_params(&method.params, context)?,
-            type_ref(&method.returns, context)?
+            return_type_ref(&method.returns, context)?
         )?;
     }
     source.push_str("  close(): void;\n}\n");
@@ -305,7 +305,7 @@ fn typescript_api(items: &NamespaceItems<'_>, context: &TypeScriptContext<'_>) -
     for error in &items.errors {
         writeln!(
             source,
-            "\nexport class {} extends Error {{\n  constructor(code, message) {{\n    super(message);\n    this.name = {};\n    this.code = code;\n  }}\n}}",
+            "\nexport class {} extends globalThis.Error {{\n  constructor(code, message) {{\n    super(message);\n    this.name = {};\n    this.code = code;\n  }}\n}}",
             error.name,
             ts_string(&error.name)
         )?;
@@ -330,7 +330,7 @@ fn typescript_api(items: &NamespaceItems<'_>, context: &TypeScriptContext<'_>) -
 
 fn typescript_runtime(manifest: &Manifest) -> Result<String> {
     let mut source = String::from(
-        "import initializeNative, * as native from \"./native.js\";\n\nconst wasmUrl = new URL(\"./native_bg.wasm\", import.meta.url);\nlet wasmInput = wasmUrl;\nif (wasmUrl.protocol === \"file:\" && globalThis.process?.versions?.node) {\n  const nodeModule = \"node:fs/promises\";\n  const { readFile } = await import(nodeModule);\n  wasmInput = await readFile(wasmUrl);\n}\nawait initializeNative({ module_or_path: wasmInput });\n\nexport { native };\n",
+        "import initializeNative, * as native from \"./native.js\";\n\nconst wasmUrl = new URL(\"./native_bg.wasm\", import.meta.url);\nlet wasmInput = wasmUrl;\nif (globalThis.process?.versions?.node) {\n  const nodeModule = \"node:fs/promises\";\n  const { readFile } = await import(/* @vite-ignore */ nodeModule);\n  if (wasmUrl.protocol === \"file:\") {\n    wasmInput = await readFile(wasmUrl);\n  } else if (wasmUrl.pathname.startsWith(\"/@fs/\")) {\n    wasmInput = await readFile(decodeURIComponent(wasmUrl.pathname.slice(4)));\n  }\n}\nawait initializeNative({ module_or_path: wasmInput });\n\nexport { native };\n",
     );
     source.push_str(TYPESCRIPT_ADAPTERS);
     source.push_str("\nconst nativeSchemas = {\n");
@@ -412,20 +412,36 @@ const bufferConstructors = {
   f32: Float32Array, f64: Float64Array,
 };
 
+function restoreJson(value) {
+  if (typeof value === "bigint") {
+    const number = Number(value);
+    if (!Number.isSafeInteger(number) || BigInt(number) !== value) {
+      throw new RangeError("JSON integer exceeds JavaScript's safe integer range");
+    }
+    return number;
+  }
+  if (Array.isArray(value)) return Object.freeze(value.map(restoreJson));
+  if (value !== null && typeof value === "object") {
+    return Object.freeze(Object.fromEntries(Object.entries(value).map(([key, item]) => [key, restoreJson(item)])));
+  }
+  return value;
+}
+
 export function restoreHost(value, spec) {
   if (value == null || spec == null) return value;
   const [kind, detail, variants] = spec;
   if (kind === "bytes") return new Uint8Array(value);
   if (kind === "buffer") return new bufferConstructors[detail](value);
-  if (kind === "list") return Array.from(value, item => restoreHost(item, detail));
-  if (kind === "map") return Object.fromEntries(Object.entries(value).map(([key, item]) => [key, restoreHost(item, detail)]));
-  if (kind === "tuple") return value.map((item, index) => restoreHost(item, detail[index]));
+  if (kind === "json") return restoreJson(value);
+  if (kind === "list") return Object.freeze(Array.from(value, item => restoreHost(item, detail)));
+  if (kind === "map") return Object.freeze(Object.fromEntries(Object.entries(value).map(([key, item]) => [key, restoreHost(item, detail)])));
+  if (kind === "tuple") return Object.freeze(value.map((item, index) => restoreHost(item, detail[index])));
   if (kind === "named") return restoreHost(value, nativeSchemas[detail]);
   if (kind === "alias") return restoreHost(value, detail);
-  if (kind === "struct") return Object.fromEntries(Object.entries(value).map(([key, item]) => [key, restoreHost(item, detail[key])]));
+  if (kind === "struct") return Object.freeze(Object.fromEntries(Object.entries(value).map(([key, item]) => [key, restoreHost(item, detail[key])])));
   if (kind === "tagged") {
     const fields = variants[value[detail]] ?? {};
-    return Object.fromEntries(Object.entries(value).map(([key, item]) => [key, restoreHost(item, fields[key])]));
+    return Object.freeze(Object.fromEntries(Object.entries(value).map(([key, item]) => [key, restoreHost(item, fields[key])])));
   }
   return value;
 }
@@ -464,7 +480,7 @@ fn emit_typescript_function(
     while parameter_names.contains(result_name.as_str()) {
         result_name.push_str("Value");
     }
-    let native_name = format!("__rspyts_export_{}", function.host_name);
+    let native_name = &function.native_name;
     let (indent, signature, call) = if receiver.is_some() {
         (
             "  ",
@@ -475,10 +491,7 @@ fn emit_typescript_function(
         (
             "",
             format!("export function {}({params}) {{", function.host_name),
-            format!(
-                "native[{quoted}]({calls})",
-                quoted = ts_string(&native_name)
-            ),
+            format!("native[{quoted}]({calls})", quoted = ts_string(native_name)),
         )
     };
     writeln!(source, "\n{signature}")?;
@@ -534,7 +547,10 @@ fn emit_typescript_resource(
         .join(", ");
     writeln!(source, "\nexport class {} {{", resource.name)?;
     writeln!(source, "  constructor({params}) {{")?;
-    let native_call = format!("new native.RspytsWasm{}({calls})", resource.name);
+    let native_call = format!(
+        "new native[{quoted}]({calls})",
+        quoted = ts_string(&resource.native_name)
+    );
     if constructor.error.is_some() {
         source.push_str("    try {\n");
         writeln!(source, "      this.nativeResource = {native_call};")?;
@@ -573,8 +589,9 @@ fn emit_typescript_resource(
             resource.name
         )?;
         let native_call = format!(
-            "native.RspytsWasm{}.{}({calls})",
-            resource.name, factory.host_name
+            "native[{quoted}].{}({calls})",
+            factory.host_name,
+            quoted = ts_string(&resource.native_name)
         );
         if factory.error.is_some() {
             source.push_str("    try {\n");
@@ -597,6 +614,7 @@ fn emit_typescript_resource(
             rust_module: resource.rust_module.clone(),
             rust_name: method.rust_name.clone(),
             host_name: method.host_name.clone(),
+            native_name: resource.native_name.clone(),
             docs: method.docs.clone(),
             params: method.params.clone(),
             returns: method.returns.clone(),
@@ -610,7 +628,7 @@ fn emit_typescript_resource(
 
 fn type_ref(reference: &TypeRef, context: &TypeScriptContext<'_>) -> Result<String> {
     Ok(match reference {
-        TypeRef::Unit => "void".into(),
+        TypeRef::Unit => "null".into(),
         TypeRef::Bool => "boolean".into(),
         TypeRef::Int { bits: 64, .. } => "bigint".into(),
         TypeRef::Int { .. } | TypeRef::Float { .. } => "number".into(),
@@ -633,6 +651,13 @@ fn type_ref(reference: &TypeRef, context: &TypeScriptContext<'_>) -> Result<Stri
         TypeRef::Bytes | TypeRef::FixedBytes { .. } => "Uint8Array".into(),
         TypeRef::Buffer { element } => typescript_buffer_name(*element).into(),
     })
+}
+
+fn return_type_ref(reference: &TypeRef, context: &TypeScriptContext<'_>) -> Result<String> {
+    if matches!(reference, TypeRef::Unit) {
+        return Ok("void".into());
+    }
+    type_ref(reference, context)
 }
 
 #[cfg(test)]
@@ -805,6 +830,7 @@ fn typescript_params(params: &[ParamDef], context: &TypeScriptContext<'_>) -> Re
 
 fn typescript_spec(reference: &TypeRef) -> Result<String> {
     Ok(match reference {
+        TypeRef::Json => "[\"json\"]".into(),
         TypeRef::Option { item } => typescript_spec(item)?,
         TypeRef::List { item } => format!("[\"list\", {}]", typescript_spec(item)?),
         TypeRef::Map { value } => format!("[\"map\", {}]", typescript_spec(value)?),
@@ -1083,7 +1109,6 @@ mod tests {
     #[test]
     fn generated_package_exports_empty_parent_namespaces() {
         let manifest = Manifest {
-            ir_version: rspyts::ir::IR_VERSION,
             package_name: "example".to_owned(),
             package_version: "1.2.3".to_owned(),
             module_name: "native".to_owned(),
@@ -1094,6 +1119,7 @@ mod tests {
                 rust_module: "example_dice::fair::deep::roll".to_owned(),
                 rust_name: "roll".to_owned(),
                 host_name: "roll".to_owned(),
+                native_name: "__rspyts_function_roll".to_owned(),
                 docs: None,
                 params: Vec::new(),
                 returns: TypeRef::Unit,
@@ -1141,7 +1167,6 @@ mod tests {
     #[test]
     fn generated_api_keeps_boundary_code_in_the_runtime_module() {
         let mut manifest = Manifest {
-            ir_version: 2,
             package_name: "example".into(),
             package_version: "1.0.0".into(),
             module_name: "native".into(),
@@ -1152,6 +1177,7 @@ mod tests {
                 rust_module: "example".into(),
                 rust_name: "ping".into(),
                 host_name: "ping".into(),
+                native_name: "__rspyts_function_ping".into(),
                 docs: None,
                 params: Vec::new(),
                 returns: TypeRef::Unit,
@@ -1175,6 +1201,23 @@ mod tests {
         assert!(api.contains("from \"./runtime.js\""));
         assert!(!api.contains("initializeNative"));
         assert!(!api.contains("function prepareHost"));
+        let declarations = typescript_declarations(
+            views.get(&namespace).expect("root namespace"),
+            &TypeScriptContext {
+                manifest: &manifest,
+                package: "example",
+                namespace: &namespace,
+            },
+        )
+        .expect("declarations generate");
+        assert!(declarations.contains("export function ping(): void;"));
+        let runtime = typescript_runtime(&manifest).expect("runtime generates");
+        assert!(runtime.contains("globalThis.process?.versions?.node"));
+        assert!(runtime.contains("import(/* @vite-ignore */ nodeModule)"));
+        assert!(runtime.contains("wasmUrl.pathname.startsWith(\"/@fs/\")"));
+        assert!(runtime.contains("function restoreJson(value)"));
+        assert!(runtime.contains("JSON integer exceeds JavaScript's safe integer range"));
+        assert!(runtime.contains("return Object.freeze"));
 
         drop(views);
         manifest.functions[0].params.push(ParamDef {
@@ -1199,6 +1242,27 @@ mod tests {
         let runtime = typescript_runtime(&manifest).expect("runtime generates");
         assert!(runtime.contains("initializeNative"));
         assert!(runtime.contains("export function prepareHost"));
+    }
+
+    #[test]
+    fn generated_error_named_error_extends_the_global_constructor() {
+        let mut manifest = cross_namespace_manifest();
+        manifest.errors[0].name = "Error".to_owned();
+        let namespace = Namespace {
+            package: Some("two".to_owned()),
+            modules: vec!["model".to_owned()],
+        };
+        let views = namespaces(&manifest);
+        let context = TypeScriptContext {
+            manifest: &manifest,
+            package: "example",
+            namespace: &namespace,
+        };
+        let api = typescript_api(&views[&namespace], &context).expect("API generates");
+        let declarations =
+            typescript_declarations(&views[&namespace], &context).expect("declarations generate");
+        assert!(api.contains("export class Error extends globalThis.Error"));
+        assert!(declarations.contains("export class Error extends globalThis.Error"));
     }
 
     #[test]
@@ -1286,7 +1350,6 @@ mod tests {
             docs: None,
         };
         Manifest {
-            ir_version: rspyts::ir::IR_VERSION,
             package_name: "example".to_owned(),
             package_version: "1.2.3".to_owned(),
             module_name: "native".to_owned(),
@@ -1297,6 +1360,7 @@ mod tests {
                 rust_module: "example_one::service".to_owned(),
                 rust_name: "find".to_owned(),
                 host_name: "find".to_owned(),
+                native_name: "__rspyts_function_find".to_owned(),
                 docs: None,
                 params: vec![ParamDef {
                     rust_name: "target".to_owned(),

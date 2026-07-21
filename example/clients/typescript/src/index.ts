@@ -7,7 +7,8 @@ import {
   type RollResult,
 } from "example/dice/fair/roll";
 import {
-  loadedRoll,
+  DiceCup as LoadedDiceCup,
+  rollDice as loadedRollDice,
   type RollResult as LoadedRollResult,
 } from "example/dice/loaded/roll";
 import {
@@ -30,9 +31,12 @@ const seed = seedFromBytes(new TextEncoder().encode("rspyts"));
 const values: Uint32Array = rollValues({ sides: 6, count: 3 }, seed);
 console.log(values);
 
-const loaded: LoadedRollResult = loadedRoll(6);
+const loaded: LoadedRollResult = loadedRollDice(6);
+const loadedCup = new LoadedDiceCup(6);
+const loadedFromCup: LoadedRollResult = loadedCup.roll(3);
+loadedCup.close();
 const summary: RollSummary = summarizeRoll("fair", rollThreeDice());
-console.log(loaded, summary);
+console.log(loaded, loadedFromCup, summary);
 
 try {
   summarizeRoll("", summary.result);

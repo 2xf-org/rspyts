@@ -66,7 +66,16 @@ Link the API crate in the binding crate:
 rspyts::application!(hello_rspyts_api);
 ```
 
-The build writes both packages to `crates/bindings/dist`.
+The build writes both packages to `crates/bindings/dist`. To keep generated
+artifacts outside the binding crate, pass an explicit output directory:
+
+```sh
+rspyts build --output dist/packages
+rspyts check --output dist/packages
+```
+
+Relative output paths resolve from the current working directory. The CLI
+refuses to replace the binding project or Cargo workspace root.
 
 Install and use the Python package:
 
@@ -133,8 +142,8 @@ rspyts applies these rules:
 Paths can have any depth. All paths share the same native extension and the
 same WebAssembly file.
 
-Model, error, and constant names can repeat in different modules. Function
-names and resource names must be unique in one application. Python model
+Model, error, function, resource, and constant names can repeat in different
+modules. Public names must remain unique within one namespace. Python model
 modules must not have a dependency cycle. `rspyts build` reports these errors
 and identifies their source.
 
@@ -157,7 +166,7 @@ and `import.meta.url`.
 * `rspyts check` checks that generated files match the Rust source.
 
 Use `--manifest-path path/to/Cargo.toml` when a workspace has more than one
-binding crate.
+binding crate. `build`, `watch`, and `check` also accept `--output path`.
 
 ## Example
 

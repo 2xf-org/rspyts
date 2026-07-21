@@ -8,7 +8,6 @@ class RollResult(BaseModel):
 
     model_config = ConfigDict(
         frozen=True,
-        strict=True,
         populate_by_name=True,
         extra="forbid",
         arbitrary_types_allowed=True,

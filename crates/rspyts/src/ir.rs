@@ -6,14 +6,10 @@ use std::fmt;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-/// The serialized contract format produced by this release.
-pub const IR_VERSION: u32 = 2;
-
 /// The complete application contract consumed by the package generators.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Manifest {
-    pub ir_version: u32,
     pub package_name: String,
     pub package_version: String,
     pub module_name: String,
@@ -296,6 +292,8 @@ pub struct FunctionDef {
     pub rust_module: String,
     pub rust_name: String,
     pub host_name: String,
+    /// The globally unique name of the native bridge target.
+    pub native_name: String,
     pub docs: Option<String>,
     pub params: Vec<ParamDef>,
     pub returns: TypeRef,
@@ -318,6 +316,8 @@ pub struct ResourceDef {
     pub owner: CargoPackageId,
     pub rust_module: String,
     pub name: String,
+    /// The globally unique name of the native bridge class.
+    pub native_name: String,
     pub docs: Option<String>,
     pub constructors: Vec<FunctionDef>,
     pub methods: Vec<MethodDef>,
@@ -353,7 +353,6 @@ mod tests {
 
     fn manifest(binding: &str, declarations: &[(&str, &str)]) -> Manifest {
         Manifest {
-            ir_version: IR_VERSION,
             package_name: binding.to_owned(),
             package_version: "1.2.3".to_owned(),
             module_name: "native".to_owned(),
@@ -366,6 +365,7 @@ mod tests {
                     rust_module: (*rust_module).to_owned(),
                     rust_name: format!("call_{}", owner.replace('-', "_")),
                     host_name: format!("call{}", owner.replace('-', "")),
+                    native_name: format!("__rspyts_function_{}", owner.replace('-', "_")),
                     docs: None,
                     params: Vec::new(),
                     returns: TypeRef::Unit,

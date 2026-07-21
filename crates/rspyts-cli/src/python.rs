@@ -198,7 +198,7 @@ fn python_models(items: &NamespaceItems<'_>, context: &PythonContext<'_>) -> Res
     let mut rebuilds = Vec::new();
     for definition in &items.types {
         match definition.shape {
-            TypeShape::Struct { .. } | TypeShape::Alias { .. } => {
+            TypeShape::Struct { .. } => {
                 rebuilds.push(definition.name.clone());
             }
             TypeShape::TaggedEnum { ref variants, .. } => {
@@ -206,7 +206,7 @@ fn python_models(items: &NamespaceItems<'_>, context: &PythonContext<'_>) -> Res
                     rebuilds.push(tagged_variant_name(&definition.name, &variant.rust_name));
                 }
             }
-            TypeShape::StringEnum { .. } => {}
+            TypeShape::StringEnum { .. } | TypeShape::Alias { .. } => {}
         }
     }
     if !rebuilds.is_empty() {
@@ -251,7 +251,7 @@ fn model_imports(items: &NamespaceItems<'_>) -> ModelImports {
                 }
             }
             TypeShape::Alias { target } => {
-                imports.pydantic.insert("RootModel");
+                imports.typing.insert("TypeAlias");
                 collect_reference_imports(target, &mut imports);
             }
         }
@@ -381,10 +381,10 @@ fn emit_python_type(
             writeln!(source, "{}: TypeAlias = {}", definition.name, names)?;
         }
         TypeShape::Alias { target } => {
-            begin_python_top_level(source);
+            begin_python_alias(source);
             writeln!(
                 source,
-                "class {}(RootModel[{}]):\n    pass",
+                "{}: TypeAlias = {}",
                 definition.name,
                 python_ref(target, context)?
             )?;
@@ -395,7 +395,7 @@ fn emit_python_type(
 
 fn emit_model_config(source: &mut String) {
     source.push_str(
-        "    model_config = ConfigDict(\n        frozen=True,\n        strict=True,\n        populate_by_name=True,\n        extra=\"forbid\",\n        arbitrary_types_allowed=True,\n    )\n",
+        "    model_config = ConfigDict(\n        frozen=True,\n        populate_by_name=True,\n        extra=\"forbid\",\n        arbitrary_types_allowed=True,\n    )\n",
     );
 }
 
@@ -801,7 +801,11 @@ fn emit_python_function(
             format!("self.native_resource.{}", function.host_name),
         )
     } else {
-        ("", None, format!("native.{}", function.host_name))
+        (
+            "",
+            None,
+            format!("getattr(native, {})", py_string(&function.native_name)),
+        )
     };
     if receiver.is_some() {
         source.push('\n');
@@ -963,7 +967,7 @@ fn emit_python_resource(
         .map(|param| format!("prepare_host({})", safe_python_name(&param.rust_name)))
         .collect::<Vec<_>>();
     emit_python_signature(source, "    ", "__init__", Some("self"), &params, "None")?;
-    let native_call = format!("native.{}", resource.name);
+    let native_call = format!("getattr(native, {})", py_string(&resource.native_name));
     if constructor.error.is_some() {
         writeln!(source, "        try:")?;
         emit_python_call(
@@ -1013,7 +1017,11 @@ fn emit_python_resource(
             &resource.name,
         )?;
         writeln!(source, "        value = cls.__new__(cls)")?;
-        let native_call = format!("native.{}.{}", resource.name, factory.host_name);
+        let native_call = format!(
+            "getattr(native, {}).{}",
+            py_string(&resource.native_name),
+            factory.host_name
+        );
         if factory.error.is_some() {
             writeln!(source, "        try:")?;
             emit_python_call(
@@ -1046,6 +1054,7 @@ fn emit_python_resource(
             rust_module: resource.rust_module.clone(),
             rust_name: method.rust_name.clone(),
             host_name: method.host_name.clone(),
+            native_name: resource.native_name.clone(),
             docs: method.docs.clone(),
             params: method.params.clone(),
             returns: method.returns.clone(),
@@ -1611,10 +1620,36 @@ mod tests {
         let generated = render_models(&manifest);
         assert!(generated.contains("from pydantic import BaseModel, ConfigDict, Field"));
         assert!(generated.contains("    \"\"\"A message.\"\"\""));
+        assert!(generated.contains("        frozen=True,"));
+        assert!(generated.contains("        extra=\"forbid\","));
+        assert!(!generated.contains("strict=True"));
         assert!(!generated.contains("from datetime"));
         assert!(!generated.contains("from enum"));
         assert!(!generated.contains("from typing"));
         assert!(!generated.contains("RootModel"));
+    }
+
+    #[test]
+    fn aliases_are_native_python_type_aliases() {
+        let manifest = manifest_with_types(json!([
+            {
+                "owner": "example",
+                "rustModule": "example",
+                "id": "example::Identifier",
+                "name": "Identifier",
+                "docs": "A stable identifier.",
+                "shape": {
+                    "kind": "alias",
+                    "target": {"kind": "string"}
+                }
+            }
+        ]));
+
+        let generated = render_models(&manifest);
+        assert!(generated.contains("from typing import TypeAlias"));
+        assert!(generated.contains("Identifier: TypeAlias = str"));
+        assert!(!generated.contains("RootModel"));
+        assert!(!generated.contains("Identifier.model_rebuild()"));
     }
 
     #[test]
@@ -1625,6 +1660,7 @@ mod tests {
             rust_module: "example".into(),
             rust_name: "ping".into(),
             host_name: "ping".into(),
+            native_name: "__rspyts_function_ping".into(),
             docs: None,
             params: Vec::new(),
             returns: TypeRef::Unit,
@@ -1650,7 +1686,10 @@ mod tests {
         });
         manifest.functions[0].returns = TypeRef::String;
         let collision_safe = render_api(&manifest);
-        assert!(collision_safe.contains("native_result_value = native.ping"));
+        assert!(
+            collision_safe
+                .contains("native_result_value = getattr(native, \"__rspyts_function_ping\")")
+        );
         assert!(collision_safe.contains("restore_host(native_result_value"));
 
         manifest.functions[0].params.clear();
@@ -1700,7 +1739,6 @@ mod tests {
 
     fn manifest_with_types(types: serde_json::Value) -> Manifest {
         serde_json::from_value(json!({
-            "irVersion": 2,
             "packageName": "example",
             "packageVersion": "1.0.0",
             "moduleName": "native",
@@ -1767,7 +1805,6 @@ mod tests {
             docs: None,
         };
         Manifest {
-            ir_version: rspyts::ir::IR_VERSION,
             package_name: "example".to_owned(),
             package_version: "1.2.3".to_owned(),
             module_name: "native".to_owned(),
@@ -1778,6 +1815,7 @@ mod tests {
                 rust_module: "example_one::service".to_owned(),
                 rust_name: "find".to_owned(),
                 host_name: "find".to_owned(),
+                native_name: "__rspyts_function_find".to_owned(),
                 docs: None,
                 params: vec![ParamDef {
                     rust_name: "target".to_owned(),

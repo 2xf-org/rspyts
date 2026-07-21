@@ -2,10 +2,14 @@ import initializeNative, * as native from "./native.js";
 
 const wasmUrl = new URL("./native_bg.wasm", import.meta.url);
 let wasmInput = wasmUrl;
-if (wasmUrl.protocol === "file:" && globalThis.process?.versions?.node) {
+if (globalThis.process?.versions?.node) {
   const nodeModule = "node:fs/promises";
-  const { readFile } = await import(nodeModule);
-  wasmInput = await readFile(wasmUrl);
+  const { readFile } = await import(/* @vite-ignore */ nodeModule);
+  if (wasmUrl.protocol === "file:") {
+    wasmInput = await readFile(wasmUrl);
+  } else if (wasmUrl.pathname.startsWith("/@fs/")) {
+    wasmInput = await readFile(decodeURIComponent(wasmUrl.pathname.slice(4)));
+  }
 }
 await initializeNative({ module_or_path: wasmInput });
 
@@ -27,20 +31,36 @@ const bufferConstructors = {
   f32: Float32Array, f64: Float64Array,
 };
 
+function restoreJson(value) {
+  if (typeof value === "bigint") {
+    const number = Number(value);
+    if (!Number.isSafeInteger(number) || BigInt(number) !== value) {
+      throw new RangeError("JSON integer exceeds JavaScript's safe integer range");
+    }
+    return number;
+  }
+  if (Array.isArray(value)) return Object.freeze(value.map(restoreJson));
+  if (value !== null && typeof value === "object") {
+    return Object.freeze(Object.fromEntries(Object.entries(value).map(([key, item]) => [key, restoreJson(item)])));
+  }
+  return value;
+}
+
 export function restoreHost(value, spec) {
   if (value == null || spec == null) return value;
   const [kind, detail, variants] = spec;
   if (kind === "bytes") return new Uint8Array(value);
   if (kind === "buffer") return new bufferConstructors[detail](value);
-  if (kind === "list") return Array.from(value, item => restoreHost(item, detail));
-  if (kind === "map") return Object.fromEntries(Object.entries(value).map(([key, item]) => [key, restoreHost(item, detail)]));
-  if (kind === "tuple") return value.map((item, index) => restoreHost(item, detail[index]));
+  if (kind === "json") return restoreJson(value);
+  if (kind === "list") return Object.freeze(Array.from(value, item => restoreHost(item, detail)));
+  if (kind === "map") return Object.freeze(Object.fromEntries(Object.entries(value).map(([key, item]) => [key, restoreHost(item, detail)])));
+  if (kind === "tuple") return Object.freeze(value.map((item, index) => restoreHost(item, detail[index])));
   if (kind === "named") return restoreHost(value, nativeSchemas[detail]);
   if (kind === "alias") return restoreHost(value, detail);
-  if (kind === "struct") return Object.fromEntries(Object.entries(value).map(([key, item]) => [key, restoreHost(item, detail[key])]));
+  if (kind === "struct") return Object.freeze(Object.fromEntries(Object.entries(value).map(([key, item]) => [key, restoreHost(item, detail[key])])));
   if (kind === "tagged") {
     const fields = variants[value[detail]] ?? {};
-    return Object.fromEntries(Object.entries(value).map(([key, item]) => [key, restoreHost(item, fields[key])]));
+    return Object.freeze(Object.fromEntries(Object.entries(value).map(([key, item]) => [key, restoreHost(item, fields[key])])));
   }
   return value;
 }

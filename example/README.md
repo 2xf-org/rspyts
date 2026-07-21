@@ -44,7 +44,9 @@ Use these Python imports:
 
 ```python
 from example.dice.fair.roll import DiceCup, RollResult
+from example.dice.loaded.roll import DiceCup as LoadedDiceCup
 from example.dice.loaded.roll import RollResult as LoadedRollResult
+from example.dice.loaded.roll import roll_dice as loaded_roll_dice
 from example.dice.summary import summarize_roll
 ```
 
@@ -52,13 +54,18 @@ Use these TypeScript imports:
 
 ```typescript
 import { DiceCup, type RollResult } from "example/dice/fair/roll";
-import type { RollResult as LoadedRollResult } from "example/dice/loaded/roll";
+import {
+  DiceCup as LoadedDiceCup,
+  rollDice as loadedRollDice,
+  type RollResult as LoadedRollResult,
+} from "example/dice/loaded/roll";
 import { summarizeRoll } from "example/dice/summary";
 ```
 
-The two `RollResult` models have the same leaf name. They are valid because
-they are in different Rust modules. `RollSummary` contains the fair result.
-This reference crosses a namespace boundary without a second binding.
+The two modules reuse the `DiceCup`, `RollResult`, and `roll_dice` leaf names.
+They are valid because they belong to different namespaces. `RollSummary`
+contains the fair result. This reference crosses a namespace boundary without
+a second binding.
 
 Build both host packages:
 
@@ -85,5 +92,5 @@ These client commands use `uv`, Python, Node.js, and npm. They are example
 development tools. `rspyts build` does not require them.
 
 Both clients roll three seeded dice. Both clients return `[5, 4, 2]` with a
-total of `11`. They also check duplicate model names, a cross-namespace model
-reference, and a cross-namespace error.
+total of `11`. They also check duplicate model, function, and resource names;
+a cross-namespace model reference; and a cross-namespace error.

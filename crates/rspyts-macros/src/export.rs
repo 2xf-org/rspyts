@@ -11,8 +11,9 @@ use crate::attributes::{
     take_method_options, type_last_ident,
 };
 use crate::types::{
-    ensure_public, params_tokens, reject_generics, reject_reserved_resource_method,
-    reject_signature, resolved_result_types, return_tokens, type_ref_tokens, wasm_native_host_name,
+    ensure_public, native_export_name, params_tokens, reject_generics,
+    reject_reserved_resource_method, reject_signature, resolved_result_types, return_tokens,
+    type_ref_tokens,
 };
 
 pub(super) fn expand_export(item: Item) -> syn::Result<TokenStream2> {
@@ -35,14 +36,17 @@ fn expand_function(mut function: ItemFn) -> syn::Result<TokenStream2> {
     let ident = &function.sig.ident;
     let rust_name = ident.to_string();
     let host_name = apply_case(&rust_name, Some("camelCase"));
+    let native_name = native_export_name(ident.span(), "function", &host_name);
     let docs = docs_tokens(&function.attrs);
     let python_wrapper = python_function_wrapper(
         &function,
+        &native_name,
         options.returns.as_deref(),
         options.error.as_ref(),
     )?;
     let wasm_wrapper = wasm_function_wrapper(
         &function,
+        &native_name,
         options.returns.as_deref(),
         options.error.as_ref(),
     )?;
@@ -62,6 +66,7 @@ fn expand_function(mut function: ItemFn) -> syn::Result<TokenStream2> {
                     rust_module: module_path!().to_owned(),
                     rust_name: #rust_name.to_owned(),
                     host_name: #host_name.to_owned(),
+                    native_name: #native_name.to_owned(),
                     docs: #docs,
                     params: vec![#(#params),*],
                     returns: #returns,
@@ -80,13 +85,13 @@ fn expand_function(mut function: ItemFn) -> syn::Result<TokenStream2> {
 
 fn python_function_wrapper(
     function: &ItemFn,
+    native_name: &str,
     return_boundary: Option<&str>,
     declared_error: Option<&SynType>,
 ) -> syn::Result<TokenStream2> {
     let function_ident = &function.sig.ident;
     let wrapper_ident = format_ident!("__rspyts_python_{}", function_ident);
     let register_ident = format_ident!("__rspyts_register_python_{}", function_ident);
-    let host_name = apply_case(&function_ident.to_string(), Some("camelCase"));
     let params = wrapper_params(&function.sig.inputs, HostBackend::Python)?;
     let declarations = params.iter().map(|param| &param.declaration);
     let decodes = params.iter().map(|param| &param.decode);
@@ -101,7 +106,7 @@ fn python_function_wrapper(
     )?;
     Ok(quote! {
         #[cfg(not(target_arch = "wasm32"))]
-        #[::rspyts::__private::pyo3::pyfunction(name = #host_name)]
+        #[::rspyts::__private::pyo3::pyfunction(name = #native_name)]
         #[pyo3(crate = "::rspyts::__private::pyo3")]
         fn #wrapper_ident<'py>(
             __rspyts_py: ::rspyts::__private::pyo3::Python<'py>,
@@ -133,14 +138,13 @@ fn python_function_wrapper(
 
 fn wasm_function_wrapper(
     function: &ItemFn,
+    native_name: &str,
     return_boundary: Option<&str>,
     declared_error: Option<&SynType>,
 ) -> syn::Result<TokenStream2> {
     let function_ident = &function.sig.ident;
     let wrapper_ident = format_ident!("__rspyts_wasm_{}", function_ident);
     let module_ident = format_ident!("__rspyts_wasm_function_{}", function_ident);
-    let host_name = apply_case(&function_ident.to_string(), Some("camelCase"));
-    let native_host_name = wasm_native_host_name(&host_name);
     let params = wrapper_params(&function.sig.inputs, HostBackend::Wasm)?;
     let declarations = params.iter().map(|param| &param.declaration);
     let decodes = params.iter().map(|param| &param.decode);
@@ -162,7 +166,7 @@ fn wasm_function_wrapper(
             #[doc(hidden)]
             #[allow(missing_docs)]
             #[wasm_bindgen(
-                js_name = #native_host_name,
+                js_name = #native_name,
                 wasm_bindgen = ::rspyts::__private::wasm_bindgen
             )]
             pub fn #wrapper_ident(
@@ -360,7 +364,9 @@ fn expand_resource(mut item: ItemImpl) -> syn::Result<TokenStream2> {
     let docs = docs_tokens(&item.attrs);
     let wrapper_source = item.clone();
     let resource_ty = (*item.self_ty).clone();
-    let resource_name = type_last_ident(&resource_ty)?.to_string();
+    let resource_ident = type_last_ident(&resource_ty)?;
+    let resource_name = resource_ident.to_string();
+    let native_name = native_export_name(resource_ident.span(), "resource", &resource_name);
     let mut constructors = Vec::new();
     let mut methods = Vec::new();
     for impl_item in &mut item.items {
@@ -391,6 +397,7 @@ fn expand_resource(mut item: ItemImpl) -> syn::Result<TokenStream2> {
             constructors.push(resource_constructor_tokens(
                 method,
                 &resource_ty,
+                &native_name,
                 options.error.as_ref(),
             )?);
         } else {
@@ -408,8 +415,8 @@ fn expand_resource(mut item: ItemImpl) -> syn::Result<TokenStream2> {
             "an exported resource needs at least one `#[rspyts(constructor)]`",
         ));
     }
-    let python_wrapper = python_resource_wrapper(&wrapper_source)?;
-    let wasm_wrapper = wasm_resource_wrapper(&wrapper_source)?;
+    let python_wrapper = python_resource_wrapper(&wrapper_source, &native_name)?;
+    let wasm_wrapper = wasm_resource_wrapper(&wrapper_source, &native_name)?;
     Ok(quote! {
         #item
         const _: () = {
@@ -418,6 +425,7 @@ fn expand_resource(mut item: ItemImpl) -> syn::Result<TokenStream2> {
                     owner: ::rspyts::ir::CargoPackageId::new(env!("CARGO_PKG_NAME")),
                     rust_module: module_path!().to_owned(),
                     name: #resource_name.to_owned(),
+                    native_name: #native_name.to_owned(),
                     docs: #docs,
                     constructors: vec![#(#constructors),*],
                     methods: vec![#(#methods),*],
@@ -433,7 +441,7 @@ fn expand_resource(mut item: ItemImpl) -> syn::Result<TokenStream2> {
     })
 }
 
-fn python_resource_wrapper(item: &ItemImpl) -> syn::Result<TokenStream2> {
+fn python_resource_wrapper(item: &ItemImpl, native_name: &str) -> syn::Result<TokenStream2> {
     let resource_ty = item.self_ty.as_ref();
     let resource_name = type_last_ident(resource_ty)?.to_string();
     let wrapper_ident = format_ident!("__RspytsPython{}", resource_name);
@@ -486,7 +494,7 @@ fn python_resource_wrapper(item: &ItemImpl) -> syn::Result<TokenStream2> {
 
     Ok(quote! {
         #[cfg(not(target_arch = "wasm32"))]
-        #[::rspyts::__private::pyo3::pyclass(name = #resource_name)]
+        #[::rspyts::__private::pyo3::pyclass(name = #native_name)]
         #[pyo3(crate = "::rspyts::__private::pyo3")]
         struct #wrapper_ident {
             inner: Option<#resource_ty>,
@@ -593,7 +601,7 @@ fn python_resource_method(resource_ty: &SynType, method: &ImplItemFn) -> syn::Re
     })
 }
 
-fn wasm_resource_wrapper(item: &ItemImpl) -> syn::Result<TokenStream2> {
+fn wasm_resource_wrapper(item: &ItemImpl, native_name: &str) -> syn::Result<TokenStream2> {
     let resource_ty = item.self_ty.as_ref();
     let resource_name = type_last_ident(resource_ty)?.to_string();
     let wrapper_ident = format_ident!("RspytsWasm{}", resource_name);
@@ -650,14 +658,20 @@ fn wasm_resource_wrapper(item: &ItemImpl) -> syn::Result<TokenStream2> {
 
             #[doc(hidden)]
             #[allow(missing_docs)]
-            #[wasm_bindgen(wasm_bindgen = ::rspyts::__private::wasm_bindgen)]
+            #[wasm_bindgen(
+                js_name = #native_name,
+                wasm_bindgen = ::rspyts::__private::wasm_bindgen
+            )]
             pub struct #wrapper_ident {
                 inner: Option<#resource_ty>,
             }
 
             #[doc(hidden)]
             #[allow(missing_docs)]
-            #[wasm_bindgen(wasm_bindgen = ::rspyts::__private::wasm_bindgen)]
+            #[wasm_bindgen(
+                js_class = #native_name,
+                wasm_bindgen = ::rspyts::__private::wasm_bindgen
+            )]
             impl #wrapper_ident {
                 #[wasm_bindgen(constructor)]
                 pub fn new(#(#constructor_declarations),*) -> ::std::result::Result<
@@ -783,6 +797,7 @@ fn return_result(output: &ReturnType, declared_error: Option<&SynType>) -> syn::
 fn resource_constructor_tokens(
     method: &mut ImplItemFn,
     resource_ty: &SynType,
+    native_name: &str,
     declared_error: Option<&SynType>,
 ) -> syn::Result<TokenStream2> {
     let rust_name = method.sig.ident.to_string();
@@ -795,6 +810,7 @@ fn resource_constructor_tokens(
         rust_module: module_path!().to_owned(),
         rust_name: #rust_name.to_owned(),
         host_name: #host_name.to_owned(),
+        native_name: #native_name.to_owned(),
         docs: #docs,
         params: vec![#(#params),*],
         returns: ::rspyts::ir::TypeRef::Named {

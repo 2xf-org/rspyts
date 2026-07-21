@@ -2,7 +2,8 @@
 
 from .api import (
     DEFAULT_FAVORED_VALUE,
-    loaded_roll,
+    DiceCup,
+    roll_dice,
 )
 from .models import (
     RollResult,
@@ -11,5 +12,6 @@ from .models import (
 __all__ = [
     "RollResult",
     "DEFAULT_FAVORED_VALUE",
-    "loaded_roll",
+    "DiceCup",
+    "roll_dice",
 ]

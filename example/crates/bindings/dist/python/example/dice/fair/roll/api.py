@@ -33,7 +33,10 @@ def roll_dice(request: RollRequest, seed: int) -> RollResult:
     Returns [`RollError::InvalidRequest`] if the request is not valid.
     """
     try:
-        native_result = native.rollDice(prepare_host(request), prepare_host(seed))
+        native_result = getattr(native, "__rspyts_function_example_dice_6c2d689fb497e08d")(
+            prepare_host(request),
+            prepare_host(seed),
+        )
     except RuntimeError as error:
         raise native_error(error, RollError) from None
     return TypeAdapter(RollResult).validate_python(
@@ -50,7 +53,10 @@ def roll_values(request: RollRequest, seed: int) -> UInt32Buffer:
     Returns [`RollError::InvalidRequest`] if the request is not valid.
     """
     try:
-        native_result = native.rollValues(prepare_host(request), prepare_host(seed))
+        native_result = getattr(native, "__rspyts_function_example_dice_5567623c2f5c7535")(
+            prepare_host(request),
+            prepare_host(seed),
+        )
     except RuntimeError as error:
         raise native_error(error, RollError) from None
     return TypeAdapter(
@@ -64,7 +70,9 @@ def roll_values(request: RollRequest, seed: int) -> UInt32Buffer:
 
 def seed_from_bytes(bytes: bytes) -> int:
     """Convert bytes to a repeatable seed."""
-    native_result = native.seedFromBytes(prepare_host(bytes))
+    native_result = getattr(native, "__rspyts_function_example_dice_c5410f101744fbbd")(
+        prepare_host(bytes),
+    )
     return TypeAdapter(int).validate_python(
         restore_host(native_result, None),
         strict=False,
@@ -74,7 +82,7 @@ def seed_from_bytes(bytes: bytes) -> int:
 class DiceCup:
     def __init__(self, sides: int, seed: int) -> None:
         try:
-            self.native_resource = native.DiceCup(
+            self.native_resource = getattr(native, "__rspyts_resource_example_dice_44a56b40f04605c6")(
                 prepare_host(sides),
                 prepare_host(seed),
             )

@@ -1,7 +1,6 @@
 {
-  "irVersion": 2,
   "packageName": "example",
-  "packageVersion": "1.0.2",
+  "packageVersion": "1.0.3",
   "moduleName": "native",
   "types": [
     {
@@ -223,6 +222,7 @@
       "rustModule": "example_dice::fair::roll",
       "rustName": "roll_dice",
       "hostName": "rollDice",
+      "nativeName": "__rspyts_function_example_dice_6c2d689fb497e08d",
       "docs": "Roll dice from a seed.\n\n# Errors\n\nReturns [`RollError::InvalidRequest`] if the request is not valid.",
       "params": [
         {
@@ -263,6 +263,7 @@
       "rustModule": "example_dice::fair::roll",
       "rustName": "roll_values",
       "hostName": "rollValues",
+      "nativeName": "__rspyts_function_example_dice_5567623c2f5c7535",
       "docs": "Roll dice and return a compact numeric buffer.\n\n# Errors\n\nReturns [`RollError::InvalidRequest`] if the request is not valid.",
       "params": [
         {
@@ -300,6 +301,7 @@
       "rustModule": "example_dice::fair::roll",
       "rustName": "seed_from_bytes",
       "hostName": "seedFromBytes",
+      "nativeName": "__rspyts_function_example_dice_c5410f101744fbbd",
       "docs": "Convert bytes to a repeatable seed.",
       "params": [
         {
@@ -320,8 +322,9 @@
     {
       "owner": "example-dice",
       "rustModule": "example_dice::loaded::roll",
-      "rustName": "loaded_roll",
-      "hostName": "loadedRoll",
+      "rustName": "roll_dice",
+      "hostName": "rollDice",
+      "nativeName": "__rspyts_function_example_dice_3af246b4f17bbfac",
       "docs": "Return one loaded-die result.",
       "params": [
         {
@@ -348,6 +351,7 @@
       "rustModule": "example_dice::summary",
       "rustName": "summarize_roll",
       "hostName": "summarizeRoll",
+      "nativeName": "__rspyts_function_example_dice_c1857e4fef937ab5",
       "docs": "Add a label to a fair-roll result.\n\n# Errors\n\nReturns [`RollError::EmptyLabel`] if `label` is empty.",
       "params": [
         {
@@ -387,6 +391,7 @@
       "owner": "example-dice",
       "rustModule": "example_dice::fair::roll",
       "name": "DiceCup",
+      "nativeName": "__rspyts_resource_example_dice_44a56b40f04605c6",
       "docs": null,
       "constructors": [
         {
@@ -394,6 +399,7 @@
           "rustModule": "example_dice::fair::roll",
           "rustName": "new",
           "hostName": "new",
+          "nativeName": "__rspyts_resource_example_dice_44a56b40f04605c6",
           "docs": "Create a dice cup.\n\n# Errors\n\nReturns [`RollError::InvalidRequest`] if `sides` is not from 2 through 100.",
           "params": [
             {
@@ -457,6 +463,68 @@
           }
         }
       ]
+    },
+    {
+      "owner": "example-dice",
+      "rustModule": "example_dice::loaded::roll",
+      "name": "DiceCup",
+      "nativeName": "__rspyts_resource_example_dice_e5e96c8d1c3073b6",
+      "docs": null,
+      "constructors": [
+        {
+          "owner": "example-dice",
+          "rustModule": "example_dice::loaded::roll",
+          "rustName": "new",
+          "hostName": "new",
+          "nativeName": "__rspyts_resource_example_dice_e5e96c8d1c3073b6",
+          "docs": "Create a loaded dice cup.",
+          "params": [
+            {
+              "rustName": "favored_value",
+              "hostName": "favoredValue",
+              "ty": {
+                "kind": "int",
+                "signed": false,
+                "bits": 32
+              }
+            }
+          ],
+          "returns": {
+            "kind": "named",
+            "identity": {
+              "owner": "example-dice",
+              "id": "example_dice::loaded::roll::DiceCup"
+            }
+          },
+          "error": null
+        }
+      ],
+      "methods": [
+        {
+          "rustName": "roll",
+          "hostName": "roll",
+          "docs": "Return one loaded-die result.",
+          "params": [
+            {
+              "rustName": "value",
+              "hostName": "value",
+              "ty": {
+                "kind": "int",
+                "signed": false,
+                "bits": 32
+              }
+            }
+          ],
+          "returns": {
+            "kind": "named",
+            "identity": {
+              "owner": "example-dice",
+              "id": "example_dice::loaded::roll::RollResult"
+            }
+          },
+          "error": null
+        }
+      ]
     }
   ],
   "constants": [
@@ -485,5 +553,5 @@
       "value": 6
     }
   ],
-  "sourceFingerprint": "935a3b7d313e1ec15b206a2d22cad57b"
+  "sourceFingerprint": "708de0b3e7a4afe1d5b1f916b5b35f09"
 }

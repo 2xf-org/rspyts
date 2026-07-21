@@ -4,6 +4,11 @@ export interface RollResult {
   readonly favoredValue: number;
 }
 
-export function loadedRoll(value: number): RollResult;
+export function rollDice(value: number): RollResult;
+export class DiceCup {
+  constructor(favoredValue: number);
+  roll(value: number): RollResult;
+  close(): void;
+}
 
 export const DEFAULT_FAVORED_VALUE: number;

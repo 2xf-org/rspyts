@@ -1,5 +1,6 @@
 use proc_macro2::{Span, TokenStream as TokenStream2};
 use quote::quote;
+use std::path::Path;
 use syn::{
     Attribute, Expr, FnArg, GenericArgument, ImplItemFn, Lit, Pat, PathArguments, ReturnType,
     Type as SynType, TypePath, UnOp, ext::IdentExt, punctuated::Punctuated, spanned::Spanned,
@@ -884,13 +885,54 @@ pub(super) fn reject_reserved_resource_method(method: &ImplItemFn) -> syn::Resul
     Ok(())
 }
 
-pub(super) fn wasm_native_host_name(host_name: &str) -> String {
-    format!("__rspyts_export_{host_name}")
+pub(super) fn native_export_name(span: Span, kind: &str, public_name: &str) -> String {
+    let span = span.unwrap();
+    let package = std::env::var("CARGO_PKG_NAME").unwrap_or_else(|_| "crate".to_owned());
+    let manifest_dir = std::env::var_os("CARGO_MANIFEST_DIR");
+    let file = span.local_file().map_or_else(
+        || span.file(),
+        |path| {
+            manifest_dir
+                .as_deref()
+                .and_then(|root| path.strip_prefix(Path::new(root)).ok())
+                .unwrap_or(&path)
+                .to_string_lossy()
+                .replace('\\', "/")
+        },
+    );
+    let identity = format!(
+        "{package}\0{file}\0{}\0{}\0{kind}\0{public_name}",
+        span.line(),
+        span.column()
+    );
+    let package = package
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() {
+                character
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    format!(
+        "__rspyts_{kind}_{package}_{:016x}",
+        stable_hash(identity.as_bytes())
+    )
+}
+
+fn stable_hash(bytes: &[u8]) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{field_options, reject_signature};
+    use super::{field_options, reject_signature, stable_hash};
     use syn::ItemFn;
 
     #[test]
@@ -911,5 +953,14 @@ mod tests {
         };
         let error = reject_signature(&function.sig).unwrap_err();
         assert!(error.to_string().contains("async exports"));
+    }
+
+    #[test]
+    fn native_name_hash_is_stable_and_sensitive_to_its_identity() {
+        assert_eq!(stable_hash(b"rspyts"), 0xaf55_94bc_e379_d678);
+        assert_ne!(
+            stable_hash(b"module::first"),
+            stable_hash(b"module::second")
+        );
     }
 }
