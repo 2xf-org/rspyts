@@ -887,8 +887,15 @@ pub(super) fn reject_reserved_resource_method(method: &ImplItemFn) -> syn::Resul
 pub(super) fn native_export_name(span: Span, kind: &str, public_name: &str) -> String {
     let span = span.unwrap();
     let package = std::env::var("CARGO_PKG_NAME").unwrap_or_else(|_| "crate".to_owned());
-    // The on-disk path can change form across equivalent builds, especially on Windows.
-    let file = span.file().replace('\\', "/");
+    let local_file = span
+        .local_file()
+        .map(|path| path.to_string_lossy().into_owned());
+    let manifest_dir =
+        std::env::var_os("CARGO_MANIFEST_DIR").map(|path| path.to_string_lossy().into_owned());
+    let file = local_file.map_or_else(
+        || normalize_source_path(&span.file()),
+        |path| relative_source_path(&path, manifest_dir.as_deref()),
+    );
     let identity = format!(
         "{package}\0{file}\0{}\0{}\0{kind}\0{public_name}",
         span.line(),
@@ -910,6 +917,31 @@ pub(super) fn native_export_name(span: Span, kind: &str, public_name: &str) -> S
     )
 }
 
+fn relative_source_path(file: &str, manifest_dir: Option<&str>) -> String {
+    let file = normalize_source_path(file);
+    let Some(manifest_dir) = manifest_dir else {
+        return file;
+    };
+    let manifest_dir = normalize_source_path(manifest_dir);
+    file.strip_prefix(&manifest_dir)
+        .and_then(|suffix| suffix.strip_prefix('/'))
+        .unwrap_or(&file)
+        .to_owned()
+}
+
+fn normalize_source_path(path: &str) -> String {
+    let path = path.replace('\\', "/");
+    let mut path = path.strip_prefix("//?/").unwrap_or(&path).to_owned();
+    if path.as_bytes().get(1) == Some(&b':') {
+        let drive = path[..1].to_ascii_lowercase();
+        path.replace_range(0..1, &drive);
+    }
+    while path.ends_with('/') {
+        path.pop();
+    }
+    path
+}
+
 fn stable_hash(bytes: &[u8]) -> u64 {
     let mut hash = 0xcbf2_9ce4_8422_2325_u64;
     for byte in bytes {
@@ -921,7 +953,7 @@ fn stable_hash(bytes: &[u8]) -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{field_options, reject_signature, stable_hash};
+    use super::{field_options, reject_signature, relative_source_path, stable_hash};
     use syn::ItemFn;
 
     #[test]
@@ -950,6 +982,22 @@ mod tests {
         assert_ne!(
             stable_hash(b"module::first"),
             stable_hash(b"module::second")
+        );
+    }
+
+    #[test]
+    fn source_paths_are_stable_across_windows_path_forms() {
+        let manifest = r"D:\a\rspyts\rspyts\example\crates\dice";
+        let regular = r"D:\a\rspyts\rspyts\example\crates\dice\src\loaded\roll.rs";
+        let verbatim = r"\\?\D:\a\rspyts\rspyts\example\crates\dice\src\loaded\roll.rs";
+
+        assert_eq!(
+            relative_source_path(regular, Some(manifest)),
+            "src/loaded/roll.rs"
+        );
+        assert_eq!(
+            relative_source_path(verbatim, Some(manifest)),
+            "src/loaded/roll.rs"
         );
     }
 }
