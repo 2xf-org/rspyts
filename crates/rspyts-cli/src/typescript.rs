@@ -37,6 +37,7 @@ pub(super) fn emit(project: &Project, manifest: &Manifest, wasm: &Path, root: &P
         .generate(&package)
         .context("failed to generate TypeScript WebAssembly bindings")?;
     write(&package.join("runtime.js"), &typescript_runtime(manifest)?)?;
+    write(&package.join("values.js"), TYPESCRIPT_VALUES)?;
     let namespace_map = namespaces(manifest);
     for (namespace, items) in &namespace_map {
         let namespace_package = namespace
@@ -178,16 +179,27 @@ fn emit_typescript_type(
         }
         TypeShape::StringEnum { variants } => {
             emit_ts_doc(source, definition.docs.as_deref(), "")?;
+            let union = variants
+                .iter()
+                .map(|variant| ts_string(&variant.wire_name))
+                .collect::<Vec<_>>()
+                .join(" | ");
             writeln!(
                 source,
                 "export type {} = {};",
                 definition.name,
-                variants
-                    .iter()
-                    .map(|variant| ts_string(&variant.wire_name))
-                    .collect::<Vec<_>>()
-                    .join(" | ")
+                if union.is_empty() { "never" } else { &union }
             )?;
+            writeln!(source, "export declare const {}: {{", definition.name)?;
+            for variant in variants {
+                writeln!(
+                    source,
+                    "  readonly {}: {};",
+                    ts_property(&variant.rust_name),
+                    ts_string(&variant.wire_name),
+                )?;
+            }
+            source.push_str("};\n");
         }
         TypeShape::TaggedEnum { tag, variants } => {
             for variant in variants {
@@ -283,6 +295,17 @@ fn emit_typescript_resource_declaration(
 fn typescript_api(items: &NamespaceItems<'_>, context: &TypeScriptContext<'_>) -> Result<String> {
     let runtime_imports = typescript_runtime_imports(items);
     let mut source = String::new();
+    if items
+        .types
+        .iter()
+        .any(|definition| matches!(&definition.shape, TypeShape::StringEnum { .. }))
+    {
+        writeln!(
+            source,
+            "import {{ freeze as $rspytsFreeze }} from {};",
+            ts_string(&typescript_values_path(context.namespace))
+        )?;
+    }
     if !runtime_imports.is_empty() {
         source.push_str("import {\n");
         for name in runtime_imports {
@@ -301,6 +324,25 @@ fn typescript_api(items: &NamespaceItems<'_>, context: &TypeScriptContext<'_>) -
             namespace_alias(&import),
             ts_string(&typescript_import(context.package, &import))
         )?;
+    }
+    for (index, definition) in items.types.iter().enumerate() {
+        if let TypeShape::StringEnum { variants } = &definition.shape {
+            let binding = format!("$rspytsStringEnum{index}");
+            writeln!(source, "\nconst {binding} = $rspytsFreeze({{")?;
+            for variant in variants {
+                writeln!(
+                    source,
+                    "  [{}]: {},",
+                    ts_string(&variant.rust_name),
+                    ts_string(&variant.wire_name),
+                )?;
+            }
+            writeln!(
+                source,
+                "}});\nexport {{ {binding} as {} }};",
+                definition.name
+            )?;
+        }
     }
     for error in &items.errors {
         writeln!(
@@ -394,6 +436,8 @@ fn typescript_runtime_imports(items: &NamespaceItems<'_>) -> Vec<&'static str> {
     }
     imports
 }
+
+const TYPESCRIPT_VALUES: &str = "export const freeze = Object.freeze;\n";
 
 const TYPESCRIPT_ADAPTERS: &str = r#"
 export function prepareHost(value) {
@@ -799,6 +843,15 @@ fn typescript_runtime_path(namespace: &Namespace) -> String {
         "./runtime.js".to_owned()
     } else {
         format!("{}runtime.js", "../".repeat(depth))
+    }
+}
+
+fn typescript_values_path(namespace: &Namespace) -> String {
+    let depth = namespace.typescript_segments().len();
+    if depth == 0 {
+        "./values.js".to_owned()
+    } else {
+        format!("{}values.js", "../".repeat(depth))
     }
 }
 
@@ -1263,6 +1316,143 @@ mod tests {
             typescript_declarations(&views[&namespace], &context).expect("declarations generate");
         assert!(api.contains("export class Error extends globalThis.Error"));
         assert!(declarations.contains("export class Error extends globalThis.Error"));
+    }
+
+    #[test]
+    fn generated_string_enums_have_runtime_values() {
+        let manifest = Manifest {
+            package_name: "example".to_owned(),
+            package_version: "1.0.0".to_owned(),
+            module_name: "native".to_owned(),
+            types: vec![TypeDef {
+                owner: CargoPackageId::new("example"),
+                rust_module: "example".to_owned(),
+                id: "example::RunMode".to_owned(),
+                name: "RunMode".to_owned(),
+                docs: None,
+                shape: TypeShape::StringEnum {
+                    variants: vec![
+                        EnumVariantDef {
+                            rust_name: "Fast".to_owned(),
+                            wire_name: "fast".to_owned(),
+                            docs: None,
+                            fields: Vec::new(),
+                        },
+                        EnumVariantDef {
+                            rust_name: "Safe".to_owned(),
+                            wire_name: "safe-mode".to_owned(),
+                            docs: None,
+                            fields: Vec::new(),
+                        },
+                    ],
+                },
+            }],
+            errors: Vec::new(),
+            functions: Vec::new(),
+            resources: Vec::new(),
+            constants: Vec::new(),
+        };
+        let namespace = Namespace::root();
+        let views = namespaces(&manifest);
+        let context = TypeScriptContext {
+            manifest: &manifest,
+            package: "example",
+            namespace: &namespace,
+        };
+        let declarations =
+            typescript_declarations(&views[&namespace], &context).expect("declarations generate");
+        let api = typescript_api(&views[&namespace], &context).expect("API generates");
+
+        assert!(declarations.contains("export type RunMode = \"fast\" | \"safe-mode\";"));
+        assert!(declarations.contains("export declare const RunMode: {"));
+        assert!(declarations.contains("readonly Fast: \"fast\";"));
+        assert!(declarations.contains("readonly Safe: \"safe-mode\";"));
+        assert!(api.contains("freeze as $rspytsFreeze"));
+        assert!(api.contains("from \"./values.js\""));
+        assert!(!api.contains("runtime.js"));
+        assert!(api.contains("const $rspytsStringEnum0 = $rspytsFreeze({"));
+        assert!(api.contains("[\"Fast\"]: \"fast\","));
+        assert!(api.contains("[\"Safe\"]: \"safe-mode\","));
+        assert!(api.contains("export { $rspytsStringEnum0 as RunMode };"));
+    }
+
+    #[test]
+    fn generated_string_enum_values_avoid_javascript_name_collisions() {
+        let string_enum = |name: &str, variant: &str| TypeDef {
+            owner: CargoPackageId::new("example"),
+            rust_module: "example".to_owned(),
+            id: format!("example::{name}"),
+            name: name.to_owned(),
+            docs: None,
+            shape: TypeShape::StringEnum {
+                variants: vec![EnumVariantDef {
+                    rust_name: variant.to_owned(),
+                    wire_name: "wire".to_owned(),
+                    docs: None,
+                    fields: Vec::new(),
+                }],
+            },
+        };
+        let manifest = Manifest {
+            package_name: "example".to_owned(),
+            package_version: "1.0.0".to_owned(),
+            module_name: "native".to_owned(),
+            types: vec![
+                string_enum("Object", "Safe"),
+                string_enum("Readonly", "Safe"),
+                string_enum("native", "Safe"),
+                string_enum("Mode", "__proto__"),
+                TypeDef {
+                    owner: CargoPackageId::new("example"),
+                    rust_module: "example".to_owned(),
+                    id: "example::Empty".to_owned(),
+                    name: "Empty".to_owned(),
+                    docs: None,
+                    shape: TypeShape::StringEnum {
+                        variants: Vec::new(),
+                    },
+                },
+            ],
+            errors: Vec::new(),
+            functions: vec![FunctionDef {
+                owner: CargoPackageId::new("example"),
+                rust_module: "example".to_owned(),
+                rust_name: "ping".to_owned(),
+                host_name: "ping".to_owned(),
+                native_name: "__rspyts_function_ping".to_owned(),
+                docs: None,
+                params: Vec::new(),
+                returns: TypeRef::Unit,
+                error: None,
+            }],
+            resources: Vec::new(),
+            constants: Vec::new(),
+        };
+        let namespace = Namespace::root();
+        let views = namespaces(&manifest);
+        let context = TypeScriptContext {
+            manifest: &manifest,
+            package: "example",
+            namespace: &namespace,
+        };
+        let declarations =
+            typescript_declarations(&views[&namespace], &context).expect("declarations generate");
+        let api = typescript_api(&views[&namespace], &context).expect("API generates");
+
+        assert!(api.contains("freeze as $rspytsFreeze"));
+        assert!(api.contains("from \"./values.js\""));
+        assert!(api.contains("from \"./runtime.js\""));
+        assert!(api.contains("  native,"));
+        assert!(api.contains("export { $rspytsStringEnum0 as Object };"));
+        assert!(api.contains("export { $rspytsStringEnum1 as Readonly };"));
+        assert!(api.contains("export { $rspytsStringEnum2 as native };"));
+        assert!(api.contains("[\"__proto__\"]: \"wire\","));
+        assert!(!api.contains("export const Object ="));
+        assert!(!api.contains("export const native ="));
+        assert!(declarations.contains("export declare const Readonly: {"));
+        assert!(!declarations.contains("Readonly<{"));
+        assert!(declarations.contains("export type Empty = never;"));
+        assert!(api.contains("export { $rspytsStringEnum4 as Empty };"));
     }
 
     #[test]

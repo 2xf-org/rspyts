@@ -5,6 +5,7 @@ from typing import Final
 from pydantic import ConfigDict, TypeAdapter
 
 from .models import (
+    RollMode,
     RollRequest,
     RollResult,
     UInt32Buffer,
@@ -33,7 +34,7 @@ def roll_dice(request: RollRequest, seed: int) -> RollResult:
     Returns [`RollError::InvalidRequest`] if the request is not valid.
     """
     try:
-        native_result = getattr(native, "__rspyts_function_example_dice_f230a4119ceb9b1d")(
+        native_result = getattr(native, "__rspyts_function_example_dice_3f04e55579ef1c90")(
             prepare_host(request),
             prepare_host(seed),
         )
@@ -53,7 +54,7 @@ def roll_values(request: RollRequest, seed: int) -> UInt32Buffer:
     Returns [`RollError::InvalidRequest`] if the request is not valid.
     """
     try:
-        native_result = getattr(native, "__rspyts_function_example_dice_7da6db2d088cd0a5")(
+        native_result = getattr(native, "__rspyts_function_example_dice_79ab58465b7e5143")(
             prepare_host(request),
             prepare_host(seed),
         )
@@ -70,7 +71,7 @@ def roll_values(request: RollRequest, seed: int) -> UInt32Buffer:
 
 def seed_from_bytes(bytes: bytes) -> int:
     """Convert bytes to a repeatable seed."""
-    native_result = getattr(native, "__rspyts_function_example_dice_d05b90e269d62a6d")(
+    native_result = getattr(native, "__rspyts_function_example_dice_5026eacb605dfd00")(
         prepare_host(bytes),
     )
     return TypeAdapter(int).validate_python(
@@ -82,7 +83,7 @@ def seed_from_bytes(bytes: bytes) -> int:
 class DiceCup:
     def __init__(self, sides: int, seed: int) -> None:
         try:
-            self.native_resource = getattr(native, "__rspyts_resource_example_dice_618e979366d8f5d6")(
+            self.native_resource = getattr(native, "__rspyts_resource_example_dice_e8caefb21754b303")(
                 prepare_host(sides),
                 prepare_host(seed),
             )

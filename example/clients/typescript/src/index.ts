@@ -2,6 +2,7 @@ import {
   DEFAULT_SEED,
   DiceCup,
   RollError,
+  RollMode,
   rollValues,
   seedFromBytes,
   type RollResult,
@@ -30,6 +31,14 @@ console.log(rollThreeDice());
 const seed = seedFromBytes(new TextEncoder().encode("rspyts"));
 const values: Uint32Array = rollValues({ sides: 6, count: 3 }, seed);
 console.log(values);
+
+const mode: RollMode = RollMode.Safe;
+if (mode !== "safe") {
+  throw new Error("string enum runtime value is unavailable");
+}
+if (!Object.isFrozen(RollMode)) {
+  throw new Error("string enum runtime value is mutable");
+}
 
 const loaded: LoadedRollResult = loadedRollDice(6);
 const loadedCup = new LoadedDiceCup(6);

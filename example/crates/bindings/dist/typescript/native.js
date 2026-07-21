@@ -1,4 +1,29 @@
 /**
+ * @param {any} request
+ * @param {any} seed
+ * @returns {any}
+ */
+export function __rspyts_function_example_dice_3f04e55579ef1c90(request, seed) {
+    const ret = wasm.__rspyts_function_example_dice_3f04e55579ef1c90(request, seed);
+    if (ret[2]) {
+        throw takeFromExternrefTable0(ret[1]);
+    }
+    return takeFromExternrefTable0(ret[0]);
+}
+
+/**
+ * @param {any} bytes
+ * @returns {any}
+ */
+export function __rspyts_function_example_dice_5026eacb605dfd00(bytes) {
+    const ret = wasm.__rspyts_function_example_dice_5026eacb605dfd00(bytes);
+    if (ret[2]) {
+        throw takeFromExternrefTable0(ret[1]);
+    }
+    return takeFromExternrefTable0(ret[0]);
+}
+
+/**
  * @param {any} label
  * @param {any} result
  * @returns {any}
@@ -16,8 +41,8 @@ export function __rspyts_function_example_dice_5e9e146e9f6141a5(label, result) {
  * @param {any} seed
  * @returns {any}
  */
-export function __rspyts_function_example_dice_7da6db2d088cd0a5(request, seed) {
-    const ret = wasm.__rspyts_function_example_dice_7da6db2d088cd0a5(request, seed);
+export function __rspyts_function_example_dice_79ab58465b7e5143(request, seed) {
+    const ret = wasm.__rspyts_function_example_dice_79ab58465b7e5143(request, seed);
     if (ret[2]) {
         throw takeFromExternrefTable0(ret[1]);
     }
@@ -35,72 +60,6 @@ export function __rspyts_function_example_dice_9d0dbc0bafe3c85c(value) {
     }
     return takeFromExternrefTable0(ret[0]);
 }
-
-/**
- * @param {any} bytes
- * @returns {any}
- */
-export function __rspyts_function_example_dice_d05b90e269d62a6d(bytes) {
-    const ret = wasm.__rspyts_function_example_dice_d05b90e269d62a6d(bytes);
-    if (ret[2]) {
-        throw takeFromExternrefTable0(ret[1]);
-    }
-    return takeFromExternrefTable0(ret[0]);
-}
-
-/**
- * @param {any} request
- * @param {any} seed
- * @returns {any}
- */
-export function __rspyts_function_example_dice_f230a4119ceb9b1d(request, seed) {
-    const ret = wasm.__rspyts_function_example_dice_f230a4119ceb9b1d(request, seed);
-    if (ret[2]) {
-        throw takeFromExternrefTable0(ret[1]);
-    }
-    return takeFromExternrefTable0(ret[0]);
-}
-
-export class __rspyts_resource_example_dice_618e979366d8f5d6 {
-    __destroy_into_raw() {
-        const ptr = this.__wbg_ptr;
-        this.__wbg_ptr = 0;
-        __rspyts_resource_example_dice_618e979366d8f5d6Finalization.unregister(this);
-        return ptr;
-    }
-    free() {
-        const ptr = this.__destroy_into_raw();
-        wasm.__wbg___rspyts_resource_example_dice_618e979366d8f5d6_free(ptr, 0);
-    }
-    close() {
-        wasm.__rspyts_resource_example_dice_618e979366d8f5d6_close(this.__wbg_ptr);
-    }
-    /**
-     * @param {any} sides
-     * @param {any} seed
-     */
-    constructor(sides, seed) {
-        const ret = wasm.__rspyts_resource_example_dice_618e979366d8f5d6_new(sides, seed);
-        if (ret[2]) {
-            throw takeFromExternrefTable0(ret[1]);
-        }
-        this.__wbg_ptr = ret[0];
-        __rspyts_resource_example_dice_618e979366d8f5d6Finalization.register(this, this.__wbg_ptr, this);
-        return this;
-    }
-    /**
-     * @param {any} count
-     * @returns {any}
-     */
-    roll(count) {
-        const ret = wasm.__rspyts_resource_example_dice_618e979366d8f5d6_roll(this.__wbg_ptr, count);
-        if (ret[2]) {
-            throw takeFromExternrefTable0(ret[1]);
-        }
-        return takeFromExternrefTable0(ret[0]);
-    }
-}
-if (Symbol.dispose) __rspyts_resource_example_dice_618e979366d8f5d6.prototype[Symbol.dispose] = __rspyts_resource_example_dice_618e979366d8f5d6.prototype.free;
 
 export class __rspyts_resource_example_dice_c66dffb26ab1fc66 {
     __destroy_into_raw() {
@@ -141,6 +100,47 @@ export class __rspyts_resource_example_dice_c66dffb26ab1fc66 {
     }
 }
 if (Symbol.dispose) __rspyts_resource_example_dice_c66dffb26ab1fc66.prototype[Symbol.dispose] = __rspyts_resource_example_dice_c66dffb26ab1fc66.prototype.free;
+
+export class __rspyts_resource_example_dice_e8caefb21754b303 {
+    __destroy_into_raw() {
+        const ptr = this.__wbg_ptr;
+        this.__wbg_ptr = 0;
+        __rspyts_resource_example_dice_e8caefb21754b303Finalization.unregister(this);
+        return ptr;
+    }
+    free() {
+        const ptr = this.__destroy_into_raw();
+        wasm.__wbg___rspyts_resource_example_dice_e8caefb21754b303_free(ptr, 0);
+    }
+    close() {
+        wasm.__rspyts_resource_example_dice_e8caefb21754b303_close(this.__wbg_ptr);
+    }
+    /**
+     * @param {any} sides
+     * @param {any} seed
+     */
+    constructor(sides, seed) {
+        const ret = wasm.__rspyts_resource_example_dice_e8caefb21754b303_new(sides, seed);
+        if (ret[2]) {
+            throw takeFromExternrefTable0(ret[1]);
+        }
+        this.__wbg_ptr = ret[0];
+        __rspyts_resource_example_dice_e8caefb21754b303Finalization.register(this, this.__wbg_ptr, this);
+        return this;
+    }
+    /**
+     * @param {any} count
+     * @returns {any}
+     */
+    roll(count) {
+        const ret = wasm.__rspyts_resource_example_dice_e8caefb21754b303_roll(this.__wbg_ptr, count);
+        if (ret[2]) {
+            throw takeFromExternrefTable0(ret[1]);
+        }
+        return takeFromExternrefTable0(ret[0]);
+    }
+}
+if (Symbol.dispose) __rspyts_resource_example_dice_e8caefb21754b303.prototype[Symbol.dispose] = __rspyts_resource_example_dice_e8caefb21754b303.prototype.free;
 
 /**
  * @returns {string}
@@ -363,12 +363,12 @@ function __wbg_get_imports() {
     };
 }
 
-const __rspyts_resource_example_dice_618e979366d8f5d6Finalization = (typeof FinalizationRegistry === 'undefined')
-    ? { register: () => {}, unregister: () => {} }
-    : new FinalizationRegistry(ptr => wasm.__wbg___rspyts_resource_example_dice_618e979366d8f5d6_free(ptr, 1));
 const __rspyts_resource_example_dice_c66dffb26ab1fc66Finalization = (typeof FinalizationRegistry === 'undefined')
     ? { register: () => {}, unregister: () => {} }
     : new FinalizationRegistry(ptr => wasm.__wbg___rspyts_resource_example_dice_c66dffb26ab1fc66_free(ptr, 1));
+const __rspyts_resource_example_dice_e8caefb21754b303Finalization = (typeof FinalizationRegistry === 'undefined')
+    ? { register: () => {}, unregister: () => {} }
+    : new FinalizationRegistry(ptr => wasm.__wbg___rspyts_resource_example_dice_e8caefb21754b303_free(ptr, 1));
 
 function addToExternrefTable0(obj) {
     const idx = wasm.__externref_table_alloc_command_export();

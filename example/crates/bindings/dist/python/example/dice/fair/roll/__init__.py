@@ -9,12 +9,14 @@ from .api import (
     seed_from_bytes,
 )
 from .models import (
+    RollMode,
     RollRequest,
     RollResult,
     UInt32Buffer,
 )
 
 __all__ = [
+    "RollMode",
     "RollRequest",
     "RollResult",
     "UInt32Buffer",

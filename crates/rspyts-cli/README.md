@@ -35,7 +35,8 @@ Root and parent namespaces do not export items from child namespaces.
 Python and Node.js are not build dependencies. The generated Python package
 requires CPython 3.11 or later. Its installer adds Pydantic 2 and adds NumPy 2
 only when the Rust API uses numeric buffers. The generated TypeScript package
-has no runtime npm dependencies.
+has no runtime npm dependencies. Rust string enums are emitted as TypeScript
+string unions with same-named frozen runtime values.
 
 Read the [project README](https://github.com/2xf-org/rspyts).
 
