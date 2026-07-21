@@ -1,9 +1,9 @@
 /** The strategy used for a dice roll. */
 export type RollMode = "fast" | "safe";
-export declare const RollMode: Readonly<{
+export declare const RollMode: {
   readonly Fast: "fast";
   readonly Safe: "safe";
-}>;
+};
 /** A request to roll one type of die. */
 export interface RollRequest {
   /** The number of sides on each die. */

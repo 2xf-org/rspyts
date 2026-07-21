@@ -1,14 +1,16 @@
 import {
+  freeze as $rspytsFreeze,
   native,
   nativeError,
   prepareHost,
   restoreHost,
 } from "../../../runtime.js";
 
-export const RollMode = Object.freeze({
-  Fast: "fast",
-  Safe: "safe",
+const $rspytsStringEnum0 = $rspytsFreeze({
+  ["Fast"]: "fast",
+  ["Safe"]: "safe",
 });
+export { $rspytsStringEnum0 as RollMode };
 
 export class RollError extends globalThis.Error {
   constructor(code, message) {

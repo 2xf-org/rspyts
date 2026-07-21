@@ -5,8 +5,8 @@ from pydantic import TypeAdapter
 from .models import (
     RollSummary,
 )
-from example.dice.fair.roll import models as _rspyts_dice__fair__roll__models
-from example.dice.fair.roll import api as _rspyts_dice__fair__roll__api
+import example.dice.fair.roll.models
+import example.dice.fair.roll.api
 from example.runtime import (
     native,
     native_error,
@@ -17,7 +17,7 @@ from example.runtime import (
 
 def summarize_roll(
     label: str,
-    result: _rspyts_dice__fair__roll__models.RollResult,
+    result: example.dice.fair.roll.models.RollResult,
 ) -> RollSummary:
     """Add a label to a fair-roll result.
 
@@ -31,7 +31,7 @@ def summarize_roll(
             prepare_host(result),
         )
     except RuntimeError as error:
-        raise native_error(error, _rspyts_dice__fair__roll__api.RollError) from None
+        raise native_error(error, example.dice.fair.roll.api.RollError) from None
     return TypeAdapter(RollSummary).validate_python(
         restore_host(native_result, ("named", "example-dice::example_dice::summary::RollSummary")),
         strict=False,

@@ -111,9 +111,9 @@ union and a same-named frozen runtime value, so clients can use an enum without
 duplicating its wire strings:
 
 ```typescript
-import { RunMode, type RunMode as RunModeValue } from "hello-rspyts/api";
+import { RunMode } from "hello-rspyts/api";
 
-const mode: RunModeValue = RunMode.Safe;
+const mode: RunMode = RunMode.Safe;
 ```
 
 ## Package names

@@ -179,13 +179,8 @@ fn python_models(items: &NamespaceItems<'_>, context: &PythonContext<'_>) -> Res
         source.push_str(&package_imports.join("\n"));
         source.push('\n');
     }
-    for namespace in python_model_imports(items, context)? {
-        writeln!(
-            source,
-            "\nfrom {} import models as {}",
-            python_namespace_module(context.package, &namespace),
-            python_module_alias(&namespace, "models"),
-        )?;
+    for import in python_model_imports(items, context)? {
+        writeln!(source, "\nimport {import}")?;
     }
     for element in buffers {
         let name = buffer_name(element);
@@ -534,21 +529,11 @@ fn python_api(items: &NamespaceItems<'_>, context: &PythonContext<'_>) -> Result
         }
         source.push_str(")\n");
     }
-    for namespace in python_api_model_imports(&references, context)? {
-        writeln!(
-            source,
-            "from {} import models as {}",
-            python_namespace_module(context.package, &namespace),
-            python_module_alias(&namespace, "models"),
-        )?;
+    for import in python_api_model_imports(&references, context)? {
+        writeln!(source, "import {import}")?;
     }
-    for namespace in python_error_imports(items, context)? {
-        writeln!(
-            source,
-            "from {} import api as {}",
-            python_namespace_module(context.package, &namespace),
-            python_module_alias(&namespace, "api"),
-        )?;
+    for import in python_error_imports(items, context)? {
+        writeln!(source, "import {import}")?;
     }
     if !runtime_imports.is_empty() {
         writeln!(source, "from {}.runtime import (", context.package)?;
@@ -1098,16 +1083,16 @@ fn python_init(items: &NamespaceItems<'_>) -> String {
         source.push_str("__all__: list[str] = []\n");
         return source;
     }
-    if !model_names.is_empty() {
-        source.push_str("from .models import (\n");
-        for name in &model_names {
+    if !api_names.is_empty() {
+        source.push_str("from .api import (\n");
+        for name in &api_names {
             writeln!(source, "    {name},").unwrap();
         }
         source.push_str(")\n");
     }
-    if !api_names.is_empty() {
-        source.push_str("from .api import (\n");
-        for name in &api_names {
+    if !model_names.is_empty() {
+        source.push_str("from .models import (\n");
+        for name in &model_names {
             writeln!(source, "    {name},").unwrap();
         }
         source.push_str(")\n");
@@ -1264,7 +1249,7 @@ fn namespace_buffers(items: &NamespaceItems<'_>) -> BTreeSet<BufferElement> {
 fn python_model_imports(
     items: &NamespaceItems<'_>,
     context: &PythonContext<'_>,
-) -> Result<BTreeSet<Namespace>> {
+) -> Result<BTreeSet<String>> {
     let references = items
         .types
         .iter()
@@ -1276,7 +1261,7 @@ fn python_model_imports(
 fn python_api_model_imports(
     references: &[&TypeRef],
     context: &PythonContext<'_>,
-) -> Result<BTreeSet<Namespace>> {
+) -> Result<BTreeSet<String>> {
     let mut imports = BTreeSet::new();
     for reference in references {
         let mut identities = Vec::new();
@@ -1284,7 +1269,7 @@ fn python_api_model_imports(
         for identity in identities {
             let namespace = type_namespace(identity, context.manifest)?;
             if namespace != *context.namespace {
-                imports.insert(namespace);
+                imports.insert(python_module(context.package, &namespace, "models"));
             }
         }
     }
@@ -1294,7 +1279,7 @@ fn python_api_model_imports(
 fn python_error_imports(
     items: &NamespaceItems<'_>,
     context: &PythonContext<'_>,
-) -> Result<BTreeSet<Namespace>> {
+) -> Result<BTreeSet<String>> {
     let mut identities = items
         .functions
         .iter()
@@ -1319,7 +1304,7 @@ fn python_error_imports(
             .manifest
             .namespace(&definition.owner, &definition.rust_module);
         if namespace != *context.namespace {
-            imports.insert(namespace);
+            imports.insert(python_module(context.package, &namespace, "api"));
         }
     }
     Ok(imports)
@@ -1338,7 +1323,7 @@ fn python_named_ref(
     } else {
         Ok(format!(
             "{}.{}",
-            python_module_alias(&namespace, "models"),
+            python_module(context.package, &namespace, "models"),
             definition.name
         ))
     }
@@ -1358,29 +1343,20 @@ fn python_error_ref(
     } else {
         Ok(format!(
             "{}.{}",
-            python_module_alias(&namespace, "api"),
+            python_module(context.package, &namespace, "api"),
             definition.name
         ))
     }
 }
 
-fn python_namespace_module(package: &str, namespace: &Namespace) -> String {
+fn python_module(package: &str, namespace: &Namespace, leaf: &str) -> String {
     package
         .split('.')
         .map(str::to_owned)
         .chain(namespace.python_segments())
+        .chain([leaf.to_owned()])
         .collect::<Vec<_>>()
         .join(".")
-}
-
-fn python_module_alias(namespace: &Namespace, leaf: &str) -> String {
-    let segments = namespace.python_segments();
-    let namespace = if segments.is_empty() {
-        "root".to_owned()
-    } else {
-        segments.join("__")
-    };
-    format!("_rspyts_{namespace}__{leaf}")
 }
 
 fn python_scalar(value: &ScalarValue) -> String {
@@ -1750,27 +1726,15 @@ mod tests {
         let api = python_api(items, &context).expect("API generates");
         let runtime = python_runtime(&manifest).expect("runtime generates");
 
-        assert!(
-            models.contains("from example.two.model import models as _rspyts_two__model__models")
-        );
-        assert!(models.contains("target: _rspyts_two__model__models.Target"));
-        assert!(api.contains("from example.two.model import api as _rspyts_two__model__api"));
-        assert!(api.contains("from example.two.model import models as _rspyts_two__model__models"));
-        assert!(api.contains("target: _rspyts_two__model__models.Target"));
-        assert!(api.contains("_rspyts_two__model__api.TargetError"));
-        assert!(api.contains("TARGET: Final[_rspyts_two__model__models.Target]"));
+        assert!(models.contains("import example.two.model.models"));
+        assert!(models.contains("target: example.two.model.models.Target"));
+        assert!(api.contains("import example.two.model.api"));
+        assert!(api.contains("import example.two.model.models"));
+        assert!(api.contains("target: example.two.model.models.Target"));
+        assert!(api.contains("example.two.model.api.TargetError"));
+        assert!(api.contains("TARGET: Final[example.two.model.models.Target]"));
         assert!(runtime.contains("example-two::example_two::model::Target"));
         assert!(runtime.contains("example-one::example_one::service::Event"));
-
-        let init = python_init(items);
-        let models_position = init
-            .find("from .models import")
-            .expect("models import exists");
-        let api_position = init.find("from .api import").expect("API import exists");
-        assert!(
-            models_position < api_position,
-            "models must initialize before API wrappers"
-        );
     }
 
     fn manifest_with_types(types: serde_json::Value) -> Manifest {
