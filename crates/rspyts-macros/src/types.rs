@@ -1,6 +1,5 @@
 use proc_macro2::{Span, TokenStream as TokenStream2};
 use quote::quote;
-use std::path::Path;
 use syn::{
     Attribute, Expr, FnArg, GenericArgument, ImplItemFn, Lit, Pat, PathArguments, ReturnType,
     Type as SynType, TypePath, UnOp, ext::IdentExt, punctuated::Punctuated, spanned::Spanned,
@@ -888,18 +887,8 @@ pub(super) fn reject_reserved_resource_method(method: &ImplItemFn) -> syn::Resul
 pub(super) fn native_export_name(span: Span, kind: &str, public_name: &str) -> String {
     let span = span.unwrap();
     let package = std::env::var("CARGO_PKG_NAME").unwrap_or_else(|_| "crate".to_owned());
-    let manifest_dir = std::env::var_os("CARGO_MANIFEST_DIR");
-    let file = span.local_file().map_or_else(
-        || span.file(),
-        |path| {
-            manifest_dir
-                .as_deref()
-                .and_then(|root| path.strip_prefix(Path::new(root)).ok())
-                .unwrap_or(&path)
-                .to_string_lossy()
-                .replace('\\', "/")
-        },
-    );
+    // The on-disk path can change form across equivalent builds, especially on Windows.
+    let file = span.file().replace('\\', "/");
     let identity = format!(
         "{package}\0{file}\0{}\0{}\0{kind}\0{public_name}",
         span.line(),
