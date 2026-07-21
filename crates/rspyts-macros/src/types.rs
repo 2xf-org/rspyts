@@ -887,20 +887,24 @@ pub(super) fn reject_reserved_resource_method(method: &ImplItemFn) -> syn::Resul
 pub(super) fn native_export_name(span: Span, kind: &str, public_name: &str) -> String {
     let span = span.unwrap();
     let package = std::env::var("CARGO_PKG_NAME").unwrap_or_else(|_| "crate".to_owned());
+    let display_file = span.file();
     let local_file = span
         .local_file()
         .map(|path| path.to_string_lossy().into_owned());
     let manifest_dir =
         std::env::var_os("CARGO_MANIFEST_DIR").map(|path| path.to_string_lossy().into_owned());
-    let file = local_file.map_or_else(
-        || normalize_source_path(&span.file()),
+    let file = local_file.as_deref().map_or_else(
+        || normalize_source_path(&display_file),
         |path| relative_source_path(&path, manifest_dir.as_deref()),
     );
-    let identity = format!(
-        "{package}\0{file}\0{}\0{}\0{kind}\0{public_name}",
-        span.line(),
-        span.column()
-    );
+    let line = span.line();
+    let column = span.column();
+    if std::env::var_os("RSPYTS_TRACE_NATIVE_NAMES").is_some() {
+        eprintln!(
+            "rspyts native identity: package={package:?} display_file={display_file:?} local_file={local_file:?} manifest_dir={manifest_dir:?} file={file:?} line={line} column={column} kind={kind:?} public_name={public_name:?}"
+        );
+    }
+    let identity = format!("{package}\0{file}\0{line}\0{column}\0{kind}\0{public_name}",);
     let package = package
         .chars()
         .map(|character| {
