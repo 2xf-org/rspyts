@@ -72,6 +72,7 @@ export function nativeError(error, ErrorType) {
 }
 
 const nativeSchemas = {
+  "example-dice::example_dice::fair::roll::RollMode": null,
   "example-dice::example_dice::fair::roll::RollRequest": ["struct", {sides: null, count: null}],
   "example-dice::example_dice::fair::roll::RollResult": ["struct", {values: ["list", null], total: null}],
   "example-dice::example_dice::loaded::roll::RollResult": ["struct", {value: null, favoredValue: null}],

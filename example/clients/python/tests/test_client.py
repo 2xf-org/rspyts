@@ -1,6 +1,6 @@
 import numpy as np
 import pytest
-from example.dice.fair.roll import RollError, RollRequest, roll_values, seed_from_bytes
+from example.dice.fair.roll import RollError, RollMode, RollRequest, roll_values, seed_from_bytes
 from example.dice.loaded.roll import (
     DiceCup as LoadedDiceCup,
     RollResult as LoadedRollResult,
@@ -21,6 +21,10 @@ def test_generated_binary_types() -> None:
     values = roll_values(RollRequest(sides=6, count=3), seed)
     assert isinstance(values, np.ndarray)
     assert values.dtype == np.uint32
+
+
+def test_generated_string_enums_are_runtime_values() -> None:
+    assert RollMode.Safe == "safe"
 
 
 def test_namespaces_keep_equal_model_names_separate() -> None:

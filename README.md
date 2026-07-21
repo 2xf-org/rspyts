@@ -106,6 +106,16 @@ console.log(result.message);
 The TypeScript package loads its WebAssembly file when the program imports
 the package.
 
+Rust string enums are Python `StrEnum` classes. TypeScript emits both a string
+union and a same-named frozen runtime value, so clients can use an enum without
+duplicating its wire strings:
+
+```typescript
+import { RunMode, type RunMode as RunModeValue } from "hello-rspyts/api";
+
+const mode: RunModeValue = RunMode.Safe;
+```
+
 ## Package names
 
 rspyts makes package paths from Cargo package names and Rust module paths. You

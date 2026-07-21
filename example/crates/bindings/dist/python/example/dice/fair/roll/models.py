@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from enum import StrEnum
 from typing import Annotated, TypeAlias
 
 import numpy as np
@@ -13,6 +14,13 @@ UInt32Buffer: TypeAlias = Annotated[
     BeforeValidator(lambda value: np.asarray(value, dtype=np.uint32)),
     PlainSerializer(lambda value: value.tolist(), return_type=list),
 ]
+
+
+class RollMode(StrEnum):
+    """The strategy used for a dice roll."""
+
+    Fast = "fast"
+    Safe = "safe"
 
 
 class RollRequest(BaseModel):

@@ -188,6 +188,20 @@ fn emit_typescript_type(
                     .collect::<Vec<_>>()
                     .join(" | ")
             )?;
+            writeln!(
+                source,
+                "export declare const {}: Readonly<{{",
+                definition.name
+            )?;
+            for variant in variants {
+                writeln!(
+                    source,
+                    "  readonly {}: {};",
+                    ts_property(&variant.rust_name),
+                    ts_string(&variant.wire_name),
+                )?;
+            }
+            source.push_str("}>;\n");
         }
         TypeShape::TaggedEnum { tag, variants } => {
             for variant in variants {
@@ -301,6 +315,24 @@ fn typescript_api(items: &NamespaceItems<'_>, context: &TypeScriptContext<'_>) -
             namespace_alias(&import),
             ts_string(&typescript_import(context.package, &import))
         )?;
+    }
+    for definition in &items.types {
+        if let TypeShape::StringEnum { variants } = &definition.shape {
+            writeln!(
+                source,
+                "\nexport const {} = Object.freeze({{",
+                definition.name
+            )?;
+            for variant in variants {
+                writeln!(
+                    source,
+                    "  {}: {},",
+                    ts_property(&variant.rust_name),
+                    ts_string(&variant.wire_name),
+                )?;
+            }
+            source.push_str("});\n");
+        }
     }
     for error in &items.errors {
         writeln!(
@@ -1263,6 +1295,60 @@ mod tests {
             typescript_declarations(&views[&namespace], &context).expect("declarations generate");
         assert!(api.contains("export class Error extends globalThis.Error"));
         assert!(declarations.contains("export class Error extends globalThis.Error"));
+    }
+
+    #[test]
+    fn generated_string_enums_have_runtime_values() {
+        let manifest = Manifest {
+            package_name: "example".to_owned(),
+            package_version: "1.0.0".to_owned(),
+            module_name: "native".to_owned(),
+            types: vec![TypeDef {
+                owner: CargoPackageId::new("example"),
+                rust_module: "example".to_owned(),
+                id: "example::RunMode".to_owned(),
+                name: "RunMode".to_owned(),
+                docs: None,
+                shape: TypeShape::StringEnum {
+                    variants: vec![
+                        EnumVariantDef {
+                            rust_name: "Fast".to_owned(),
+                            wire_name: "fast".to_owned(),
+                            docs: None,
+                            fields: Vec::new(),
+                        },
+                        EnumVariantDef {
+                            rust_name: "Safe".to_owned(),
+                            wire_name: "safe-mode".to_owned(),
+                            docs: None,
+                            fields: Vec::new(),
+                        },
+                    ],
+                },
+            }],
+            errors: Vec::new(),
+            functions: Vec::new(),
+            resources: Vec::new(),
+            constants: Vec::new(),
+        };
+        let namespace = Namespace::root();
+        let views = namespaces(&manifest);
+        let context = TypeScriptContext {
+            manifest: &manifest,
+            package: "example",
+            namespace: &namespace,
+        };
+        let declarations =
+            typescript_declarations(&views[&namespace], &context).expect("declarations generate");
+        let api = typescript_api(&views[&namespace], &context).expect("API generates");
+
+        assert!(declarations.contains("export type RunMode = \"fast\" | \"safe-mode\";"));
+        assert!(declarations.contains("export declare const RunMode: Readonly<{"));
+        assert!(declarations.contains("readonly Fast: \"fast\";"));
+        assert!(declarations.contains("readonly Safe: \"safe-mode\";"));
+        assert!(api.contains("export const RunMode = Object.freeze({"));
+        assert!(api.contains("Fast: \"fast\","));
+        assert!(api.contains("Safe: \"safe-mode\","));
     }
 
     #[test]

@@ -3,6 +3,14 @@
 use rspyts::Model;
 use serde::{Deserialize, Serialize};
 
+/// The strategy used for a dice roll.
+#[derive(Debug, Clone, Serialize, Deserialize, Model)]
+#[serde(rename_all = "snake_case")]
+pub enum RollMode {
+    Fast,
+    Safe,
+}
+
 /// A request to roll one type of die.
 #[derive(Debug, Clone, Serialize, Deserialize, Model)]
 #[serde(rename_all = "camelCase")]

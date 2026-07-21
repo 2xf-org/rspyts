@@ -1,5 +1,11 @@
 """Generated from the Rust application API."""
 
+from .models import (
+    RollMode,
+    RollRequest,
+    RollResult,
+    UInt32Buffer,
+)
 from .api import (
     DEFAULT_SEED,
     DiceCup,
@@ -8,13 +14,9 @@ from .api import (
     roll_values,
     seed_from_bytes,
 )
-from .models import (
-    RollRequest,
-    RollResult,
-    UInt32Buffer,
-)
 
 __all__ = [
+    "RollMode",
     "RollRequest",
     "RollResult",
     "UInt32Buffer",
