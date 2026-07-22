@@ -427,7 +427,7 @@ fn validate_contract(project: &Project, manifest: &Manifest) -> Result<()> {
     }
     if !is_python_identifier(&manifest.module_name)
         || matches!(manifest.module_name.as_str(), "api" | "models" | "runtime")
-        || is_python_dunder(&manifest.module_name)
+        || is_python_package_attribute(&manifest.module_name)
     {
         bail!(
             "Python native module name `{}` is invalid or reserved for generated package loading",
@@ -449,14 +449,14 @@ fn validate_namespaces(manifest: &Manifest) -> Result<()> {
         let namespace = manifest.namespace(owner, rust_module);
         if let Some(package) = &namespace.package {
             let segment = package.replace('-', "_");
-            if !is_python_identifier(&segment) || is_python_dunder(&segment) {
+            if !is_python_identifier(&segment) || is_python_package_attribute(&segment) {
                 bail!(
                     "Cargo package `{owner}` derives the invalid Python namespace segment `{segment}`; rename the Cargo package"
                 );
             }
         }
         for segment in rust_module.split("::").skip(1) {
-            if !is_python_identifier(segment) || is_python_dunder(segment) {
+            if !is_python_identifier(segment) || is_python_package_attribute(segment) {
                 bail!(
                     "Rust module `{rust_module}` in Cargo package `{owner}` contains the invalid Python namespace segment `{segment}`; rename the Rust module"
                 );
@@ -535,7 +535,7 @@ fn validate_namespaces(manifest: &Manifest) -> Result<()> {
                 name.as_str(),
                 "__all__" | "__dir__" | "__getattr__" | "api" | "models"
             ) || name.starts_with("_rspyts_models_")
-                || is_python_dunder(name)
+                || is_python_package_attribute(name)
                 || (namespace == Namespace::root()
                     && (name.as_str() == "runtime"
                         || name.as_str() == manifest.module_name.as_str()))
@@ -699,7 +699,11 @@ pub(super) fn unique_public_names<S: AsRef<str>>(
 }
 
 pub(super) fn validate_python_package(value: &str) -> Result<()> {
-    if value.is_empty() || value.split('.').any(|part| !is_python_identifier(part)) {
+    if value.is_empty()
+        || value
+            .split('.')
+            .any(|part| !is_python_identifier(part) || is_python_package_attribute(part))
+    {
         bail!("Python package `{value}` must contain dot-separated identifiers");
     }
     Ok(())
@@ -775,8 +779,46 @@ fn is_python_identifier(value: &str) -> bool {
         )
 }
 
-fn is_python_dunder(value: &str) -> bool {
-    value.starts_with("__") && value.ends_with("__")
+fn is_python_package_attribute(value: &str) -> bool {
+    matches!(
+        value,
+        "__all__"
+            | "__annotations__"
+            | "__builtins__"
+            | "__cached__"
+            | "__class__"
+            | "__delattr__"
+            | "__dict__"
+            | "__dir__"
+            | "__doc__"
+            | "__eq__"
+            | "__file__"
+            | "__format__"
+            | "__ge__"
+            | "__getattr__"
+            | "__getattribute__"
+            | "__getstate__"
+            | "__gt__"
+            | "__hash__"
+            | "__init__"
+            | "__init_subclass__"
+            | "__le__"
+            | "__loader__"
+            | "__lt__"
+            | "__name__"
+            | "__ne__"
+            | "__new__"
+            | "__package__"
+            | "__path__"
+            | "__reduce__"
+            | "__reduce_ex__"
+            | "__repr__"
+            | "__setattr__"
+            | "__sizeof__"
+            | "__spec__"
+            | "__str__"
+            | "__subclasshook__"
+    )
 }
 
 fn string<'a>(value: &'a Value, key: &str) -> Result<&'a str> {
@@ -993,6 +1035,10 @@ mod tests {
             error.to_string(),
             "Rust module `app_domain::__path__` in Cargo package `app-domain` contains the invalid Python namespace segment `__path__`; rename the Rust module"
         );
+
+        let conventional = model("app-domain", "app_domain::__version__", "Value", Vec::new());
+        validate_namespaces(&manifest(vec![conventional]))
+            .expect("non-intrinsic double-underscore segments are valid");
     }
 
     #[test]
@@ -1045,6 +1091,15 @@ mod tests {
                 )
             );
         }
+
+        let conventional = model(
+            "app-domain",
+            "app_domain::shared",
+            "__version__",
+            Vec::new(),
+        );
+        validate_namespaces(&manifest(vec![conventional]))
+            .expect("non-intrinsic double-underscore exports are valid");
     }
 
     #[test]
