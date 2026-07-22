@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from pydantic import BaseModel, ConfigDict, Field
 
-import example.dice.fair.roll.models
+import example.dice.fair.roll.models as _rspyts_models_3
 
 
 class RollSummary(BaseModel):
@@ -15,7 +15,7 @@ class RollSummary(BaseModel):
         arbitrary_types_allowed=True,
     )
     label: str = Field(default=...)
-    result: example.dice.fair.roll.models.RollResult = Field(default=...)
+    result: _rspyts_models_3.RollResult = Field(default=...)
 
 
 RollSummary.model_rebuild()

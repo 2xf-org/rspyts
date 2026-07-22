@@ -15,4 +15,4 @@ build-backend = "hatchling.build"
 packages = ["example_client"]
 
 [dependency-groups]
-dev = ["pytest>=8,<9"]
+dev = ["mypy>=1,<2", "pyright>=1,<2", "pytest>=8,<9"]

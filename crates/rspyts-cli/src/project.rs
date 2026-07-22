@@ -495,6 +495,15 @@ fn validate_namespaces(manifest: &Manifest) -> Result<()> {
                 .into_iter()
                 .map(|element| python::buffer_name(element).to_owned()),
         );
+        if let Some(name) = python_names.iter().find(|name| {
+            matches!(name.as_str(), "__all__" | "__dir__" | "__getattr__")
+                || name.starts_with("_rspyts_models_")
+        }) {
+            bail!(
+                "Python export name `{name}` is reserved for generated package loading in namespace `{}`",
+                display_namespace(&namespace)
+            );
+        }
         unique_public_names("Python", python_names.into_iter())
             .with_context(|| format!("in namespace `{}`", display_namespace(&namespace)))?;
 
@@ -942,6 +951,21 @@ mod tests {
 
         assert!(diagnostic.contains("in namespace `domain::shared`"));
         assert!(diagnostic.contains("duplicate Python export name `Conflict`"));
+    }
+
+    #[test]
+    fn rejects_names_reserved_for_generated_python_package_loading() {
+        for name in ["__getattr__", "_rspyts_models_0"] {
+            let item = model("app-domain", "app_domain::shared", name, Vec::new());
+            let error = validate_namespaces(&manifest(vec![item])).unwrap_err();
+
+            assert_eq!(
+                error.to_string(),
+                format!(
+                    "Python export name `{name}` is reserved for generated package loading in namespace `domain::shared`"
+                )
+            );
+        }
     }
 
     #[test]

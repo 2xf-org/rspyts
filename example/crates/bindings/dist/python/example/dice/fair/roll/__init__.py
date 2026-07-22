@@ -1,20 +1,5 @@
 """Generated from the Rust application API."""
 
-from .api import (
-    DEFAULT_SEED,
-    DiceCup,
-    RollError,
-    roll_dice,
-    roll_values,
-    seed_from_bytes,
-)
-from .models import (
-    RollMode,
-    RollRequest,
-    RollResult,
-    UInt32Buffer,
-)
-
 __all__ = [
     "RollMode",
     "RollRequest",
@@ -27,3 +12,44 @@ __all__ = [
     "roll_values",
     "seed_from_bytes",
 ]
+
+def __getattr__(
+    name: str,
+    _exports: dict[str, tuple[str, str]] = {
+        "RollMode": (".models", "RollMode"),
+        "RollRequest": (".models", "RollRequest"),
+        "RollResult": (".models", "RollResult"),
+        "UInt32Buffer": (".models", "UInt32Buffer"),
+        "DEFAULT_SEED": (".api", "DEFAULT_SEED"),
+        "DiceCup": (".api", "DiceCup"),
+        "RollError": (".api", "RollError"),
+        "roll_dice": (".api", "roll_dice"),
+        "roll_values": (".api", "roll_values"),
+        "seed_from_bytes": (".api", "seed_from_bytes"),
+    },
+    _package: str = __name__,
+) -> object:
+    from builtins import AttributeError as builtin_attribute_error
+    from builtins import KeyError as builtin_key_error
+    from builtins import getattr as builtin_getattr
+    from importlib import import_module
+    from sys import modules
+
+    try:
+        module_name, member_name = _exports[name]
+    except builtin_key_error:
+        raise builtin_attribute_error(name) from None
+    value = builtin_getattr(import_module(module_name, _package), member_name)
+    modules[_package].__dict__[name] = value
+    return value
+
+
+def __dir__(
+    _exports: tuple[str, ...] = tuple(__all__),
+    _package: str = __name__,
+) -> list[str]:
+    from builtins import set as builtin_set
+    from builtins import sorted as builtin_sorted
+    from sys import modules
+
+    return builtin_sorted(builtin_set(modules[_package].__dict__) | builtin_set(_exports))

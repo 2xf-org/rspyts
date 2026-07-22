@@ -155,12 +155,16 @@ same WebAssembly file.
 Model, error, function, resource, and constant names can repeat in different
 modules. Public names must remain unique within one namespace. Python model
 modules must not have a dependency cycle. `rspyts build` reports these errors
-and identifies their source.
+and identifies their source. Python exports cannot use `__all__`, `__dir__`,
+`__getattr__`, or the generated `_rspyts_models_` prefix.
 
 ## Requirements
 
 The generated Python package requires CPython 3.11 or later. Its installer
 adds Pydantic 2. It adds NumPy 2 when the API uses a numeric buffer.
+Generated namespace packages resolve their public models and API members
+lazily, while matching `__init__.pyi` files preserve static type checking and
+editor completion for the documented imports.
 
 The generated TypeScript package has no runtime npm dependencies. Use an ES
 module runtime with WebAssembly. The runtime must support top-level `await`
