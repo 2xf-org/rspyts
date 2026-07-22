@@ -780,45 +780,7 @@ fn is_python_identifier(value: &str) -> bool {
 }
 
 fn is_python_package_attribute(value: &str) -> bool {
-    matches!(
-        value,
-        "__all__"
-            | "__annotations__"
-            | "__builtins__"
-            | "__cached__"
-            | "__class__"
-            | "__delattr__"
-            | "__dict__"
-            | "__dir__"
-            | "__doc__"
-            | "__eq__"
-            | "__file__"
-            | "__format__"
-            | "__ge__"
-            | "__getattr__"
-            | "__getattribute__"
-            | "__getstate__"
-            | "__gt__"
-            | "__hash__"
-            | "__init__"
-            | "__init_subclass__"
-            | "__le__"
-            | "__loader__"
-            | "__lt__"
-            | "__name__"
-            | "__ne__"
-            | "__new__"
-            | "__package__"
-            | "__path__"
-            | "__reduce__"
-            | "__reduce_ex__"
-            | "__repr__"
-            | "__setattr__"
-            | "__sizeof__"
-            | "__spec__"
-            | "__str__"
-            | "__subclasshook__"
-    )
+    value != "__version__" && value.starts_with("__") && value.ends_with("__")
 }
 
 fn string<'a>(value: &'a Value, key: &str) -> Result<&'a str> {
@@ -1076,6 +1038,7 @@ mod tests {
     fn rejects_names_reserved_for_generated_python_package_loading() {
         for name in [
             "__getattr__",
+            "__annotate__",
             "__path__",
             "_rspyts_models_0",
             "api",

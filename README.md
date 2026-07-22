@@ -155,12 +155,13 @@ same WebAssembly file.
 Model, error, function, resource, and constant names can repeat in different
 modules. Public names must remain unique within one namespace. Python model
 modules must not have a dependency cycle. `rspyts build` reports these errors
-and identifies their source. Python exports cannot use intrinsic module
-attributes, `api`, `models`, or the generated `_rspyts_models_` prefix.
+and identifies their source. Python exports cannot use `api`, `models`, the
+generated `_rspyts_models_` prefix, or double-underscore module attributes
+other than `__version__`.
 A root export also cannot use `runtime` or the configured native module name,
 and an export cannot have the same name as a direct child package. Namespace
 paths cannot shadow the generated `api`, `models`, `runtime`, or native
-modules or use intrinsic module attributes as package segments.
+modules or use reserved double-underscore package segments.
 
 ## Requirements
 
