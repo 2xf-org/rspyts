@@ -130,6 +130,7 @@ serde = { version = "1", features = ["derive"] }
 "#;
 
 const GITIGNORE: &str = r"/target/
+/.rspyts-build.lock
 **/.venv/
 **/__pycache__/
 **/node_modules/

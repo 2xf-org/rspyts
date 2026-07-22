@@ -44,6 +44,13 @@ fn assert_project_layout(project: &Path) {
             .expect("read TypeScript entrypoint"),
         "export * from \"./models.js\";\nexport * from \"./api.js\";\n"
     );
+    let root_gitignore =
+        std::fs::read_to_string(project.join(".gitignore")).expect("read root ignore");
+    assert!(
+        root_gitignore
+            .lines()
+            .any(|line| line == "/.rspyts-build.lock")
+    );
     let ownership =
         std::fs::read_to_string(project.join("rspyts.toml")).expect("read RSPYTS config");
     assert!(ownership.starts_with("# RSPYTS application configuration"));

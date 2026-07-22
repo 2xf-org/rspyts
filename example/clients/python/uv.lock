@@ -27,7 +27,7 @@ wheels = [
 
 [[package]]
 name = "example"
-version = "2.0.0"
+version = "2.0.1"
 source = { directory = "../../crates/dice/src-py" }
 dependencies = [
     { name = "numpy", version = "2.4.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.12'" },
