@@ -160,7 +160,7 @@ module attributes, `api`, `models`, or the generated `_rspyts_models_` prefix.
 A root export also cannot use `runtime` or the configured native module name,
 and an export cannot have the same name as a direct child package. Namespace
 paths cannot shadow the generated `api`, `models`, `runtime`, or native
-modules.
+modules or use double-underscore package segments.
 
 ## Requirements
 

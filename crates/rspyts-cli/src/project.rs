@@ -427,7 +427,7 @@ fn validate_contract(project: &Project, manifest: &Manifest) -> Result<()> {
     }
     if !is_python_identifier(&manifest.module_name)
         || matches!(manifest.module_name.as_str(), "api" | "models" | "runtime")
-        || (manifest.module_name.starts_with("__") && manifest.module_name.ends_with("__"))
+        || is_python_dunder(&manifest.module_name)
     {
         bail!(
             "Python native module name `{}` is invalid or reserved for generated package loading",
@@ -449,14 +449,14 @@ fn validate_namespaces(manifest: &Manifest) -> Result<()> {
         let namespace = manifest.namespace(owner, rust_module);
         if let Some(package) = &namespace.package {
             let segment = package.replace('-', "_");
-            if !is_python_identifier(&segment) {
+            if !is_python_identifier(&segment) || is_python_dunder(&segment) {
                 bail!(
                     "Cargo package `{owner}` derives the invalid Python namespace segment `{segment}`; rename the Cargo package"
                 );
             }
         }
         for segment in rust_module.split("::").skip(1) {
-            if !is_python_identifier(segment) {
+            if !is_python_identifier(segment) || is_python_dunder(segment) {
                 bail!(
                     "Rust module `{rust_module}` in Cargo package `{owner}` contains the invalid Python namespace segment `{segment}`; rename the Rust module"
                 );
@@ -535,7 +535,7 @@ fn validate_namespaces(manifest: &Manifest) -> Result<()> {
                 name.as_str(),
                 "__all__" | "__dir__" | "__getattr__" | "api" | "models"
             ) || name.starts_with("_rspyts_models_")
-                || (name.starts_with("__") && name.ends_with("__"))
+                || is_python_dunder(name)
                 || (namespace == Namespace::root()
                     && (name.as_str() == "runtime"
                         || name.as_str() == manifest.module_name.as_str()))
@@ -775,6 +775,10 @@ fn is_python_identifier(value: &str) -> bool {
         )
 }
 
+fn is_python_dunder(value: &str) -> bool {
+    value.starts_with("__") && value.ends_with("__")
+}
+
 fn string<'a>(value: &'a Value, key: &str) -> Result<&'a str> {
     value[key]
         .as_str()
@@ -976,6 +980,18 @@ mod tests {
         assert_eq!(
             error.to_string(),
             "Rust module `app_domain::class` in Cargo package `app-domain` contains the invalid Python namespace segment `class`; rename the Rust module"
+        );
+    }
+
+    #[test]
+    fn rejects_an_intrinsic_attribute_in_a_derived_path() {
+        let intrinsic = model("app-domain", "app_domain::__path__", "Value", Vec::new());
+
+        let error = validate_namespaces(&manifest(vec![intrinsic])).unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "Rust module `app_domain::__path__` in Cargo package `app-domain` contains the invalid Python namespace segment `__path__`; rename the Rust module"
         );
     }
 
