@@ -1,8 +1,41 @@
 {
   "packageName": "example",
-  "packageVersion": "1.0.4",
+  "packageVersion": "1.0.5",
   "moduleName": "native",
   "types": [
+    {
+      "owner": "example-dice",
+      "rustModule": "example_dice",
+      "id": "example_dice::DiceReport",
+      "name": "DiceReport",
+      "docs": "A root report that references a model from a nested namespace.",
+      "shape": {
+        "kind": "struct",
+        "fields": [
+          {
+            "rustName": "summary",
+            "wireName": "summary",
+            "docs": null,
+            "ty": {
+              "kind": "named",
+              "identity": {
+                "owner": "example-dice",
+                "id": "example_dice::summary::RollSummary"
+              }
+            },
+            "required": true,
+            "default": null,
+            "constraints": {
+              "literal": null,
+              "minLength": null,
+              "maxLength": null,
+              "ge": null,
+              "le": null
+            }
+          }
+        ]
+      }
+    },
     {
       "owner": "example-dice",
       "rustModule": "example_dice::fair::roll",
@@ -577,5 +610,5 @@
       "value": 6
     }
   ],
-  "sourceFingerprint": "2dc70bab1cddced907631f0989668a52"
+  "sourceFingerprint": "8866bfb621083a3f183cfee3e96404cf"
 }

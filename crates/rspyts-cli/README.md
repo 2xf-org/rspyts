@@ -28,6 +28,10 @@ packages to `dist` next to that crate by default. Pass `--output path` to
 `build`, `watch`, or `check` when generated artifacts belong elsewhere; a
 relative path resolves from the current working directory.
 
+Python namespace packages expose their documented public names through lazy
+runtime facades and matching `__init__.pyi` files, so importing one namespace
+does not eagerly initialize its nested model and API modules.
+
 The generated public paths follow the Cargo package names and Rust declaration
 modules. The CLI does not use namespace configuration or namespace attributes.
 Root and parent namespaces do not export items from child namespaces.

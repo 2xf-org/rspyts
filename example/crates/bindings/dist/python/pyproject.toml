@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "example"
-version = "1.0.4"
+version = "1.0.5"
 requires-python = ">=3.11"
 dependencies = ["pydantic>=2,<3", "numpy>=2,<3"]
 
@@ -12,4 +12,4 @@ dependencies = ["pydantic>=2,<3", "numpy>=2,<3"]
 where = ["."]
 
 [tool.setuptools.package-data]
-"*" = ["*.so", "*.pyd", "py.typed"]
+"*" = ["*.pyi", "*.so", "*.pyd", "py.typed"]

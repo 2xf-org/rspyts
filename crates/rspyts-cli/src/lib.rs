@@ -121,7 +121,9 @@ mod tests {
     #[test]
     fn validates_package_names() {
         assert!(project::validate_python_package("example.client").is_ok());
+        assert!(project::validate_python_package("example.__version__").is_ok());
         assert!(project::validate_python_package("example-client").is_err());
+        assert!(project::validate_python_package("example.__path__").is_err());
         assert!(project::validate_typescript_package("@example/client").is_ok());
         assert!(project::validate_typescript_package("Example").is_err());
     }

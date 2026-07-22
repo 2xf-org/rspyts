@@ -91,6 +91,10 @@ pub(super) fn emit(
             )?;
         }
         write(&namespace_package.join("__init__.py"), &python_init(items))?;
+        write(
+            &namespace_package.join("__init__.pyi"),
+            &python_init_stub(items),
+        )?;
     }
     for namespace in namespace_map.keys() {
         let mut namespace_package = package.clone();
@@ -99,6 +103,10 @@ pub(super) fn emit(
             let init = namespace_package.join("__init__.py");
             if !init.exists() {
                 write(&init, "")?;
+            }
+            let init_stub = namespace_package.join("__init__.pyi");
+            if !init_stub.exists() {
+                write(&init_stub, "")?;
             }
         }
     }
@@ -126,7 +134,7 @@ fn python_project_file(distribution: &str, version: &str, needs_numpy: bool) -> 
         "dependencies = [\"pydantic>=2,<3\"]"
     };
     format!(
-        "[build-system]\nrequires = [\"setuptools>=77\"]\nbuild-backend = \"setuptools.build_meta\"\n\n[project]\nname = {}\nversion = {}\nrequires-python = \">=3.11\"\n{}\n\n[tool.setuptools.packages.find]\nwhere = [\".\"]\n\n[tool.setuptools.package-data]\n\"*\" = [\"*.so\", \"*.pyd\", \"py.typed\"]\n",
+        "[build-system]\nrequires = [\"setuptools>=77\"]\nbuild-backend = \"setuptools.build_meta\"\n\n[project]\nname = {}\nversion = {}\nrequires-python = \">=3.11\"\n{}\n\n[tool.setuptools.packages.find]\nwhere = [\".\"]\n\n[tool.setuptools.package-data]\n\"*\" = [\"*.pyi\", \"*.so\", \"*.pyd\", \"py.typed\"]\n",
         py_string(distribution),
         py_string(version),
         dependencies,
@@ -179,8 +187,13 @@ fn python_models(items: &NamespaceItems<'_>, context: &PythonContext<'_>) -> Res
         source.push_str(&package_imports.join("\n"));
         source.push('\n');
     }
-    for import in python_model_imports(items, context)? {
-        writeln!(source, "\nimport {import}")?;
+    for namespace in python_model_imports(items, context)? {
+        writeln!(
+            source,
+            "\nimport {} as {}",
+            python_module(context.package, &namespace, "models"),
+            python_model_alias(&namespace, context)
+        )?;
     }
     for element in buffers {
         let name = buffer_name(element);
@@ -529,8 +542,13 @@ fn python_api(items: &NamespaceItems<'_>, context: &PythonContext<'_>) -> Result
         }
         source.push_str(")\n");
     }
-    for import in python_api_model_imports(&references, context)? {
-        writeln!(source, "import {import}")?;
+    for namespace in python_api_model_imports(&references, context)? {
+        writeln!(
+            source,
+            "import {} as {}",
+            python_module(context.package, &namespace, "models"),
+            python_model_alias(&namespace, context)
+        )?;
     }
     for import in python_error_imports(items, context)? {
         writeln!(source, "import {import}")?;
@@ -1067,6 +1085,74 @@ fn emit_python_resource(
 }
 
 fn python_init(items: &NamespaceItems<'_>) -> String {
+    let (model_names, api_names) = python_export_names(items);
+    let mut source = String::from("\"\"\"Generated from the Rust application API.\"\"\"\n\n");
+    if model_names.is_empty() && api_names.is_empty() {
+        source.push_str("__all__: list[str] = []\n");
+        return source;
+    }
+    source.push_str("__all__ = [\n");
+    for name in model_names.iter().chain(&api_names) {
+        writeln!(source, "    {},", py_string(name)).unwrap();
+    }
+    source.push_str("]\n\n");
+    source.push_str(
+        "def __getattr__(\n    name: str,\n    _exports: dict[str, tuple[str, str]] = {\n",
+    );
+    for name in &model_names {
+        writeln!(
+            source,
+            "        {}: (\".models\", {}),",
+            py_string(name),
+            py_string(name)
+        )
+        .unwrap();
+    }
+    for name in &api_names {
+        writeln!(
+            source,
+            "        {}: (\".api\", {}),",
+            py_string(name),
+            py_string(name)
+        )
+        .unwrap();
+    }
+    source.push_str(
+        "    },\n    _package: str = __name__,\n) -> object:\n    from builtins import AttributeError as builtin_attribute_error\n    from builtins import KeyError as builtin_key_error\n    from builtins import getattr as builtin_getattr\n    from importlib import import_module\n    from sys import modules\n\n    try:\n        module_name, member_name = _exports[name]\n    except builtin_key_error:\n        raise builtin_attribute_error(name) from None\n    value = builtin_getattr(import_module(module_name, _package), member_name)\n    modules[_package].__dict__[name] = value\n    return value\n\n\ndef __dir__(\n    _exports: tuple[str, ...] = tuple(__all__),\n    _package: str = __name__,\n) -> list[str]:\n    from builtins import set as builtin_set\n    from builtins import sorted as builtin_sorted\n    from sys import modules\n\n    return builtin_sorted(builtin_set(modules[_package].__dict__) | builtin_set(_exports))\n",
+    );
+    source
+}
+
+fn python_init_stub(items: &NamespaceItems<'_>) -> String {
+    let (model_names, api_names) = python_export_names(items);
+    let mut source = String::from("\"\"\"Generated from the Rust application API.\"\"\"\n\n");
+    if model_names.is_empty() && api_names.is_empty() {
+        source.push_str("__all__: list[str]\n");
+        return source;
+    }
+    if !api_names.is_empty() {
+        source.push_str("from .api import (\n");
+        for name in &api_names {
+            writeln!(source, "    {name} as {name},").unwrap();
+        }
+        source.push_str(")\n");
+    }
+    if !model_names.is_empty() {
+        source.push_str("from .models import (\n");
+        for name in &model_names {
+            writeln!(source, "    {name} as {name},").unwrap();
+        }
+        source.push_str(")\n");
+    }
+    source.push_str("\n__all__ = [\n");
+    for name in model_names.iter().chain(&api_names) {
+        writeln!(source, "    {},", py_string(name)).unwrap();
+    }
+    source.push_str("]\n");
+    source
+}
+
+fn python_export_names(items: &NamespaceItems<'_>) -> (Vec<String>, Vec<String>) {
     let mut model_names = python_model_names(items);
     let mut api_names = items
         .errors
@@ -1078,33 +1164,7 @@ fn python_init(items: &NamespaceItems<'_>) -> String {
         .collect::<Vec<_>>();
     model_names.sort();
     api_names.sort();
-    let mut source = String::from("\"\"\"Generated from the Rust application API.\"\"\"\n\n");
-    if model_names.is_empty() && api_names.is_empty() {
-        source.push_str("__all__: list[str] = []\n");
-        return source;
-    }
-    if !api_names.is_empty() {
-        source.push_str("from .api import (\n");
-        for name in &api_names {
-            writeln!(source, "    {name},").unwrap();
-        }
-        source.push_str(")\n");
-    }
-    if !model_names.is_empty() {
-        source.push_str("from .models import (\n");
-        for name in &model_names {
-            writeln!(source, "    {name},").unwrap();
-        }
-        source.push_str(")\n");
-    }
-    let mut all = model_names;
-    all.extend(api_names);
-    source.push_str("\n__all__ = [\n");
-    for name in all {
-        writeln!(source, "    {},", py_string(&name)).unwrap();
-    }
-    source.push_str("]\n");
-    source
+    (model_names, api_names)
 }
 
 fn python_ref(reference: &TypeRef, context: &PythonContext<'_>) -> Result<String> {
@@ -1249,7 +1309,7 @@ fn namespace_buffers(items: &NamespaceItems<'_>) -> BTreeSet<BufferElement> {
 fn python_model_imports(
     items: &NamespaceItems<'_>,
     context: &PythonContext<'_>,
-) -> Result<BTreeSet<String>> {
+) -> Result<BTreeSet<Namespace>> {
     let references = items
         .types
         .iter()
@@ -1261,7 +1321,7 @@ fn python_model_imports(
 fn python_api_model_imports(
     references: &[&TypeRef],
     context: &PythonContext<'_>,
-) -> Result<BTreeSet<String>> {
+) -> Result<BTreeSet<Namespace>> {
     let mut imports = BTreeSet::new();
     for reference in references {
         let mut identities = Vec::new();
@@ -1269,7 +1329,7 @@ fn python_api_model_imports(
         for identity in identities {
             let namespace = type_namespace(identity, context.manifest)?;
             if namespace != *context.namespace {
-                imports.insert(python_module(context.package, &namespace, "models"));
+                imports.insert(namespace);
             }
         }
     }
@@ -1323,10 +1383,18 @@ fn python_named_ref(
     } else {
         Ok(format!(
             "{}.{}",
-            python_module(context.package, &namespace, "models"),
+            python_model_alias(&namespace, context),
             definition.name
         ))
     }
+}
+
+fn python_model_alias(namespace: &Namespace, context: &PythonContext<'_>) -> String {
+    let index = namespaces(context.manifest)
+        .keys()
+        .position(|candidate| candidate == namespace)
+        .expect("referenced namespace belongs to the manifest");
+    format!("_rspyts_models_{index}")
 }
 
 fn python_error_ref(
@@ -1558,7 +1626,8 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        PythonContext, python_api, python_init, python_models, python_project_file, python_runtime,
+        PythonContext, python_api, python_init, python_init_stub, python_models,
+        python_project_file, python_runtime,
     };
     use crate::contract::namespaces;
 
@@ -1569,7 +1638,7 @@ mod tests {
         assert!(standard.contains("dependencies = [\"pydantic>=2,<3\"]"));
         assert!(!standard.contains("numpy"));
         assert!(!standard.contains("wheel"));
-        assert!(!standard.contains("*.pyi"));
+        assert!(standard.contains("\"*.pyi\""));
 
         let buffered = python_project_file("example", "1.0.0", true);
         assert!(buffered.contains("dependencies = [\"pydantic>=2,<3\", \"numpy>=2,<3\"]"));
@@ -1585,6 +1654,29 @@ mod tests {
         assert!(!generated.contains("from .api"));
         assert!(!generated.contains("from .models"));
         assert!(generated.contains("__all__: list[str] = []"));
+    }
+
+    #[test]
+    fn generated_namespace_facades_are_lazy_and_statically_typed() {
+        let manifest = cross_namespace_manifest();
+        let namespace = Namespace {
+            package: Some("one".to_owned()),
+            modules: vec!["service".to_owned()],
+        };
+        let views = namespaces(&manifest);
+        let items = views.get(&namespace).expect("service namespace");
+
+        let runtime = python_init(items);
+        let stub = python_init_stub(items);
+
+        assert!(!runtime.contains("from .api import"));
+        assert!(!runtime.contains("from .models import"));
+        assert!(runtime.contains("\"Event\": (\".models\", \"Event\")"));
+        assert!(runtime.contains("\"find\": (\".api\", \"find\")"));
+        assert!(runtime.contains("def __getattr__("));
+        assert!(runtime.contains("def __dir__("));
+        assert!(stub.contains("find as find"));
+        assert!(stub.contains("Event as Event"));
     }
 
     #[test]
@@ -1726,13 +1818,14 @@ mod tests {
         let api = python_api(items, &context).expect("API generates");
         let runtime = python_runtime(&manifest).expect("runtime generates");
 
-        assert!(models.contains("import example.two.model.models"));
-        assert!(models.contains("target: example.two.model.models.Target"));
+        assert!(models.contains("import example.two.model.models as _rspyts_models_"));
+        assert!(models.contains("target: _rspyts_models_"));
+        assert!(!models.contains("target: example.two.model.models.Target"));
         assert!(api.contains("import example.two.model.api"));
-        assert!(api.contains("import example.two.model.models"));
-        assert!(api.contains("target: example.two.model.models.Target"));
+        assert!(api.contains("import example.two.model.models as _rspyts_models_"));
+        assert!(api.contains("target: _rspyts_models_"));
         assert!(api.contains("example.two.model.api.TargetError"));
-        assert!(api.contains("TARGET: Final[example.two.model.models.Target]"));
+        assert!(api.contains("TARGET: Final[_rspyts_models_"));
         assert!(runtime.contains("example-two::example_two::model::Target"));
         assert!(runtime.contains("example-one::example_one::service::Event"));
     }

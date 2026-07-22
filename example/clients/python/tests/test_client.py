@@ -1,5 +1,9 @@
+import subprocess
+import sys
+
 import numpy as np
 import pytest
+from example.dice import DiceReport
 from example.dice.fair.roll import RollError, RollMode, RollRequest, roll_values, seed_from_bytes
 from example.dice.loaded.roll import (
     DiceCup as LoadedDiceCup,
@@ -35,6 +39,37 @@ def test_namespaces_keep_equal_model_names_separate() -> None:
     assert isinstance(summary, RollSummary)
     assert summary.result.total == 11
     assert loaded.value == 6
+
+
+def test_nested_model_packages_import_during_root_facade_initialization() -> None:
+    summary = summarize_roll("fair", roll_three_dice())
+    report = DiceReport(summary=summary)
+
+    assert report.summary == summary
+    assert DiceReport.model_json_schema()["title"] == "DiceReport"
+
+
+def test_namespace_facades_load_models_and_api_only_on_access() -> None:
+    subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "\n".join(
+                [
+                    "import sys",
+                    "import example.dice.summary as summary",
+                    "assert 'example.dice.summary.models' not in sys.modules",
+                    "assert 'example.dice.summary.api' not in sys.modules",
+                    "summary.RollSummary",
+                    "assert 'example.dice.summary.models' in sys.modules",
+                    "assert 'example.dice.summary.api' not in sys.modules",
+                    "summary.summarize_roll",
+                    "assert 'example.dice.summary.api' in sys.modules",
+                ]
+            ),
+        ],
+        check=True,
+    )
 
 
 def test_namespaces_keep_equal_function_and_resource_names_separate() -> None:

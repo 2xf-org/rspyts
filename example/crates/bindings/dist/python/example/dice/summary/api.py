@@ -5,7 +5,7 @@ from pydantic import TypeAdapter
 from .models import (
     RollSummary,
 )
-import example.dice.fair.roll.models
+import example.dice.fair.roll.models as _rspyts_models_3
 import example.dice.fair.roll.api
 from example.runtime import (
     native,
@@ -15,10 +15,7 @@ from example.runtime import (
 )
 
 
-def summarize_roll(
-    label: str,
-    result: example.dice.fair.roll.models.RollResult,
-) -> RollSummary:
+def summarize_roll(label: str, result: _rspyts_models_3.RollResult) -> RollSummary:
     """Add a label to a fair-roll result.
 
     # Errors

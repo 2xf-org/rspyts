@@ -425,8 +425,14 @@ fn validate_contract(project: &Project, manifest: &Manifest) -> Result<()> {
     {
         bail!("the discovered package does not match Cargo metadata");
     }
-    if manifest.module_name.is_empty() {
-        bail!("the Python module name cannot be empty");
+    if !is_python_identifier(&manifest.module_name)
+        || matches!(manifest.module_name.as_str(), "api" | "models" | "runtime")
+        || is_python_package_attribute(&manifest.module_name)
+    {
+        bail!(
+            "Python native module name `{}` is invalid or reserved for generated package loading",
+            manifest.module_name
+        );
     }
     validate_namespaces(manifest)?;
     validate_model_namespace_cycles(manifest)?;
@@ -435,18 +441,22 @@ fn validate_contract(project: &Project, manifest: &Manifest) -> Result<()> {
 
 fn validate_namespaces(manifest: &Manifest) -> Result<()> {
     let namespace_map = namespaces(manifest);
+    let python_namespace_paths = namespace_map
+        .keys()
+        .map(Namespace::python_segments)
+        .collect::<Vec<_>>();
     for (owner, rust_module) in export_origins(manifest) {
         let namespace = manifest.namespace(owner, rust_module);
         if let Some(package) = &namespace.package {
             let segment = package.replace('-', "_");
-            if !is_python_identifier(&segment) {
+            if !is_python_identifier(&segment) || is_python_package_attribute(&segment) {
                 bail!(
                     "Cargo package `{owner}` derives the invalid Python namespace segment `{segment}`; rename the Cargo package"
                 );
             }
         }
         for segment in rust_module.split("::").skip(1) {
-            if !is_python_identifier(segment) {
+            if !is_python_identifier(segment) || is_python_package_attribute(segment) {
                 bail!(
                     "Rust module `{rust_module}` in Cargo package `{owner}` contains the invalid Python namespace segment `{segment}`; rename the Rust module"
                 );
@@ -468,6 +478,15 @@ fn validate_namespaces(manifest: &Manifest) -> Result<()> {
         }
     }
     for (namespace, items) in namespace_map {
+        let namespace_path = namespace.python_segments();
+        let child_package_names = python_namespace_paths
+            .iter()
+            .filter(|path| {
+                path.len() == namespace_path.len() + 1
+                    && path.starts_with(namespace_path.as_slice())
+            })
+            .filter_map(|path| path.last().map(String::as_str))
+            .collect::<BTreeSet<_>>();
         let mut python_names = items
             .types
             .iter()
@@ -490,11 +509,43 @@ fn validate_namespaces(manifest: &Manifest) -> Result<()> {
         for reference in namespace_refs(&items) {
             crate::contract::collect_buffers(reference, &mut buffers);
         }
+        let has_models = !items.types.is_empty() || !buffers.is_empty();
+        let has_api = !items.errors.is_empty()
+            || !items.functions.is_empty()
+            || !items.resources.is_empty()
+            || !items.constants.is_empty();
+        if let Some(name) = child_package_names.iter().find(|name| {
+            (**name == "models" && has_models)
+                || (**name == "api" && has_api)
+                || (namespace == Namespace::root()
+                    && (**name == "runtime" || **name == manifest.module_name.as_str()))
+        }) {
+            bail!(
+                "Python namespace segment `{name}` conflicts with a generated module in namespace `{}`",
+                display_namespace(&namespace)
+            );
+        }
         python_names.extend(
             buffers
                 .into_iter()
                 .map(|element| python::buffer_name(element).to_owned()),
         );
+        if let Some(name) = python_names.iter().find(|name| {
+            matches!(
+                name.as_str(),
+                "__all__" | "__dir__" | "__getattr__" | "api" | "models"
+            ) || name.starts_with("_rspyts_models_")
+                || is_python_package_attribute(name)
+                || (namespace == Namespace::root()
+                    && (name.as_str() == "runtime"
+                        || name.as_str() == manifest.module_name.as_str()))
+                || child_package_names.contains(name.as_str())
+        }) {
+            bail!(
+                "Python export name `{name}` is reserved for generated package loading in namespace `{}`",
+                display_namespace(&namespace)
+            );
+        }
         unique_public_names("Python", python_names.into_iter())
             .with_context(|| format!("in namespace `{}`", display_namespace(&namespace)))?;
 
@@ -648,7 +699,11 @@ pub(super) fn unique_public_names<S: AsRef<str>>(
 }
 
 pub(super) fn validate_python_package(value: &str) -> Result<()> {
-    if value.is_empty() || value.split('.').any(|part| !is_python_identifier(part)) {
+    if value.is_empty()
+        || value
+            .split('.')
+            .any(|part| !is_python_identifier(part) || is_python_package_attribute(part))
+    {
         bail!("Python package `{value}` must contain dot-separated identifiers");
     }
     Ok(())
@@ -724,6 +779,10 @@ fn is_python_identifier(value: &str) -> bool {
         )
 }
 
+fn is_python_package_attribute(value: &str) -> bool {
+    value != "__version__" && value.starts_with("__") && value.ends_with("__")
+}
+
 fn string<'a>(value: &'a Value, key: &str) -> Result<&'a str> {
     value[key]
         .as_str()
@@ -760,7 +819,8 @@ mod tests {
     use std::path::PathBuf;
 
     use rspyts::ir::{
-        CargoPackageId, ErrorDef, FieldConstraints, FieldDef, Manifest, TypeDef, TypeRef, TypeShape,
+        CargoPackageId, ErrorDef, FieldConstraints, FieldDef, FunctionDef, Manifest, TypeDef,
+        TypeRef, TypeShape,
     };
 
     use super::{validate_generated_files, validate_model_namespace_cycles, validate_namespaces};
@@ -800,6 +860,20 @@ mod tests {
             functions: Vec::new(),
             resources: Vec::new(),
             constants: Vec::new(),
+        }
+    }
+
+    fn function(owner: &str, module: &str, name: &str) -> FunctionDef {
+        FunctionDef {
+            owner: CargoPackageId::new(owner),
+            rust_module: module.to_owned(),
+            rust_name: name.to_owned(),
+            host_name: name.to_owned(),
+            native_name: format!("__rspyts_function_{name}"),
+            docs: None,
+            params: Vec::new(),
+            returns: TypeRef::Unit,
+            error: None,
         }
     }
 
@@ -914,6 +988,22 @@ mod tests {
     }
 
     #[test]
+    fn rejects_an_intrinsic_attribute_in_a_derived_path() {
+        let intrinsic = model("app-domain", "app_domain::__path__", "Value", Vec::new());
+
+        let error = validate_namespaces(&manifest(vec![intrinsic])).unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "Rust module `app_domain::__path__` in Cargo package `app-domain` contains the invalid Python namespace segment `__path__`; rename the Rust module"
+        );
+
+        let conventional = model("app-domain", "app_domain::__version__", "Value", Vec::new());
+        validate_namespaces(&manifest(vec![conventional]))
+            .expect("non-intrinsic double-underscore segments are valid");
+    }
+
+    #[test]
     fn identifies_the_cargo_package_that_makes_an_invalid_python_path() {
         let invalid = model("app-123", "app_123", "Value", Vec::new());
 
@@ -942,6 +1032,99 @@ mod tests {
 
         assert!(diagnostic.contains("in namespace `domain::shared`"));
         assert!(diagnostic.contains("duplicate Python export name `Conflict`"));
+    }
+
+    #[test]
+    fn rejects_names_reserved_for_generated_python_package_loading() {
+        for name in [
+            "__getattr__",
+            "__annotate__",
+            "__path__",
+            "_rspyts_models_0",
+            "api",
+            "models",
+        ] {
+            let item = model("app-domain", "app_domain::shared", name, Vec::new());
+            let error = validate_namespaces(&manifest(vec![item])).unwrap_err();
+
+            assert_eq!(
+                error.to_string(),
+                format!(
+                    "Python export name `{name}` is reserved for generated package loading in namespace `domain::shared`"
+                )
+            );
+        }
+
+        let conventional = model(
+            "app-domain",
+            "app_domain::shared",
+            "__version__",
+            Vec::new(),
+        );
+        validate_namespaces(&manifest(vec![conventional]))
+            .expect("non-intrinsic double-underscore exports are valid");
+    }
+
+    #[test]
+    fn rejects_root_names_used_by_generated_python_runtime_modules() {
+        for name in ["runtime", "native"] {
+            let item = model("app", "app", name, Vec::new());
+            let error = validate_namespaces(&manifest(vec![item])).unwrap_err();
+
+            assert_eq!(
+                error.to_string(),
+                format!(
+                    "Python export name `{name}` is reserved for generated package loading in namespace `<root>`"
+                )
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_an_export_that_shadows_a_child_python_package() {
+        let export = model("app", "app", "child", Vec::new());
+        let child = model("app", "app::child", "Value", Vec::new());
+        let error = validate_namespaces(&manifest(vec![export, child])).unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "Python export name `child` is reserved for generated package loading in namespace `<root>`"
+        );
+    }
+
+    #[test]
+    fn rejects_child_packages_that_shadow_generated_namespace_modules() {
+        let root = model("app", "app", "Root", Vec::new());
+        let models_child = model("app", "app::models", "Value", Vec::new());
+        let error = validate_namespaces(&manifest(vec![root, models_child])).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "Python namespace segment `models` conflicts with a generated module in namespace `<root>`"
+        );
+
+        let api_child = model("app", "app::api", "Value", Vec::new());
+        let mut contract = manifest(vec![api_child]);
+        contract.functions.push(function("app", "app", "ping"));
+        let error = validate_namespaces(&contract).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "Python namespace segment `api` conflicts with a generated module in namespace `<root>`"
+        );
+    }
+
+    #[test]
+    fn rejects_root_children_that_shadow_runtime_modules() {
+        for name in ["runtime", "native"] {
+            let child = model("app", &format!("app::{name}"), "Value", Vec::new());
+            let error = validate_namespaces(&manifest(vec![child])).unwrap_err();
+
+            assert_eq!(
+                error.to_string(),
+                format!(
+                    "Python namespace segment `{name}` conflicts with a generated module in namespace `<root>`"
+                )
+            );
+        }
     }
 
     #[test]
