@@ -26,7 +26,7 @@ name = "example"
 
 [generated]
 # Fingerprint of the Rust/Cargo sources and active [application] settings.
-source_fingerprint = "2b4cf7933a1f5764ecab14904010202e"
+source_fingerprint = "2e8a2b7bcbd0506564b13c797c6c9f12"
 
 [generated.python]
 # Python files owned by RSPYTS and safe to overwrite or remove.
