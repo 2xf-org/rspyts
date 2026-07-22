@@ -9,11 +9,12 @@ use toml_edit::DocumentMut;
 
 pub(super) const CONFIG_FILE: &str = "rspyts.toml";
 
-pub(super) const CONFIG_TEMPLATE: &str = r#"# RSPYTS application configuration and generated-file ownership.
-# Edit [application]. RSPYTS updates only the [generated] tables.
+pub(super) const CONFIG_TEMPLATE: &str = r#"# rspyts application configuration and generated-file ownership.
+# Edit [application]. rspyts updates only the [generated] tables.
 
 [application]
 # Manifests and root entrypoints are user-owned; update them with any override.
+# Package version comes from Cargo.toml and must match both language manifests.
 
 # Override the public application name.
 # Defaults to the adjacent Cargo package name.
@@ -31,7 +32,7 @@ pub(super) const CONFIG_TEMPLATE: &str = r#"# RSPYTS application configuration a
 # Defaults to the application name and must match src-ts/package.json.
 # typescript_package = "my-application"
 
-# Generate src-py/.gitignore and src-ts/.gitignore for RSPYTS-owned files.
+# Generate src-py/.gitignore and src-ts/.gitignore for rspyts-owned files.
 # Defaults to true. Set this to false to allow generated files to be committed.
 # gitignore = false
 
@@ -40,14 +41,14 @@ pub(super) const CONFIG_TEMPLATE: &str = r#"# RSPYTS application configuration a
 source_fingerprint = ""
 
 [generated.python]
-# Python files owned by RSPYTS and safe to overwrite or remove.
+# Python files owned by rspyts and safe to overwrite or remove.
 files = ["src-py/.gitignore"]
 
-# Extension-module basenames; the platform supplies .so or .pyd.
+# Extension-module basenames; the platform supplies .abi3.so or .pyd.
 native_modules = []
 
 [generated.typescript]
-# TypeScript, wasm-bindgen declarations/JavaScript, and Wasm files owned by RSPYTS.
+# TypeScript, wasm-bindgen declarations/JavaScript, and Wasm files owned by rspyts.
 files = ["src-ts/.gitignore"]
 "#;
 
@@ -56,14 +57,14 @@ const GENERATED_TEMPLATE: &str = r#"[generated]
 source_fingerprint = __SOURCE_FINGERPRINT__
 
 [generated.python]
-# Python files owned by RSPYTS and safe to overwrite or remove.
+# Python files owned by rspyts and safe to overwrite or remove.
 files = __PYTHON_FILES__
 
-# Extension-module basenames; the platform supplies .so or .pyd.
+# Extension-module basenames; the platform supplies .abi3.so or .pyd.
 native_modules = __PYTHON_NATIVE_MODULES__
 
 [generated.typescript]
-# TypeScript, wasm-bindgen declarations/JavaScript, and Wasm files owned by RSPYTS.
+# TypeScript, wasm-bindgen declarations/JavaScript, and Wasm files owned by rspyts.
 files = __TYPESCRIPT_FILES__
 "#;
 
@@ -129,14 +130,14 @@ impl Config {
     pub(super) fn read(path: &Path) -> Result<Self> {
         let path = path
             .canonicalize()
-            .with_context(|| format!("cannot find RSPYTS configuration {}", path.display()))?;
+            .with_context(|| format!("cannot find rspyts configuration {}", path.display()))?;
         let source = fs::read_to_string(&path)
             .with_context(|| format!("failed to read {}", path.display()))?;
         let document = source
             .parse::<DocumentMut>()
             .with_context(|| format!("failed to parse {}", path.display()))?;
         let data = toml::from_str::<ConfigData>(&source)
-            .with_context(|| format!("invalid RSPYTS configuration in {}", path.display()))?;
+            .with_context(|| format!("invalid rspyts configuration in {}", path.display()))?;
         Ok(Self {
             path,
             application: data.application,
@@ -168,14 +169,14 @@ impl Config {
             );
         let mut fragment = fragment
             .parse::<DocumentMut>()
-            .context("failed to render generated RSPYTS configuration")?;
+            .context("failed to render generated rspyts configuration")?;
         let mut document = self.document.clone();
         let generated_decor = document["generated"]
             .as_table()
             .map(|table| table.decor().clone());
         let mut generated = fragment
             .remove("generated")
-            .context("rendered RSPYTS configuration omitted [generated]")?;
+            .context("rendered rspyts configuration omitted [generated]")?;
         if let (Some(decor), Some(table)) = (generated_decor, generated.as_table_mut()) {
             *table.decor_mut() = decor;
         }
@@ -218,7 +219,7 @@ pub(super) fn discover(explicit: Option<&Path>) -> Result<PathBuf> {
         };
         return path
             .canonicalize()
-            .with_context(|| format!("cannot find RSPYTS configuration {}", path.display()));
+            .with_context(|| format!("cannot find rspyts configuration {}", path.display()));
     }
 
     let current = std::env::current_dir().context("failed to read the current directory")?;
@@ -276,7 +277,7 @@ pub(super) fn discover(explicit: Option<&Path>) -> Result<PathBuf> {
             "no rspyts.toml found in the Cargo workspace; run from an application directory or pass `--config path/to/rspyts.toml`"
         ),
         paths => bail!(
-            "multiple RSPYTS applications found: {paths:?}; select one with `--config path/to/rspyts.toml`"
+            "multiple rspyts applications found: {paths:?}; select one with `--config path/to/rspyts.toml`"
         ),
     }
 }

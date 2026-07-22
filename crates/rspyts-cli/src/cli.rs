@@ -31,11 +31,14 @@ pub(crate) enum Command {
 pub(crate) struct InitArgs {
     /// New project directory. The final path component is the package name.
     pub(crate) path: PathBuf,
+    /// Initial Cargo, Python, and npm package version.
+    #[arg(long, default_value = "0.1.0")]
+    pub(crate) version: semver::Version,
 }
 
 #[derive(Debug, Args)]
 pub(crate) struct ProjectArgs {
-    /// Path to an RSPYTS application configuration.
+    /// Path to an rspyts application configuration.
     #[arg(long)]
     pub(crate) config: Option<PathBuf>,
 }

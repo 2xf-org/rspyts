@@ -1,0 +1,10 @@
+[package]
+name = "example"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+rspyts.workspace = true
+serde.workspace = true

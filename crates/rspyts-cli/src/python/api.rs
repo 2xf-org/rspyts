@@ -151,8 +151,8 @@ pub(super) fn python_runtime(manifest: &Manifest) -> Result<String> {
     source.push_str("from pydantic import BaseModel\n");
     writeln!(
         source,
-        "\nfrom . import {} as native  # type: ignore[attr-defined]",
-        manifest.module_name
+        "\nfrom .{} import {} as native  # type: ignore[attr-defined]",
+        manifest.module_name, manifest.module_name
     )?;
     emit_python_adapters(&mut source, uses_buffer(manifest));
     begin_python_top_level(&mut source);

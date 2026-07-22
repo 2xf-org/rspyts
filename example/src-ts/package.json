@@ -1,0 +1,33 @@
+{
+  "//": "User-owned package configuration; rspyts never modifies this file. Keep version aligned with Cargo.toml and add dependencies here.",
+  "name": "example",
+  "version": "0.1.0",
+  "type": "module",
+  "sideEffects": true,
+  "scripts": {
+    "build": "tsc",
+    "check": "tsc --noEmit"
+  },
+  "exports": {
+    ".": {
+      "types": "./build/example/index.d.ts",
+      "import": "./build/example/index.js"
+    },
+    "./api": {
+      "types": "./build/example/api.d.ts",
+      "import": "./build/example/api.js"
+    },
+    "./models": {
+      "types": "./build/example/models.d.ts",
+      "import": "./build/example/models.js"
+    },
+    "./*": {
+      "types": "./build/example/*/index.d.ts",
+      "import": "./build/example/*/index.js"
+    }
+  },
+  "files": ["build"],
+  "devDependencies": {
+    "typescript": "^5.9.0"
+  }
+}

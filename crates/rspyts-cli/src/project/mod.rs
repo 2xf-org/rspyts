@@ -35,7 +35,7 @@ pub(super) struct Project {
     linked_packages: Vec<LinkedPackage>,
     rspyts_dependency: ResolvedDependency,
     pub(super) package_name: String,
-    package_version: String,
+    pub(super) package_version: String,
     pub(super) python_package: String,
     pub(super) typescript_package: String,
     python_source: PathBuf,
@@ -100,7 +100,7 @@ impl Project {
                 .iter()
                 .any(|package| package["name"].as_str() == Some(name))
             {
-                bail!("RSPYTS application package `{name}` is listed more than once");
+                bail!("rspyts application package `{name}` is listed more than once");
             }
             let mut matches = packages.iter().filter(|package| {
                 package["name"].as_str() == Some(name)
@@ -109,17 +109,17 @@ impl Project {
                         .is_some_and(|id| workspace_members.iter().any(|member| member == id))
             });
             let package = matches.next().with_context(|| {
-                format!("additional RSPYTS package `{name}` is not a workspace member")
+                format!("additional rspyts package `{name}` is not a workspace member")
             })?;
             if matches.next().is_some() {
-                bail!("additional RSPYTS package name `{name}` is ambiguous");
+                bail!("additional rspyts package name `{name}` is ambiguous");
             }
             selected.push(package);
         }
         for package in &selected {
             if !has_library_target(package) {
                 bail!(
-                    "RSPYTS application package `{}` must have a library target",
+                    "rspyts application package `{}` must have a library target",
                     string(package, "name")?
                 );
             }
@@ -130,7 +130,7 @@ impl Project {
             .map(|package| direct_rspyts_id(&metadata, string(package, "id")?))
             .collect::<Result<Vec<_>>>()?;
         if rspyts_id.iter().any(|id| id != &rspyts_id[0]) {
-            bail!("all RSPYTS application packages must resolve the same `rspyts` package");
+            bail!("all rspyts application packages must resolve the same `rspyts` package");
         }
         let rspyts_package = packages
             .iter()
@@ -339,10 +339,10 @@ fn prepare_bridge(project: &Project) -> Result<Bridge> {
         ])
         .arg(&bridge_manifest)
         .output()
-        .context("failed to inspect the generated RSPYTS bridge")?;
+        .context("failed to inspect the generated rspyts bridge")?;
     if !output.status.success() {
         bail!(
-            "generated RSPYTS bridge metadata failed\n{}",
+            "generated rspyts bridge metadata failed\n{}",
             String::from_utf8_lossy(&output.stderr)
         );
     }
@@ -350,7 +350,7 @@ fn prepare_bridge(project: &Project) -> Result<Bridge> {
     let package = metadata["packages"]
         .as_array()
         .and_then(|packages| packages.first())
-        .context("generated RSPYTS bridge metadata has no package")?;
+        .context("generated rspyts bridge metadata has no package")?;
     Ok(Bridge {
         manifest: bridge_manifest,
         package_id: string(package, "id")?.to_owned(),
@@ -479,7 +479,7 @@ fn read_contract(library_path: &Path, package_name: &str) -> Result<Manifest> {
     let contract: Symbol<'_, ContractFn> = unsafe { library.get(contract_name.as_bytes()) }
         .with_context(|| {
             format!(
-                "generated RSPYTS bridge is missing `{}`",
+                "generated rspyts bridge is missing `{}`",
                 contract_name.trim_end_matches('\0')
             )
         })?;
@@ -489,7 +489,7 @@ fn read_contract(library_path: &Path, package_name: &str) -> Result<Manifest> {
     // SAFETY: the loaded function follows the discovery ABI.
     let result = unsafe { contract() };
     if result.payload.is_null() {
-        bail!("the generated RSPYTS bridge panicked during contract discovery");
+        bail!("the generated rspyts bridge panicked during contract discovery");
     }
     // SAFETY: the discovery ABI returns a live NUL-terminated string.
     let payload = unsafe { CStr::from_ptr(result.payload) }
@@ -565,9 +565,9 @@ fn direct_rspyts_id(metadata: &Value, package_id: &str) -> Result<String> {
         });
     let dependency = matches
         .next()
-        .context("each RSPYTS application package must directly depend on `rspyts`")?;
+        .context("each rspyts application package must directly depend on `rspyts`")?;
     if matches.next().is_some() {
-        bail!("an RSPYTS application package resolves multiple direct `rspyts` dependencies");
+        bail!("an rspyts application package resolves multiple direct `rspyts` dependencies");
     }
     Ok(dependency.to_owned())
 }

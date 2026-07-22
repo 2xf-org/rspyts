@@ -15,205 +15,183 @@
   </a>
 </p>
 
-rspyts builds one Rust API as typed packages for Python and TypeScript. It
-generates Pydantic models and type declarations. Each application uses one
-Python native extension and one WebAssembly file.
+rspyts builds one Rust API as typed packages for Python and TypeScript. In Python, it generates a native extension and Pydantic models, and in Typescript it generates a WebAssembly package and type declarations. Built as means to keep backend and frontend code fully synchronized via Rust.
 
 ## Installing
 
-Install rspyts and the WebAssembly target:
+rspyts requires Rust 1.88 or newer.
 
-```sh
+```console
 cargo install rspyts-cli --locked
 rustup target add wasm32-unknown-unknown
 ```
 
-rspyts requires Rust 1.88 or later.
+## Usage
 
-## Using
-
-Create a project and build both packages:
-
-```sh
-rspyts init hello-rspyts
-cd hello-rspyts
+```console
+rspyts init dice --version 0.1.0 && cd dice
 rspyts build
 ```
 
-The new project contains one Rust package with the greeting example and
-persistent `src-py` and `src-ts` package projects. Define the API normally in
-the Rust package:
-
-```rust
-use rspyts::Model;
-use serde::{Deserialize, Serialize};
-
-#[derive(Debug, Clone, Serialize, Deserialize, Model)]
-pub struct Greeting {
-    pub message: String,
-}
-
-#[rspyts::export]
-pub fn greet(name: String) -> Greeting {
-    Greeting {
-        message: format!("Hello, {name}!"),
-    }
-}
-```
-
-The build updates RSPYTS-owned files inside the package source projects:
+`init` creates a working Rust `greet` example and gives Cargo, Python, and npm the same version. `build` compiles it for Python and WebAssembly, then writes the generated package files beside the Rust source.
 
 ```text
-hello-rspyts/
+dice/
+├── .gitignore
+├── Cargo.toml
+├── rspyts.toml
 ├── src/
-├── src-py/hello_rspyts/
-├── src-ts/hello-rspyts/
-└── rspyts.toml
+│   └── lib.rs
+├── src-py/
+│   ├── .gitignore
+│   ├── pyproject.toml
+│   └── dice/
+│       ├── __init__.py
+│       ├── api.py
+│       ├── models.py
+│       ├── runtime.py
+│       ├── py.typed
+│       └── native/
+│           ├── __init__.py
+│           └── native.abi3.so # native.pyd on Windows
+└── src-ts/
+    ├── .gitignore
+    ├── package.json
+    ├── tsconfig.json
+    ├── dice/
+    │   ├── index.ts
+    │   ├── api.ts
+    │   ├── models.ts
+    │   ├── runtime.ts
+    │   └── native/
+    │       ├── native.js
+    │       └── native.d.ts
+    └── build/
+        └── dice/
+            └── native/
+                └── native_bg.wasm
 ```
 
-Add ordinary Python and TypeScript files alongside the generated `api`,
-`models`, and `runtime` modules. Subsequent builds preserve every user-owned
-file and only replace files listed in `rspyts.toml` beside `Cargo.toml`.
-Generated text files carry an explicit do-not-edit header.
+### Generated Code
 
-By default, RSPYTS also owns `src-py/.gitignore` and `src-ts/.gitignore` and
-updates them with exact paths for generated files. To allow generated outputs
-to be committed instead, opt out in `rspyts.toml`:
+rspyts replaces only the paths recorded in `rspyts.toml`. Generated text files carry an overwrite warning, while native and Wasm files are tracked by their paths. Package manifests, root entrypoints, and unlisted files remain under your control.
 
-```toml
-[application]
-gitignore = false
-```
+#### Python
 
-The nested ignore files never include `pyproject.toml`, `package.json`,
-`tsconfig.json`, root entrypoints, or other authored files.
+Python models use Pydantic, and exported Rust functions call the compiled extension in `dice/native`. The source project uses only `pyproject.toml`; its build backend packages the existing native artifact without compiling or copying it. Numeric `buffer` boundaries use NumPy arrays, while ordinary `Vec<T>` values become Python lists.
 
-Install and use the Python package:
-
-```sh
+```console
 python -m pip install ./src-py
 ```
 
 ```python
-from hello_rspyts import Greeting, greet
+from dice import greet
 
-result: Greeting = greet("Ada")
-print(result.message)
+print(greet("Ada").message)
 ```
 
-Install and use the TypeScript package:
+#### TypeScript
 
-```sh
+The TypeScript package contains strict ESM source and declarations. Rust is compiled to WebAssembly (Wasm), which rspyts writes directly to `src-ts/build/dice/native`; the generated `native.js` loads it and converts values at the boundary. The package has no runtime npm dependencies, and `npm run build` only runs the TypeScript compiler.
+
+```console
 npm --prefix src-ts install
 npm --prefix src-ts run build
-npm install ./src-ts
 ```
+
+Install the built source project from your client:
+
+```console
+npm install ../dice/src-ts
+```
+
+Then import the package by name:
 
 ```typescript
-import { greet, type Greeting } from "hello-rspyts";
+import { greet } from "dice";
 
-const result: Greeting = greet("Ada");
-console.log(result.message);
+console.log(greet("Ada").message);
 ```
 
-The TypeScript package loads its WebAssembly file when the program imports
-the package.
+### Custom Code
 
-Rust string enums are Python `StrEnum` classes. TypeScript emits both a string
-union and a same-named frozen runtime value, so clients can use an enum without
-duplicating its wire strings:
-
-```typescript
-import { RunMode } from "hello-rspyts";
-
-const mode: RunMode = RunMode.Safe;
-```
-
-## Package names
-
-rspyts makes package paths from Cargo package names and Rust module paths. You
-do not add namespace settings.
-
-For an `example` application and this Rust declaration:
-
-```text
-Cargo package: example-catalog
-Rust module:   inventory::shelf::position
-Type:          Position
-```
-
-Use these imports:
+Add Python files inside `src-py/dice` and TypeScript files inside `src-ts/dice`. rspyts preserves any file that is not listed under `[generated.python]` or `[generated.typescript]`.
 
 ```python
-from example.catalog.inventory.shelf.position import Position
+# src-py/dice/convenience/__init__.py
+from ..models import Greeting
+
+
+def shout(greeting: Greeting) -> str:
+    return greeting.message.upper()
 ```
 
 ```typescript
-import type { Position } from "example/catalog/inventory/shelf/position";
+// src-ts/dice/convenience/index.ts
+import type { Greeting } from "../models.js";
+
+export function shout(greeting: Greeting): string {
+  return greeting.message.toUpperCase();
+}
 ```
 
-rspyts applies these rules:
+Import them directly with `from dice.convenience import shout` and `import { shout } from "dice/convenience"`, or edit the user-owned `dice/__init__.py` and `dice/index.ts` entrypoints to re-export them.
 
-* Remove the longest shared hyphen-separated prefix between the public
-  application name and each linked Cargo package name.
-* Add the Rust module path where the item is declared.
-* Replace each Cargo hyphen with `_` in Python. Keep hyphens in TypeScript.
-* Keep the declaration path when Rust re-exports an item.
-* Export only the items declared in each module. Do not copy child items into
-  a parent module.
+### Config
 
-Paths can have any depth. All paths share the same native extension and the
-same WebAssembly file.
+`rspyts.toml` sits next to `Cargo.toml`. Edit `[application]` to change package names, include other Cargo workspace packages, or commit generated files. rspyts updates the `[generated]` tables after each build; do not edit those tables by hand. Files you add to `src-py` or `src-ts` are preserved unless their paths appear in a generated list. Package versions do not live in `rspyts.toml`: `init --version` writes the initial value into all three package manifests, and later builds require those values to stay aligned.
 
-Model, error, function, resource, and constant names can repeat in different
-modules. Public names must remain unique within one namespace. Python model
-modules must not have a dependency cycle. `rspyts build` reports these errors
-and identifies their source. Python exports cannot use `api`, `models`, the
-generated `_rspyts_models_` prefix, or double-underscore module attributes
-other than `__version__`.
-A root export also cannot use `runtime` or the configured native module name,
-and an export cannot have the same name as a direct child package. Namespace
-paths cannot shadow the generated `api`, `models`, `runtime`, or native
-modules or use reserved double-underscore package segments.
+```toml
+# Edit [application]. rspyts updates only the [generated] tables.
 
-## Requirements
+[application]
+# Override the public application name.
+# Defaults to the adjacent Cargo package name.
+# name = "dice"
 
-The generated Python package requires CPython 3.11 or later. Its initialized,
-user-owned `pyproject.toml` includes Pydantic 2. APIs with numeric buffers must
-also declare NumPy 2; `rspyts build` reports the missing dependency. Package
-entrypoints re-export the explicit `__all__` values from generated model and
-API modules.
+# Link other library packages from the same Cargo workspace.
+# The adjacent package is always linked.
+# additional_packages = ["dice-models"]
 
-The generated TypeScript package has no runtime npm dependencies. Its
-initialized project compiles strict TypeScript and copies the WebAssembly
-asset into the package build. Use an ES module runtime that supports top-level
-`await` and `import.meta.url`.
+# Override the Python import package.
+# Defaults to the application name with each `-` changed to `_`.
+# python_package = "dice"
 
-`rspyts build` does not run Python, Node.js, npm, or a TypeScript compiler.
+# Override the npm package name.
+# Defaults to the application name and must match src-ts/package.json.
+# typescript_package = "dice"
 
-## Commands
+# Generate src-py/.gitignore and src-ts/.gitignore for generated files.
+# Defaults to true. Set false to commit generated files.
+# gitignore = false
 
-* `rspyts init <path>` creates Rust, Python, and TypeScript source projects.
-* `rspyts build [--config <path>]` regenerates RSPYTS-owned sources and binaries.
-* `rspyts watch [--config <path>]` rebuilds after Rust or Cargo files change.
-* `rspyts check [--config <path>]` checks generated files against the Rust source.
+[generated]
+# Fingerprint of the Rust and Cargo sources plus [application].
+source_fingerprint = "..."
 
-Commands use the nearest `rspyts.toml`. From elsewhere in a workspace, they
-select its only RSPYTS application or require `--config path/to/rspyts.toml`
-when more than one exists. The adjacent Cargo package is always linked; list
-other workspace packages in `application.additional_packages`.
+[generated.python]
+# Python files rspyts may overwrite or remove.
+files = [
+    "src-py/.gitignore",
+    "src-py/dice/api.py",
+    "src-py/dice/models.py",
+    "src-py/dice/native/__init__.py",
+    "src-py/dice/py.typed",
+    "src-py/dice/runtime.py",
+]
 
-## Example
+# Extension basename; the platform supplies .abi3.so or .pyd.
+native_modules = ["src-py/dice/native/native"]
 
-The [`example`](example/) directory contains a Rust dice API and working
-clients for Python and TypeScript. It shows module paths with more than three
-levels and repeated model names. It also sends a type across a module
-boundary.
-
-## Development
-
-The repository uses integration tests at public Rust, CLI, Python, and
-TypeScript boundaries. See [`TESTING.md`](TESTING.md) for the test layout and
-commands.
-
-Licensed under [MIT](LICENSE).
+[generated.typescript]
+# TypeScript, wasm-bindgen, and Wasm files rspyts may overwrite or remove.
+files = [
+    "src-ts/.gitignore",
+    "src-ts/build/dice/native/native_bg.wasm",
+    "src-ts/dice/api.ts",
+    "src-ts/dice/models.ts",
+    "src-ts/dice/native/native.d.ts",
+    "src-ts/dice/native/native.js",
+    "src-ts/dice/runtime.ts",
+]
+```

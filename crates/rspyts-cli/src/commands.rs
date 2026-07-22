@@ -21,7 +21,7 @@ pub(crate) fn execute(
     stderr: &mut dyn Write,
 ) -> Result<()> {
     match command {
-        Command::Init(args) => write_json(stdout, &init::create(&args.path)?),
+        Command::Init(args) => write_json(stdout, &init::create(&args.path, &args.version)?),
         Command::Build(args) => {
             let project = read_project(&args)?;
             write_json(stdout, &build(&project)?)

@@ -2,6 +2,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
+use semver::Version;
 use serde::Serialize;
 
 use crate::config::CONFIG_TEMPLATE;
@@ -13,7 +14,7 @@ pub(super) struct InitReport {
     project: PathBuf,
 }
 
-pub(super) fn create(path: &Path) -> Result<InitReport> {
+pub(super) fn create(path: &Path, version: &Version) -> Result<InitReport> {
     if path.exists() {
         bail!(
             "{} already exists; rspyts will not overwrite it",
@@ -35,20 +36,16 @@ pub(super) fn create(path: &Path) -> Result<InitReport> {
         .prefix(".rspyts-init-")
         .tempdir_in(parent)?;
     let root = temporary.path();
+    let version = version.to_string();
 
-    write(
-        &root.join("Cargo.toml"),
-        &CARGO.replace("__PROJECT__", name),
-    )?;
+    write(&root.join("Cargo.toml"), &template(CARGO, name, &version))?;
     write(&root.join(".gitignore"), GITIGNORE)?;
     write(&root.join("rspyts.toml"), CONFIG_TEMPLATE)?;
     write(&root.join("src/lib.rs"), RUST_LIB)?;
     write(
         &root.join("src-py/pyproject.toml"),
-        &PYPROJECT.replace("__PROJECT__", name),
+        &template(PYPROJECT, name, &version).replace("__PYTHON_PACKAGE__", &rust_name),
     )?;
-    write(&root.join("src-py/setup.py"), PYTHON_SETUP)?;
-    write(&root.join("src-py/setup.cfg"), PYTHON_SETUP_CONFIG)?;
     write(
         &root.join(format!("src-py/{rust_name}/__init__.py")),
         PYTHON_INIT,
@@ -58,15 +55,16 @@ pub(super) fn create(path: &Path) -> Result<InitReport> {
         &generated_gitignore(&[
             format!("{rust_name}/api.py"),
             format!("{rust_name}/models.py"),
-            format!("{rust_name}/native.pyd"),
-            format!("{rust_name}/native.so"),
+            format!("{rust_name}/native/__init__.py"),
+            format!("{rust_name}/native/native.abi3.so"),
+            format!("{rust_name}/native/native.pyd"),
             format!("{rust_name}/py.typed"),
             format!("{rust_name}/runtime.py"),
         ]),
     )?;
     write(
         &root.join("src-ts/package.json"),
-        &TYPESCRIPT_PACKAGE.replace("__PROJECT__", name),
+        &template(TYPESCRIPT_PACKAGE, name, &version),
     )?;
     write(
         &root.join(format!("src-ts/{name}/index.ts")),
@@ -77,19 +75,14 @@ pub(super) fn create(path: &Path) -> Result<InitReport> {
         &TYPESCRIPT_CONFIG.replace("__PROJECT__", name),
     )?;
     write(
-        &root.join("src-ts/scripts/copy-assets.mjs"),
-        &TYPESCRIPT_COPY_ASSETS.replace("__PROJECT__", name),
-    )?;
-    write(
         &root.join("src-ts/.gitignore"),
         &generated_gitignore(&[
             format!("{name}/api.ts"),
             format!("{name}/models.ts"),
-            format!("{name}/native.d.ts"),
-            format!("{name}/native.js"),
-            format!("{name}/native_bg.wasm"),
-            format!("{name}/native_bg.wasm.d.ts"),
+            format!("{name}/native/native.d.ts"),
+            format!("{name}/native/native.js"),
             format!("{name}/runtime.ts"),
+            format!("build/{name}/native/native_bg.wasm"),
         ]),
     )?;
 
@@ -99,6 +92,12 @@ pub(super) fn create(path: &Path) -> Result<InitReport> {
         status: "ok",
         project: path.to_path_buf(),
     })
+}
+
+fn template(source: &str, project: &str, version: &str) -> String {
+    source
+        .replace("__PROJECT__", project)
+        .replace("__VERSION__", version)
 }
 
 fn validate_name(name: &str) -> Result<()> {
@@ -120,12 +119,12 @@ fn validate_name(name: &str) -> Result<()> {
 
 const CARGO: &str = r#"[package]
 name = "__PROJECT__"
-version = "0.1.0"
+version = "__VERSION__"
 edition = "2024"
 rust-version = "1.88"
 
 [dependencies]
-rspyts = "2"
+rspyts = "3"
 serde = { version = "1", features = ["derive"] }
 "#;
 
@@ -153,36 +152,34 @@ pub fn greet(name: String) -> Greeting {
 }
 "#;
 
-const PYPROJECT: &str = r#"[project]
+const PYPROJECT: &str = r#"# User-owned package configuration; rspyts never modifies this file.
+# Keep project.version aligned with Cargo.toml and add dependencies or tooling here.
+
+[project]
 name = "__PROJECT__"
-version = "0.1.0"
+version = "__VERSION__"
 requires-python = ">=3.11"
 dependencies = ["pydantic>=2,<3"]
 
 [build-system]
-requires = ["setuptools>=77"]
-build-backend = "setuptools.build_meta"
+requires = ["pdm-backend>=2.4,<3"]
+build-backend = "pdm.backend"
 
-[tool.setuptools.packages.find]
-where = ["."]
-
-[tool.setuptools.package-data]
-"*" = ["*.pyi", "*.so", "*.pyd", "py.typed"]
+[tool.pdm.build]
+includes = ["__PYTHON_PACKAGE__"]
+is-purelib = false
 "#;
-
-const PYTHON_SETUP: &str = "from setuptools import Distribution, setup\n\n\nclass BinaryDistribution(Distribution):\n    def has_ext_modules(self) -> bool:\n        return True\n\n\nsetup(distclass=BinaryDistribution)\n";
-
-const PYTHON_SETUP_CONFIG: &str = "[bdist_wheel]\npy_limited_api = cp311\n";
 
 const PYTHON_INIT: &str = "from .models import *\nfrom .models import __all__ as __models__\n\nfrom .api import *\nfrom .api import __all__ as __api__\n\n__all__ = [*__models__, *__api__]\n";
 
 const TYPESCRIPT_PACKAGE: &str = r#"{
+  "//": "User-owned package configuration; rspyts never modifies this file. Keep version aligned with Cargo.toml and add dependencies here.",
   "name": "__PROJECT__",
-  "version": "0.1.0",
+  "version": "__VERSION__",
   "type": "module",
   "sideEffects": true,
   "scripts": {
-    "build": "tsc && node scripts/copy-assets.mjs",
+    "build": "tsc",
     "check": "tsc --noEmit"
   },
   "exports": {
@@ -213,6 +210,7 @@ const TYPESCRIPT_PACKAGE: &str = r#"{
 const TYPESCRIPT_INDEX: &str = "export * from \"./models.js\";\nexport * from \"./api.js\";\n";
 
 const TYPESCRIPT_CONFIG: &str = r#"{
+  // User-owned compiler configuration; rspyts never modifies this file.
   "compilerOptions": {
     "module": "NodeNext",
     "moduleResolution": "NodeNext",
@@ -227,10 +225,4 @@ const TYPESCRIPT_CONFIG: &str = r#"{
   },
   "include": ["__PROJECT__/**/*"]
 }
-"#;
-
-const TYPESCRIPT_COPY_ASSETS: &str = r#"import { cp, mkdir } from "node:fs/promises";
-
-await mkdir("build/__PROJECT__", { recursive: true });
-await cp("__PROJECT__/native_bg.wasm", "build/__PROJECT__/native_bg.wasm");
 "#;

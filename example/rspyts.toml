@@ -1,0 +1,58 @@
+# rspyts application configuration and generated-file ownership.
+# Edit [application]. rspyts updates only the [generated] tables.
+
+[application]
+# Manifests and root entrypoints are user-owned; update them with any override.
+# Package version comes from Cargo.toml and must match both language manifests.
+
+# Override the public application name.
+# Defaults to the adjacent Cargo package name.
+# name = "my-application"
+
+# Link additional Cargo workspace packages into the application.
+# The adjacent Cargo package is always linked automatically.
+# additional_packages = ["my-shared-api"]
+
+# Override the Python import package.
+# Defaults to the application name with hyphens replaced by underscores.
+# python_package = "my_application"
+
+# Override the npm package name.
+# Defaults to the application name and must match src-ts/package.json.
+# typescript_package = "my-application"
+
+# Generate src-py/.gitignore and src-ts/.gitignore for rspyts-owned files.
+# Defaults to true. Set this to false to allow generated files to be committed.
+# gitignore = false
+
+[generated]
+# Fingerprint of the Rust/Cargo sources and active [application] settings.
+source_fingerprint = "d90139dd8eac06f3c4ab695174b68add"
+
+[generated.python]
+# Python files owned by rspyts and safe to overwrite or remove.
+files = [
+    "src-py/.gitignore",
+    "src-py/example/api.py",
+    "src-py/example/models.py",
+    "src-py/example/native/__init__.py",
+    "src-py/example/py.typed",
+    "src-py/example/runtime.py",
+]
+
+# Extension-module basenames; the platform supplies .abi3.so or .pyd.
+native_modules = [
+    "src-py/example/native/native",
+]
+
+[generated.typescript]
+# TypeScript, wasm-bindgen declarations/JavaScript, and Wasm files owned by rspyts.
+files = [
+    "src-ts/.gitignore",
+    "src-ts/build/example/native/native_bg.wasm",
+    "src-ts/example/api.ts",
+    "src-ts/example/models.ts",
+    "src-ts/example/native/native.d.ts",
+    "src-ts/example/native/native.js",
+    "src-ts/example/runtime.ts",
+]

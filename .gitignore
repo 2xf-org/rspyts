@@ -1,12 +1,12 @@
 /target/
 **/target/
-/example/crates/dice/src-py/build/
-/example/crates/dice/src-py/*.egg-info/
+/example/src-py/build/
+/example/src-py/*.egg-info/
+/example/src-py/wheelhouse/
 **/.rspyts-build.lock
 **/.venv/
 **/node_modules/
-/example/clients/typescript/build/
-/example/crates/dice/src-ts/build/
+/example/src-ts/build/
 **/.pytest_cache/
 **/.ruff_cache/
 **/.mypy_cache/

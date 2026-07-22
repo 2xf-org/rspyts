@@ -1,0 +1,16 @@
+{
+  // User-owned compiler configuration; rspyts never modifies this file.
+  "compilerOptions": {
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "outDir": "build",
+    "rootDir": ".",
+    "allowJs": true,
+    "checkJs": false,
+    "declaration": true,
+    "lib": ["ES2022", "DOM", "ESNext.Disposable"],
+    "strict": true,
+    "target": "ES2022"
+  },
+  "include": ["example/**/*"]
+}

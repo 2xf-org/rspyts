@@ -78,7 +78,7 @@ pub(super) fn typescript_api(
 
 pub(super) fn typescript_runtime(manifest: &Manifest) -> Result<String> {
     let mut source = String::from(
-        "import initializeNative, * as native from \"./native.js\";\n\nconst wasmUrl = new URL(\"./native_bg.wasm\", import.meta.url);\nlet wasmInput: any = wasmUrl;\nconst process = (globalThis as { process?: { versions?: { node?: string } } }).process;\nif (process?.versions?.node) {\n  const nodeModule = \"node:fs/promises\";\n  const { readFile } = await import(/* @vite-ignore */ nodeModule);\n  if (wasmUrl.protocol === \"file:\") {\n    wasmInput = await readFile(wasmUrl);\n  } else if (wasmUrl.pathname.startsWith(\"/@fs/\")) {\n    wasmInput = await readFile(decodeURIComponent(wasmUrl.pathname.slice(4)));\n  }\n}\nawait initializeNative({ module_or_path: wasmInput });\n\nexport { native };\n",
+        "import initializeNative, * as native from \"./native/native.js\";\n\nconst wasmUrl = new URL(\"./native/native_bg.wasm\", import.meta.url);\nlet wasmInput: any = wasmUrl;\nconst process = (globalThis as { process?: { versions?: { node?: string } } }).process;\nif (process?.versions?.node) {\n  const nodeModule = \"node:fs/promises\";\n  const { readFile } = await import(/* @vite-ignore */ nodeModule);\n  if (wasmUrl.protocol === \"file:\") {\n    wasmInput = await readFile(wasmUrl);\n  } else if (wasmUrl.pathname.startsWith(\"/@fs/\")) {\n    wasmInput = await readFile(decodeURIComponent(wasmUrl.pathname.slice(4)));\n  }\n}\nawait initializeNative({ module_or_path: wasmInput });\n\nexport { native };\n",
     );
     source.push_str(TYPESCRIPT_ADAPTERS);
     source.push_str("\nconst nativeSchemas: Record<string, any> = {\n");
