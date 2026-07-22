@@ -156,7 +156,9 @@ Model, error, function, resource, and constant names can repeat in different
 modules. Public names must remain unique within one namespace. Python model
 modules must not have a dependency cycle. `rspyts build` reports these errors
 and identifies their source. Python exports cannot use `__all__`, `__dir__`,
-`__getattr__`, or the generated `_rspyts_models_` prefix.
+`__getattr__`, `api`, `models`, or the generated `_rspyts_models_` prefix. A
+root export also cannot use `runtime` or the configured native module name,
+and an export cannot have the same name as a direct child package.
 
 ## Requirements
 

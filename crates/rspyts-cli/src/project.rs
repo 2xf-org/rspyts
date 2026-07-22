@@ -435,6 +435,10 @@ fn validate_contract(project: &Project, manifest: &Manifest) -> Result<()> {
 
 fn validate_namespaces(manifest: &Manifest) -> Result<()> {
     let namespace_map = namespaces(manifest);
+    let python_namespace_paths = namespace_map
+        .keys()
+        .map(Namespace::python_segments)
+        .collect::<Vec<_>>();
     for (owner, rust_module) in export_origins(manifest) {
         let namespace = manifest.namespace(owner, rust_module);
         if let Some(package) = &namespace.package {
@@ -468,6 +472,15 @@ fn validate_namespaces(manifest: &Manifest) -> Result<()> {
         }
     }
     for (namespace, items) in namespace_map {
+        let namespace_path = namespace.python_segments();
+        let child_package_names = python_namespace_paths
+            .iter()
+            .filter(|path| {
+                path.len() == namespace_path.len() + 1
+                    && path.starts_with(namespace_path.as_slice())
+            })
+            .filter_map(|path| path.last().map(String::as_str))
+            .collect::<BTreeSet<_>>();
         let mut python_names = items
             .types
             .iter()
@@ -496,8 +509,14 @@ fn validate_namespaces(manifest: &Manifest) -> Result<()> {
                 .map(|element| python::buffer_name(element).to_owned()),
         );
         if let Some(name) = python_names.iter().find(|name| {
-            matches!(name.as_str(), "__all__" | "__dir__" | "__getattr__")
-                || name.starts_with("_rspyts_models_")
+            matches!(
+                name.as_str(),
+                "__all__" | "__dir__" | "__getattr__" | "api" | "models"
+            ) || name.starts_with("_rspyts_models_")
+                || (namespace == Namespace::root()
+                    && (name.as_str() == "runtime"
+                        || name.as_str() == manifest.module_name.as_str()))
+                || child_package_names.contains(name.as_str())
         }) {
             bail!(
                 "Python export name `{name}` is reserved for generated package loading in namespace `{}`",
@@ -955,7 +974,7 @@ mod tests {
 
     #[test]
     fn rejects_names_reserved_for_generated_python_package_loading() {
-        for name in ["__getattr__", "_rspyts_models_0"] {
+        for name in ["__getattr__", "_rspyts_models_0", "api", "models"] {
             let item = model("app-domain", "app_domain::shared", name, Vec::new());
             let error = validate_namespaces(&manifest(vec![item])).unwrap_err();
 
@@ -966,6 +985,33 @@ mod tests {
                 )
             );
         }
+    }
+
+    #[test]
+    fn rejects_root_names_used_by_generated_python_runtime_modules() {
+        for name in ["runtime", "native"] {
+            let item = model("app", "app", name, Vec::new());
+            let error = validate_namespaces(&manifest(vec![item])).unwrap_err();
+
+            assert_eq!(
+                error.to_string(),
+                format!(
+                    "Python export name `{name}` is reserved for generated package loading in namespace `<root>`"
+                )
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_an_export_that_shadows_a_child_python_package() {
+        let export = model("app", "app", "child", Vec::new());
+        let child = model("app", "app::child", "Value", Vec::new());
+        let error = validate_namespaces(&manifest(vec![export, child])).unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "Python export name `child` is reserved for generated package loading in namespace `<root>`"
+        );
     }
 
     #[test]
