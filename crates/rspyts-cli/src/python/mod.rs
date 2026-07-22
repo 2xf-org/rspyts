@@ -3,7 +3,7 @@ use std::fmt::Write;
 use std::fs;
 use std::path::Path;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use rspyts::ir::{
     BufferElement, FieldDef, FunctionDef, Manifest, Namespace, ParamDef, ResourceDef, ScalarValue,
     TypeDef, TypeRef, TypeShape,
@@ -38,20 +38,9 @@ pub(super) fn emit(
     native: &Path,
     root: &Path,
 ) -> Result<()> {
-    let python_root = root.join("python");
+    let python_root = root.join("src-py");
     let package = python_root.join(project.python_package.replace('.', "/"));
     fs::create_dir_all(&package)?;
-    let mut parent = python_root.clone();
-    for segment in project
-        .python_package
-        .split('.')
-        .collect::<Vec<_>>()
-        .iter()
-        .take(project.python_package.split('.').count().saturating_sub(1))
-    {
-        parent.push(segment);
-        write(&parent.join("__init__.py"), "")?;
-    }
 
     let extension = if cfg!(windows) { "pyd" } else { "so" };
     fs::copy(
@@ -59,8 +48,19 @@ pub(super) fn emit(
         package.join(format!("{}.{}", manifest.module_name, extension)),
     )
     .with_context(|| format!("failed to copy Python extension {}", native.display()))?;
-    write(&package.join("runtime.py"), &python_runtime(manifest)?)?;
-    write(&package.join("py.typed"), "")?;
+    write(
+        &package.join("runtime.py"),
+        &generated_python_module(
+            &[
+                "native".to_owned(),
+                "native_error".to_owned(),
+                "prepare_host".to_owned(),
+                "restore_host".to_owned(),
+            ],
+            &python_runtime(manifest)?,
+        ),
+    )?;
+    write(&package.join("py.typed"), GENERATED_HEADER)?;
 
     let namespace_map = namespaces(manifest);
     for namespace in namespace_map.keys() {
@@ -81,140 +81,93 @@ pub(super) fn emit(
             package: &project.python_package,
             namespace,
         };
-        let model_names = python_model_names(items);
-        let has_api = !items.errors.is_empty()
-            || !items.functions.is_empty()
-            || !items.resources.is_empty()
-            || !items.constants.is_empty();
-        if !model_names.is_empty() {
-            write(
-                &namespace_package.join("models.py"),
-                &python_models(items, &context)?,
-            )?;
-        }
-        if has_api {
-            write(
-                &namespace_package.join("api.py"),
-                &python_api(items, &context)?,
-            )?;
-        }
-        write(&namespace_package.join("__init__.py"), &python_init(items))?;
+        let (model_names, api_names) = python_export_names(items);
         write(
-            &namespace_package.join("__init__.pyi"),
-            &python_init_stub(items),
+            &namespace_package.join("models.py"),
+            &generated_python_module(&model_names, &python_models(items, &context)?),
         )?;
-    }
-    for namespace in namespace_map.keys() {
-        let mut namespace_package = package.clone();
-        for segment in namespace.python_segments() {
-            namespace_package.push(segment);
-            let init = namespace_package.join("__init__.py");
-            if !init.exists() {
-                write(&init, "")?;
-            }
-            let init_stub = namespace_package.join("__init__.pyi");
-            if !init_stub.exists() {
-                write(&init_stub, "")?;
-            }
+        write(
+            &namespace_package.join("api.py"),
+            &generated_python_module(&api_names, &python_api(items, &context)?),
+        )?;
+        if *namespace != Namespace::root() {
+            write(
+                &namespace_package.join("__init__.py"),
+                &generated_python(&python_init()),
+            )?;
         }
     }
+    Ok(())
+}
 
-    let pyproject = python_project_file(
-        &project.python_package.replace('.', "-"),
-        &manifest.package_version,
+pub(super) fn validate_project(project: &Project, manifest: &Manifest) -> Result<()> {
+    validate_project_dependencies(
+        &project.python_source().join("pyproject.toml"),
         uses_buffer(manifest),
-    );
-    write(&python_root.join("pyproject.toml"), &pyproject)?;
-    write(
-        &python_root.join("setup.py"),
-        "from setuptools import Distribution, setup\n\n\nclass BinaryDistribution(Distribution):\n    def has_ext_modules(self) -> bool:\n        return True\n\n\nsetup(distclass=BinaryDistribution)\n",
-    )?;
-    write(
-        &python_root.join("setup.cfg"),
-        "[bdist_wheel]\npy_limited_api = cp311\n",
     )
 }
 
-fn python_project_file(distribution: &str, version: &str, needs_numpy: bool) -> String {
-    let dependencies = if needs_numpy {
-        "dependencies = [\"pydantic>=2,<3\", \"numpy>=2,<3\"]"
-    } else {
-        "dependencies = [\"pydantic>=2,<3\"]"
-    };
-    format!(
-        "[build-system]\nrequires = [\"setuptools>=77\"]\nbuild-backend = \"setuptools.build_meta\"\n\n[project]\nname = {}\nversion = {}\nrequires-python = \">=3.11\"\n{}\n\n[tool.setuptools.packages.find]\nwhere = [\".\"]\n\n[tool.setuptools.package-data]\n\"*\" = [\"*.pyi\", \"*.so\", \"*.pyd\", \"py.typed\"]\n",
-        py_string(distribution),
-        py_string(version),
-        dependencies,
-    )
+fn validate_project_dependencies(path: &Path, needs_numpy: bool) -> Result<()> {
+    let source = fs::read_to_string(path)
+        .with_context(|| format!("failed to read user-owned {}", path.display()))?;
+    let value = source
+        .parse::<toml::Value>()
+        .with_context(|| format!("failed to parse {}", path.display()))?;
+    let dependencies = value
+        .get("project")
+        .and_then(|project| project.get("dependencies"))
+        .and_then(toml::Value::as_array)
+        .context("Python project must define `[project].dependencies`")?;
+    for required in ["pydantic"]
+        .into_iter()
+        .chain(needs_numpy.then_some("numpy"))
+    {
+        let present = dependencies
+            .iter()
+            .filter_map(toml::Value::as_str)
+            .any(|item| {
+                item.split(|character: char| {
+                    !character.is_ascii_alphanumeric() && !matches!(character, '-' | '_' | '.')
+                })
+                .next()
+                .is_some_and(|name| name.eq_ignore_ascii_case(required))
+            });
+        if !present {
+            bail!(
+                "{} must declare the generated runtime dependency `{required}`",
+                path.display()
+            );
+        }
+    }
+    Ok(())
 }
 
-fn python_init(items: &NamespaceItems<'_>) -> String {
-    let (model_names, api_names) = python_export_names(items);
-    let mut source = String::from("\"\"\"Generated from the Rust application API.\"\"\"\n\n");
-    if model_names.is_empty() && api_names.is_empty() {
-        source.push_str("__all__: list[str] = []\n");
-        return source;
-    }
-    source.push_str("__all__ = [\n");
-    for name in model_names.iter().chain(&api_names) {
-        writeln!(source, "    {},", py_string(name)).unwrap();
-    }
-    source.push_str("]\n\n");
-    source.push_str(
-        "def __getattr__(\n    name: str,\n    _exports: dict[str, tuple[str, str]] = {\n",
-    );
-    for name in &model_names {
-        writeln!(
-            source,
-            "        {}: (\".models\", {}),",
-            py_string(name),
-            py_string(name)
-        )
-        .unwrap();
-    }
-    for name in &api_names {
-        writeln!(
-            source,
-            "        {}: (\".api\", {}),",
-            py_string(name),
-            py_string(name)
-        )
-        .unwrap();
-    }
-    source.push_str(
-        "    },\n    _package: str = __name__,\n) -> object:\n    from builtins import AttributeError as builtin_attribute_error\n    from builtins import KeyError as builtin_key_error\n    from builtins import getattr as builtin_getattr\n    from importlib import import_module\n    from sys import modules\n\n    try:\n        module_name, member_name = _exports[name]\n    except builtin_key_error:\n        raise builtin_attribute_error(name) from None\n    value = builtin_getattr(import_module(module_name, _package), member_name)\n    modules[_package].__dict__[name] = value\n    return value\n\n\ndef __dir__(\n    _exports: tuple[str, ...] = tuple(__all__),\n    _package: str = __name__,\n) -> list[str]:\n    from builtins import set as builtin_set\n    from builtins import sorted as builtin_sorted\n    from sys import modules\n\n    return builtin_sorted(builtin_set(modules[_package].__dict__) | builtin_set(_exports))\n",
-    );
-    source
+const GENERATED_HEADER: &str =
+    "# Generated by rspyts. Do not edit this file; it may be overwritten by `rspyts build`.\n\n";
+
+fn generated_python(source: &str) -> String {
+    format!("{GENERATED_HEADER}{source}")
 }
 
-fn python_init_stub(items: &NamespaceItems<'_>) -> String {
-    let (model_names, api_names) = python_export_names(items);
-    let mut source = String::from("\"\"\"Generated from the Rust application API.\"\"\"\n\n");
-    if model_names.is_empty() && api_names.is_empty() {
-        source.push_str("__all__: list[str]\n");
-        return source;
+fn generated_python_module(exports: &[String], source: &str) -> String {
+    let mut exports = exports.to_vec();
+    exports.sort();
+    let mut generated = String::from(GENERATED_HEADER);
+    generated.push_str(source);
+    if !generated.ends_with('\n') {
+        generated.push('\n');
     }
-    if !api_names.is_empty() {
-        source.push_str("from .api import (\n");
-        for name in &api_names {
-            writeln!(source, "    {name} as {name},").unwrap();
-        }
-        source.push_str(")\n");
+    generated.push('\n');
+    generated.push_str("__all__ = [\n");
+    for name in &exports {
+        writeln!(generated, "    {},", py_string(name)).expect("writing to String cannot fail");
     }
-    if !model_names.is_empty() {
-        source.push_str("from .models import (\n");
-        for name in &model_names {
-            writeln!(source, "    {name} as {name},").unwrap();
-        }
-        source.push_str(")\n");
-    }
-    source.push_str("\n__all__ = [\n");
-    for name in model_names.iter().chain(&api_names) {
-        writeln!(source, "    {},", py_string(name)).unwrap();
-    }
-    source.push_str("]\n");
-    source
+    generated.push_str("]\n");
+    generated
+}
+
+fn python_init() -> String {
+    "from .models import *\nfrom .models import __all__ as __models__\n\nfrom .api import *\nfrom .api import __all__ as __api__\n\n__all__ = [*__models__, *__api__]\n".to_owned()
 }
 
 fn python_export_names(items: &NamespaceItems<'_>) -> (Vec<String>, Vec<String>) {
@@ -230,4 +183,28 @@ fn python_export_names(items: &NamespaceItems<'_>) -> (Vec<String>, Vec<String>)
     model_names.sort();
     api_names.sort();
     (model_names, api_names)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn generated_modules_have_a_warning_and_sorted_explicit_exports() {
+        let generated = generated_python_module(
+            &["Zulu".to_owned(), "Alpha".to_owned()],
+            "from __future__ import annotations\n",
+        );
+
+        assert!(generated.starts_with(GENERATED_HEADER));
+        assert!(generated.ends_with("__all__ = [\n    \"Alpha\",\n    \"Zulu\",\n]\n"));
+    }
+
+    #[test]
+    fn generated_empty_modules_still_declare_exports() {
+        let generated = generated_python_module(&[], "from __future__ import annotations\n");
+
+        assert!(generated.starts_with(GENERATED_HEADER));
+        assert!(generated.ends_with("__all__ = [\n]\n"));
+    }
 }

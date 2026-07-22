@@ -1,7 +1,7 @@
 # Testing rspyts
 
-rspyts tests behavior through public boundaries. The repository does not keep
-in-module unit-test suites or shallow smoke checks.
+rspyts tests behavior through public boundaries, with focused unit coverage
+for transactional generated-file ownership.
 
 ## Test boundaries
 
@@ -33,13 +33,17 @@ cargo test --locked -p rspyts --test contract --test python
 cargo test --locked -p rspyts-cli --test cli
 ```
 
-Build the generated packages before running the language clients:
+Build the generated sources before running the language clients:
 
 ```sh
 cargo run --locked -p rspyts-cli -- build
 uv run --frozen --project example/clients/python pytest -q example/clients/python/tests
 uv run --frozen --project example/clients/python mypy example/clients/python/typecheck.py
 uv run --frozen --project example/clients/python pyright example/clients/python/typecheck.py
+python -m pip wheel --no-deps example/crates/dice/src-py --wheel-dir /tmp/rspyts-wheels
+npm --prefix example/crates/dice/src-ts run check
+npm --prefix example/crates/dice/src-ts run build
+npm pack ./example/crates/dice/src-ts --dry-run
 npm --prefix example/clients/typescript run check
 npm --prefix example/clients/typescript run build
 npm --prefix example/clients/typescript run test:integration

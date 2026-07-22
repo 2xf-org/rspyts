@@ -23,7 +23,7 @@ pub(crate) enum Command {
     Build(ProjectArgs),
     /// Rebuild when Rust or Cargo files change.
     Watch(ProjectArgs),
-    /// Check that dist matches the Rust source.
+    /// Check that generated language sources match the Rust source.
     Check(ProjectArgs),
 }
 
@@ -35,11 +35,7 @@ pub(crate) struct InitArgs {
 
 #[derive(Debug, Args)]
 pub(crate) struct ProjectArgs {
-    /// Path to a workspace or binding Cargo.toml.
-    #[arg(long, default_value = "Cargo.toml")]
-    pub(crate) manifest_path: PathBuf,
-
-    /// Generated package directory. Defaults to `dist` beside the binding manifest.
+    /// Path to an RSPYTS application configuration.
     #[arg(long)]
-    pub(crate) output: Option<PathBuf>,
+    pub(crate) config: Option<PathBuf>,
 }

@@ -15,7 +15,7 @@ An API crate that defines models normally needs these dependencies:
 
 ```toml
 [dependencies]
-rspyts = "1"
+rspyts = "2"
 serde = { version = "1", features = ["derive"] }
 ```
 

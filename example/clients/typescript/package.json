@@ -8,7 +8,7 @@
     "test:integration": "node build/index.js"
   },
   "dependencies": {
-    "example": "file:../../crates/bindings/dist/typescript"
+    "example": "file:../../crates/dice/src-ts"
   },
   "devDependencies": {
     "typescript": "^5.9.0"

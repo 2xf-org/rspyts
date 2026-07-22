@@ -108,7 +108,7 @@ impl Namespace {
 /// The Cargo package that declared an item.
 ///
 /// rspyts uses this value to distinguish Rust items and derive their public
-/// namespace inside one aggregate binding.
+/// namespace inside one application.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct CargoPackageId(pub String);
@@ -125,7 +125,7 @@ impl fmt::Display for CargoPackageId {
     }
 }
 
-/// A Rust item identity inside the aggregate binding.
+/// A Rust item identity inside the application.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct DefinitionId {

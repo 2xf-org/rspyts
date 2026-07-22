@@ -40,8 +40,9 @@ cd hello-rspyts
 rspyts build
 ```
 
-The new project contains an API crate and a binding crate. It also contains
-one client for each language. Define the API in the API crate:
+The new project contains one Rust package with the greeting example and
+persistent `src-py` and `src-ts` package projects. Define the API normally in
+the Rust package:
 
 ```rust
 use rspyts::Model;
@@ -60,31 +61,41 @@ pub fn greet(name: String) -> Greeting {
 }
 ```
 
-Link the API crate in the binding crate:
+The build updates RSPYTS-owned files inside the package source projects:
 
-```rust
-rspyts::application!(hello_rspyts_api);
+```text
+hello-rspyts/
+├── src/
+├── src-py/hello_rspyts/
+├── src-ts/hello-rspyts/
+└── rspyts.toml
 ```
 
-The build writes both packages to `crates/bindings/dist`. To keep generated
-artifacts outside the binding crate, pass an explicit output directory:
+Add ordinary Python and TypeScript files alongside the generated `api`,
+`models`, and `runtime` modules. Subsequent builds preserve every user-owned
+file and only replace files listed in `rspyts.toml` beside `Cargo.toml`.
+Generated text files carry an explicit do-not-edit header.
 
-```sh
-rspyts build --output dist/packages
-rspyts check --output dist/packages
+By default, RSPYTS also owns `src-py/.gitignore` and `src-ts/.gitignore` and
+updates them with exact paths for generated files. To allow generated outputs
+to be committed instead, opt out in `rspyts.toml`:
+
+```toml
+[application]
+gitignore = false
 ```
 
-Relative output paths resolve from the current working directory. The CLI
-refuses to replace the binding project or Cargo workspace root.
+The nested ignore files never include `pyproject.toml`, `package.json`,
+`tsconfig.json`, root entrypoints, or other authored files.
 
 Install and use the Python package:
 
 ```sh
-python -m pip install ./crates/bindings/dist/python
+python -m pip install ./src-py
 ```
 
 ```python
-from hello_rspyts.api import Greeting, greet
+from hello_rspyts import Greeting, greet
 
 result: Greeting = greet("Ada")
 print(result.message)
@@ -93,11 +104,13 @@ print(result.message)
 Install and use the TypeScript package:
 
 ```sh
-npm install ./crates/bindings/dist/typescript
+npm --prefix src-ts install
+npm --prefix src-ts run build
+npm install ./src-ts
 ```
 
 ```typescript
-import { greet, type Greeting } from "hello-rspyts/api";
+import { greet, type Greeting } from "hello-rspyts";
 
 const result: Greeting = greet("Ada");
 console.log(result.message);
@@ -111,7 +124,7 @@ union and a same-named frozen runtime value, so clients can use an enum without
 duplicating its wire strings:
 
 ```typescript
-import { RunMode } from "hello-rspyts/api";
+import { RunMode } from "hello-rspyts";
 
 const mode: RunMode = RunMode.Safe;
 ```
@@ -121,7 +134,7 @@ const mode: RunMode = RunMode.Safe;
 rspyts makes package paths from Cargo package names and Rust module paths. You
 do not add namespace settings.
 
-For an `example` binding package and this Rust declaration:
+For an `example` application and this Rust declaration:
 
 ```text
 Cargo package: example-catalog
@@ -141,8 +154,8 @@ import type { Position } from "example/catalog/inventory/shelf/position";
 
 rspyts applies these rules:
 
-* Remove the longest shared hyphen-separated prefix from the application
-  Cargo package names.
+* Remove the longest shared hyphen-separated prefix between the public
+  application name and each linked Cargo package name.
 * Add the Rust module path where the item is declared.
 * Replace each Cargo hyphen with `_` in Python. Keep hyphens in TypeScript.
 * Keep the declaration path when Rust re-exports an item.
@@ -165,27 +178,30 @@ modules or use reserved double-underscore package segments.
 
 ## Requirements
 
-The generated Python package requires CPython 3.11 or later. Its installer
-adds Pydantic 2. It adds NumPy 2 when the API uses a numeric buffer.
-Generated namespace packages resolve their public models and API members
-lazily, while matching `__init__.pyi` files preserve static type checking and
-editor completion for the documented imports.
+The generated Python package requires CPython 3.11 or later. Its initialized,
+user-owned `pyproject.toml` includes Pydantic 2. APIs with numeric buffers must
+also declare NumPy 2; `rspyts build` reports the missing dependency. Package
+entrypoints re-export the explicit `__all__` values from generated model and
+API modules.
 
-The generated TypeScript package has no runtime npm dependencies. Use an ES
-module runtime with WebAssembly. The runtime must support top-level `await`
-and `import.meta.url`.
+The generated TypeScript package has no runtime npm dependencies. Its
+initialized project compiles strict TypeScript and copies the WebAssembly
+asset into the package build. Use an ES module runtime that supports top-level
+`await` and `import.meta.url`.
 
 `rspyts build` does not run Python, Node.js, npm, or a TypeScript compiler.
 
 ## Commands
 
-* `rspyts init <path>` creates a project and both clients.
-* `rspyts build` builds both packages.
-* `rspyts watch` rebuilds after a Rust or Cargo file changes.
-* `rspyts check` checks that generated files match the Rust source.
+* `rspyts init <path>` creates Rust, Python, and TypeScript source projects.
+* `rspyts build [--config <path>]` regenerates RSPYTS-owned sources and binaries.
+* `rspyts watch [--config <path>]` rebuilds after Rust or Cargo files change.
+* `rspyts check [--config <path>]` checks generated files against the Rust source.
 
-Use `--manifest-path path/to/Cargo.toml` when a workspace has more than one
-binding crate. `build`, `watch`, and `check` also accept `--output path`.
+Commands use the nearest `rspyts.toml`. From elsewhere in a workspace, they
+select its only RSPYTS application or require `--config path/to/rspyts.toml`
+when more than one exists. The adjacent Cargo package is always linked; list
+other workspace packages in `application.additional_packages`.
 
 ## Example
 

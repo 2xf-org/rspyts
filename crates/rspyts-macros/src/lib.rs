@@ -45,7 +45,7 @@ pub fn export(args: TokenStream, input: TokenStream) -> TokenStream {
 }
 
 #[proc_macro]
-/// Declare the one aggregate Python and WebAssembly application binding.
+/// Declare an application bridge for all linked Rust packages.
 pub fn application(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as ModuleInput);
     expand_application(input).into()

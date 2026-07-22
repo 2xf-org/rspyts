@@ -16,6 +16,7 @@ import {
   summarizeRoll,
   type RollSummary,
 } from "example/dice/summary";
+import { averageRoll } from "example/convenience";
 
 export function rollThreeDice(): RollResult {
   const cup = new DiceCup(6, DEFAULT_SEED);
@@ -27,6 +28,7 @@ export function rollThreeDice(): RollResult {
 }
 
 console.log(rollThreeDice());
+console.log(averageRoll(rollThreeDice()));
 
 const seed = seedFromBytes(new TextEncoder().encode("rspyts"));
 const values: Uint32Array = rollValues({ sides: 6, count: 3 }, seed);

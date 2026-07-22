@@ -33,8 +33,8 @@ pub(super) fn expand_application(input: ModuleInput) -> TokenStream2 {
         pub extern "C" fn rspyts_contract() -> ::rspyts::__private::DiscoveryResult {
             ::rspyts::__private::discovery_contract(|| {
                 let __rspyts_manifest = ::rspyts::registry::manifest(
-                    env!("CARGO_PKG_NAME"),
-                    env!("CARGO_PKG_VERSION"),
+                    option_env!("RSPYTS_APPLICATION_NAME").unwrap_or(env!("CARGO_PKG_NAME")),
+                    option_env!("RSPYTS_APPLICATION_VERSION").unwrap_or(env!("CARGO_PKG_VERSION")),
                     "native",
                 ).map_err(|__rspyts_error| format!("invalid rspyts registry: {__rspyts_error}"))?;
                 ::rspyts::__private::serde_json::to_string(&__rspyts_manifest)
@@ -63,8 +63,8 @@ pub(super) fn expand_application(input: ModuleInput) -> TokenStream2 {
         )]
         pub fn rspyts_contract_json() -> String {
             let __rspyts_manifest = ::rspyts::registry::manifest(
-                env!("CARGO_PKG_NAME"),
-                env!("CARGO_PKG_VERSION"),
+                option_env!("RSPYTS_APPLICATION_NAME").unwrap_or(env!("CARGO_PKG_NAME")),
+                option_env!("RSPYTS_APPLICATION_VERSION").unwrap_or(env!("CARGO_PKG_VERSION")),
                 "native",
             ).expect("invalid rspyts registry");
             ::rspyts::__private::serde_json::to_string(&__rspyts_manifest)

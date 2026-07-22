@@ -1,3 +1,5 @@
+use std::collections::{BTreeMap, BTreeSet};
+
 use super::*;
 
 pub(crate) fn validate_contract(project: &Project, manifest: &Manifest) -> Result<()> {
@@ -90,14 +92,9 @@ pub(crate) fn validate_namespaces(manifest: &Manifest) -> Result<()> {
         for reference in namespace_refs(&items) {
             crate::contract::collect_buffers(reference, &mut buffers);
         }
-        let has_models = !items.types.is_empty() || !buffers.is_empty();
-        let has_api = !items.errors.is_empty()
-            || !items.functions.is_empty()
-            || !items.resources.is_empty()
-            || !items.constants.is_empty();
         if let Some(name) = child_package_names.iter().find(|name| {
-            (**name == "models" && has_models)
-                || (**name == "api" && has_api)
+            **name == "models"
+                || **name == "api"
                 || (namespace == Namespace::root()
                     && (**name == "runtime" || **name == manifest.module_name.as_str()))
         }) {
@@ -306,6 +303,24 @@ pub(crate) fn validate_typescript_package(value: &str) -> Result<()> {
         })
     {
         bail!("invalid TypeScript package `{value}`");
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_application_name(value: &str) -> Result<()> {
+    let mut characters = value.chars();
+    if !characters
+        .next()
+        .is_some_and(|character| character.is_ascii_lowercase())
+        || !characters.all(|character| {
+            character.is_ascii_lowercase() || character.is_ascii_digit() || character == '-'
+        })
+        || value.ends_with('-')
+        || value.contains("--")
+    {
+        bail!(
+            "application name `{value}` must use lower-case letters, numbers, and single hyphens"
+        );
     }
     Ok(())
 }

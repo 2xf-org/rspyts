@@ -1,4 +1,4 @@
-//! Collect all exports that are linked into one application binding.
+//! Collect all exports that are linked into one application.
 
 use std::collections::BTreeSet;
 
@@ -38,15 +38,15 @@ pub enum RegistryError {
         kind: &'static str,
         identity: DefinitionId,
     },
-    #[error("type `{identity}` is used but is not linked into the aggregate binding")]
+    #[error("type `{identity}` is used but is not linked into the application")]
     MissingType { identity: DefinitionId },
-    #[error("error `{identity}` is used but is not linked into the aggregate binding")]
+    #[error("error `{identity}` is used but is not linked into the application")]
     MissingError { identity: DefinitionId },
     #[error("invalid exported constant: {0}")]
     InvalidConstant(String),
 }
 
-/// Collect and validate every export linked into an application binding.
+/// Collect and validate every export linked into an application.
 ///
 /// # Errors
 ///
@@ -214,7 +214,7 @@ fn unique_global_names<'a>(
             return Err(RegistryError::DuplicateName {
                 kind,
                 name: value.to_owned(),
-                namespace: "the aggregate binding".to_owned(),
+                namespace: "the application".to_owned(),
             });
         }
     }

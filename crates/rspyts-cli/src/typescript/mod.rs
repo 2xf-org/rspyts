@@ -8,14 +8,14 @@ use rspyts::ir::{
     BufferElement, FieldConstraints, FieldDef, FunctionDef, Manifest, Namespace, ParamDef,
     ResourceDef, TypeDef, TypeRef, TypeShape,
 };
-use serde_json::{Value, json};
+use serde_json::Value;
 use wasm_bindgen_cli_support::Bindgen;
 
 use crate::contract::{
     NamespaceItems, definition_key, error_definition, named_identities, namespace_refs, namespaces,
     reference_contains, tagged_variant_name, type_definition, type_namespace,
 };
-use crate::output::{write, write_json};
+use crate::output::write;
 use crate::project::{Project, is_identifier};
 
 mod api;
@@ -28,24 +28,33 @@ pub(crate) use render::*;
 
 pub(super) struct TypeScriptContext<'a> {
     manifest: &'a Manifest,
-    package: &'a str,
     namespace: &'a Namespace,
 }
 
 pub(super) fn emit(project: &Project, manifest: &Manifest, wasm: &Path, root: &Path) -> Result<()> {
-    let package = root.join("typescript");
+    let package = root.join("src-ts").join(&project.package_name);
     fs::create_dir_all(&package)?;
     let mut bindgen = Bindgen::new();
     bindgen
         .input_path(wasm)
         .web(true)?
-        .typescript(false)
+        .typescript(true)
         .omit_default_module_path(false)
         .out_name("native")
         .generate(&package)
         .context("failed to generate TypeScript WebAssembly bindings")?;
-    write(&package.join("runtime.js"), &typescript_runtime(manifest)?)?;
-    write(&package.join("values.js"), TYPESCRIPT_VALUES)?;
+    for entry in fs::read_dir(&package)? {
+        let path = entry?.path();
+        if path.extension().is_some_and(|extension| extension == "js")
+            || path.to_string_lossy().ends_with(".d.ts")
+        {
+            prepend_generated_header(&path)?;
+        }
+    }
+    write(
+        &package.join("runtime.ts"),
+        &generated_typescript(&typescript_runtime(manifest)?),
+    )?;
     let namespace_map = namespaces(manifest);
     for (namespace, items) in &namespace_map {
         let namespace_package = namespace
@@ -55,59 +64,68 @@ pub(super) fn emit(project: &Project, manifest: &Manifest, wasm: &Path, root: &P
         fs::create_dir_all(&namespace_package)?;
         let context = TypeScriptContext {
             manifest,
-            package: &project.typescript_package,
             namespace,
         };
         write(
-            &namespace_package.join("index.d.ts"),
-            &typescript_declarations(items, &context)?,
+            &namespace_package.join("models.ts"),
+            &generated_typescript(&typescript_models(items, &context)?),
         )?;
         write(
-            &namespace_package.join("index.js"),
-            &typescript_api(items, &context)?,
+            &namespace_package.join("api.ts"),
+            &generated_typescript(&typescript_api(items, &context)?),
         )?;
+        if *namespace != Namespace::root() {
+            write(
+                &namespace_package.join("index.ts"),
+                &generated_typescript(TYPESCRIPT_INDEX),
+            )?;
+        }
     }
-    let package_json = package_manifest(
-        &project.typescript_package,
-        &manifest.package_version,
-        namespace_map.keys(),
-    );
-    write_json(&package.join("package.json"), &package_json)
+    Ok(())
 }
 
-fn package_manifest<'a>(
-    package_name: &str,
-    package_version: &str,
-    namespaces: impl Iterator<Item = &'a Namespace>,
-) -> Value {
-    let mut exports = serde_json::Map::new();
-    for namespace in namespaces {
-        let segments = namespace.typescript_segments();
-        let subpath = if segments.is_empty() {
-            ".".to_owned()
-        } else {
-            format!("./{}", segments.join("/"))
-        };
-        let file = if segments.is_empty() {
-            "./index".to_owned()
-        } else {
-            format!("./{}/index", segments.join("/"))
-        };
-        exports.insert(
-            subpath,
-            json!({
-                "types": format!("{file}.d.ts"),
-                "import": format!("{file}.js")
-            }),
+pub(super) fn validate_project(project: &Project) -> Result<()> {
+    let path = project.typescript_source().join("package.json");
+    let source = fs::read_to_string(&path)
+        .with_context(|| format!("failed to read user-owned {}", path.display()))?;
+    let package: Value = serde_json::from_str(&source)
+        .with_context(|| format!("failed to parse user-owned {}", path.display()))?;
+    let name = package["name"]
+        .as_str()
+        .with_context(|| format!("{} must define a string `name`", path.display()))?;
+    if name != project.typescript_package {
+        anyhow::bail!(
+            "{} declares npm package `{name}`, but rspyts.toml configures `{}`",
+            path.display(),
+            project.typescript_package
         );
     }
-    json!({
-        "name": package_name,
-        "version": package_version,
-        "type": "module",
-        "sideEffects": true,
-        "types": "./index.d.ts",
-        "exports": exports,
-        "files": ["**/*.js", "**/*.d.ts", "native_bg.wasm"]
-    })
+    Ok(())
+}
+
+const GENERATED_HEADER: &str =
+    "// Generated by rspyts. Do not edit this file; it may be overwritten by `rspyts build`.\n\n";
+const TYPESCRIPT_INDEX: &str = "export * from \"./models.js\";\nexport * from \"./api.js\";\n";
+
+fn generated_typescript(source: &str) -> String {
+    format!("{GENERATED_HEADER}{source}")
+}
+
+fn prepend_generated_header(path: &Path) -> Result<()> {
+    let source = fs::read_to_string(path)?;
+    fs::write(path, generated_typescript(&source))?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn generated_typescript_has_an_explicit_warning() {
+        let generated = generated_typescript("export const value = 1;\n");
+
+        assert!(generated.starts_with(GENERATED_HEADER));
+        assert!(generated.contains("Do not edit this file"));
+    }
 }

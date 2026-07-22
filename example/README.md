@@ -1,16 +1,16 @@
 # Example application
 
-This example uses one aggregate binding and one linked Rust domain crate. It
+This example keeps the generated language projects beside the Rust source and
 shows the automatic namespace rules.
 
 ```text
 example/
 ├── crates/
-│   ├── bindings/
-│   │   ├── Cargo.toml
-│   │   └── src/lib.rs
 │   └── dice/
 │       ├── Cargo.toml
+│       ├── rspyts.toml
+│       ├── src-py/
+│       ├── src-ts/
 │       └── src/
 │           ├── fair/roll.rs
 │           ├── loaded/roll.rs
@@ -29,16 +29,18 @@ example/
         └── tsconfig.json
 ```
 
-The `example-dice` crate owns the models and behavior. The `example` crate
-contains only this application declaration:
+The `example-dice` crate owns the models and behavior. Its `rspyts.toml`
+overrides the public package name while the adjacent Cargo package is linked
+automatically:
 
-```rust
-rspyts::application!(example_dice);
+```toml
+[application]
+name = "example"
 ```
 
-The binding Cargo package is `example`. The API Cargo package is
-`example-dice`. rspyts removes the shared `example` prefix. It then adds the
-Rust declaration modules.
+The API Cargo package is `example-dice`. rspyts uses the public application
+name `example`, removes that shared prefix, and then adds the Rust declaration
+modules.
 
 Use these Python imports:
 
@@ -65,7 +67,7 @@ import { summarizeRoll } from "example/dice/summary";
 The two modules reuse the `DiceCup`, `RollResult`, and `roll_dice` leaf names.
 They are valid because they belong to different namespaces. `RollSummary`
 contains the fair result. This reference crosses a namespace boundary without
-a second binding.
+a second application package.
 
 Build both host packages:
 
@@ -73,15 +75,18 @@ Build both host packages:
 cargo run -p rspyts-cli -- build
 ```
 
-The build creates the generated Python and TypeScript packages in
-`example/crates/bindings/dist`. Git stores the portable generated snapshot,
-including the WebAssembly binary, but not the platform-specific Python native
-extension. Run the build before using either client.
+The build updates the generated files inside
+`example/crates/dice/src-py` and `example/crates/dice/src-ts`. Their generated
+`.gitignore` files exclude only RSPYTS-owned outputs; authored manifests,
+entrypoints, and convenience modules remain normal Git files. Run the build
+before using either client.
 
 Then run the authored clients:
 
 ```sh
 uv run --project example/clients/python pytest -q example/clients/python/tests
+npm --prefix example/crates/dice/src-ts ci
+npm --prefix example/crates/dice/src-ts run build
 npm --prefix example/clients/typescript ci
 npm --prefix example/clients/typescript run check
 npm --prefix example/clients/typescript run build

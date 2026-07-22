@@ -25,4 +25,6 @@ libloading.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tempfile.workspace = true
+toml.workspace = true
+toml_edit.workspace = true
 wasm-bindgen-cli-support.workspace = true

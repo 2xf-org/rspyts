@@ -9,6 +9,7 @@ use serde::Serialize;
 use serde_json::json;
 
 use crate::cli::{Command, ProjectArgs};
+use crate::config;
 use crate::init;
 use crate::output::SourceWatcher;
 use crate::project::{Project, build, check};
@@ -32,16 +33,17 @@ pub(crate) fn execute(
                 stdout,
                 &json!({
                     "status": "ok",
-                    "output": project.output(),
+                    "pythonSource": project.python_source(),
+                    "typescriptSource": project.typescript_source(),
                 }),
             )
         }
-        Command::Watch(args) => watch(read_project(&args)?, stdout, stderr),
+        Command::Watch(args) => watch(config::discover(args.config.as_deref())?, stdout, stderr),
     }
 }
 
 fn read_project(args: &ProjectArgs) -> Result<Project> {
-    Project::read(&args.manifest_path, args.output.as_deref())
+    Project::read(&config::discover(args.config.as_deref())?)
 }
 
 /// Build once, then rebuild after each observed source change.
@@ -49,19 +51,25 @@ fn read_project(args: &ProjectArgs) -> Result<Project> {
 /// The loop deliberately remains at the process boundary: a fatal watcher
 /// error ends the command, while a build error is reported and waits for the
 /// next source change.
-fn watch(project: Project, stdout: &mut dyn Write, stderr: &mut dyn Write) -> Result<()> {
+fn watch(config: std::path::PathBuf, stdout: &mut dyn Write, stderr: &mut dyn Write) -> Result<()> {
+    let project = Project::read(&config)?;
     build(&project)?;
     writeln!(
         stdout,
         "rspyts is watching {}",
         project.workspace_root.display()
     )?;
-    let mut watcher = SourceWatcher::new(&project.workspace_root)?;
+    let mut watcher = SourceWatcher::new(&project.workspace_root, &config)?;
     loop {
         thread::sleep(Duration::from_millis(500));
         if watcher.changed()? {
-            match build(&project) {
-                Ok(_) => writeln!(stdout, "rspyts rebuilt {}", project.output().display())?,
+            match Project::read(&config).and_then(|project| build(&project)) {
+                Ok(_) => writeln!(
+                    stdout,
+                    "rspyts rebuilt {} and {}",
+                    project.python_source().display(),
+                    project.typescript_source().display()
+                )?,
                 Err(error) => writeln!(stderr, "rspyts build failed: {error:#}")?,
             }
         }

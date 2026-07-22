@@ -6,15 +6,24 @@ pub(super) fn typescript_api(
 ) -> Result<String> {
     let runtime_imports = typescript_runtime_imports(items);
     let mut source = String::new();
-    if items
-        .types
-        .iter()
-        .any(|definition| matches!(&definition.shape, TypeShape::StringEnum { .. }))
-    {
+    let local_types = typescript_local_type_names(items);
+    if !local_types.is_empty() {
         writeln!(
             source,
-            "import {{ freeze as $rspytsFreeze }} from {};",
-            ts_string(&typescript_values_path(context.namespace))
+            "import type {{ {} }} from \"./models.js\";",
+            local_types.join(", ")
+        )?;
+    }
+    for import in typescript_type_imports(items, context)? {
+        writeln!(
+            source,
+            "import type * as {} from {};",
+            namespace_alias(&import),
+            ts_string(&typescript_namespace_path(
+                context.namespace,
+                &import,
+                "models.js"
+            ))
         )?;
     }
     if !runtime_imports.is_empty() {
@@ -32,33 +41,18 @@ pub(super) fn typescript_api(
         writeln!(
             source,
             "import * as {} from {};",
-            namespace_alias(&import),
-            ts_string(&typescript_import(context.package, &import))
+            api_namespace_alias(&import),
+            ts_string(&typescript_namespace_path(
+                context.namespace,
+                &import,
+                "api.js"
+            ))
         )?;
-    }
-    for (index, definition) in items.types.iter().enumerate() {
-        if let TypeShape::StringEnum { variants } = &definition.shape {
-            let binding = format!("$rspytsStringEnum{index}");
-            writeln!(source, "\nconst {binding} = $rspytsFreeze({{")?;
-            for variant in variants {
-                writeln!(
-                    source,
-                    "  [{}]: {},",
-                    ts_string(&variant.rust_name),
-                    ts_string(&variant.wire_name),
-                )?;
-            }
-            writeln!(
-                source,
-                "}});\nexport {{ {binding} as {} }};",
-                definition.name
-            )?;
-        }
     }
     for error in &items.errors {
         writeln!(
             source,
-            "\nexport class {} extends globalThis.Error {{\n  constructor(code, message) {{\n    super(message);\n    this.name = {};\n    this.code = code;\n  }}\n}}",
+            "\nexport class {} extends globalThis.Error {{\n  readonly code: string;\n\n  constructor(code: string, message: string) {{\n    super(message);\n    this.name = {};\n    this.code = code;\n  }}\n}}",
             error.name,
             ts_string(&error.name)
         )?;
@@ -72,8 +66,9 @@ pub(super) fn typescript_api(
     for constant in &items.constants {
         writeln!(
             source,
-            "\nexport const {} = restoreHost({}, {});",
+            "\nexport const {}: {} = restoreHost({}, {});",
             constant.host_name,
+            type_ref(&constant.ty, context)?,
             typescript_value(&constant.value, &constant.ty, context.manifest)?,
             typescript_spec(&constant.ty)?
         )?;
@@ -83,10 +78,10 @@ pub(super) fn typescript_api(
 
 pub(super) fn typescript_runtime(manifest: &Manifest) -> Result<String> {
     let mut source = String::from(
-        "import initializeNative, * as native from \"./native.js\";\n\nconst wasmUrl = new URL(\"./native_bg.wasm\", import.meta.url);\nlet wasmInput = wasmUrl;\nif (globalThis.process?.versions?.node) {\n  const nodeModule = \"node:fs/promises\";\n  const { readFile } = await import(/* @vite-ignore */ nodeModule);\n  if (wasmUrl.protocol === \"file:\") {\n    wasmInput = await readFile(wasmUrl);\n  } else if (wasmUrl.pathname.startsWith(\"/@fs/\")) {\n    wasmInput = await readFile(decodeURIComponent(wasmUrl.pathname.slice(4)));\n  }\n}\nawait initializeNative({ module_or_path: wasmInput });\n\nexport { native };\n",
+        "import initializeNative, * as native from \"./native.js\";\n\nconst wasmUrl = new URL(\"./native_bg.wasm\", import.meta.url);\nlet wasmInput: any = wasmUrl;\nconst process = (globalThis as { process?: { versions?: { node?: string } } }).process;\nif (process?.versions?.node) {\n  const nodeModule = \"node:fs/promises\";\n  const { readFile } = await import(/* @vite-ignore */ nodeModule);\n  if (wasmUrl.protocol === \"file:\") {\n    wasmInput = await readFile(wasmUrl);\n  } else if (wasmUrl.pathname.startsWith(\"/@fs/\")) {\n    wasmInput = await readFile(decodeURIComponent(wasmUrl.pathname.slice(4)));\n  }\n}\nawait initializeNative({ module_or_path: wasmInput });\n\nexport { native };\n",
     );
     source.push_str(TYPESCRIPT_ADAPTERS);
-    source.push_str("\nconst nativeSchemas = {\n");
+    source.push_str("\nconst nativeSchemas: Record<string, any> = {\n");
     for definition in &manifest.types {
         writeln!(
             source,
@@ -97,6 +92,23 @@ pub(super) fn typescript_runtime(manifest: &Manifest) -> Result<String> {
     }
     source.push_str("};\n");
     Ok(source)
+}
+
+fn typescript_local_type_names(items: &NamespaceItems<'_>) -> Vec<String> {
+    let mut names = items
+        .types
+        .iter()
+        .map(|definition| definition.name.clone())
+        .collect::<Vec<_>>();
+    if namespace_refs(items)
+        .iter()
+        .any(|reference| reference_contains(reference, &|item| matches!(item, TypeRef::Json)))
+    {
+        names.push("JsonValue".to_owned());
+    }
+    names.sort();
+    names.dedup();
+    names
 }
 
 fn typescript_runtime_imports(items: &NamespaceItems<'_>) -> Vec<&'static str> {
@@ -148,10 +160,8 @@ fn typescript_runtime_imports(items: &NamespaceItems<'_>) -> Vec<&'static str> {
     imports
 }
 
-pub(super) const TYPESCRIPT_VALUES: &str = "export const freeze = Object.freeze;\n";
-
 const TYPESCRIPT_ADAPTERS: &str = r#"
-export function prepareHost(value) {
+export function prepareHost(value: any): any {
   if (value instanceof Date) return value.toISOString();
   if (ArrayBuffer.isView(value)) return value;
   if (Array.isArray(value)) return value.map(prepareHost);
@@ -161,13 +171,13 @@ export function prepareHost(value) {
   return value;
 }
 
-const bufferConstructors = {
+const bufferConstructors: Record<string, any> = {
   u8: Uint8Array, i8: Int8Array, u16: Uint16Array, i16: Int16Array,
   u32: Uint32Array, i32: Int32Array, u64: BigUint64Array, i64: BigInt64Array,
   f32: Float32Array, f64: Float64Array,
 };
 
-function restoreJson(value) {
+function restoreJson(value: any): any {
   if (typeof value === "bigint") {
     const number = Number(value);
     if (!Number.isSafeInteger(number) || BigInt(number) !== value) {
@@ -182,15 +192,15 @@ function restoreJson(value) {
   return value;
 }
 
-export function restoreHost(value, spec) {
+export function restoreHost(value: any, spec: any): any {
   if (value == null || spec == null) return value;
   const [kind, detail, variants] = spec;
   if (kind === "bytes") return new Uint8Array(value);
   if (kind === "buffer") return new bufferConstructors[detail](value);
   if (kind === "json") return restoreJson(value);
-  if (kind === "list") return Object.freeze(Array.from(value, item => restoreHost(item, detail)));
+  if (kind === "list") return Object.freeze(Array.from(value, (item: any) => restoreHost(item, detail)));
   if (kind === "map") return Object.freeze(Object.fromEntries(Object.entries(value).map(([key, item]) => [key, restoreHost(item, detail)])));
-  if (kind === "tuple") return Object.freeze(value.map((item, index) => restoreHost(item, detail[index])));
+  if (kind === "tuple") return Object.freeze(value.map((item: any, index: number) => restoreHost(item, detail[index])));
   if (kind === "named") return restoreHost(value, nativeSchemas[detail]);
   if (kind === "alias") return restoreHost(value, detail);
   if (kind === "struct") return Object.freeze(Object.fromEntries(Object.entries(value).map(([key, item]) => [key, restoreHost(item, detail[key])])));
@@ -201,7 +211,7 @@ export function restoreHost(value, spec) {
   return value;
 }
 
-export function nativeError(error, ErrorType) {
+export function nativeError(error: any, ErrorType: new (code: string, message: string) => Error): any {
   const text = String(error);
   const line = text.indexOf("\n");
   return line < 0 ? error : new ErrorType(text.slice(0, line), text.slice(line + 1));
@@ -214,12 +224,7 @@ fn emit_typescript_function(
     context: &TypeScriptContext<'_>,
     receiver: Option<&str>,
 ) -> Result<()> {
-    let params = function
-        .params
-        .iter()
-        .map(|param| param.host_name.clone())
-        .collect::<Vec<_>>()
-        .join(", ");
+    let params = typescript_params(&function.params, context)?;
     let calls = function
         .params
         .iter()
@@ -239,13 +244,21 @@ fn emit_typescript_function(
     let (indent, signature, call) = if receiver.is_some() {
         (
             "  ",
-            format!("  {}({params}) {{", function.host_name),
+            format!(
+                "  {}({params}): {} {{",
+                function.host_name,
+                return_type_ref(&function.returns, context)?
+            ),
             format!("this.nativeResource.{}({calls})", function.host_name),
         )
     } else {
         (
             "",
-            format!("export function {}({params}) {{", function.host_name),
+            format!(
+                "export function {}({params}): {} {{",
+                function.host_name,
+                return_type_ref(&function.returns, context)?
+            ),
             format!("native[{quoted}]({calls})", quoted = ts_string(native_name)),
         )
     };
@@ -288,12 +301,7 @@ fn emit_typescript_resource(
         .find(|item| item.rust_name == "new")
         .or_else(|| resource.constructors.first())
         .context("resource has no constructor")?;
-    let params = constructor
-        .params
-        .iter()
-        .map(|item| item.host_name.clone())
-        .collect::<Vec<_>>()
-        .join(", ");
+    let params = typescript_params(&constructor.params, context)?;
     let calls = constructor
         .params
         .iter()
@@ -301,6 +309,7 @@ fn emit_typescript_resource(
         .collect::<Vec<_>>()
         .join(", ");
     writeln!(source, "\nexport class {} {{", resource.name)?;
+    source.push_str("  private nativeResource!: any;\n\n");
     writeln!(source, "  constructor({params}) {{")?;
     let native_call = format!(
         "new native[{quoted}]({calls})",
@@ -325,19 +334,18 @@ fn emit_typescript_resource(
         .iter()
         .filter(|item| !std::ptr::eq(*item, constructor))
     {
-        let params = factory
-            .params
-            .iter()
-            .map(|item| item.host_name.clone())
-            .collect::<Vec<_>>()
-            .join(", ");
+        let params = typescript_params(&factory.params, context)?;
         let calls = factory
             .params
             .iter()
             .map(|item| format!("prepareHost({})", item.host_name))
             .collect::<Vec<_>>()
             .join(", ");
-        writeln!(source, "\n  static {}({params}) {{", factory.host_name)?;
+        writeln!(
+            source,
+            "\n  static {}({params}): {} {{",
+            factory.host_name, resource.name
+        )?;
         writeln!(
             source,
             "    const value = Object.create({}.prototype);",
@@ -377,6 +385,6 @@ fn emit_typescript_resource(
         };
         emit_typescript_function(source, &function, context, Some(&resource.name))?;
     }
-    source.push_str("\n  close() {\n    this.nativeResource.close();\n  }\n}\n");
+    source.push_str("\n  close(): void {\n    this.nativeResource.close();\n  }\n}\n");
     Ok(())
 }

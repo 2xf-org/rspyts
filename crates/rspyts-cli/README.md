@@ -10,7 +10,7 @@ cargo install rspyts-cli --locked
 rustup target add wasm32-unknown-unknown
 ```
 
-The rspyts binary contains the matching WebAssembly binding generator.
+The rspyts binary contains the matching WebAssembly code generator.
 
 Then create or build a project:
 
@@ -23,23 +23,29 @@ rspyts check
 ```
 
 The CLI always builds one Python package and one TypeScript and WebAssembly
-package. It finds the one binding crate in the Cargo workspace. It writes both
-packages to `dist` next to that crate by default. Pass `--output path` to
-`build`, `watch`, or `check` when generated artifacts belong elsewhere; a
-relative path resolves from the current working directory.
+package. It uses the nearest `rspyts.toml` and updates `src-py` and `src-ts`
+beside the adjacent Cargo package's Rust `src` directory. The adjacent package
+is linked automatically; `application.additional_packages` can link more
+workspace packages.
 
-Python namespace packages expose their documented public names through lazy
-runtime facades and matching `__init__.pyi` files, so importing one namespace
-does not eagerly initialize its nested model and API modules.
+Package manifests and root entrypoints are initialized once and then belong to
+the user. Generated model, API, runtime, native, and WebAssembly files are
+tracked in the generated Python and TypeScript file lists in `rspyts.toml`;
+all other files are preserved.
+
+RSPYTS maintains exact generated-file rules in `src-py/.gitignore` and
+`src-ts/.gitignore` by default. Set `application.gitignore = false` to remove
+those generated ignore files and allow the generated outputs to be committed.
+Generated text files include an explicit do-not-edit warning.
 
 The generated public paths follow the Cargo package names and Rust declaration
 modules. The CLI does not use namespace configuration or namespace attributes.
 Root and parent namespaces do not export items from child namespaces.
 
-Python and Node.js are not build dependencies. The generated Python package
-requires CPython 3.11 or later. Its installer adds Pydantic 2 and adds NumPy 2
-only when the Rust API uses numeric buffers. The generated TypeScript package
-has no runtime npm dependencies. Rust string enums are emitted as TypeScript
+Python and Node.js are not `rspyts build` dependencies. The generated Python
+package requires CPython 3.11 or later. The generated TypeScript source project
+uses its own standard npm scripts for strict compilation and packaging and has
+no runtime npm dependencies. Rust string enums are emitted as TypeScript
 string unions with same-named frozen runtime values.
 
 Read the [project README](https://github.com/2xf-org/rspyts).

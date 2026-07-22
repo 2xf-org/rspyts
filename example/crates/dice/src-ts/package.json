@@ -1,0 +1,34 @@
+{
+  "devDependencies": {
+    "typescript": "^5.9.0"
+  },
+  "exports": {
+    ".": {
+      "import": "./build/example/index.js",
+      "types": "./build/example/index.d.ts"
+    },
+    "./*": {
+      "import": "./build/example/*/index.js",
+      "types": "./build/example/*/index.d.ts"
+    },
+    "./api": {
+      "import": "./build/example/api.js",
+      "types": "./build/example/api.d.ts"
+    },
+    "./models": {
+      "import": "./build/example/models.js",
+      "types": "./build/example/models.d.ts"
+    }
+  },
+  "files": [
+    "build"
+  ],
+  "name": "example",
+  "scripts": {
+    "build": "tsc && node scripts/copy-assets.mjs",
+    "check": "tsc --noEmit"
+  },
+  "sideEffects": true,
+  "type": "module",
+  "version": "2.0.0"
+}

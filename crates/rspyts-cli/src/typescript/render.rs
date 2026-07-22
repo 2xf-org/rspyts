@@ -108,6 +108,10 @@ pub(crate) fn typescript_named_ref(
     }
 }
 
+pub(crate) fn api_namespace_alias(namespace: &Namespace) -> String {
+    format!("api_{}", &namespace_alias(namespace)["types_".len()..])
+}
+
 pub(crate) fn typescript_error_ref(
     identity: Option<&rspyts::ir::DefinitionId>,
     context: &TypeScriptContext<'_>,
@@ -122,7 +126,7 @@ pub(crate) fn typescript_error_ref(
     } else {
         Ok(format!(
             "{}.{}",
-            namespace_alias(&namespace),
+            api_namespace_alias(&namespace),
             definition.name
         ))
     }
@@ -148,12 +152,22 @@ pub(crate) fn namespace_alias(namespace: &Namespace) -> String {
     format!("types_{suffix}")
 }
 
-pub(crate) fn typescript_import(package: &str, namespace: &Namespace) -> String {
-    let segments = namespace.typescript_segments();
-    if segments.is_empty() {
-        package.to_owned()
+pub(crate) fn typescript_namespace_path(from: &Namespace, to: &Namespace, leaf: &str) -> String {
+    let from = from.typescript_segments();
+    let to = to.typescript_segments();
+    let shared = from
+        .iter()
+        .zip(&to)
+        .take_while(|(left, right)| left == right)
+        .count();
+    let mut parts = vec!["..".to_owned(); from.len().saturating_sub(shared)];
+    parts.extend(to.into_iter().skip(shared));
+    parts.push(leaf.to_owned());
+    let path = parts.join("/");
+    if path.starts_with('.') {
+        path
     } else {
-        format!("{package}/{}", segments.join("/"))
+        format!("./{path}")
     }
 }
 
@@ -163,15 +177,6 @@ pub(crate) fn typescript_runtime_path(namespace: &Namespace) -> String {
         "./runtime.js".to_owned()
     } else {
         format!("{}runtime.js", "../".repeat(depth))
-    }
-}
-
-pub(crate) fn typescript_values_path(namespace: &Namespace) -> String {
-    let depth = namespace.typescript_segments().len();
-    if depth == 0 {
-        "./values.js".to_owned()
-    } else {
-        format!("{}values.js", "../".repeat(depth))
     }
 }
 

@@ -1,0 +1,93 @@
+# RSPYTS application configuration and generated-file ownership.
+# Edit [application]. RSPYTS updates only the [generated] tables.
+
+[application]
+# Manifests and root entrypoints are user-owned; update them with any override.
+
+# Override the public application name.
+# Defaults to the adjacent Cargo package name.
+name = "example"
+
+# Link additional Cargo workspace packages into the application.
+# The adjacent Cargo package is always linked automatically.
+# additional_packages = ["my-shared-api"]
+
+# Override the Python import package.
+# Defaults to the application name with hyphens replaced by underscores.
+# python_package = "my_application"
+
+# Override the npm package name.
+# Defaults to the application name and must match src-ts/package.json.
+# typescript_package = "my-application"
+
+# Generate src-py/.gitignore and src-ts/.gitignore for RSPYTS-owned files.
+# Defaults to true. Set this to false to allow generated files to be committed.
+# gitignore = false
+
+[generated]
+# Fingerprint of the Rust/Cargo sources and active [application] settings.
+source_fingerprint = "182b415b1ae1a627e068caa66503a7ed"
+
+[generated.python]
+# Python files owned by RSPYTS and safe to overwrite or remove.
+files = [
+    "src-py/.gitignore",
+    "src-py/example/api.py",
+    "src-py/example/dice/__init__.py",
+    "src-py/example/dice/api.py",
+    "src-py/example/dice/fair/__init__.py",
+    "src-py/example/dice/fair/api.py",
+    "src-py/example/dice/fair/models.py",
+    "src-py/example/dice/fair/roll/__init__.py",
+    "src-py/example/dice/fair/roll/api.py",
+    "src-py/example/dice/fair/roll/models.py",
+    "src-py/example/dice/loaded/__init__.py",
+    "src-py/example/dice/loaded/api.py",
+    "src-py/example/dice/loaded/models.py",
+    "src-py/example/dice/loaded/roll/__init__.py",
+    "src-py/example/dice/loaded/roll/api.py",
+    "src-py/example/dice/loaded/roll/models.py",
+    "src-py/example/dice/models.py",
+    "src-py/example/dice/summary/__init__.py",
+    "src-py/example/dice/summary/api.py",
+    "src-py/example/dice/summary/models.py",
+    "src-py/example/models.py",
+    "src-py/example/py.typed",
+    "src-py/example/runtime.py",
+]
+
+# Extension-module basenames; the platform supplies .so or .pyd.
+native_modules = [
+    "src-py/example/native",
+]
+
+[generated.typescript]
+# TypeScript, wasm-bindgen declarations/JavaScript, and Wasm files owned by RSPYTS.
+files = [
+    "src-ts/.gitignore",
+    "src-ts/example/api.ts",
+    "src-ts/example/dice/api.ts",
+    "src-ts/example/dice/fair/api.ts",
+    "src-ts/example/dice/fair/index.ts",
+    "src-ts/example/dice/fair/models.ts",
+    "src-ts/example/dice/fair/roll/api.ts",
+    "src-ts/example/dice/fair/roll/index.ts",
+    "src-ts/example/dice/fair/roll/models.ts",
+    "src-ts/example/dice/index.ts",
+    "src-ts/example/dice/loaded/api.ts",
+    "src-ts/example/dice/loaded/index.ts",
+    "src-ts/example/dice/loaded/models.ts",
+    "src-ts/example/dice/loaded/roll/api.ts",
+    "src-ts/example/dice/loaded/roll/index.ts",
+    "src-ts/example/dice/loaded/roll/models.ts",
+    "src-ts/example/dice/models.ts",
+    "src-ts/example/dice/summary/api.ts",
+    "src-ts/example/dice/summary/index.ts",
+    "src-ts/example/dice/summary/models.ts",
+    "src-ts/example/models.ts",
+    "src-ts/example/native.d.ts",
+    "src-ts/example/native.js",
+    "src-ts/example/native_bg.wasm",
+    "src-ts/example/native_bg.wasm.d.ts",
+    "src-ts/example/runtime.ts",
+]

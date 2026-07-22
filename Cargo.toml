@@ -4,7 +4,6 @@ members = [
     "crates/rspyts",
     "crates/rspyts-macros",
     "crates/rspyts-cli",
-    "example/crates/bindings",
     "example/crates/dice",
 ]
 default-members = [
@@ -14,15 +13,15 @@ default-members = [
 ]
 
 [workspace.package]
-version = "1.0.5"
+version = "2.0.0"
 edition = "2024"
 rust-version = "1.88"
 license = "MIT"
 repository = "https://github.com/2xf-org/rspyts"
 
 [workspace.dependencies]
-rspyts = { version = "1", path = "crates/rspyts" }
-rspyts-macros = { version = "=1.0.5", path = "crates/rspyts-macros" }
+rspyts = { version = "2", path = "crates/rspyts" }
+rspyts-macros = { version = "=2.0.0", path = "crates/rspyts-macros" }
 
 anyhow = "1.0"
 chrono = { version = "0.4", default-features = false, features = ["serde"] }
@@ -41,6 +40,8 @@ serde-wasm-bindgen = "0.6.5"
 syn = { version = "2.0", features = ["full"] }
 thiserror = "2.0"
 tempfile = "3.27"
+toml = "0.8"
+toml_edit = { version = "0.22", features = ["serde"] }
 wasm-bindgen = "=0.2.126"
 wasm-bindgen-cli-support = "=0.2.126"
 

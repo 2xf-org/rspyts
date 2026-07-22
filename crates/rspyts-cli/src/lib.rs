@@ -12,6 +12,7 @@ use clap::Parser;
 
 mod cli;
 mod commands;
+mod config;
 mod contract;
 mod init;
 mod output;

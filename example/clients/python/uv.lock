@@ -27,8 +27,8 @@ wheels = [
 
 [[package]]
 name = "example"
-version = "1.0.5"
-source = { directory = "../../crates/bindings/dist/python" }
+version = "2.0.0"
+source = { directory = "../../crates/dice/src-py" }
 dependencies = [
     { name = "numpy", version = "2.4.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.12'" },
     { name = "numpy", version = "2.5.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12'" },
@@ -57,7 +57,7 @@ dev = [
 ]
 
 [package.metadata]
-requires-dist = [{ name = "example", directory = "../../crates/bindings/dist/python" }]
+requires-dist = [{ name = "example", directory = "../../crates/dice/src-py" }]
 
 [package.metadata.requires-dev]
 dev = [
