@@ -74,9 +74,9 @@ cargo run -p rspyts-cli -- build
 ```
 
 The build creates the generated Python and TypeScript packages in
-`example/crates/bindings/dist`. Git stores this generated snapshot, including
-the native Python extension and the WebAssembly binary. Run the build again to
-replace the snapshot with binaries for your operating system.
+`example/crates/bindings/dist`. Git stores the portable generated snapshot,
+including the WebAssembly binary, but not the platform-specific Python native
+extension. Run the build before using either client.
 
 Then run the authored clients:
 
@@ -85,7 +85,7 @@ uv run --project example/clients/python pytest -q example/clients/python/tests
 npm --prefix example/clients/typescript ci
 npm --prefix example/clients/typescript run check
 npm --prefix example/clients/typescript run build
-npm --prefix example/clients/typescript run start
+npm --prefix example/clients/typescript run test:integration
 ```
 
 These client commands use `uv`, Python, Node.js, and npm. They are example

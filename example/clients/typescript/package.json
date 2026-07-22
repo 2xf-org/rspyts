@@ -5,7 +5,7 @@
   "scripts": {
     "build": "tsc",
     "check": "tsc --noEmit",
-    "start": "node build/index.js"
+    "test:integration": "node build/index.js"
   },
   "dependencies": {
     "example": "file:../../crates/bindings/dist/typescript"

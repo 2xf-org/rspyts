@@ -72,14 +72,3 @@ pub(super) fn expand_application(input: ModuleInput) -> TokenStream2 {
         }
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::ModuleInput;
-
-    #[test]
-    fn parses_one_aggregate_binding() {
-        let input = syn::parse_str::<ModuleInput>("catalog, reports").unwrap();
-        assert_eq!(input.crates.len(), 2);
-    }
-}

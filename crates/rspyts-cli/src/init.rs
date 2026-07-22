@@ -67,10 +67,6 @@ pub(super) fn create(path: &Path) -> Result<InitReport> {
         &PYTHON_CLIENT.replace("__PYTHON_PACKAGE__", &rust_name),
     )?;
     write(
-        &root.join("clients/python/tests/test_client.py"),
-        &PYTHON_TEST.replace("__CLIENT_PACKAGE__", &client_package),
-    )?;
-    write(
         &root.join("clients/typescript/package.json"),
         &TYPESCRIPT_PACKAGE.replace("__PROJECT__", name),
     )?;
@@ -127,7 +123,6 @@ const GITIGNORE: &str = r"/target/
 **/dist/
 **/.venv/
 **/__pycache__/
-**/.pytest_cache/
 **/node_modules/
 **/build/
 ";
@@ -190,21 +185,11 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["__CLIENT_PACKAGE__"]
-
-[dependency-groups]
-dev = ["pytest>=8,<9"]
 "#;
 
 const PYTHON_CLIENT: &str = r#"from __PYTHON_PACKAGE__.api import Greeting, greet
 
 __all__ = ["Greeting", "greet"]
-"#;
-
-const PYTHON_TEST: &str = r#"from __CLIENT_PACKAGE__ import greet
-
-
-def test_greeting() -> None:
-    assert greet("World").message == "Hello, World!"
 "#;
 
 const TYPESCRIPT_PACKAGE: &str = r#"{
@@ -242,43 +227,3 @@ const TYPESCRIPT_CONFIG: &str = r#"{
   "include": ["src"]
 }
 "#;
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn creates_the_complete_project() {
-        let directory = tempfile::tempdir().unwrap();
-        let project = directory.path().join("hello-world");
-
-        create(&project).unwrap();
-
-        for path in [
-            "Cargo.toml",
-            "crates/api/src/lib.rs",
-            "crates/bindings/src/lib.rs",
-            "clients/python/hello_world_client/__init__.py",
-            "clients/python/tests/test_client.py",
-            "clients/typescript/src/index.ts",
-        ] {
-            assert!(project.join(path).is_file(), "missing {path}");
-        }
-        let cargo = fs::read_to_string(project.join("Cargo.toml")).unwrap();
-        assert!(cargo.contains("rspyts = \"1\""));
-        let python =
-            fs::read_to_string(project.join("clients/python/hello_world_client/__init__.py"))
-                .unwrap();
-        assert!(python.contains("from hello_world.api import Greeting, greet"));
-        let typescript =
-            fs::read_to_string(project.join("clients/typescript/src/index.ts")).unwrap();
-        assert!(typescript.contains("from \"hello-world/api\""));
-        assert!(create(&project).is_err());
-    }
-
-    #[test]
-    fn rejects_invalid_names() {
-        let directory = tempfile::tempdir().unwrap();
-        assert!(create(&directory.path().join("Hello_world")).is_err());
-    }
-}

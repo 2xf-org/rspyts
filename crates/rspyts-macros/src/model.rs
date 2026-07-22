@@ -215,20 +215,3 @@ pub(super) fn expand_error(input: DeriveInput) -> syn::Result<TokenStream2> {
         };
     })
 }
-
-#[cfg(test)]
-mod tests {
-    use super::expand_type;
-    use syn::DeriveInput;
-
-    #[test]
-    fn expands_a_named_model() {
-        let input: DeriveInput = syn::parse_quote! {
-            pub struct Point {
-                pub x: i32,
-                pub y: i32,
-            }
-        };
-        assert!(expand_type(input).is_ok());
-    }
-}

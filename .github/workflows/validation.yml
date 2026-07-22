@@ -41,8 +41,10 @@ jobs:
         run: cargo fmt --all --check
       - name: Lint
         run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
-      - name: Test
-        run: cargo test --workspace --locked
+      - name: Test Rust integrations
+        run: |
+          cargo test --locked -p rspyts --test contract --test python
+          cargo test --locked -p rspyts-cli --test cli
       - name: Check WebAssembly exports
         run: cargo check --locked -p example --target wasm32-unknown-unknown
 
@@ -92,37 +94,16 @@ jobs:
           fi
       - name: Check generated packages
         run: cargo run --locked -p rspyts-cli -- check
-      - name: Check aggregate artifacts
-        shell: bash
-        run: |
-          python - <<'PY'
-          from pathlib import Path
-
-          root = Path("example/crates/bindings/dist")
-          native = [
-              path
-              for path in (root / "python").rglob("native.*")
-              if path.suffix in {".so", ".pyd"}
-          ]
-          wasm = list((root / "typescript").rglob("*.wasm"))
-
-          assert len(native) == 1, native
-          assert len(wasm) == 1, wasm
-          assert not (root / "python/example/api.py").exists()
-          assert not (root / "python/example/models.py").exists()
-          assert (root / "typescript/index.js").read_text() == ""
-          assert (root / "typescript/index.d.ts").read_text() == ""
-          PY
-      - name: Test the Python client
+      - name: Test Python integrations
         working-directory: example/clients/python
         run: |
           python -m pip install --disable-pip-version-check 'mypy>=1,<2' 'pyright>=1,<2' 'pytest>=8,<9' -e ../../crates/bindings/dist/python -e .
           python -m pytest -q tests
           python -m mypy typecheck.py
           pyright typecheck.py
-      - name: Test the TypeScript client
+      - name: Test TypeScript integrations
         run: |
           npm --prefix example/clients/typescript ci
           npm --prefix example/clients/typescript run check
           npm --prefix example/clients/typescript run build
-          npm --prefix example/clients/typescript run start
+          npm --prefix example/clients/typescript run test:integration

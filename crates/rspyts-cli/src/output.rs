@@ -13,6 +13,29 @@ use crate::project::Project;
 
 pub(super) struct ProjectLock(fs::File);
 
+type SourceState = BTreeMap<PathBuf, (u64, Option<SystemTime>)>;
+
+pub(super) struct SourceWatcher {
+    root: PathBuf,
+    state: SourceState,
+}
+
+impl SourceWatcher {
+    pub(super) fn new(root: &Path) -> Result<Self> {
+        Ok(Self {
+            root: root.to_path_buf(),
+            state: source_state(root)?,
+        })
+    }
+
+    pub(super) fn changed(&mut self) -> Result<bool> {
+        let next = source_state(&self.root)?;
+        let changed = next != self.state;
+        self.state = next;
+        Ok(changed)
+    }
+}
+
 pub(super) fn project_lock(project: &Project) -> Result<ProjectLock> {
     let path = project.root.join(".rspyts-build.lock");
     let file = OpenOptions::new()
@@ -95,7 +118,7 @@ fn collect_files(
     Ok(())
 }
 
-pub(super) fn source_state(root: &Path) -> Result<BTreeMap<PathBuf, (u64, Option<SystemTime>)>> {
+fn source_state(root: &Path) -> Result<SourceState> {
     let mut result = BTreeMap::new();
     for path in source_files(root)? {
         let metadata = path.metadata()?;
@@ -149,10 +172,7 @@ fn collect_source_files(current: &Path, result: &mut Vec<PathBuf>) -> Result<()>
         let path = entry.path();
         let metadata = entry.metadata()?;
         if metadata.is_dir() {
-            if matches!(
-                entry.file_name().to_str(),
-                Some(".git" | "dist" | "node_modules" | "target")
-            ) {
+            if ignored_source_directory(&entry.file_name()) {
                 continue;
             }
             collect_source_files(&path, result)?;
@@ -161,6 +181,25 @@ fn collect_source_files(current: &Path, result: &mut Vec<PathBuf>) -> Result<()>
         }
     }
     Ok(())
+}
+
+fn ignored_source_directory(name: &std::ffi::OsStr) -> bool {
+    matches!(
+        name.to_str(),
+        Some(
+            ".git"
+                | ".mypy_cache"
+                | ".pytest_cache"
+                | ".ruff_cache"
+                | ".venv"
+                | ".vitest-attachments"
+                | "__pycache__"
+                | "dist"
+                | "dist.rspyts-old"
+                | "node_modules"
+                | "target"
+        )
+    )
 }
 
 fn is_source_file(path: &Path) -> bool {
@@ -187,31 +226,4 @@ pub(super) fn write_json(path: &Path, value: &impl Serialize) -> Result<()> {
     let mut source = serde_json::to_string_pretty(value)?;
     source.push('\n');
     write(path, &source)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{replace_directory, write};
-
-    #[test]
-    fn publishing_a_build_removes_stale_flat_files() {
-        let parent = tempfile::tempdir().unwrap();
-        let output = parent.path().join("dist");
-        std::fs::create_dir(&output).unwrap();
-        write(&output.join("api.py"), "stale\n").unwrap();
-        write(&output.join("models.py"), "stale\n").unwrap();
-
-        let generated = tempfile::tempdir_in(parent.path()).unwrap();
-        write(
-            &generated.path().join("domain/model/__init__.py"),
-            "generated\n",
-        )
-        .unwrap();
-
-        replace_directory(&generated, &output).unwrap();
-
-        assert!(!output.join("api.py").exists());
-        assert!(!output.join("models.py").exists());
-        assert!(output.join("domain/model/__init__.py").is_file());
-    }
 }

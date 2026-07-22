@@ -194,4 +194,10 @@ clients for Python and TypeScript. It shows module paths with more than three
 levels and repeated model names. It also sends a type across a module
 boundary.
 
+## Development
+
+The repository uses integration tests at public Rust, CLI, Python, and
+TypeScript boundaries. See [`TESTING.md`](TESTING.md) for the test layout and
+commands.
+
 Licensed under [MIT](LICENSE).

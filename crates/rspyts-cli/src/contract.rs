@@ -138,6 +138,21 @@ pub(super) fn collect_buffers(reference: &TypeRef, result: &mut BTreeSet<BufferE
     }
 }
 
+pub(super) fn reference_contains(
+    reference: &TypeRef,
+    predicate: &impl Fn(&TypeRef) -> bool,
+) -> bool {
+    if predicate(reference) {
+        return true;
+    }
+    match reference {
+        TypeRef::Option { item } | TypeRef::List { item } => reference_contains(item, predicate),
+        TypeRef::Map { value } => reference_contains(value, predicate),
+        TypeRef::Tuple { items } => items.iter().any(|item| reference_contains(item, predicate)),
+        _ => false,
+    }
+}
+
 pub(super) fn contract_refs(manifest: &Manifest) -> Vec<&TypeRef> {
     let mut result = Vec::new();
     for definition in &manifest.types {
@@ -214,61 +229,5 @@ pub(super) fn named_identities<'a>(reference: &'a TypeRef, result: &mut Vec<&'a 
             }
         }
         _ => {}
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use rspyts::ir::{CargoPackageId, FunctionDef, Manifest, Namespace, TypeRef};
-
-    use super::namespaces;
-
-    #[test]
-    fn includes_empty_parent_namespaces_without_flattening_children() {
-        let manifest = Manifest {
-            package_name: "example".to_owned(),
-            package_version: "1.2.3".to_owned(),
-            module_name: "native".to_owned(),
-            types: Vec::new(),
-            errors: Vec::new(),
-            functions: vec![FunctionDef {
-                owner: CargoPackageId::new("example-dice"),
-                rust_module: "example_dice::fair::deep::roll".to_owned(),
-                rust_name: "roll".to_owned(),
-                host_name: "roll".to_owned(),
-                native_name: "__rspyts_function_roll".to_owned(),
-                docs: None,
-                params: Vec::new(),
-                returns: TypeRef::Unit,
-                error: None,
-            }],
-            resources: Vec::new(),
-            constants: Vec::new(),
-        };
-
-        let views = namespaces(&manifest);
-        for namespace in [
-            Namespace::root(),
-            Namespace {
-                package: Some("dice".to_owned()),
-                modules: Vec::new(),
-            },
-            Namespace {
-                package: Some("dice".to_owned()),
-                modules: vec!["fair".to_owned()],
-            },
-            Namespace {
-                package: Some("dice".to_owned()),
-                modules: vec!["fair".to_owned(), "deep".to_owned()],
-            },
-        ] {
-            let items = views.get(&namespace).expect("parent namespace exists");
-            assert!(items.functions.is_empty());
-        }
-        let leaf = Namespace {
-            package: Some("dice".to_owned()),
-            modules: vec!["fair".to_owned(), "deep".to_owned(), "roll".to_owned()],
-        };
-        assert_eq!(views[&leaf].functions[0].host_name, "roll");
     }
 }

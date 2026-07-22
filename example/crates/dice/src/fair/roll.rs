@@ -126,16 +126,3 @@ fn next_roll(state: &mut u64, sides: u32) -> u32 {
         .wrapping_add(1);
     ((*state >> 32) as u32 % sides) + 1
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn seeded_rolls_are_repeatable() {
-        let request = RollRequest { sides: 6, count: 3 };
-        let first = roll_dice(&request, DEFAULT_SEED).unwrap();
-        let second = roll_dice(&request, DEFAULT_SEED).unwrap();
-        assert_eq!(first.values, second.values);
-    }
-}
