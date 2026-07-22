@@ -425,8 +425,14 @@ fn validate_contract(project: &Project, manifest: &Manifest) -> Result<()> {
     {
         bail!("the discovered package does not match Cargo metadata");
     }
-    if manifest.module_name.is_empty() {
-        bail!("the Python module name cannot be empty");
+    if !is_python_identifier(&manifest.module_name)
+        || matches!(manifest.module_name.as_str(), "api" | "models" | "runtime")
+        || (manifest.module_name.starts_with("__") && manifest.module_name.ends_with("__"))
+    {
+        bail!(
+            "Python native module name `{}` is invalid or reserved for generated package loading",
+            manifest.module_name
+        );
     }
     validate_namespaces(manifest)?;
     validate_model_namespace_cycles(manifest)?;
@@ -503,6 +509,22 @@ fn validate_namespaces(manifest: &Manifest) -> Result<()> {
         for reference in namespace_refs(&items) {
             crate::contract::collect_buffers(reference, &mut buffers);
         }
+        let has_models = !items.types.is_empty() || !buffers.is_empty();
+        let has_api = !items.errors.is_empty()
+            || !items.functions.is_empty()
+            || !items.resources.is_empty()
+            || !items.constants.is_empty();
+        if let Some(name) = child_package_names.iter().find(|name| {
+            (**name == "models" && has_models)
+                || (**name == "api" && has_api)
+                || (namespace == Namespace::root()
+                    && (**name == "runtime" || **name == manifest.module_name.as_str()))
+        }) {
+            bail!(
+                "Python namespace segment `{name}` conflicts with a generated module in namespace `{}`",
+                display_namespace(&namespace)
+            );
+        }
         python_names.extend(
             buffers
                 .into_iter()
@@ -513,6 +535,7 @@ fn validate_namespaces(manifest: &Manifest) -> Result<()> {
                 name.as_str(),
                 "__all__" | "__dir__" | "__getattr__" | "api" | "models"
             ) || name.starts_with("_rspyts_models_")
+                || (name.starts_with("__") && name.ends_with("__"))
                 || (namespace == Namespace::root()
                     && (name.as_str() == "runtime"
                         || name.as_str() == manifest.module_name.as_str()))
@@ -788,7 +811,8 @@ mod tests {
     use std::path::PathBuf;
 
     use rspyts::ir::{
-        CargoPackageId, ErrorDef, FieldConstraints, FieldDef, Manifest, TypeDef, TypeRef, TypeShape,
+        CargoPackageId, ErrorDef, FieldConstraints, FieldDef, FunctionDef, Manifest, TypeDef,
+        TypeRef, TypeShape,
     };
 
     use super::{validate_generated_files, validate_model_namespace_cycles, validate_namespaces};
@@ -828,6 +852,20 @@ mod tests {
             functions: Vec::new(),
             resources: Vec::new(),
             constants: Vec::new(),
+        }
+    }
+
+    fn function(owner: &str, module: &str, name: &str) -> FunctionDef {
+        FunctionDef {
+            owner: CargoPackageId::new(owner),
+            rust_module: module.to_owned(),
+            rust_name: name.to_owned(),
+            host_name: name.to_owned(),
+            native_name: format!("__rspyts_function_{name}"),
+            docs: None,
+            params: Vec::new(),
+            returns: TypeRef::Unit,
+            error: None,
         }
     }
 
@@ -974,7 +1012,13 @@ mod tests {
 
     #[test]
     fn rejects_names_reserved_for_generated_python_package_loading() {
-        for name in ["__getattr__", "_rspyts_models_0", "api", "models"] {
+        for name in [
+            "__getattr__",
+            "__path__",
+            "_rspyts_models_0",
+            "api",
+            "models",
+        ] {
             let item = model("app-domain", "app_domain::shared", name, Vec::new());
             let error = validate_namespaces(&manifest(vec![item])).unwrap_err();
 
@@ -1012,6 +1056,41 @@ mod tests {
             error.to_string(),
             "Python export name `child` is reserved for generated package loading in namespace `<root>`"
         );
+    }
+
+    #[test]
+    fn rejects_child_packages_that_shadow_generated_namespace_modules() {
+        let root = model("app", "app", "Root", Vec::new());
+        let models_child = model("app", "app::models", "Value", Vec::new());
+        let error = validate_namespaces(&manifest(vec![root, models_child])).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "Python namespace segment `models` conflicts with a generated module in namespace `<root>`"
+        );
+
+        let api_child = model("app", "app::api", "Value", Vec::new());
+        let mut contract = manifest(vec![api_child]);
+        contract.functions.push(function("app", "app", "ping"));
+        let error = validate_namespaces(&contract).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "Python namespace segment `api` conflicts with a generated module in namespace `<root>`"
+        );
+    }
+
+    #[test]
+    fn rejects_root_children_that_shadow_runtime_modules() {
+        for name in ["runtime", "native"] {
+            let child = model("app", &format!("app::{name}"), "Value", Vec::new());
+            let error = validate_namespaces(&manifest(vec![child])).unwrap_err();
+
+            assert_eq!(
+                error.to_string(),
+                format!(
+                    "Python namespace segment `{name}` conflicts with a generated module in namespace `<root>`"
+                )
+            );
+        }
     }
 
     #[test]
