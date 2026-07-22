@@ -29,14 +29,14 @@ rustup target add wasm32-unknown-unknown
 ## Usage
 
 ```console
-rspyts init dice --version 0.1.0 && cd dice
+rspyts init example --version 0.1.0 && cd example
 rspyts build
 ```
 
 `init` creates a working Rust `greet` example and gives Cargo, Python, and npm the same version. `build` compiles it for Python and WebAssembly, then writes the generated package files beside the Rust source.
 
 ```text
-dice/
+example/
 ├── .gitignore
 ├── Cargo.toml
 ├── rspyts.toml
@@ -45,7 +45,7 @@ dice/
 ├── src-py/
 │   ├── .gitignore
 │   ├── pyproject.toml
-│   └── dice/
+│   └── example/
 │       ├── __init__.py
 │       ├── api.py
 │       ├── models.py
@@ -58,7 +58,7 @@ dice/
     ├── .gitignore
     ├── package.json
     ├── tsconfig.json
-    ├── dice/
+    ├── example/
     │   ├── index.ts
     │   ├── api.ts
     │   ├── models.ts
@@ -67,7 +67,7 @@ dice/
     │       ├── native.js
     │       └── native.d.ts
     └── build/
-        └── dice/
+        └── example/
             └── native/
                 └── native_bg.wasm
 ```
@@ -78,21 +78,21 @@ rspyts replaces only the paths recorded in `rspyts.toml`. Generated text files c
 
 #### Python
 
-Python models use Pydantic, and exported Rust functions call the compiled extension in `dice/native`. The source project uses only `pyproject.toml`; its build backend packages the existing native artifact without compiling or copying it. Numeric `buffer` boundaries use NumPy arrays, while ordinary `Vec<T>` values become Python lists.
+Python models use Pydantic, and exported Rust functions call the compiled extension in `example/native`. The source project uses only `pyproject.toml`; its build backend packages the existing native artifact without compiling or copying it. Numeric `buffer` boundaries use NumPy arrays, while ordinary `Vec<T>` values become Python lists.
 
 ```console
 python -m pip install ./src-py
 ```
 
 ```python
-from dice import greet
+from example import greet
 
 print(greet("Ada").message)
 ```
 
 #### TypeScript
 
-The TypeScript package contains strict ESM source and declarations. Rust is compiled to WebAssembly (Wasm), which rspyts writes directly to `src-ts/build/dice/native`; the generated `native.js` loads it and converts values at the boundary. The package has no runtime npm dependencies, and `npm run build` only runs the TypeScript compiler.
+The TypeScript package contains strict ESM source and declarations. Rust is compiled to WebAssembly (Wasm), which rspyts writes directly to `src-ts/build/example/native`; the generated `native.js` loads it and converts values at the boundary. The package has no runtime npm dependencies, and `npm run build` only runs the TypeScript compiler.
 
 ```console
 npm --prefix src-ts install
@@ -102,23 +102,23 @@ npm --prefix src-ts run build
 Install the built source project from your client:
 
 ```console
-npm install ../dice/src-ts
+npm install ../example/src-ts
 ```
 
 Then import the package by name:
 
 ```typescript
-import { greet } from "dice";
+import { greet } from "example";
 
 console.log(greet("Ada").message);
 ```
 
 ### Custom Code
 
-Add Python files inside `src-py/dice` and TypeScript files inside `src-ts/dice`. rspyts preserves any file that is not listed under `[generated.python]` or `[generated.typescript]`.
+Add Python files inside `src-py/example` and TypeScript files inside `src-ts/example`. rspyts preserves any file that is not listed under `[generated.python]` or `[generated.typescript]`.
 
 ```python
-# src-py/dice/convenience/__init__.py
+# src-py/example/convenience/__init__.py
 from ..models import Greeting
 
 
@@ -127,7 +127,7 @@ def shout(greeting: Greeting) -> str:
 ```
 
 ```typescript
-// src-ts/dice/convenience/index.ts
+// src-ts/example/convenience/index.ts
 import type { Greeting } from "../models.js";
 
 export function shout(greeting: Greeting): string {
@@ -135,7 +135,7 @@ export function shout(greeting: Greeting): string {
 }
 ```
 
-Import them directly with `from dice.convenience import shout` and `import { shout } from "dice/convenience"`, or edit the user-owned `dice/__init__.py` and `dice/index.ts` entrypoints to re-export them.
+Import them directly with `from example.convenience import shout` and `import { shout } from "example/convenience"`, or edit the user-owned `example/__init__.py` and `example/index.ts` entrypoints to re-export them.
 
 ### Config
 
@@ -147,19 +147,19 @@ Import them directly with `from dice.convenience import shout` and `import { sho
 [application]
 # Override the public application name.
 # Defaults to the adjacent Cargo package name.
-# name = "dice"
+# name = "example"
 
 # Link other library packages from the same Cargo workspace.
 # The adjacent package is always linked.
-# additional_packages = ["dice-models"]
+# additional_packages = ["example-models"]
 
 # Override the Python import package.
 # Defaults to the application name with each `-` changed to `_`.
-# python_package = "dice"
+# python_package = "example"
 
 # Override the npm package name.
 # Defaults to the application name and must match src-ts/package.json.
-# typescript_package = "dice"
+# typescript_package = "example"
 
 # Generate src-py/.gitignore and src-ts/.gitignore for generated files.
 # Defaults to true. Set false to commit generated files.
@@ -173,25 +173,25 @@ source_fingerprint = "..."
 # Python files rspyts may overwrite or remove.
 files = [
     "src-py/.gitignore",
-    "src-py/dice/api.py",
-    "src-py/dice/models.py",
-    "src-py/dice/native/__init__.py",
-    "src-py/dice/py.typed",
-    "src-py/dice/runtime.py",
+    "src-py/example/api.py",
+    "src-py/example/models.py",
+    "src-py/example/native/__init__.py",
+    "src-py/example/py.typed",
+    "src-py/example/runtime.py",
 ]
 
 # Extension basename; the platform supplies .abi3.so or .pyd.
-native_modules = ["src-py/dice/native/native"]
+native_modules = ["src-py/example/native/native"]
 
 [generated.typescript]
 # TypeScript, wasm-bindgen, and Wasm files rspyts may overwrite or remove.
 files = [
     "src-ts/.gitignore",
-    "src-ts/build/dice/native/native_bg.wasm",
-    "src-ts/dice/api.ts",
-    "src-ts/dice/models.ts",
-    "src-ts/dice/native/native.d.ts",
-    "src-ts/dice/native/native.js",
-    "src-ts/dice/runtime.ts",
+    "src-ts/build/example/native/native_bg.wasm",
+    "src-ts/example/api.ts",
+    "src-ts/example/models.ts",
+    "src-ts/example/native/native.d.ts",
+    "src-ts/example/native/native.js",
+    "src-ts/example/runtime.ts",
 ]
 ```
