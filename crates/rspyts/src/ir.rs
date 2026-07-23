@@ -1,4 +1,9 @@
-//! The small description that the generators read.
+//! Stable, host-neutral contract consumed by the package generators.
+//!
+//! The IR contains only information required to validate and render public
+//! Python and TypeScript APIs. It intentionally excludes generator state and
+//! backend-specific syntax. All collections are sorted before publication so
+//! serialized contracts and generated packages remain deterministic.
 
 use std::collections::BTreeSet;
 use std::fmt;
@@ -10,13 +15,21 @@ use serde_json::Value;
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Manifest {
+    /// Cargo package that owns the application entry point.
     pub package_name: String,
+    /// Version shared by the Cargo, Python, and npm packages.
     pub package_version: String,
+    /// Basename of the native Python and WebAssembly bridge module.
     pub module_name: String,
+    /// Linked model declarations.
     pub types: Vec<TypeDef>,
+    /// Linked typed-error declarations.
     pub errors: Vec<ErrorDef>,
+    /// Linked free functions.
     pub functions: Vec<FunctionDef>,
+    /// Linked stateful resources.
     pub resources: Vec<ResourceDef>,
+    /// Linked constants and statics.
     pub constants: Vec<ConstantDef>,
 }
 
@@ -59,7 +72,9 @@ impl Manifest {
 /// A generated namespace derived from one Cargo package and Rust module.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Namespace {
+    /// Cargo-derived package segment, omitted for the application package.
     pub package: Option<String>,
+    /// Rust module segments below the declaring crate root.
     pub modules: Vec<String>,
 }
 
@@ -111,9 +126,14 @@ impl Namespace {
 /// namespace inside one application.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
-pub struct CargoPackageId(pub String);
+pub struct CargoPackageId(
+    /// Cargo package name used as the ownership identity.
+    pub String,
+);
 
 impl CargoPackageId {
+    /// Create a package identity from a Cargo package name.
+    #[must_use]
     pub fn new(value: impl Into<String>) -> Self {
         Self(value.into())
     }
@@ -129,11 +149,15 @@ impl fmt::Display for CargoPackageId {
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct DefinitionId {
+    /// Cargo package that owns the definition.
     pub owner: CargoPackageId,
+    /// Stable Rust declaration identity, including its module path.
     pub id: String,
 }
 
 impl DefinitionId {
+    /// Create a definition identity from its owner and Rust declaration path.
+    #[must_use]
     pub fn new(owner: impl Into<String>, id: impl Into<String>) -> Self {
         Self {
             owner: CargoPackageId::new(owner),
@@ -152,36 +176,90 @@ impl fmt::Display for DefinitionId {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "camelCase", deny_unknown_fields)]
 pub enum TypeRef {
+    /// Rust's unit type, represented as null by host languages.
     Unit,
+    /// A Boolean value.
     Bool,
-    Int { signed: bool, bits: u16 },
-    Float { bits: u16 },
+    /// A fixed-width signed or unsigned integer.
+    Int {
+        /// Whether the integer is signed.
+        signed: bool,
+        /// Width in bits.
+        bits: u16,
+    },
+    /// An IEEE-754 floating-point value.
+    Float {
+        /// Width in bits.
+        bits: u16,
+    },
+    /// A UTF-8 string.
     String,
+    /// An RFC 3339 date-time value.
     DateTime,
+    /// An arbitrary JSON value.
     Json,
-    Option { item: Box<TypeRef> },
-    List { item: Box<TypeRef> },
-    Map { value: Box<TypeRef> },
-    Tuple { items: Vec<TypeRef> },
-    Named { identity: DefinitionId },
+    /// A nullable value.
+    Option {
+        /// Inner non-null value type.
+        item: Box<TypeRef>,
+    },
+    /// A variable-length sequence.
+    List {
+        /// Element type.
+        item: Box<TypeRef>,
+    },
+    /// A string-keyed map.
+    Map {
+        /// Mapped value type.
+        value: Box<TypeRef>,
+    },
+    /// A fixed-length heterogeneous sequence.
+    Tuple {
+        /// Element types in positional order.
+        items: Vec<TypeRef>,
+    },
+    /// A reference to a linked model declaration.
+    Named {
+        /// Identity of the referenced declaration.
+        identity: DefinitionId,
+    },
+    /// An owned or borrowed byte sequence using the direct binary ABI.
     Bytes,
-    FixedBytes { length: u64 },
-    Buffer { element: BufferElement },
+    /// A fixed-length byte sequence using the direct binary ABI.
+    FixedBytes {
+        /// Required byte length.
+        length: u64,
+    },
+    /// A contiguous numeric sequence using the direct typed-buffer ABI.
+    Buffer {
+        /// Primitive buffer element type.
+        element: BufferElement,
+    },
 }
 
 /// A supported element type for a contiguous numeric buffer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum BufferElement {
+    /// Unsigned 8-bit integer.
     U8,
+    /// Signed 8-bit integer.
     I8,
+    /// Unsigned 16-bit integer.
     U16,
+    /// Signed 16-bit integer.
     I16,
+    /// Unsigned 32-bit integer.
     U32,
+    /// Signed 32-bit integer.
     I32,
+    /// Unsigned 64-bit integer.
     U64,
+    /// Signed 64-bit integer.
     I64,
+    /// 32-bit floating-point value.
     F32,
+    /// 64-bit floating-point value.
     F64,
 }
 
@@ -189,15 +267,22 @@ pub enum BufferElement {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct TypeDef {
+    /// Cargo package that owns the type.
     pub owner: CargoPackageId,
+    /// Rust module where the type is declared.
     pub rust_module: String,
+    /// Stable Rust declaration identity.
     pub id: String,
+    /// Public host-language type name.
     pub name: String,
+    /// Normalized Rust documentation, when present.
     pub docs: Option<String>,
+    /// Serializable host-language representation.
     pub shape: TypeShape,
 }
 
 impl TypeDef {
+    /// Return this type's globally unique definition identity.
     #[must_use]
     pub fn identity(&self) -> DefinitionId {
         DefinitionId::new(self.owner.0.clone(), self.id.clone())
@@ -208,17 +293,26 @@ impl TypeDef {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "camelCase", deny_unknown_fields)]
 pub enum TypeShape {
+    /// An object with named fields.
     Struct {
+        /// Fields in Rust declaration order.
         fields: Vec<FieldDef>,
     },
+    /// An enum represented by string literals.
     StringEnum {
+        /// Variants in Rust declaration order.
         variants: Vec<EnumVariantDef>,
     },
+    /// A discriminated union represented by tagged objects.
     TaggedEnum {
+        /// Serialized discriminator field name.
         tag: String,
+        /// Variants in Rust declaration order.
         variants: Vec<EnumVariantDef>,
     },
+    /// A transparent named alias around another contract type.
     Alias {
+        /// Host representation wrapped by the alias.
         target: TypeRef,
     },
 }
@@ -227,12 +321,19 @@ pub enum TypeShape {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct FieldDef {
+    /// Original Rust field name.
     pub rust_name: String,
+    /// Serialized and host-visible field name.
     pub wire_name: String,
+    /// Normalized Rust documentation, when present.
     pub docs: Option<String>,
+    /// Host-neutral field type.
     pub ty: TypeRef,
+    /// Whether callers must supply the field.
     pub required: bool,
+    /// Host-side default for an omitted field.
     pub default: Option<ScalarValue>,
+    /// Host-side validation constraints.
     pub constraints: FieldConstraints,
 }
 
@@ -240,8 +341,11 @@ pub struct FieldDef {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum ScalarValue {
+    /// Boolean scalar.
     Bool(bool),
+    /// Signed integer scalar.
     I64(i64),
+    /// UTF-8 string scalar.
     String(String),
 }
 
@@ -249,10 +353,15 @@ pub enum ScalarValue {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct FieldConstraints {
+    /// Exact literal accepted by the field.
     pub literal: Option<ScalarValue>,
+    /// Inclusive minimum string or collection length.
     pub min_length: Option<u64>,
+    /// Inclusive maximum string or collection length.
     pub max_length: Option<u64>,
+    /// Inclusive numeric lower bound.
     pub ge: Option<i64>,
+    /// Inclusive numeric upper bound.
     pub le: Option<i64>,
 }
 
@@ -260,9 +369,13 @@ pub struct FieldConstraints {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct EnumVariantDef {
+    /// Original Rust variant name.
     pub rust_name: String,
+    /// Serialized variant name.
     pub wire_name: String,
+    /// Normalized Rust documentation, when present.
     pub docs: Option<String>,
+    /// Fields carried by a tagged variant; empty for string enums.
     pub fields: Vec<FieldDef>,
 }
 
@@ -270,14 +383,20 @@ pub struct EnumVariantDef {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ErrorDef {
+    /// Cargo package that owns the error.
     pub owner: CargoPackageId,
+    /// Rust module where the error is declared.
     pub rust_module: String,
+    /// Stable Rust declaration identity.
     pub id: String,
+    /// Public host-language error class name.
     pub name: String,
+    /// Normalized Rust documentation, when present.
     pub docs: Option<String>,
 }
 
 impl ErrorDef {
+    /// Return this error's globally unique definition identity.
     #[must_use]
     pub fn identity(&self) -> DefinitionId {
         DefinitionId::new(self.owner.0.clone(), self.id.clone())
@@ -288,15 +407,23 @@ impl ErrorDef {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct FunctionDef {
+    /// Cargo package that owns the function.
     pub owner: CargoPackageId,
+    /// Rust module where the function is declared.
     pub rust_module: String,
+    /// Original Rust function name.
     pub rust_name: String,
+    /// Public host-language function name.
     pub host_name: String,
     /// The globally unique name of the native bridge target.
     pub native_name: String,
+    /// Normalized Rust documentation, when present.
     pub docs: Option<String>,
+    /// Parameters in declaration order.
     pub params: Vec<ParamDef>,
+    /// Successful return type.
     pub returns: TypeRef,
+    /// Typed error returned by the function, when any.
     pub error: Option<DefinitionId>,
 }
 
@@ -304,8 +431,11 @@ pub struct FunctionDef {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ParamDef {
+    /// Original Rust parameter name.
     pub rust_name: String,
+    /// Public host-language parameter name.
     pub host_name: String,
+    /// Host-neutral parameter type.
     pub ty: TypeRef,
 }
 
@@ -313,13 +443,19 @@ pub struct ParamDef {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ResourceDef {
+    /// Cargo package that owns the resource.
     pub owner: CargoPackageId,
+    /// Rust module where the resource is declared.
     pub rust_module: String,
+    /// Public host-language resource class name.
     pub name: String,
     /// The globally unique name of the native bridge class.
     pub native_name: String,
+    /// Normalized Rust documentation, when present.
     pub docs: Option<String>,
+    /// Public constructors, including named factories.
     pub constructors: Vec<FunctionDef>,
+    /// Public instance methods.
     pub methods: Vec<MethodDef>,
 }
 
@@ -327,11 +463,17 @@ pub struct ResourceDef {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct MethodDef {
+    /// Original Rust method name.
     pub rust_name: String,
+    /// Public host-language method name.
     pub host_name: String,
+    /// Normalized Rust documentation, when present.
     pub docs: Option<String>,
+    /// Parameters following the receiver.
     pub params: Vec<ParamDef>,
+    /// Successful return type.
     pub returns: TypeRef,
+    /// Typed error returned by the method, when any.
     pub error: Option<DefinitionId>,
 }
 
@@ -339,10 +481,16 @@ pub struct MethodDef {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ConstantDef {
+    /// Cargo package that owns the constant.
     pub owner: CargoPackageId,
+    /// Rust module where the constant is declared.
     pub rust_module: String,
+    /// Public host-language constant name.
     pub host_name: String,
+    /// Normalized Rust documentation, when present.
     pub docs: Option<String>,
+    /// Host-neutral constant type.
     pub ty: TypeRef,
+    /// Serialized constant value.
     pub value: Value,
 }

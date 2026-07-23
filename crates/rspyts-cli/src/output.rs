@@ -1,3 +1,10 @@
+//! Generated-file ownership, transactional publication, and source watching.
+//!
+//! Publication is a three-phase operation: validate every destination, back up
+//! the complete affected set, then install and publish ownership. Any failure
+//! restores the prior state. Only paths recorded in `rspyts.toml` may be
+//! replaced or removed; every untracked path is treated as user-owned.
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 use std::fs::{self, OpenOptions};
@@ -10,10 +17,24 @@ use crate::project::Project;
 use anyhow::{Context, Result, bail};
 use fs4::FileExt;
 
+/// Exclusive process lock held for the duration of a build or check.
 pub(super) struct ProjectLock(fs::File);
 
-type SourceState = (BTreeMap<PathBuf, (u64, Option<SystemTime>)>, String);
+/// Observable Rust/Cargo inputs used by the polling watcher.
+#[derive(Eq, PartialEq)]
+struct SourceState {
+    files: BTreeMap<PathBuf, SourceFileState>,
+    application: String,
+}
 
+/// Metadata sufficient to detect an ordinary source-file update cheaply.
+#[derive(Eq, PartialEq)]
+struct SourceFileState {
+    length: u64,
+    modified: Option<SystemTime>,
+}
+
+/// Polling watcher for source metadata and active application settings.
 pub(super) struct SourceWatcher {
     root: PathBuf,
     config: PathBuf,
@@ -21,6 +42,7 @@ pub(super) struct SourceWatcher {
 }
 
 impl SourceWatcher {
+    /// Capture the initial state beneath a Cargo workspace root.
     pub(super) fn new(root: &Path, config: &Path) -> Result<Self> {
         Ok(Self {
             root: root.to_path_buf(),
@@ -29,6 +51,7 @@ impl SourceWatcher {
         })
     }
 
+    /// Refresh the snapshot and report whether any observed input changed.
     pub(super) fn changed(&mut self) -> Result<bool> {
         let next = source_state(&self.root, &self.config)?;
         let changed = next != self.state;
@@ -37,6 +60,7 @@ impl SourceWatcher {
     }
 }
 
+/// Acquire the application-wide build lock.
 pub(super) fn project_lock(project: &Project) -> Result<ProjectLock> {
     let path = project.root.join(".rspyts-build.lock");
     let file = OpenOptions::new()
@@ -56,12 +80,14 @@ impl Drop for ProjectLock {
     }
 }
 
+/// Read a generated tree into deterministic relative paths and file bytes.
 fn file_tree(root: &Path) -> Result<BTreeMap<PathBuf, Vec<u8>>> {
     let mut result = BTreeMap::new();
     collect_files(root, root, &mut result)?;
     Ok(result)
 }
 
+/// Generate language-specific ignore files from a temporary output tree.
 pub(super) fn write_generated_gitignores(root: &Path) -> Result<()> {
     let files = file_tree(root)?;
     for source_root in ["src-py", "src-ts"] {
@@ -88,6 +114,7 @@ pub(super) fn write_generated_gitignores(root: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Render a deterministic ignore file for rspyts-owned paths.
 pub(super) fn generated_gitignore(paths: &[String]) -> String {
     let mut paths = paths.iter().cloned().collect::<BTreeSet<_>>();
     paths.insert(".gitignore".to_owned());
@@ -100,12 +127,14 @@ pub(super) fn generated_gitignore(paths: &[String]) -> String {
     source
 }
 
+/// Validated publication plan derived from one temporary generated tree.
 struct GeneratedPlan {
     ownership: GeneratedState,
     files: BTreeMap<PathBuf, Vec<u8>>,
 }
 
 impl GeneratedPlan {
+    /// Read all outputs and derive the ownership state published with them.
     fn read(root: &Path, source_fingerprint: &str) -> Result<Self> {
         let files = file_tree(root)?;
         let mut python_files = BTreeSet::new();
@@ -156,6 +185,119 @@ impl GeneratedPlan {
     }
 }
 
+// Transactional publication ------------------------------------------------
+
+/// Filesystem transaction for replacing one complete generated state.
+struct PublicationTransaction<'a> {
+    generated: &'a Path,
+    project_root: &'a Path,
+    expected: BTreeSet<PathBuf>,
+    affected: BTreeSet<PathBuf>,
+    backup: tempfile::TempDir,
+    backed_up: Vec<PathBuf>,
+    installed: Vec<PathBuf>,
+    created_directories: Vec<PathBuf>,
+}
+
+impl<'a> PublicationTransaction<'a> {
+    /// Validate every destination and back up all existing affected files.
+    fn prepare(
+        generated: &'a Path,
+        project_root: &'a Path,
+        previous: &GeneratedState,
+        plan: &GeneratedPlan,
+    ) -> Result<Self> {
+        let previous = ownership_paths(previous)?;
+        let expected = plan.files.keys().cloned().collect::<BTreeSet<_>>();
+        let affected = previous.union(&expected).cloned().collect::<BTreeSet<_>>();
+        validate_destinations(project_root, &previous, &expected, &affected)?;
+
+        let backup = tempfile::Builder::new()
+            .prefix(".rspyts-backup-")
+            .tempdir_in(project_root)?;
+        let backed_up = backup_files(project_root, backup.path(), &affected)?;
+        Ok(Self {
+            generated,
+            project_root,
+            expected,
+            affected,
+            backup,
+            backed_up,
+            installed: Vec::new(),
+            created_directories: Vec::new(),
+        })
+    }
+
+    /// Install the staged state and remove directories made stale by it.
+    fn install(&mut self) -> Result<()> {
+        for relative in &self.backed_up {
+            fs::remove_file(self.project_root.join(relative))?;
+        }
+        for relative in &self.expected {
+            let source = self.generated.join(relative);
+            let destination = self.project_root.join(relative);
+            if let Some(parent) = destination.parent() {
+                create_directories(self.project_root, parent, &mut self.created_directories)?;
+            }
+            fs::rename(&source, &destination).with_context(|| {
+                format!("failed to publish generated file {}", destination.display())
+            })?;
+            self.installed.push(relative.clone());
+        }
+        cleanup_empty_directories(self.project_root, &self.affected)
+    }
+
+    /// Restore backed-up files and remove paths created by a failed install.
+    ///
+    /// Every restoration is attempted even if an earlier one fails. The
+    /// combined error makes a partial rollback visible to the caller.
+    fn rollback(&self) -> Result<()> {
+        let mut failures = Vec::new();
+        for relative in self.installed.iter().rev() {
+            let path = self.project_root.join(relative);
+            if let Err(error) = fs::remove_file(&path)
+                && error.kind() != ErrorKind::NotFound
+            {
+                failures.push(format!("remove {}: {error}", path.display()));
+            }
+        }
+        for relative in self.backed_up.iter().rev() {
+            let source = self.backup.path().join(relative);
+            let destination = self.project_root.join(relative);
+            if let Some(parent) = destination.parent()
+                && let Err(error) = fs::create_dir_all(parent)
+            {
+                failures.push(format!("create {}: {error}", parent.display()));
+                continue;
+            }
+            if let Err(error) = fs::copy(&source, &destination) {
+                failures.push(format!(
+                    "restore {} from {}: {error}",
+                    destination.display(),
+                    source.display()
+                ));
+            }
+        }
+        for directory in self.created_directories.iter().rev() {
+            if directory.is_dir()
+                && fs::read_dir(directory).is_ok_and(|mut entries| entries.next().is_none())
+                && let Err(error) = fs::remove_dir(directory)
+            {
+                failures.push(format!("remove {}: {error}", directory.display()));
+            }
+        }
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            bail!(
+                "generated-file rollback was incomplete: {}",
+                failures.join("; ")
+            )
+        }
+    }
+}
+
+/// Reconcile generated outputs while preserving every user-owned path.
 pub(super) fn reconcile_generated_files(
     generated: &Path,
     project_root: &Path,
@@ -171,6 +313,7 @@ pub(super) fn reconcile_generated_files(
     )
 }
 
+/// Reconcile with an injectable ownership publisher for rollback testing.
 fn reconcile_generated_files_with(
     generated: &Path,
     project_root: &Path,
@@ -179,20 +322,33 @@ fn reconcile_generated_files_with(
     publish_ownership: impl FnOnce(&Config, &GeneratedState) -> Result<()>,
 ) -> Result<()> {
     let plan = GeneratedPlan::read(generated, source_fingerprint)?;
-    let previous = &config.generated;
-    let previous_paths = ownership_paths(previous)?;
-    let expected_paths = plan.files.keys().cloned().collect::<BTreeSet<_>>();
-    let affected = previous_paths
-        .union(&expected_paths)
-        .cloned()
-        .collect::<BTreeSet<_>>();
+    let mut transaction =
+        PublicationTransaction::prepare(generated, project_root, &config.generated, &plan)?;
+    if let Err(error) = transaction
+        .install()
+        .and_then(|()| publish_ownership(config, &plan.ownership))
+    {
+        if let Err(rollback) = transaction.rollback() {
+            return Err(error.context(format!("publication failed and {rollback:#}")));
+        }
+        return Err(error);
+    }
+    Ok(())
+}
 
-    for relative in &affected {
+/// Reject all user-owned collisions before any project path is mutated.
+fn validate_destinations(
+    project_root: &Path,
+    previous: &BTreeSet<PathBuf>,
+    expected: &BTreeSet<PathBuf>,
+    affected: &BTreeSet<PathBuf>,
+) -> Result<()> {
+    for relative in affected {
         let destination = project_root.join(relative);
         validate_parent_directories(project_root, relative)?;
         match fs::symlink_metadata(&destination) {
             Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => {
-                if expected_paths.contains(relative) && !previous_paths.contains(relative) {
+                if expected.contains(relative) && !previous.contains(relative) {
                     bail!(
                         "generated path collides with a user-owned file: {}",
                         destination.display()
@@ -200,7 +356,7 @@ fn reconcile_generated_files_with(
                 }
             }
             Ok(_) => {
-                if expected_paths.contains(relative) && !previous_paths.contains(relative) {
+                if expected.contains(relative) && !previous.contains(relative) {
                     bail!(
                         "generated path collides with a user-owned path: {}",
                         destination.display()
@@ -215,75 +371,34 @@ fn reconcile_generated_files_with(
             Err(error) => return Err(error.into()),
         }
     }
+    Ok(())
+}
 
-    let backup = tempfile::Builder::new()
-        .prefix(".rspyts-backup-")
-        .tempdir_in(project_root)?;
+/// Copy all existing affected files into the transaction backup tree.
+fn backup_files(
+    project_root: &Path,
+    backup_root: &Path,
+    affected: &BTreeSet<PathBuf>,
+) -> Result<Vec<PathBuf>> {
     let mut backed_up = Vec::new();
-    for relative in &affected {
+    for relative in affected {
         let source = project_root.join(relative);
         match fs::symlink_metadata(&source) {
             Ok(_) => {}
             Err(error) if error.kind() == ErrorKind::NotFound => continue,
             Err(error) => return Err(error.into()),
         }
-        let destination = backup.path().join(relative);
+        let destination = backup_root.join(relative);
         if let Some(parent) = destination.parent() {
             fs::create_dir_all(parent)?;
         }
         fs::copy(&source, &destination)?;
         backed_up.push(relative.clone());
     }
-
-    let mut installed = Vec::new();
-    let mut created_directories = Vec::new();
-    let publish = (|| -> Result<()> {
-        for relative in &backed_up {
-            fs::remove_file(project_root.join(relative))?;
-        }
-        for relative in &expected_paths {
-            let source = generated.join(relative);
-            let destination = project_root.join(relative);
-            if let Some(parent) = destination.parent() {
-                create_directories(project_root, parent, &mut created_directories)?;
-            }
-            fs::rename(&source, &destination).with_context(|| {
-                format!("failed to publish generated file {}", destination.display())
-            })?;
-            installed.push(relative.clone());
-        }
-        cleanup_empty_directories(project_root, &affected)?;
-        publish_ownership(config, &plan.ownership)
-    })();
-
-    if let Err(error) = publish {
-        for relative in installed.iter().rev() {
-            let path = project_root.join(relative);
-            if path.exists() {
-                let _ = fs::remove_file(path);
-            }
-        }
-        for relative in backed_up.iter().rev() {
-            let source = backup.path().join(relative);
-            let destination = project_root.join(relative);
-            if let Some(parent) = destination.parent() {
-                let _ = fs::create_dir_all(parent);
-            }
-            let _ = fs::copy(source, destination);
-        }
-        for directory in created_directories.iter().rev() {
-            if directory.is_dir()
-                && fs::read_dir(directory).is_ok_and(|mut entries| entries.next().is_none())
-            {
-                let _ = fs::remove_dir(directory);
-            }
-        }
-        return Err(error);
-    }
-
-    Ok(())
+    Ok(backed_up)
 }
 
+/// Reject symlink or file collisions in every existing destination parent.
 fn validate_parent_directories(root: &Path, relative: &Path) -> Result<()> {
     let mut parent = root.to_path_buf();
     if let Some(relative_parent) = relative.parent() {
@@ -305,6 +420,7 @@ fn validate_parent_directories(root: &Path, relative: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Create missing destination parents and record them for rollback.
 fn create_directories(root: &Path, parent: &Path, created: &mut Vec<PathBuf>) -> Result<()> {
     let relative = parent.strip_prefix(root)?;
     let mut current = root.to_path_buf();
@@ -327,6 +443,7 @@ fn create_directories(root: &Path, parent: &Path, created: &mut Vec<PathBuf>) ->
     Ok(())
 }
 
+/// Compare expected outputs with only the paths owned by rspyts.
 pub(super) fn check_generated_files(
     generated: &Path,
     project_root: &Path,
@@ -363,6 +480,7 @@ pub(super) fn check_generated_files(
     Ok(())
 }
 
+/// Atomically replace the generated ownership subtree in `rspyts.toml`.
 fn write_ownership(config: &Config, ownership: &GeneratedState) -> Result<()> {
     let mut temporary = tempfile::NamedTempFile::new_in(config.root())?;
     temporary.write_all(config.render_generated(ownership)?.as_bytes())?;
@@ -376,6 +494,9 @@ fn write_ownership(config: &Config, ownership: &GeneratedState) -> Result<()> {
     Ok(())
 }
 
+// Owned-path normalization --------------------------------------------------
+
+/// Expand persisted ownership, including both native extension suffixes.
 fn ownership_paths(ownership: &GeneratedState) -> Result<BTreeSet<PathBuf>> {
     let mut paths = ownership
         .python
@@ -395,6 +516,7 @@ fn ownership_paths(ownership: &GeneratedState) -> Result<BTreeSet<PathBuf>> {
     Ok(paths)
 }
 
+/// Parse and validate a portable path read from `rspyts.toml`.
 fn checked_relative(value: &str) -> Result<PathBuf> {
     let path = PathBuf::from(value.replace('/', std::path::MAIN_SEPARATOR_STR));
     if path.is_absolute()
@@ -407,6 +529,7 @@ fn checked_relative(value: &str) -> Result<PathBuf> {
     Ok(path)
 }
 
+/// Encode a platform path as a slash-separated persisted path.
 fn portable_path(path: &Path) -> Result<String> {
     if path.is_absolute()
         || path
@@ -427,11 +550,13 @@ fn portable_path(path: &Path) -> Result<String> {
         .join("/"))
 }
 
+/// Return whether a path denotes a supported Python extension artifact.
 fn is_native_binary(path: &Path) -> bool {
     path.extension()
         .is_some_and(|extension| matches!(extension.to_str(), Some("pyd" | "so")))
 }
 
+/// Remove the platform extension from a generated native-module path.
 fn native_module_base(path: &Path) -> Option<PathBuf> {
     let mut base = path.to_path_buf();
     match path.extension()?.to_str()? {
@@ -450,6 +575,7 @@ fn native_module_base(path: &Path) -> Option<PathBuf> {
     Some(base)
 }
 
+/// Remove generated directories left empty after stale files are deleted.
 fn cleanup_empty_directories(project_root: &Path, paths: &BTreeSet<PathBuf>) -> Result<()> {
     let mut directories = paths
         .iter()
@@ -470,6 +596,7 @@ fn cleanup_empty_directories(project_root: &Path, paths: &BTreeSet<PathBuf>) -> 
     Ok(())
 }
 
+/// Recursively collect regular files while rejecting generated symlinks.
 fn collect_files(
     root: &Path,
     current: &Path,
@@ -494,16 +621,29 @@ fn collect_files(
     Ok(())
 }
 
+// Source change detection ---------------------------------------------------
+
+/// Capture inexpensive metadata plus configuration for polling comparisons.
 fn source_state(root: &Path, config_path: &Path) -> Result<SourceState> {
     let mut result = BTreeMap::new();
     for path in source_files(root)? {
         let metadata = path.metadata()?;
-        result.insert(path, (metadata.len(), metadata.modified().ok()));
+        result.insert(
+            path,
+            SourceFileState {
+                length: metadata.len(),
+                modified: metadata.modified().ok(),
+            },
+        );
     }
     let application = Config::read(config_path)?.application_fingerprint_source()?;
-    Ok((result, application))
+    Ok(SourceState {
+        files: result,
+        application,
+    })
 }
 
+/// Hash Rust/Cargo source contents and active application settings.
 pub(super) fn source_fingerprint(root: &Path, config: &Config) -> Result<String> {
     const OFFSET: u128 = 144_066_263_297_769_815_596_495_629_667_062_367_629;
     const PRIME: u128 = 309_485_009_821_345_068_724_781_371;
@@ -535,6 +675,7 @@ pub(super) fn source_fingerprint(root: &Path, config: &Config) -> Result<String>
     Ok(format!("{fingerprint:032x}"))
 }
 
+/// Return every Rust or Cargo input considered by build/check freshness.
 fn source_files(root: &Path) -> Result<Vec<PathBuf>> {
     let mut result = Vec::new();
     collect_source_files(root, &mut result)?;
@@ -542,6 +683,7 @@ fn source_files(root: &Path) -> Result<Vec<PathBuf>> {
     Ok(result)
 }
 
+/// Recursively collect source inputs while pruning tool-owned directories.
 fn collect_source_files(current: &Path, result: &mut Vec<PathBuf>) -> Result<()> {
     let entries = match fs::read_dir(current) {
         Ok(entries) => entries,
@@ -564,6 +706,7 @@ fn collect_source_files(current: &Path, result: &mut Vec<PathBuf>) -> Result<()>
     Ok(())
 }
 
+/// Return whether a directory is known to contain no application source.
 fn ignored_source_directory(path: &Path, name: &std::ffi::OsStr) -> bool {
     if name == "target"
         && (path.join("CACHEDIR.TAG").is_file() || path.join(".rustc_info.json").is_file())
@@ -585,6 +728,7 @@ fn ignored_source_directory(path: &Path, name: &std::ffi::OsStr) -> bool {
     )
 }
 
+/// Return whether a path is a Rust source or Cargo input.
 fn is_source_file(path: &Path) -> bool {
     path.extension().is_some_and(|value| value == "rs")
         || path
@@ -592,6 +736,7 @@ fn is_source_file(path: &Path) -> bool {
             .is_some_and(|value| matches!(value.to_str(), Some("Cargo.toml" | "Cargo.lock")))
 }
 
+/// Create a new UTF-8 file, rejecting any destination collision.
 pub(super) fn write(path: &Path, source: &str) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;

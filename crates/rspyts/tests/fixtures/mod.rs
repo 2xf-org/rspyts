@@ -17,6 +17,7 @@ mod inline {
     )]
     #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Model)]
     pub struct InlineValue {
+        /// Payload retained under the declaration's original module.
         pub value: String,
     }
 }
@@ -31,7 +32,10 @@ pub use inline::InlineValue;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Model)]
 #[serde(transparent)]
 #[rspyts(host = String)]
-pub struct JobId(pub String);
+pub struct JobId(
+    /// Identifier text as received from or sent to the host.
+    pub String,
+);
 
 /// The supported ways to run a job.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Model)]
@@ -55,12 +59,6 @@ pub struct JobRequest {
     pub count: u32,
     /// Select the execution strategy.
     pub mode: RunMode,
-    /// Binary input that must remain a byte boundary.
-    #[rspyts(bytes)]
-    pub payload: Vec<u8>,
-    /// Numeric input that must remain a contiguous buffer boundary.
-    #[rspyts(buffer)]
-    pub samples: Vec<f64>,
     /// Disable side effects when true.
     #[serde(default)]
     #[rspyts(default = false)]
@@ -73,23 +71,44 @@ pub struct JobRequest {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Model)]
 #[serde(rename_all = "camelCase")]
 pub struct JobResult {
+    /// Stable identifier allocated for the accepted job.
     pub id: JobId,
+    /// Number of values accepted for processing.
     pub accepted_count: u32,
+    /// Sum of the supplied numeric samples.
     pub sample_total: f64,
+    /// Terminal state produced by execution.
     pub event: JobEvent,
+}
+
+/// Full-width unsigned values used to verify the Python boundary.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Model)]
+#[serde(rename_all = "camelCase")]
+pub struct WideNumbers {
+    /// Scalar unsigned value at the full Rust width.
+    pub value: u64,
+    /// Nested unsigned values at the full Rust width.
+    pub values: Vec<u64>,
+    /// Optional unsigned value at the full Rust width.
+    pub optional: Option<u64>,
 }
 
 /// Optional context attached to a job.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Model)]
 #[serde(rename_all = "camelCase")]
 pub struct JobContext {
+    /// UTC creation timestamp.
     pub created_at: DateTime<Utc>,
+    /// Arbitrary JSON metadata supplied by the caller.
     pub metadata: serde_json::Value,
+    /// Deterministically ordered labels.
     pub labels: BTreeMap<String, String>,
+    /// Inclusive integer range associated with the job.
     pub range: (i32, i32),
+    /// Optional free-form note.
     pub note: Option<String>,
-    #[rspyts(bytes)]
-    pub fingerprint: [u8; 16],
+    /// Binary fingerprint serialized as an ordinary model field.
+    pub fingerprint: Vec<u8>,
 }
 
 /// A state update emitted by a job.
@@ -101,16 +120,24 @@ pub struct JobContext {
 )]
 pub enum JobEvent {
     /// The job completed.
-    Completed { accepted_count: u32 },
+    Completed {
+        /// Number of values accepted by the completed job.
+        accepted_count: u32,
+    },
     /// The job was rejected.
-    Rejected { reason: String },
+    Rejected {
+        /// Human-readable rejection reason.
+        reason: String,
+    },
 }
 
 /// Failures that callers can handle by stable code.
 #[derive(Debug, thiserror::Error, rspyts::Error)]
 pub enum JobError {
+    /// A requested count fell outside the supported interval.
     #[error("count must be between 1 and 100")]
     InvalidCount,
+    /// A counter constructor received a negative initial value.
     #[error("the initial counter value cannot be negative")]
     #[serde(rename = "negative_start")]
     NegativeStart,
@@ -118,14 +145,19 @@ pub enum JobError {
 
 /// Validate and execute one job.
 #[rspyts::export]
-pub fn execute_job(request: &JobRequest) -> Result<JobResult, JobError> {
+pub fn execute_job(
+    request: &JobRequest,
+    #[rspyts(bytes)] payload: &[u8],
+    #[rspyts(buffer)] samples: &[f64],
+) -> Result<JobResult, JobError> {
     if !(1..=100).contains(&request.count) {
         return Err(JobError::InvalidCount);
     }
+    let _payload_size = payload.len();
     Ok(JobResult {
         id: JobId(format!("job-{}", request.display_name)),
         accepted_count: request.count,
-        sample_total: request.samples.iter().sum(),
+        sample_total: samples.iter().sum(),
         event: JobEvent::Completed {
             accepted_count: request.count,
         },
@@ -144,6 +176,20 @@ pub fn reverse_bytes(#[rspyts(bytes)] input: &[u8]) -> Vec<u8> {
 #[rspyts(returns(buffer))]
 pub fn scale_samples(#[rspyts(buffer)] samples: &[f64], factor: f64) -> Vec<f64> {
     samples.iter().map(|value| value * factor).collect()
+}
+
+/// Return full-width unsigned values unchanged.
+#[rspyts::export]
+#[must_use]
+pub fn echo_u64(value: u64) -> u64 {
+    value
+}
+
+/// Return nested full-width unsigned values unchanged.
+#[rspyts::export]
+#[must_use]
+pub fn echo_wide_numbers(value: WideNumbers) -> WideNumbers {
+    value
 }
 
 /// A stateful counter exposed as one native resource.

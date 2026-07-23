@@ -1,5 +1,7 @@
 #![cfg(not(target_arch = "wasm32"))]
 
+//! Integration tests for discovery and the serialized application contract.
+
 mod fixtures;
 
 use std::{collections::BTreeSet, ffi::CStr};
@@ -95,6 +97,7 @@ fn discovery_returns_the_complete_application_contract() {
             "JobRequest",
             "JobResult",
             "RunMode",
+            "WideNumbers",
             "InlineValue",
         ]
     );
@@ -104,7 +107,13 @@ fn discovery_returns_the_complete_application_contract() {
             .iter()
             .map(|item| item.host_name.as_str())
             .collect::<Vec<_>>(),
-        ["executeJob", "reverseBytes", "scaleSamples"]
+        [
+            "echoU64",
+            "echoWideNumbers",
+            "executeJob",
+            "reverseBytes",
+            "scaleSamples",
+        ]
     );
     assert_eq!(
         manifest
@@ -159,14 +168,6 @@ fn request_fields_preserve_names_constraints_defaults_and_boundaries() {
     let count = field_named(&request.shape, "count");
     assert_eq!(count.constraints.ge, Some(1));
     assert_eq!(count.constraints.le, Some(100));
-    assert_eq!(field_named(&request.shape, "payload").ty, TypeRef::Bytes);
-    assert_eq!(
-        field_named(&request.shape, "samples").ty,
-        TypeRef::Buffer {
-            element: BufferElement::F64,
-        }
-    );
-
     let dry_run = field_named(&request.shape, "dryRun");
     assert!(!dry_run.required);
     assert_eq!(dry_run.default, Some(ScalarValue::Bool(false)));
@@ -222,7 +223,12 @@ fn context_fields_cover_supported_composite_types() {
     );
     assert_eq!(
         field_named(&context.shape, "fingerprint").ty,
-        TypeRef::FixedBytes { length: 16 }
+        TypeRef::List {
+            item: Box::new(TypeRef::Int {
+                signed: false,
+                bits: 8,
+            }),
+        }
     );
 }
 
@@ -264,6 +270,13 @@ fn functions_preserve_names_boundaries_and_typed_errors() {
     assert_eq!(execute.rust_name, "execute_job");
     assert!(matches!(execute.returns, TypeRef::Named { .. }));
     assert_eq!(execute.error, Some(manifest.errors[0].identity()));
+    assert_eq!(execute.params[1].ty, TypeRef::Bytes);
+    assert_eq!(
+        execute.params[2].ty,
+        TypeRef::Buffer {
+            element: BufferElement::F64,
+        }
+    );
 
     let reverse = function_named(&manifest, "reverseBytes");
     assert_eq!(reverse.params[0].ty, TypeRef::Bytes);

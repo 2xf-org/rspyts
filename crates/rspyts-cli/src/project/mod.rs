@@ -1,3 +1,10 @@
+//! Cargo project resolution, bridge compilation, and package generation.
+//!
+//! A [`Project`] is an immutable snapshot of Cargo metadata and application
+//! settings for one command invocation. Builds use a synthetic `cdylib` bridge
+//! outside the source tree to link every selected package, discover the
+//! contract on the native target, and compile the same exports for Wasm.
+
 use std::ffi::{CStr, c_char};
 use std::fmt::Write as _;
 use std::fs;
@@ -10,6 +17,7 @@ use rspyts::ir::{Manifest, Namespace};
 use serde_json::Value;
 use tempfile::TempDir;
 
+use crate::cargo::{self, Metadata as CargoMetadata, Package as CargoPackage};
 use crate::config::Config;
 use crate::contract::{
     named_identities, namespace_refs, namespaces, tagged_variant_name, type_namespace, type_refs,
@@ -22,130 +30,87 @@ use crate::{python, typescript};
 
 mod validation;
 
+/// Cross-language validation and identifier helpers used by generators.
 pub(crate) use validation::*;
 
 const CONTRACT_SYMBOL: &str = "rspyts_discovery_v1_contract";
 const FREE_SYMBOL: &str = "rspyts_discovery_v1_contract_free";
 
+/// Fully resolved inputs for one CLI invocation.
+///
+/// The snapshot is constructed once from `rspyts.toml` and Cargo metadata.
+/// Commands that perform a long-running build re-read the configuration before
+/// publication so a concurrent edit cannot produce output from mixed inputs.
 #[derive(Debug, Clone)]
 pub(super) struct Project {
+    /// Directory containing `rspyts.toml` and the primary Cargo package.
     pub(super) root: PathBuf,
+    /// Cargo workspace root used for source fingerprinting and path remapping.
     pub(super) workspace_root: PathBuf,
+    /// Cargo target directory shared by the generated bridge builds.
     target_directory: PathBuf,
+    /// Ordered application packages linked into the bridge.
     linked_packages: Vec<LinkedPackage>,
+    /// Exact `rspyts` dependency used by every linked package.
     rspyts_dependency: ResolvedDependency,
+    /// Public application/package name.
     pub(super) package_name: String,
+    /// Version inherited from the primary Cargo package.
     pub(super) package_version: String,
+    /// Python distribution and import package name.
     pub(super) python_package: String,
+    /// npm package name.
     pub(super) typescript_package: String,
+    /// User-owned Python project root.
     python_source: PathBuf,
+    /// User-owned TypeScript project root.
     typescript_source: PathBuf,
+    /// Configuration snapshot used to construct this project.
     pub(super) config: Config,
 }
 
+/// Cargo package linked into the synthetic application bridge.
 #[derive(Debug, Clone)]
 struct LinkedPackage {
     name: String,
     manifest: PathBuf,
 }
 
+/// Reproducible dependency specification for the generated bridge manifest.
 #[derive(Debug, Clone)]
-struct ResolvedDependency {
-    root: PathBuf,
+enum ResolvedDependency {
+    Path(PathBuf),
+    CratesIo { version: String },
 }
 
 impl Project {
+    /// Resolve configuration and Cargo metadata for the package at `path`.
     pub(super) fn read(path: &Path) -> Result<Self> {
         let config = Config::read(path)?;
         let requested_manifest = config.root().join("Cargo.toml");
         let requested_manifest = requested_manifest
             .canonicalize()
             .with_context(|| format!("cannot find Cargo.toml beside {}", config.path.display()))?;
-        let output = ProcessCommand::new(cargo())
-            .args(["metadata", "--format-version", "1", "--manifest-path"])
-            .arg(&requested_manifest)
-            .output()
-            .context("failed to run cargo metadata")?;
-        if !output.status.success() {
-            bail!(
-                "cargo metadata failed\n{}",
-                String::from_utf8_lossy(&output.stderr)
-            );
-        }
-        let metadata: Value = serde_json::from_slice(&output.stdout)?;
-        let packages = metadata["packages"]
-            .as_array()
-            .context("Cargo metadata has no package list")?;
-        let workspace_members = metadata["workspace_members"]
-            .as_array()
-            .context("Cargo metadata has no workspace member list")?;
-        let primary = packages
-            .iter()
-            .find(|package| {
-                package["manifest_path"]
-                    .as_str()
-                    .and_then(|value| Path::new(value).canonicalize().ok())
-                    .as_ref()
-                    == Some(&requested_manifest)
-            })
-            .context("rspyts.toml must be beside a Cargo package manifest")?;
-        let primary_id = string(primary, "id")?;
-        if !workspace_members.iter().any(|member| member == primary_id) {
-            bail!("the Cargo package beside rspyts.toml must be a workspace member");
-        }
+        let metadata = cargo::metadata(&requested_manifest, false)?;
+        let selected = select_application_packages(
+            &metadata,
+            &requested_manifest,
+            &config.application.additional_packages,
+        )?;
+        let primary = selected
+            .first()
+            .copied()
+            .context("an rspyts application must select a primary Cargo package")?;
+        let rspyts_dependency = resolve_rspyts_dependency(&metadata, &selected)?;
 
-        let mut selected = vec![primary];
-        for name in &config.application.additional_packages {
-            if selected
-                .iter()
-                .any(|package| package["name"].as_str() == Some(name))
-            {
-                bail!("rspyts application package `{name}` is listed more than once");
-            }
-            let mut matches = packages.iter().filter(|package| {
-                package["name"].as_str() == Some(name)
-                    && package["id"]
-                        .as_str()
-                        .is_some_and(|id| workspace_members.iter().any(|member| member == id))
-            });
-            let package = matches.next().with_context(|| {
-                format!("additional rspyts package `{name}` is not a workspace member")
-            })?;
-            if matches.next().is_some() {
-                bail!("additional rspyts package name `{name}` is ambiguous");
-            }
-            selected.push(package);
-        }
-        for package in &selected {
-            if !has_library_target(package) {
-                bail!(
-                    "rspyts application package `{}` must have a library target",
-                    string(package, "name")?
-                );
-            }
-        }
-
-        let rspyts_id = selected
-            .iter()
-            .map(|package| direct_rspyts_id(&metadata, string(package, "id")?))
-            .collect::<Result<Vec<_>>>()?;
-        if rspyts_id.iter().any(|id| id != &rspyts_id[0]) {
-            bail!("all rspyts application packages must resolve the same `rspyts` package");
-        }
-        let rspyts_package = packages
-            .iter()
-            .find(|package| package["id"].as_str() == Some(&rspyts_id[0]))
-            .context("Cargo metadata omitted the resolved rspyts package")?;
-        let rspyts_dependency = resolved_dependency(rspyts_package)?;
-
-        let primary_package_name = string(primary, "name")?.to_owned();
+        let primary_package_name = primary.name.clone();
         let package_name = config
             .application
             .name
             .clone()
             .unwrap_or_else(|| primary_package_name.clone());
         validate_application_name(&package_name)?;
-        let package_version = string(primary, "version")?.to_owned();
+        let package_version = primary.version.clone();
         let python_package = config
             .application
             .python_package
@@ -160,19 +125,17 @@ impl Project {
         validate_typescript_package(&typescript_package)?;
 
         let root = config.root().to_path_buf();
-        let workspace_root = PathBuf::from(string(&metadata, "workspace_root")?);
-        let target_directory = PathBuf::from(string(&metadata, "target_directory")?);
+        let workspace_root = metadata.workspace_root.clone();
+        let target_directory = metadata.target_directory.clone();
         let python_source = root.join("src-py");
         let typescript_source = root.join("src-ts");
         let linked_packages = selected
             .iter()
-            .map(|package| {
-                Ok(LinkedPackage {
-                    name: string(package, "name")?.to_owned(),
-                    manifest: PathBuf::from(string(package, "manifest_path")?),
-                })
+            .map(|package| LinkedPackage {
+                name: package.name.clone(),
+                manifest: package.manifest_path.clone(),
             })
-            .collect::<Result<Vec<_>>>()?;
+            .collect();
 
         Ok(Self {
             root,
@@ -190,19 +153,23 @@ impl Project {
         })
     }
 
+    /// Return the Python source project root.
     pub(super) fn python_source(&self) -> &Path {
         &self.python_source
     }
 
+    /// Return the TypeScript source project root.
     pub(super) fn typescript_source(&self) -> &Path {
         &self.typescript_source
     }
 
+    /// Return the authoritative configuration path.
     pub(super) fn config_path(&self) -> &Path {
         &self.config.path
     }
 }
 
+/// Machine-readable result emitted after a successful build.
 #[derive(Debug, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(super) struct BuildReport {
@@ -213,6 +180,7 @@ pub(super) struct BuildReport {
     typescript_package: String,
 }
 
+/// Generate, validate, and transactionally publish both language packages.
 pub(super) fn build(project: &Project) -> Result<BuildReport> {
     let _lock = project_lock(project)?;
     current_config(project)?;
@@ -235,6 +203,7 @@ pub(super) fn build(project: &Project) -> Result<BuildReport> {
     })
 }
 
+/// Verify that every owned output matches the current Rust sources.
 pub(super) fn check(project: &Project) -> Result<()> {
     let _lock = project_lock(project)?;
     current_config(project)?;
@@ -248,6 +217,7 @@ pub(super) fn check(project: &Project) -> Result<()> {
     )
 }
 
+/// Re-read configuration and reject application changes made mid-command.
 fn current_config(project: &Project) -> Result<Config> {
     let config = Config::read(project.config_path())?;
     if config.application != project.config.application {
@@ -256,6 +226,7 @@ fn current_config(project: &Project) -> Result<Config> {
     Ok(config)
 }
 
+/// Build both targets and stage generated packages in a temporary directory.
 fn generate(project: &Project) -> Result<(TempDir, Manifest)> {
     let temporary = tempfile::Builder::new()
         .prefix(".rspyts-")
@@ -274,18 +245,23 @@ fn generate(project: &Project) -> Result<(TempDir, Manifest)> {
     Ok((temporary, manifest))
 }
 
+// Bridge generation and compilation
+
+/// Target-specific form of the generated application bridge.
 #[derive(Clone, Copy)]
 enum CompileKind {
     Native,
     Wasm,
 }
 
+/// Synthetic Cargo package that links all selected application crates.
 struct Bridge {
     manifest: PathBuf,
     package_id: String,
     package_name: String,
 }
 
+/// Materialize the stable synthetic bridge package under Cargo's target tree.
 fn prepare_bridge(project: &Project) -> Result<Bridge> {
     let key = stable_key(project.config_path().to_string_lossy().as_bytes());
     let root = project
@@ -329,41 +305,26 @@ fn prepare_bridge(project: &Project) -> Result<Bridge> {
     write_if_changed(&source_root.join("lib.rs"), &source)?;
 
     let bridge_manifest = root.join("Cargo.toml");
-    let output = ProcessCommand::new(cargo())
-        .args([
-            "metadata",
-            "--format-version",
-            "1",
-            "--no-deps",
-            "--manifest-path",
-        ])
-        .arg(&bridge_manifest)
-        .output()
+    let metadata = cargo::metadata(&bridge_manifest, true)
         .context("failed to inspect the generated rspyts bridge")?;
-    if !output.status.success() {
-        bail!(
-            "generated rspyts bridge metadata failed\n{}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
-    let metadata: Value = serde_json::from_slice(&output.stdout)?;
-    let package = metadata["packages"]
-        .as_array()
-        .and_then(|packages| packages.first())
+    let package = metadata
+        .packages
+        .first()
         .context("generated rspyts bridge metadata has no package")?;
     Ok(Bridge {
         manifest: bridge_manifest,
-        package_id: string(package, "id")?.to_owned(),
+        package_id: package.id.clone(),
         package_name,
     })
 }
 
+/// Compile one bridge target and return Cargo's reported `cdylib` artifact.
 fn compile(project: &Project, bridge: &Bridge, kind: CompileKind) -> Result<PathBuf> {
     let (feature, label) = match kind {
         CompileKind::Native => (Some("rspyts/python-extension"), "Python"),
         CompileKind::Wasm => (None, "WebAssembly"),
     };
-    let mut command = ProcessCommand::new(cargo());
+    let mut command = ProcessCommand::new(cargo::executable());
     command
         .arg("build")
         .arg("--manifest-path")
@@ -424,6 +385,7 @@ fn compile(project: &Project, bridge: &Bridge, kind: CompileKind) -> Result<Path
     })
 }
 
+/// Append one rustc flag while preserving flags supplied by the caller.
 fn append_rust_flag(flags: &mut String, value: &str) {
     if !flags.is_empty() {
         flags.push(' ');
@@ -431,6 +393,7 @@ fn append_rust_flag(flags: &mut String, value: &str) {
     flags.push_str(value);
 }
 
+/// Find the requested bridge artifact in Cargo's JSON message stream.
 fn artifact_from_messages(bytes: &[u8], package_id: &str, kind: CompileKind) -> Option<PathBuf> {
     String::from_utf8_lossy(bytes)
         .lines()
@@ -458,6 +421,7 @@ fn artifact_from_messages(bytes: &[u8], package_id: &str, kind: CompileKind) -> 
         })
 }
 
+/// Extract rendered compiler diagnostics from Cargo's JSON message stream.
 fn cargo_diagnostics(bytes: &[u8]) -> String {
     String::from_utf8_lossy(bytes)
         .lines()
@@ -466,6 +430,9 @@ fn cargo_diagnostics(bytes: &[u8]) -> String {
         .collect()
 }
 
+// Discovery ABI
+
+/// Load the native bridge and deserialize its discovered application contract.
 fn read_contract(library_path: &Path, package_name: &str) -> Result<Manifest> {
     type ContractFn = unsafe extern "C" fn() -> rspyts::__private::DiscoveryResult;
     type FreeFn = unsafe extern "C" fn(*mut c_char);
@@ -509,60 +476,112 @@ fn read_contract(library_path: &Path, package_name: &str) -> Result<Manifest> {
     }
 }
 
-fn string<'a>(value: &'a Value, key: &str) -> Result<&'a str> {
-    value[key]
-        .as_str()
-        .with_context(|| format!("Cargo metadata has no `{key}` string"))
-}
+// Cargo dependency rendering
 
-fn has_library_target(package: &Value) -> bool {
-    package["targets"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .any(|target| {
-            target["kind"]
-                .as_array()
-                .into_iter()
-                .flatten()
-                .any(|kind| kind == "lib")
-                || target["crate_types"]
-                    .as_array()
-                    .into_iter()
-                    .flatten()
-                    .any(|kind| matches!(kind.as_str(), Some("lib" | "rlib" | "cdylib")))
+/// Select and validate the primary and configured application packages.
+fn select_application_packages<'a>(
+    metadata: &'a CargoMetadata,
+    requested_manifest: &Path,
+    additional_packages: &[String],
+) -> Result<Vec<&'a CargoPackage>> {
+    let primary = metadata
+        .packages
+        .iter()
+        .find(|package| {
+            package
+                .manifest_path
+                .canonicalize()
+                .is_ok_and(|path| path == requested_manifest)
         })
+        .context("rspyts.toml must be beside a Cargo package manifest")?;
+    if !metadata.workspace_members.contains(&primary.id) {
+        bail!("the Cargo package beside rspyts.toml must be a workspace member");
+    }
+
+    let mut selected = vec![primary];
+    for name in additional_packages {
+        if selected.iter().any(|package| &package.name == name) {
+            bail!("rspyts application package `{name}` is listed more than once");
+        }
+        let mut matches = metadata.packages.iter().filter(|package| {
+            &package.name == name && metadata.workspace_members.contains(&package.id)
+        });
+        let package = matches.next().with_context(|| {
+            format!("additional rspyts package `{name}` is not a workspace member")
+        })?;
+        if matches.next().is_some() {
+            bail!("additional rspyts package name `{name}` is ambiguous");
+        }
+        selected.push(package);
+    }
+    for package in &selected {
+        if !has_library_target(package) {
+            bail!(
+                "rspyts application package `{}` must have a library target",
+                package.name
+            );
+        }
+    }
+    Ok(selected)
 }
 
-fn direct_rspyts_id(metadata: &Value, package_id: &str) -> Result<String> {
-    let packages = metadata["packages"]
-        .as_array()
-        .context("Cargo metadata has no package list")?;
-    let nodes = metadata["resolve"]["nodes"]
-        .as_array()
+/// Require every application package to use the same direct `rspyts` package.
+fn resolve_rspyts_dependency(
+    metadata: &CargoMetadata,
+    selected: &[&CargoPackage],
+) -> Result<ResolvedDependency> {
+    let mut identities = selected
+        .iter()
+        .map(|package| direct_rspyts_id(metadata, &package.id));
+    let identity = identities
+        .next()
+        .context("an rspyts application must select at least one Cargo package")??;
+    for candidate in identities {
+        if candidate? != identity {
+            bail!("all rspyts application packages must resolve the same `rspyts` package");
+        }
+    }
+    let package = metadata
+        .packages
+        .iter()
+        .find(|package| package.id == identity)
+        .context("Cargo metadata omitted the resolved rspyts package")?;
+    resolved_dependency(package)
+}
+
+/// Return whether a Cargo package exposes a linkable library target.
+fn has_library_target(package: &CargoPackage) -> bool {
+    package.targets.iter().any(|target| {
+        target.kind.iter().any(|kind| kind == "lib")
+            || target
+                .crate_types
+                .iter()
+                .any(|kind| matches!(kind.as_str(), "lib" | "rlib" | "cdylib"))
+    })
+}
+
+/// Resolve the package ID of a package's direct normal `rspyts` dependency.
+fn direct_rspyts_id(metadata: &CargoMetadata, package_id: &str) -> Result<String> {
+    let nodes = &metadata
+        .resolve
+        .as_ref()
         .context("Cargo metadata has no dependency graph")?;
     let node = nodes
+        .nodes
         .iter()
-        .find(|node| node["id"].as_str() == Some(package_id))
+        .find(|node| node.id == package_id)
         .context("Cargo metadata omitted an application package from its dependency graph")?;
-    let mut matches = node["deps"]
-        .as_array()
-        .context("Cargo metadata dependency node has no dependency list")?
+    let mut matches = node
+        .deps
         .iter()
-        .filter(|dependency| {
-            dependency["dep_kinds"]
-                .as_array()
-                .into_iter()
-                .flatten()
-                .any(|kind| kind["kind"].is_null())
-        })
-        .filter_map(|dependency| dependency["pkg"].as_str())
+        .filter(|dependency| dependency.dep_kinds.iter().any(|kind| kind.kind.is_none()))
         .filter(|dependency_id| {
-            packages.iter().any(|package| {
-                package["id"].as_str() == Some(*dependency_id)
-                    && package["name"].as_str() == Some("rspyts")
-            })
-        });
+            metadata
+                .packages
+                .iter()
+                .any(|package| package.id == dependency_id.pkg && package.name == "rspyts")
+        })
+        .map(|dependency| dependency.pkg.as_str());
     let dependency = matches
         .next()
         .context("each rspyts application package must directly depend on `rspyts`")?;
@@ -572,23 +591,42 @@ fn direct_rspyts_id(metadata: &Value, package_id: &str) -> Result<String> {
     Ok(dependency.to_owned())
 }
 
-fn resolved_dependency(package: &Value) -> Result<ResolvedDependency> {
-    let manifest = PathBuf::from(string(package, "manifest_path")?);
-    let root = manifest
+/// Convert Cargo's resolved package into an exact bridge dependency.
+fn resolved_dependency(package: &CargoPackage) -> Result<ResolvedDependency> {
+    if let Some(source) = package.source.as_deref() {
+        if matches!(
+            source,
+            "registry+https://github.com/rust-lang/crates.io-index"
+                | "registry+sparse+https://index.crates.io/"
+        ) {
+            return Ok(ResolvedDependency::CratesIo {
+                version: package.version.clone(),
+            });
+        }
+        bail!("the selected rspyts package uses unsupported Cargo source `{source}`");
+    }
+    let root = package
+        .manifest_path
         .parent()
         .context("resolved rspyts manifest has no parent")?
         .canonicalize()
         .context("cannot resolve the selected rspyts package source")?;
-    Ok(ResolvedDependency { root })
+    Ok(ResolvedDependency::Path(root))
 }
 
+/// Render an exact Cargo dependency specification for the synthetic bridge.
 fn bridge_dependency(dependency: &ResolvedDependency) -> String {
-    format!(
-        "{{ path = {} }}",
-        toml_string(&dependency.root.to_string_lossy())
-    )
+    match dependency {
+        ResolvedDependency::Path(root) => {
+            format!("{{ path = {} }}", toml_string(&root.to_string_lossy()))
+        }
+        ResolvedDependency::CratesIo { version } => {
+            format!("{{ version = {} }}", toml_string(&format!("={version}")))
+        }
+    }
 }
 
+/// Compute a stable FNV-1a key for target-directory isolation.
 fn stable_key(bytes: &[u8]) -> u64 {
     let mut hash = 0xcbf2_9ce4_8422_2325_u64;
     for byte in bytes {
@@ -598,10 +636,12 @@ fn stable_key(bytes: &[u8]) -> u64 {
     hash
 }
 
+/// Quote a TOML string through serde's compatible JSON string encoder.
 fn toml_string(value: &str) -> String {
     serde_json::to_string(value).expect("serializing a string cannot fail")
 }
 
+/// Replace a generated bridge file only when its bytes changed.
 fn write_if_changed(path: &Path, source: &str) -> Result<()> {
     if fs::read(path).is_ok_and(|current| current == source.as_bytes()) {
         return Ok(());
@@ -612,6 +652,47 @@ fn write_if_changed(path: &Path, source: &str) -> Result<()> {
     fs::write(path, source).with_context(|| format!("failed to write {}", path.display()))
 }
 
-fn cargo() -> std::ffi::OsString {
-    std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into())
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn crates_io_dependency_keeps_its_cargo_identity() {
+        let package: CargoPackage = serde_json::from_value(serde_json::json!({
+            "id": "rspyts 3.0.1 (registry+https://github.com/rust-lang/crates.io-index)",
+            "name": "rspyts",
+            "manifest_path": "/cargo/registry/rspyts-3.0.1/Cargo.toml",
+            "source": "registry+https://github.com/rust-lang/crates.io-index",
+            "version": "3.0.1",
+            "targets": [],
+        }))
+        .expect("deserialize package metadata");
+
+        let dependency = resolved_dependency(&package).expect("resolve crates.io dependency");
+
+        assert_eq!(bridge_dependency(&dependency), "{ version = \"=3.0.1\" }");
+    }
+
+    #[test]
+    fn path_dependency_keeps_its_canonical_path() {
+        let manifest = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../rspyts/Cargo.toml")
+            .canonicalize()
+            .expect("canonical rspyts manifest");
+        let package: CargoPackage = serde_json::from_value(serde_json::json!({
+            "id": "path+file:///workspace/crates/rspyts#3.0.1",
+            "name": "rspyts",
+            "manifest_path": manifest,
+            "source": null,
+            "version": "3.0.1",
+            "targets": [],
+        }))
+        .expect("deserialize package metadata");
+
+        let dependency = resolved_dependency(&package).expect("resolve path dependency");
+        let rendered = bridge_dependency(&dependency);
+
+        assert!(rendered.starts_with("{ path = "));
+        assert!(rendered.contains("/crates/rspyts"));
+    }
 }

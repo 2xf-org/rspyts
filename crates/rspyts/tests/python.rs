@@ -1,12 +1,14 @@
 #![cfg(not(target_arch = "wasm32"))]
 
+//! Integration tests for native Python registration and value conversion.
+
 mod fixtures;
 
-use std::sync::Once;
+use std::{collections::BTreeMap, sync::Once};
 
 use rspyts::__private::pyo3::{
     Bound, PyErr, PyResult, Python,
-    types::{PyAnyMethods, PyDict, PyDictMethods, PyList, PyModule},
+    types::{PyAnyMethods, PyBytes, PyBytesMethods, PyDict, PyDictMethods, PyModule},
 };
 
 fn with_registered_module<T>(
@@ -47,9 +49,17 @@ fn job_request(py: Python<'_>, count: u32) -> PyResult<Bound<'_, PyDict>> {
     request.set_item("displayName", "release")?;
     request.set_item("count", count)?;
     request.set_item("mode", "deterministic")?;
-    request.set_item("payload", PyList::new(py, [1_u8, 2, 3])?)?;
-    request.set_item("samples", vec![1.5_f64, 2.0, 4.5])?;
     request.set_item("dryRun", false)?;
+    let context = PyDict::new(py);
+    context.set_item("createdAt", "2026-07-22T12:00:00Z")?;
+    let metadata = PyDict::new(py);
+    metadata.set_item("wide", u64::MAX)?;
+    context.set_item("metadata", metadata)?;
+    context.set_item("labels", BTreeMap::from([("team", "rspyts")]))?;
+    context.set_item("range", (-2, 4))?;
+    context.set_item("note", Option::<String>::None)?;
+    context.set_item("fingerprint", [1_u8, 2, 3])?;
+    request.set_item("context", context)?;
     Ok(request)
 }
 
@@ -63,11 +73,23 @@ fn functions_decode_call_and_encode_real_values() -> PyResult<()> {
         let execute_job = function_native_name(manifest, "executeJob");
         let reverse_bytes = function_native_name(manifest, "reverseBytes");
         let scale_samples = function_native_name(manifest, "scaleSamples");
+        let echo_u64 = function_native_name(manifest, "echoU64");
+        let echo_wide_numbers = function_native_name(manifest, "echoWideNumbers");
         assert!(module.hasattr(execute_job)?);
         assert!(module.hasattr(reverse_bytes)?);
         assert!(module.hasattr(scale_samples)?);
+        assert!(module.hasattr(echo_u64)?);
+        assert!(module.hasattr(echo_wide_numbers)?);
 
-        let result = module.getattr(execute_job)?.call1((job_request(py, 3)?,))?;
+        let samples = py
+            .import("array")?
+            .getattr("array")?
+            .call1(("d", vec![1.5_f64, 2.0, 4.5]))?;
+        let result = module.getattr(execute_job)?.call1((
+            job_request(py, 3)?,
+            PyBytes::new(py, &[1_u8, 2, 3]),
+            samples,
+        ))?;
         let result = result.cast::<PyDict>()?;
         assert_eq!(
             result
@@ -102,15 +124,48 @@ fn functions_decode_call_and_encode_real_values() -> PyResult<()> {
 
         let reversed = module
             .getattr(reverse_bytes)?
-            .call1((PyList::new(py, [3_u8, 1, 4])?,))?
+            .call1((PyBytes::new(py, &[3_u8, 1, 4]),))?
             .extract::<Vec<u8>>()?;
         assert_eq!(reversed, [4, 1, 3]);
 
-        let scaled = module
-            .getattr(scale_samples)?
-            .call1((vec![1.5_f64, -2.0], 2.0))?
-            .extract::<Vec<f64>>()?;
+        let samples = py
+            .import("array")?
+            .getattr("array")?
+            .call1(("d", vec![1.5_f64, -2.0]))?;
+        let scaled = module.getattr(scale_samples)?.call1((samples, 2.0))?;
+        let scaled = scaled
+            .cast::<PyBytes>()?
+            .as_bytes()
+            .chunks_exact(std::mem::size_of::<f64>())
+            .map(|bytes| f64::from_ne_bytes(bytes.try_into().expect("one f64")))
+            .collect::<Vec<_>>();
         assert_eq!(scaled, [3.0, -4.0]);
+
+        for value in [0, i64::MAX as u64, i64::MAX as u64 + 1, u64::MAX] {
+            assert_eq!(
+                module
+                    .getattr(echo_u64)?
+                    .call1((value,))?
+                    .extract::<u64>()?,
+                value,
+            );
+        }
+
+        let wide = PyDict::new(py);
+        wide.set_item("value", u64::MAX)?;
+        wide.set_item("values", [i64::MAX as u64 + 1, u64::MAX])?;
+        wide.set_item("optional", u64::MAX)?;
+        let echoed = module
+            .getattr(echo_wide_numbers)?
+            .call1((wide,))?
+            .cast_into::<PyDict>()?;
+        assert_eq!(
+            echoed
+                .get_item("value")?
+                .expect("wide result contains value")
+                .extract::<u64>()?,
+            u64::MAX,
+        );
 
         Ok(())
     })
@@ -119,9 +174,13 @@ fn functions_decode_call_and_encode_real_values() -> PyResult<()> {
 #[test]
 fn errors_keep_the_stable_code_and_message() -> PyResult<()> {
     with_registered_module(|py, module, manifest| {
+        let samples = py
+            .import("array")?
+            .getattr("array")?
+            .call1(("d", vec![1.0_f64]))?;
         let error = module
             .getattr(function_native_name(manifest, "executeJob"))?
-            .call1((job_request(py, 0)?,))
+            .call1((job_request(py, 0)?, PyBytes::new(py, &[]), samples))
             .expect_err("an invalid request must fail");
         assert_eq!(
             error_details(py, &error)?,

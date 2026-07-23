@@ -1,3 +1,10 @@
+//! Expansion of model and typed-error derives.
+//!
+//! Model expansion produces both a `ContractType` implementation and an
+//! inventory registration. Error expansion similarly records type identity
+//! and generates stable per-variant error codes. All structural validation is
+//! completed before token emission.
+
 use heck::ToSnakeCase;
 use proc_macro2::TokenStream as TokenStream2;
 use quote::quote;
@@ -9,13 +16,17 @@ use syn::{
 use crate::attributes::{
     apply_serde_variant_case, docs_tokens, rspyts_host_override, serde_container, serde_rename,
 };
-use crate::types::{field_options, field_tokens, reject_generics, type_ref_tokens};
+use crate::types::{
+    field_options, field_tokens, reject_generics, type_ref_tokens, validate_alias_field_options,
+};
 
+/// Expand a `Model` derive into contract identity and lazy registration.
 pub(super) fn expand_type(input: DeriveInput) -> syn::Result<TokenStream2> {
     reject_generics(&input.generics, input.ident.span())?;
     let ident = input.ident;
+    let type_name = ident.unraw().to_string();
     let docs = docs_tokens(&input.attrs);
-    let id = quote!(concat!(module_path!(), "::", stringify!(#ident)).to_owned());
+    let id = quote!(concat!(module_path!(), "::", #type_name).to_owned());
     let host = rspyts_host_override(&input.attrs)?;
     let shape = if let Some(host) = host {
         let target = type_ref_tokens(&host, None)?;
@@ -53,7 +64,7 @@ pub(super) fn expand_type(input: DeriveInput) -> syn::Result<TokenStream2> {
                     owner: ::rspyts::ir::CargoPackageId::new(env!("CARGO_PKG_NAME")),
                     rust_module: module_path!().to_owned(),
                     id: #id,
-                    name: stringify!(#ident).to_owned(),
+                    name: #type_name.to_owned(),
                     docs: #docs,
                     shape: #shape,
                 }
@@ -65,6 +76,7 @@ pub(super) fn expand_type(input: DeriveInput) -> syn::Result<TokenStream2> {
     })
 }
 
+/// Analyze one supported struct shape and render its contract representation.
 fn struct_shape(attrs: &[Attribute], ident: &Ident, data: DataStruct) -> syn::Result<TokenStream2> {
     let serde = serde_container(attrs)?;
     if serde.rename_all_fields.is_some() {
@@ -93,6 +105,7 @@ fn struct_shape(attrs: &[Attribute], ident: &Ident, data: DataStruct) -> syn::Re
         Fields::Unnamed(fields) if fields.unnamed.len() == 1 && serde.transparent => {
             let field = fields.unnamed.first().expect("one field");
             let options = field_options(&field.attrs)?;
+            validate_alias_field_options(field, &options)?;
             let target = type_ref_tokens(&field.ty, options.boundary.as_deref())?;
             Ok(quote!(::rspyts::ir::TypeShape::Alias {
                 target: #target,
@@ -109,6 +122,7 @@ fn struct_shape(attrs: &[Attribute], ident: &Ident, data: DataStruct) -> syn::Re
     }
 }
 
+/// Analyze a string or internally tagged enum and render its variants.
 fn enum_shape(attrs: &[Attribute], data: &DataEnum) -> syn::Result<TokenStream2> {
     let serde = serde_container(attrs)?;
     let variants = data
@@ -153,17 +167,19 @@ fn enum_shape(attrs: &[Attribute], data: &DataEnum) -> syn::Result<TokenStream2>
     }
 }
 
+/// Expand an `Error` derive into stable codes, identity, and registration.
 pub(super) fn expand_error(input: DeriveInput) -> syn::Result<TokenStream2> {
     reject_generics(&input.generics, input.ident.span())?;
     let ident = input.ident;
+    let error_name = ident.unraw().to_string();
     let docs = docs_tokens(&input.attrs);
-    let id = quote!(concat!(module_path!(), "::", stringify!(#ident)));
+    let id = quote!(concat!(module_path!(), "::", #error_name));
     let mut arms = Vec::new();
     let code_body = match input.data {
         Data::Enum(data) => {
             for variant in data.variants {
                 let variant_ident = variant.ident;
-                let rust_name = variant_ident.to_string();
+                let rust_name = variant_ident.unraw().to_string();
                 let code =
                     serde_rename(&variant.attrs)?.unwrap_or_else(|| rust_name.to_snake_case());
                 let pattern = match &variant.fields {
@@ -176,7 +192,7 @@ pub(super) fn expand_error(input: DeriveInput) -> syn::Result<TokenStream2> {
             quote!(match self { #(#arms),* })
         }
         Data::Struct(_) => {
-            let rust_name = ident.to_string();
+            let rust_name = ident.unraw().to_string();
             let code = serde_rename(&input.attrs)?.unwrap_or_else(|| rust_name.to_snake_case());
             quote!(#code.to_owned())
         }
@@ -205,7 +221,7 @@ pub(super) fn expand_error(input: DeriveInput) -> syn::Result<TokenStream2> {
                     owner: ::rspyts::ir::CargoPackageId::new(env!("CARGO_PKG_NAME")),
                     rust_module: module_path!().to_owned(),
                     id: #id.to_owned(),
-                    name: stringify!(#ident).to_owned(),
+                    name: #error_name.to_owned(),
                     docs: #docs,
                 }
             }

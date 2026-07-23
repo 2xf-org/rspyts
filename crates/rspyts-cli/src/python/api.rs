@@ -1,5 +1,14 @@
-use super::*;
+//! Rendering of Python callable wrappers, resources, constants, and runtime.
+//!
+//! Generated wrappers validate host values with Pydantic, delegate to the
+//! native extension, and restore immutable contract shapes. Direct binary
+//! boundaries bypass recursive adapters and preserve native bytes or NumPy
+//! arrays.
 
+use super::*;
+use crate::documentation::{CallableDocumentation, remove_rustdoc_link_brackets};
+
+/// Render errors, functions, resources, and constants for one namespace.
 pub(super) fn python_api(
     items: &NamespaceItems<'_>,
     context: &PythonContext<'_>,
@@ -8,17 +17,17 @@ pub(super) fn python_api(
     let needs_buffer_adapter = items
         .functions
         .iter()
-        .any(|function| reference_uses_buffer(&function.returns))
+        .any(|function| reference_uses_buffer(&function.returns, context.manifest))
         || items.resources.iter().any(|resource| {
             resource
                 .methods
                 .iter()
-                .any(|method| reference_uses_buffer(&method.returns))
+                .any(|method| reference_uses_buffer(&method.returns, context.manifest))
         })
         || items
             .constants
             .iter()
-            .any(|constant| reference_uses_buffer(&constant.ty));
+            .any(|constant| reference_uses_buffer(&constant.ty, context.manifest));
     let needs_type_adapter = items
         .functions
         .iter()
@@ -123,6 +132,11 @@ pub(super) fn python_api(
     }
     for constant in &items.constants {
         begin_python_top_level(&mut source);
+        if let Some(docs) = constant.docs.as_deref() {
+            for line in remove_rustdoc_link_brackets(docs).lines() {
+                writeln!(source, "#: {line}")?;
+            }
+        }
         let value = python_json(&constant.value);
         let ty = python_ref(&constant.ty, context)?;
         if is_plain_python_constant(&constant.ty) {
@@ -141,6 +155,7 @@ pub(super) fn python_api(
     Ok(source)
 }
 
+/// Render the package-level native loader and recursive host adapters.
 pub(super) fn python_runtime(manifest: &Manifest) -> Result<String> {
     let mut source = String::from(
         "from __future__ import annotations\n\nfrom datetime import date, datetime\nfrom typing import Any\n\n",
@@ -169,6 +184,9 @@ pub(super) fn python_runtime(manifest: &Manifest) -> Result<String> {
     Ok(source)
 }
 
+// Import planning ----------------------------------------------------------
+
+/// Return every type reference needed by one generated API module.
 fn python_api_references<'a>(items: &'a NamespaceItems<'a>) -> Vec<&'a TypeRef> {
     let mut references = Vec::new();
     for function in &items.functions {
@@ -188,6 +206,7 @@ fn python_api_references<'a>(items: &'a NamespaceItems<'a>) -> Vec<&'a TypeRef> 
     references
 }
 
+/// Compute the runtime helpers required by one generated API module.
 fn python_runtime_imports(items: &NamespaceItems<'_>) -> Vec<&'static str> {
     let has_calls = !items.functions.is_empty() || !items.resources.is_empty();
     let has_params = items
@@ -245,12 +264,17 @@ fn python_runtime_imports(items: &NamespaceItems<'_>) -> Vec<&'static str> {
     imports
 }
 
-fn reference_uses_buffer(reference: &TypeRef) -> bool {
+/// Resolve aliases and report whether a reference contains a numeric buffer.
+fn reference_uses_buffer(reference: &TypeRef, manifest: &Manifest) -> bool {
     let mut buffers = BTreeSet::new();
-    collect_buffers(reference, &mut buffers);
+    collect_buffers_resolved(reference, manifest, &mut buffers)
+        .expect("linked contract references were validated during discovery");
     !buffers.is_empty()
 }
 
+// Runtime adapter source ---------------------------------------------------
+
+/// Append the recursive Python-to-Rust and Rust-to-Python adapter runtime.
 fn emit_python_adapters(source: &mut String, with_buffers: bool) {
     source.push_str(PYTHON_ADAPTERS_START);
     if with_buffers {
@@ -259,7 +283,7 @@ fn emit_python_adapters(source: &mut String, with_buffers: bool) {
     source.push_str(PYTHON_ADAPTERS_RESTORE);
     if with_buffers {
         source.push_str(
-            "    if kind == \"buffer\":\n        return np.asarray(value, dtype=spec[1])\n",
+            "    if kind == \"buffer\":\n        if isinstance(value, (bytes, bytearray, memoryview)):\n            return np.frombuffer(value, dtype=spec[1]).copy()\n        return np.asarray(value, dtype=spec[1])\n",
         );
     }
     source.push_str(PYTHON_ADAPTERS_END);
@@ -319,6 +343,9 @@ def native_error(error: RuntimeError, error_type: type[RuntimeError]) -> Runtime
     return error
 "#;
 
+// Callable and resource rendering -----------------------------------------
+
+/// Render one free function or resource method wrapper.
 fn emit_python_function(
     source: &mut String,
     function: &FunctionDef,
@@ -333,7 +360,7 @@ fn emit_python_function(
     let call_params = function
         .params
         .iter()
-        .map(|param| format!("prepare_host({})", safe_python_name(&param.rust_name)))
+        .map(python_host_argument)
         .collect::<Vec<_>>();
     let mut result_name = "native_result".to_owned();
     let parameter_names = function
@@ -371,7 +398,21 @@ fn emit_python_function(
         &params,
         &return_type,
     )?;
-    emit_python_doc(source, function.docs.as_deref(), &format!("{indent}    "))?;
+    emit_python_callable_doc(
+        source,
+        &CallableDocumentation {
+            docs: function.docs.as_deref(),
+            fallback_summary: format!(
+                "Call the Rust implementation of ``{}``.",
+                function.rust_name
+            ),
+            params: &function.params,
+            returns: Some(&function.returns),
+            error: function.error.as_ref(),
+        },
+        context,
+        &format!("{indent}    "),
+    )?;
     if function.error.is_some() {
         writeln!(source, "{indent}    try:")?;
         emit_python_call(
@@ -414,6 +455,7 @@ fn emit_python_function(
     Ok(())
 }
 
+/// Emit a compact or Black-compatible multiline Python function signature.
 fn emit_python_signature(
     source: &mut String,
     indent: &str,
@@ -443,6 +485,7 @@ fn emit_python_signature(
     Ok(())
 }
 
+/// Emit a compact or multiline Python call expression.
 fn emit_python_call(
     source: &mut String,
     prefix: &str,
@@ -463,6 +506,7 @@ fn emit_python_call(
     Ok(())
 }
 
+/// Restore a native value and validate it against its generated annotation.
 fn emit_python_validation(
     source: &mut String,
     reference: &TypeRef,
@@ -472,7 +516,7 @@ fn emit_python_validation(
 ) -> Result<()> {
     let annotation = python_adapter_type(reference, context)?;
     let mut buffers = BTreeSet::new();
-    collect_buffers(reference, &mut buffers);
+    collect_buffers_resolved(reference, context.manifest, &mut buffers)?;
     if buffers.is_empty() {
         writeln!(source, "TypeAdapter({annotation}).validate_python(")?;
     } else {
@@ -490,6 +534,7 @@ fn emit_python_validation(
     Ok(())
 }
 
+/// Render one resource class, its factories, methods, and close operation.
 fn emit_python_resource(
     source: &mut String,
     resource: &ResourceDef,
@@ -515,9 +560,21 @@ fn emit_python_resource(
     let calls = constructor
         .params
         .iter()
-        .map(|param| format!("prepare_host({})", safe_python_name(&param.rust_name)))
+        .map(python_host_argument)
         .collect::<Vec<_>>();
     emit_python_signature(source, "    ", "__init__", Some("self"), &params, "None")?;
+    emit_python_callable_doc(
+        source,
+        &CallableDocumentation {
+            docs: constructor.docs.as_deref(),
+            fallback_summary: format!("Create a ``{}`` instance.", resource.name),
+            params: &constructor.params,
+            returns: None,
+            error: constructor.error.as_ref(),
+        },
+        context,
+        "        ",
+    )?;
     let native_call = format!("getattr(native, {})", py_string(&resource.native_name));
     if constructor.error.is_some() {
         writeln!(source, "        try:")?;
@@ -556,7 +613,7 @@ fn emit_python_resource(
         let calls = factory
             .params
             .iter()
-            .map(|param| format!("prepare_host({})", safe_python_name(&param.rust_name)))
+            .map(python_host_argument)
             .collect::<Vec<_>>();
         source.push_str("\n    @classmethod\n");
         emit_python_signature(
@@ -566,6 +623,18 @@ fn emit_python_resource(
             Some("cls"),
             &params,
             &resource.name,
+        )?;
+        emit_python_callable_doc(
+            source,
+            &CallableDocumentation {
+                docs: factory.docs.as_deref(),
+                fallback_summary: format!("Create a ``{}`` instance.", resource.name),
+                params: &factory.params,
+                returns: Some(&factory.returns),
+                error: factory.error.as_ref(),
+            },
+            context,
+            "        ",
         )?;
         writeln!(source, "        value = cls.__new__(cls)")?;
         let native_call = format!(
@@ -613,6 +682,32 @@ fn emit_python_resource(
         };
         emit_python_function(source, &function, context, Some(&resource.name))?;
     }
-    source.push_str("\n    def close(self) -> None:\n        self.native_resource.close()\n");
+    source.push_str("\n    def close(self) -> None:\n");
+    emit_python_callable_doc(
+        source,
+        &CallableDocumentation {
+            docs: None,
+            fallback_summary: "Release the native resources owned by this instance.".to_owned(),
+            params: &[],
+            returns: None,
+            error: None,
+        },
+        context,
+        "        ",
+    )?;
+    source.push_str("        self.native_resource.close()\n");
     Ok(())
+}
+
+/// Render one native-call argument, bypassing serialization for direct buffers.
+fn python_host_argument(param: &ParamDef) -> String {
+    let name = safe_python_name(&param.rust_name);
+    if matches!(
+        param.ty,
+        TypeRef::Bytes | TypeRef::FixedBytes { .. } | TypeRef::Buffer { .. }
+    ) {
+        name
+    } else {
+        format!("prepare_host({name})")
+    }
 }

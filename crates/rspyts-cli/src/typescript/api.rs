@@ -1,5 +1,13 @@
-use super::*;
+//! Rendering of TypeScript callables, resources, constants, and Wasm runtime.
+//!
+//! Public wrappers preserve strict host types while the runtime recursively
+//! prepares Serde-shaped values and restores immutable results. Typed arrays
+//! remain on wasm-bindgen's direct vector ABI.
 
+use super::*;
+use crate::documentation::CallableDocumentation;
+
+/// Render errors, functions, resources, and constants for one namespace.
 pub(super) fn typescript_api(
     items: &NamespaceItems<'_>,
     context: &TypeScriptContext<'_>,
@@ -50,9 +58,20 @@ pub(super) fn typescript_api(
         )?;
     }
     for error in &items.errors {
+        source.push('\n');
+        emit_ts_doc(
+            &mut source,
+            Some(
+                error
+                    .docs
+                    .as_deref()
+                    .unwrap_or("An error reported by the Rust implementation."),
+            ),
+            "",
+        )?;
         writeln!(
             source,
-            "\nexport class {} extends globalThis.Error {{\n  readonly code: string;\n\n  constructor(code: string, message: string) {{\n    super(message);\n    this.name = {};\n    this.code = code;\n  }}\n}}",
+            "export class {} extends globalThis.Error {{\n  /**\n   * Stable machine-readable error code.\n   */\n  readonly code: string;\n\n  constructor(code: string, message: string) {{\n    super(message);\n    this.name = {};\n    this.code = code;\n  }}\n}}",
             error.name,
             ts_string(&error.name)
         )?;
@@ -64,9 +83,15 @@ pub(super) fn typescript_api(
         emit_typescript_resource(&mut source, resource, context)?;
     }
     for constant in &items.constants {
+        source.push('\n');
+        let docs = constant
+            .docs
+            .as_deref()
+            .map(|docs| typescript_documentation_text(docs, context));
+        emit_ts_doc(&mut source, docs.as_deref(), "")?;
         writeln!(
             source,
-            "\nexport const {}: {} = restoreHost({}, {});",
+            "export const {}: {} = restoreHost({}, {});",
             constant.host_name,
             type_ref(&constant.ty, context)?,
             typescript_value(&constant.value, &constant.ty, context.manifest)?,
@@ -76,6 +101,7 @@ pub(super) fn typescript_api(
     Ok(source)
 }
 
+/// Render the package-level Wasm loader and recursive host adapters.
 pub(super) fn typescript_runtime(manifest: &Manifest) -> Result<String> {
     let mut source = String::from(
         "import initializeNative, * as native from \"./native/native.js\";\n\nconst wasmUrl = new URL(\"./native/native_bg.wasm\", import.meta.url);\nlet wasmInput: any = wasmUrl;\nconst process = (globalThis as { process?: { versions?: { node?: string } } }).process;\nif (process?.versions?.node) {\n  const nodeModule = \"node:fs/promises\";\n  const { readFile } = await import(/* @vite-ignore */ nodeModule);\n  if (wasmUrl.protocol === \"file:\") {\n    wasmInput = await readFile(wasmUrl);\n  } else if (wasmUrl.pathname.startsWith(\"/@fs/\")) {\n    wasmInput = await readFile(decodeURIComponent(wasmUrl.pathname.slice(4)));\n  }\n}\nawait initializeNative({ module_or_path: wasmInput });\n\nexport { native };\n",
@@ -94,6 +120,9 @@ pub(super) fn typescript_runtime(manifest: &Manifest) -> Result<String> {
     Ok(source)
 }
 
+// Import planning ----------------------------------------------------------
+
+/// Return model names declared locally and needed by the API module.
 fn typescript_local_type_names(items: &NamespaceItems<'_>) -> Vec<String> {
     let mut names = items
         .types
@@ -111,6 +140,7 @@ fn typescript_local_type_names(items: &NamespaceItems<'_>) -> Vec<String> {
     names
 }
 
+/// Compute the runtime helpers required by one generated API module.
 fn typescript_runtime_imports(items: &NamespaceItems<'_>) -> Vec<&'static str> {
     let has_calls = !items.functions.is_empty() || !items.resources.is_empty();
     let has_params = items
@@ -161,10 +191,38 @@ fn typescript_runtime_imports(items: &NamespaceItems<'_>) -> Vec<&'static str> {
 }
 
 const TYPESCRIPT_ADAPTERS: &str = r#"
-export function prepareHost(value: any): any {
+function prepareJson(value: any): any {
+  if (typeof value === "number") {
+    if (!Number.isFinite(value)) throw new RangeError("JSON numbers must be finite");
+    if (Number.isInteger(value) && !Number.isSafeInteger(value)) {
+      throw new RangeError("JSON integers outside JavaScript's safe range must be provided as bigint");
+    }
+    return value;
+  }
+  if (typeof value === "bigint" || value == null || typeof value !== "object") return value;
+  if (Array.isArray(value)) return value.map(prepareJson);
+  return Object.fromEntries(Object.entries(value).map(([key, item]) => [key, prepareJson(item)]));
+}
+
+export function prepareHost(value: any, spec: any = null): any {
+  if (value == null) return value;
   if (value instanceof Date) return value.toISOString();
   if (ArrayBuffer.isView(value)) return value;
-  if (Array.isArray(value)) return value.map(prepareHost);
+  if (spec != null) {
+    const [kind, detail, variants] = spec;
+    if (kind === "json") return prepareJson(value);
+    if (kind === "named") return prepareHost(value, nativeSchemas[detail]);
+    if (kind === "alias") return prepareHost(value, detail);
+    if (kind === "list") return Array.from(value, (item: any) => prepareHost(item, detail));
+    if (kind === "map") return Object.fromEntries(Object.entries(value).map(([key, item]) => [key, prepareHost(item, detail)]));
+    if (kind === "tuple") return value.map((item: any, index: number) => prepareHost(item, detail[index]));
+    if (kind === "struct") return Object.fromEntries(Object.entries(value).map(([key, item]) => [key, prepareHost(item, detail[key])]));
+    if (kind === "tagged") {
+      const fields = variants[value[detail]] ?? {};
+      return Object.fromEntries(Object.entries(value).map(([key, item]) => [key, prepareHost(item, fields[key])]));
+    }
+  }
+  if (Array.isArray(value)) return value.map((item: any) => prepareHost(item));
   if (value !== null && typeof value === "object") {
     return Object.fromEntries(Object.entries(value).map(([key, item]) => [key, prepareHost(item)]));
   }
@@ -180,10 +238,7 @@ const bufferConstructors: Record<string, any> = {
 function restoreJson(value: any): any {
   if (typeof value === "bigint") {
     const number = Number(value);
-    if (!Number.isSafeInteger(number) || BigInt(number) !== value) {
-      throw new RangeError("JSON integer exceeds JavaScript's safe integer range");
-    }
-    return number;
+    return Number.isSafeInteger(number) && BigInt(number) === value ? number : value;
   }
   if (Array.isArray(value)) return Object.freeze(value.map(restoreJson));
   if (value !== null && typeof value === "object") {
@@ -195,8 +250,11 @@ function restoreJson(value: any): any {
 export function restoreHost(value: any, spec: any): any {
   if (value == null || spec == null) return value;
   const [kind, detail, variants] = spec;
-  if (kind === "bytes") return new Uint8Array(value);
-  if (kind === "buffer") return new bufferConstructors[detail](value);
+  if (kind === "bytes") return value instanceof Uint8Array ? value : new Uint8Array(value);
+  if (kind === "buffer") {
+    const BufferType = bufferConstructors[detail];
+    return value instanceof BufferType ? value : new BufferType(value);
+  }
   if (kind === "json") return restoreJson(value);
   if (kind === "list") return Object.freeze(Array.from(value, (item: any) => restoreHost(item, detail)));
   if (kind === "map") return Object.freeze(Object.fromEntries(Object.entries(value).map(([key, item]) => [key, restoreHost(item, detail)])));
@@ -218,6 +276,9 @@ export function nativeError(error: any, ErrorType: new (code: string, message: s
 }
 "#;
 
+// Callable and resource rendering -----------------------------------------
+
+/// Render one free function or resource method wrapper.
 fn emit_typescript_function(
     source: &mut String,
     function: &FunctionDef,
@@ -228,8 +289,8 @@ fn emit_typescript_function(
     let calls = function
         .params
         .iter()
-        .map(|param| format!("prepareHost({})", param.host_name))
-        .collect::<Vec<_>>()
+        .map(typescript_host_argument)
+        .collect::<Result<Vec<_>>>()?
         .join(", ");
     let mut result_name = "nativeResult".to_owned();
     let parameter_names = function
@@ -262,7 +323,20 @@ fn emit_typescript_function(
             format!("native[{quoted}]({calls})", quoted = ts_string(native_name)),
         )
     };
-    writeln!(source, "\n{signature}")?;
+    source.push('\n');
+    emit_ts_callable_doc(
+        source,
+        &CallableDocumentation {
+            docs: function.docs.as_deref(),
+            fallback_summary: format!("Calls the Rust implementation of `{}`.", function.host_name),
+            params: &function.params,
+            returns: Some(&function.returns),
+            error: function.error.as_ref(),
+        },
+        context,
+        indent,
+    )?;
+    writeln!(source, "{signature}")?;
     if function.error.is_some() {
         writeln!(source, "{indent}  try {{")?;
         writeln!(source, "{indent}    const {result_name} = {call};")?;
@@ -290,6 +364,7 @@ fn emit_typescript_function(
     Ok(())
 }
 
+/// Render one resource class, its factories, methods, and disposal hooks.
 fn emit_typescript_resource(
     source: &mut String,
     resource: &ResourceDef,
@@ -305,11 +380,34 @@ fn emit_typescript_resource(
     let calls = constructor
         .params
         .iter()
-        .map(|item| format!("prepareHost({})", item.host_name))
-        .collect::<Vec<_>>()
+        .map(typescript_host_argument)
+        .collect::<Result<Vec<_>>>()?
         .join(", ");
-    writeln!(source, "\nexport class {} {{", resource.name)?;
+    source.push('\n');
+    emit_ts_doc(
+        source,
+        Some(
+            resource
+                .docs
+                .as_deref()
+                .unwrap_or("A stateful resource implemented in Rust."),
+        ),
+        "",
+    )?;
+    writeln!(source, "export class {} {{", resource.name)?;
     source.push_str("  private nativeResource!: any;\n\n");
+    emit_ts_callable_doc(
+        source,
+        &CallableDocumentation {
+            docs: constructor.docs.as_deref(),
+            fallback_summary: format!("Creates a `{}` instance.", resource.name),
+            params: &constructor.params,
+            returns: None,
+            error: constructor.error.as_ref(),
+        },
+        context,
+        "  ",
+    )?;
     writeln!(source, "  constructor({params}) {{")?;
     let native_call = format!(
         "new native[{quoted}]({calls})",
@@ -338,12 +436,25 @@ fn emit_typescript_resource(
         let calls = factory
             .params
             .iter()
-            .map(|item| format!("prepareHost({})", item.host_name))
-            .collect::<Vec<_>>()
+            .map(typescript_host_argument)
+            .collect::<Result<Vec<_>>>()?
             .join(", ");
+        source.push('\n');
+        emit_ts_callable_doc(
+            source,
+            &CallableDocumentation {
+                docs: factory.docs.as_deref(),
+                fallback_summary: format!("Creates a `{}` instance.", resource.name),
+                params: &factory.params,
+                returns: Some(&factory.returns),
+                error: factory.error.as_ref(),
+            },
+            context,
+            "  ",
+        )?;
         writeln!(
             source,
-            "\n  static {}({params}): {} {{",
+            "  static {}({params}): {} {{",
             factory.host_name, resource.name
         )?;
         writeln!(
@@ -385,6 +496,28 @@ fn emit_typescript_resource(
         };
         emit_typescript_function(source, &function, context, Some(&resource.name))?;
     }
-    source.push_str("\n  close(): void {\n    this.nativeResource.close();\n  }\n}\n");
+    source.push('\n');
+    emit_ts_callable_doc(
+        source,
+        &CallableDocumentation {
+            docs: None,
+            fallback_summary: "Releases the native resources owned by this instance.".to_owned(),
+            params: &[],
+            returns: None,
+            error: None,
+        },
+        context,
+        "  ",
+    )?;
+    source.push_str("  close(): void {\n    this.nativeResource.close();\n  }\n}\n");
     Ok(())
+}
+
+/// Render one Wasm-call argument, bypassing adapters for direct buffers.
+fn typescript_host_argument(param: &ParamDef) -> Result<String> {
+    Ok(format!(
+        "prepareHost({}, {})",
+        param.host_name,
+        typescript_spec(&param.ty)?
+    ))
 }

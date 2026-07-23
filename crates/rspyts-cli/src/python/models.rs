@@ -1,5 +1,12 @@
+//! Rendering and dependency ordering of Python models and aliases.
+//!
+//! Local aliases are topologically sorted before emission. Cross-namespace
+//! models use explicit module aliases, while post-definition `model_rebuild`
+//! calls resolve forward references deterministically.
+
 use super::*;
 
+/// Render all generated model declarations for one Python namespace.
 pub(super) fn python_models(
     items: &NamespaceItems<'_>,
     context: &PythonContext<'_>,
@@ -67,7 +74,7 @@ pub(super) fn python_models(
         )?;
     }
 
-    for definition in &items.types {
+    for definition in ordered_python_types(items)? {
         emit_python_type(&mut source, definition, context)?;
     }
     let mut rebuilds = Vec::new();
@@ -93,6 +100,52 @@ pub(super) fn python_models(
     Ok(source)
 }
 
+/// Order local aliases after the local declarations on which they depend.
+fn ordered_python_types<'a>(items: &NamespaceItems<'a>) -> Result<Vec<&'a TypeDef>> {
+    let mut ordered = items
+        .types
+        .iter()
+        .copied()
+        .filter(|definition| !matches!(definition.shape, TypeShape::Alias { .. }))
+        .collect::<Vec<_>>();
+    let mut pending = items
+        .types
+        .iter()
+        .copied()
+        .filter(|definition| matches!(definition.shape, TypeShape::Alias { .. }))
+        .collect::<Vec<_>>();
+    let local_aliases = pending
+        .iter()
+        .map(|definition| (definition.identity(), definition.name.as_str()))
+        .collect::<BTreeMap<DefinitionId, &str>>();
+    let mut emitted = BTreeSet::<DefinitionId>::new();
+    while !pending.is_empty() {
+        let Some(index) = pending.iter().position(|definition| {
+            let TypeShape::Alias { target } = &definition.shape else {
+                return true;
+            };
+            let mut dependencies = Vec::new();
+            named_identities(target, &mut dependencies);
+            dependencies
+                .into_iter()
+                .filter(|identity| local_aliases.contains_key(*identity))
+                .all(|identity| emitted.contains(identity))
+        }) else {
+            let names = pending
+                .iter()
+                .map(|definition| definition.name.as_str())
+                .collect::<Vec<_>>()
+                .join(" -> ");
+            bail!("Python aliases form a dependency cycle: {names}");
+        };
+        let definition = pending.remove(index);
+        emitted.insert(definition.identity());
+        ordered.push(definition);
+    }
+    Ok(ordered)
+}
+
+/// Minimal imports required by one generated model module.
 #[derive(Default)]
 struct ModelImports {
     datetime: bool,
@@ -101,6 +154,7 @@ struct ModelImports {
     pydantic: BTreeSet<&'static str>,
 }
 
+/// Analyze declarations and collect their standard-library and package imports.
 fn model_imports(items: &NamespaceItems<'_>) -> ModelImports {
     let mut imports = ModelImports::default();
     if !namespace_buffers(items).is_empty() {
@@ -134,6 +188,7 @@ fn model_imports(items: &NamespaceItems<'_>) -> ModelImports {
     imports
 }
 
+/// Extend an import plan with requirements from model fields.
 fn collect_field_imports(fields: &[FieldDef], imports: &mut ModelImports) {
     for field in fields {
         if field.constraints.literal.is_some() {
@@ -143,6 +198,7 @@ fn collect_field_imports(fields: &[FieldDef], imports: &mut ModelImports) {
     }
 }
 
+/// Extend an import plan by recursively visiting one type reference.
 fn collect_reference_imports(reference: &TypeRef, imports: &mut ModelImports) {
     match reference {
         TypeRef::DateTime => imports.datetime = true,
@@ -170,6 +226,7 @@ fn collect_reference_imports(reference: &TypeRef, imports: &mut ModelImports) {
     }
 }
 
+/// Separate the next Python top-level declaration with two blank lines.
 pub(super) fn begin_python_top_level(source: &mut String) {
     if !source.ends_with('\n') {
         source.push('\n');
@@ -179,6 +236,7 @@ pub(super) fn begin_python_top_level(source: &mut String) {
     }
 }
 
+/// Separate the next Python alias from the preceding declaration.
 pub(super) fn begin_python_alias(source: &mut String) {
     if !source.ends_with('\n') {
         source.push('\n');
@@ -188,6 +246,7 @@ pub(super) fn begin_python_alias(source: &mut String) {
     }
 }
 
+/// Render one contract type as a Python model, enum, union, or alias.
 fn emit_python_type(
     source: &mut String,
     definition: &TypeDef,
@@ -217,10 +276,15 @@ fn emit_python_type(
                 source.push_str("    pass\n");
             }
             for variant in variants {
+                if let Some(docs) = variant.docs.as_deref() {
+                    for line in docs.lines() {
+                        writeln!(source, "    #: {line}")?;
+                    }
+                }
                 writeln!(
                     source,
                     "    {} = {}",
-                    variant.rust_name,
+                    safe_python_name(&variant.rust_name),
                     py_string(&variant.wire_name)
                 )?;
             }
@@ -253,10 +317,20 @@ fn emit_python_type(
                 .collect::<Vec<_>>()
                 .join(" | ");
             begin_python_top_level(source);
+            if let Some(docs) = definition.docs.as_deref() {
+                for line in docs.lines() {
+                    writeln!(source, "#: {line}")?;
+                }
+            }
             writeln!(source, "{}: TypeAlias = {}", definition.name, names)?;
         }
         TypeShape::Alias { target } => {
             begin_python_alias(source);
+            if let Some(docs) = definition.docs.as_deref() {
+                for line in docs.lines() {
+                    writeln!(source, "#: {line}")?;
+                }
+            }
             writeln!(
                 source,
                 "{}: TypeAlias = {}",
@@ -268,12 +342,14 @@ fn emit_python_type(
     Ok(())
 }
 
+/// Emit the immutable, strict Pydantic configuration shared by generated models.
 fn emit_model_config(source: &mut String) {
     source.push_str(
         "    model_config = ConfigDict(\n        frozen=True,\n        populate_by_name=True,\n        extra=\"forbid\",\n        arbitrary_types_allowed=True,\n    )\n",
     );
 }
 
+/// Render one Pydantic field with its wire name, default, and constraints.
 fn emit_python_field(
     source: &mut String,
     field: &FieldDef,
@@ -281,7 +357,9 @@ fn emit_python_field(
     indent: &str,
 ) -> Result<()> {
     if let Some(docs) = field.docs.as_deref() {
-        writeln!(source, "{indent}# {}", docs.replace('\n', " "))?;
+        for line in docs.lines() {
+            writeln!(source, "{indent}#: {line}")?;
+        }
     }
     let annotation = if let Some(literal) = &field.constraints.literal {
         format!("Literal[{}]", python_scalar(literal))
@@ -318,4 +396,46 @@ fn emit_python_field(
         options.join(", ")
     )?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn definition(name: &str, shape: TypeShape) -> TypeDef {
+        TypeDef {
+            owner: rspyts::ir::CargoPackageId::new("test"),
+            rust_module: "test".to_owned(),
+            id: format!("test::{name}"),
+            name: name.to_owned(),
+            docs: None,
+            shape,
+        }
+    }
+
+    #[test]
+    fn aliases_are_emitted_after_their_local_dependencies() {
+        let target = definition("ZTarget", TypeShape::Struct { fields: Vec::new() });
+        let alias = definition(
+            "AAlias",
+            TypeShape::Alias {
+                target: TypeRef::Named {
+                    identity: target.identity(),
+                },
+            },
+        );
+        let items = NamespaceItems {
+            types: vec![&alias, &target],
+            ..NamespaceItems::default()
+        };
+
+        let ordered = ordered_python_types(&items).expect("order aliases");
+        assert_eq!(
+            ordered
+                .iter()
+                .map(|definition| definition.name.as_str())
+                .collect::<Vec<_>>(),
+            ["ZTarget", "AAlias"]
+        );
+    }
 }

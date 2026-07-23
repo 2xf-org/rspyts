@@ -1,14 +1,23 @@
+//! Loading, discovery, and comment-preserving updates of `rspyts.toml`.
+//!
+//! The `[application]` table is user-owned and retained byte-for-byte whenever
+//! generated ownership is published. Only the `[generated]` subtree is
+//! reconstructed, which keeps configuration edits and comments stable across
+//! builds.
+
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command as ProcessCommand;
 
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
-use serde_json::Value;
 use toml_edit::DocumentMut;
 
+use crate::cargo;
+
+/// Canonical configuration filename searched by CLI commands.
 pub(super) const CONFIG_FILE: &str = "rspyts.toml";
 
+/// Fully commented configuration written by `rspyts init`.
 pub(super) const CONFIG_TEMPLATE: &str = r#"# rspyts application configuration and generated-file ownership.
 # Edit [application]. rspyts updates only the [generated] tables.
 
@@ -68,13 +77,19 @@ native_modules = __PYTHON_NATIVE_MODULES__
 files = __TYPESCRIPT_FILES__
 "#;
 
+/// User-owned application settings.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 pub(super) struct ApplicationSettings {
+    /// Optional public application-name override.
     pub(super) name: Option<String>,
+    /// Additional workspace crates linked into the application bridge.
     pub(super) additional_packages: Vec<String>,
+    /// Optional Python import-package override.
     pub(super) python_package: Option<String>,
+    /// Optional npm package-name override.
     pub(super) typescript_package: Option<String>,
+    /// Whether generated-file ignore lists are maintained.
     pub(super) gitignore: bool,
 }
 
@@ -90,27 +105,37 @@ impl Default for ApplicationSettings {
     }
 }
 
+/// Complete rspyts-owned state persisted after a successful publication.
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 pub(super) struct GeneratedState {
+    /// Fingerprint of Rust inputs and active application settings.
     pub(super) source_fingerprint: String,
+    /// Owned Python paths and native modules.
     pub(super) python: PythonGeneratedState,
+    /// Owned TypeScript and WebAssembly paths.
     pub(super) typescript: TypeScriptGeneratedState,
 }
 
+/// Generated Python ownership recorded in `rspyts.toml`.
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 pub(super) struct PythonGeneratedState {
+    /// Platform-independent generated files.
     pub(super) files: Vec<String>,
+    /// Extension-module basenames without platform-specific suffixes.
     pub(super) native_modules: Vec<String>,
 }
 
+/// Generated TypeScript and WebAssembly ownership recorded in `rspyts.toml`.
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 pub(super) struct TypeScriptGeneratedState {
+    /// Generated source, declaration, loader, and Wasm paths.
     pub(super) files: Vec<String>,
 }
 
+/// Deserialization-only shape of the complete configuration document.
 #[derive(Debug, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 struct ConfigData {
@@ -118,15 +143,20 @@ struct ConfigData {
     generated: GeneratedState,
 }
 
+/// Parsed configuration plus the original editable TOML document.
 #[derive(Clone, Debug)]
 pub(super) struct Config {
+    /// Canonical path to `rspyts.toml`.
     pub(super) path: PathBuf,
+    /// User-controlled application settings.
     pub(super) application: ApplicationSettings,
+    /// Last successfully published generated state.
     pub(super) generated: GeneratedState,
     document: DocumentMut,
 }
 
 impl Config {
+    /// Parse a configuration while retaining its comments and formatting.
     pub(super) fn read(path: &Path) -> Result<Self> {
         let path = path
             .canonicalize()
@@ -146,12 +176,14 @@ impl Config {
         })
     }
 
+    /// Return the application root containing this configuration.
     pub(super) fn root(&self) -> &Path {
         self.path
             .parent()
             .expect("a canonical configuration path has a parent")
     }
 
+    /// Replace only the generated subtree in the retained TOML document.
     pub(super) fn render_generated(&self, generated: &GeneratedState) -> Result<String> {
         let fragment = GENERATED_TEMPLATE
             .replace(
@@ -184,6 +216,7 @@ impl Config {
         Ok(document.to_string())
     }
 
+    /// Render the canonical application settings used for source fingerprinting.
     pub(super) fn application_fingerprint_source(&self) -> Result<String> {
         let mut document = DocumentMut::new();
         if let Some(name) = &self.application.name {
@@ -210,6 +243,7 @@ impl Config {
     }
 }
 
+/// Resolve one configuration from an explicit path, ancestors, or workspace.
 pub(super) fn discover(explicit: Option<&Path>) -> Result<PathBuf> {
     if let Some(path) = explicit {
         let path = if path.is_dir() {
@@ -234,38 +268,13 @@ pub(super) fn discover(explicit: Option<&Path>) -> Result<PathBuf> {
         .map(|directory| directory.join("Cargo.toml"))
         .find(|path| path.is_file())
         .context("cannot find rspyts.toml or an enclosing Cargo workspace")?;
-    let output = ProcessCommand::new(cargo())
-        .args([
-            "metadata",
-            "--format-version",
-            "1",
-            "--no-deps",
-            "--manifest-path",
-        ])
-        .arg(&cargo_manifest)
-        .output()
-        .context("failed to run cargo metadata while locating rspyts.toml")?;
-    if !output.status.success() {
-        bail!(
-            "cargo metadata failed while locating rspyts.toml\n{}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
-    let metadata: Value = serde_json::from_slice(&output.stdout)?;
-    let workspace_members = metadata["workspace_members"]
-        .as_array()
-        .context("Cargo metadata has no workspace member list")?;
-    let mut candidates = metadata["packages"]
-        .as_array()
-        .context("Cargo metadata has no package list")?
+    let metadata = cargo::metadata(&cargo_manifest, true)
+        .context("failed to inspect the Cargo workspace while locating rspyts.toml")?;
+    let mut candidates = metadata
+        .packages
         .iter()
-        .filter(|package| {
-            package["id"]
-                .as_str()
-                .is_some_and(|id| workspace_members.iter().any(|member| member == id))
-        })
-        .filter_map(|package| package["manifest_path"].as_str())
-        .filter_map(|manifest| Path::new(manifest).parent())
+        .filter(|package| metadata.workspace_members.contains(&package.id))
+        .filter_map(|package| package.manifest_path.parent())
         .map(|root| root.join(CONFIG_FILE))
         .filter(|path| path.is_file())
         .collect::<Vec<_>>();
@@ -282,14 +291,17 @@ pub(super) fn discover(explicit: Option<&Path>) -> Result<PathBuf> {
     }
 }
 
+/// Iterate from a path through all of its lexical ancestors.
 fn ancestors(path: &Path) -> impl Iterator<Item = &Path> {
     path.ancestors()
 }
 
+/// Render a quoted TOML string using JSON's compatible escaping rules.
 fn quoted(value: &str) -> String {
     serde_json::to_string(value).expect("serializing a string cannot fail")
 }
 
+/// Render a stable multiline TOML string array.
 fn string_array(values: &[String]) -> String {
     if values.is_empty() {
         return "[]".to_owned();
@@ -304,16 +316,13 @@ fn string_array(values: &[String]) -> String {
     source
 }
 
+/// Construct a TOML edit item from a sequence of strings.
 fn string_array_value<'a>(values: impl Iterator<Item = &'a str>) -> toml_edit::Item {
     let mut array = toml_edit::Array::new();
     for value in values {
         array.push(value);
     }
     toml_edit::value(array)
-}
-
-fn cargo() -> std::ffi::OsString {
-    std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into())
 }
 
 #[cfg(test)]

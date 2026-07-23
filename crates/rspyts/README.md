@@ -189,6 +189,8 @@ pub fn scale(#[rspyts(buffer)] values: &[f64], factor: f64) -> Vec<f64> {
 
 Bytes become Python `bytes` and TypeScript `Uint8Array`. Numeric buffers become typed NumPy arrays and JavaScript typed arrays. Add `numpy` to `src-py/pyproject.toml` before building a contract that uses `buffer`.
 
+Binary annotations belong on top-level exported parameters and returns. rspyts rejects `bytes` and `buffer` fields inside models because nested values cannot use the direct native buffer ABI; keep metadata in the model and pass large payloads as separate annotated parameters.
+
 ## Supported value types
 
 | Rust contract type | Python | TypeScript |
@@ -200,14 +202,16 @@ Bytes become Python `bytes` and TypeScript `Uint8Array`. Numeric buffers become 
 | `f32`, `f64` | `float` | `number` |
 | `String`, `str` | `str` | `string` |
 | `Option<T>` | `T | None` | `T | null` |
-| `Vec<T>`, `[T]` | `list[T]` | `readonly T[]` |
+| `Vec<T>`, `[T]` | `list[T]` | `ReadonlyArray<T>` |
 | `HashMap<String, T>`, `BTreeMap<String, T>` | `dict[str, T]` | `Readonly<Record<string, T>>` |
 | tuples of 2 through 8 items | `tuple[...]` | readonly tuple |
 | `chrono::DateTime<Utc>` or `DateTime<FixedOffset>` | `datetime` | ISO-8601 `string` |
-| `serde_json::Value` | `Any` | JSON value union |
+| `serde_json::Value` | `Any` | JSON value union; wide integers use `bigint` |
 | a `Model` type | generated model | generated interface, union, or alias |
 
 Immutable references to supported values are accepted as function inputs. Exported functions must be synchronous, non-generic public functions with simple identifier parameters.
+
+An `Option<T>` requires an inner wire type that does not already admit null. Contracts such as `Option<Option<T>>`, `Option<()>`, and `Option<serde_json::Value>` are rejected because their distinct Rust states cannot round-trip through Python or JavaScript.
 
 ## Naming and Serde behavior
 
@@ -237,4 +241,4 @@ If you are embedding rspyts contract discovery in custom build tooling, `rspyts:
 rspyts::application!(shared_api, reporting_api);
 ```
 
-Use the [CLI and configuration reference](https://github.com/2xf-org/rspyts/tree/main/crates/rspyts-cli) for normal project builds. The [repository example](https://github.com/2xf-org/rspyts/tree/main/example) shows one generated greeting API with handwritten Python and TypeScript helpers beside it.
+Use the [CLI and configuration reference](https://github.com/2xf-org/rspyts/tree/main/crates/rspyts-cli) for normal project builds. The [repository example](https://github.com/2xf-org/rspyts/tree/main/example) shows a sensor-reading API with matching handwritten Python and TypeScript helpers beside it.

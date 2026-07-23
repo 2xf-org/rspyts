@@ -1,3 +1,9 @@
+//! Expansion of the application-level discovery and host-module entry points.
+//!
+//! The generated C ABI never unwinds and pairs every owned payload with an
+//! explicit free function. Native builds also expose the Python module, while
+//! Wasm builds expose contract JSON for tooling and wasm-bindgen exports.
+
 use proc_macro2::TokenStream as TokenStream2;
 use quote::quote;
 use syn::{
@@ -6,7 +12,9 @@ use syn::{
     punctuated::Punctuated,
 };
 
+/// Optional crate identifiers linked into the generated application bridge.
 pub(super) struct ModuleInput {
+    /// Crates that must be linked so inventory can discover their exports.
     crates: Vec<Ident>,
 }
 
@@ -20,6 +28,7 @@ impl Parse for ModuleInput {
     }
 }
 
+/// Emit native discovery/Python entry points and the Wasm contract export.
 pub(super) fn expand_application(input: ModuleInput) -> TokenStream2 {
     let crates = input.crates;
     quote! {

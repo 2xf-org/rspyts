@@ -1,5 +1,11 @@
+//! Rendering of TypeScript interfaces, unions, enums, and aliases.
+//!
+//! This module emits type-level public declarations only. Runtime restoration
+//! schemas and callable wrappers belong to `api` and `render`.
+
 use super::*;
 
+/// Render all model declarations for one TypeScript namespace.
 pub(super) fn typescript_models(
     items: &NamespaceItems<'_>,
     context: &TypeScriptContext<'_>,
@@ -21,7 +27,7 @@ pub(super) fn typescript_models(
         .iter()
         .any(|reference| reference_contains(reference, &|item| matches!(item, TypeRef::Json)))
     {
-        source.push_str("\nexport type JsonValue = null | boolean | number | string | JsonValue[] | { readonly [key: string]: JsonValue };\n");
+        source.push_str("\nexport type JsonValue = null | boolean | number | bigint | string | ReadonlyArray<JsonValue> | { readonly [key: string]: JsonValue };\n");
     }
     for definition in &items.types {
         emit_typescript_type(&mut source, definition, context)?;
@@ -29,6 +35,7 @@ pub(super) fn typescript_models(
     Ok(source)
 }
 
+/// Render one contract type as an interface, union, enum object, or alias.
 fn emit_typescript_type(
     source: &mut String,
     definition: &TypeDef,
@@ -69,6 +76,7 @@ fn emit_typescript_type(
                 definition.name
             )?;
             for variant in variants {
+                emit_ts_doc(source, variant.docs.as_deref(), "  ")?;
                 writeln!(
                     source,
                     "  {}: {},",
@@ -101,6 +109,7 @@ fn emit_typescript_type(
                 }
                 source.push_str("}\n");
             }
+            emit_ts_doc(source, definition.docs.as_deref(), "")?;
             writeln!(
                 source,
                 "export type {} = {};",

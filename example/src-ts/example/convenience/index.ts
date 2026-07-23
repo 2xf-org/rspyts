@@ -1,5 +1,6 @@
-import { greet } from "../api.js";
+import { summarizeReadings } from "../api.js";
 
-export function excitedGreeting(name: string): string {
-  return greet(name).message.toUpperCase();
+export function describeReadings(readings: ArrayLike<number>): string {
+  const summary = summarizeReadings(Float64Array.from(readings));
+  return `${summary.count} readings: ${summary.minimum.toFixed(2)} to ${summary.maximum.toFixed(2)} (mean ${summary.mean.toFixed(2)}, ${summary.trend})`;
 }

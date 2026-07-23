@@ -8,8 +8,12 @@ build-backend = "pdm.backend"
 [project]
 name = "example"
 version = "0.1.0"
+description = "A sensor-reading toolkit built with rspyts"
 requires-python = ">=3.11"
-dependencies = ["pydantic>=2,<3"]
+dependencies = ["numpy>=2,<3", "pydantic>=2,<3"]
+
+[project.optional-dependencies]
+dev = ["mypy>=1,<2", "pyright>=1,<2", "pytest>=8,<9"]
 
 [tool.pdm.build]
 includes = ["example"]

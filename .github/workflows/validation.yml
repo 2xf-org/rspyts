@@ -41,10 +41,12 @@ jobs:
         run: cargo fmt --all --check
       - name: Lint
         run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
-      - name: Test Rust integrations
-        run: |
-          cargo test --locked -p rspyts --test contract --test python
-          cargo test --locked -p rspyts-cli --test cli
+      - name: Check documentation
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc --workspace --all-features --no-deps --document-private-items --locked
+      - name: Test Rust unit and integration suites
+        run: cargo test --workspace --all-targets --locked
       - name: Check WebAssembly exports
         run: cargo check --locked -p example --target wasm32-unknown-unknown
 
@@ -98,7 +100,7 @@ jobs:
       - name: Test Python integrations
         working-directory: example/src-py
         run: |
-          python -m pip install --disable-pip-version-check 'mypy>=1,<2' 'pyright>=1,<2' 'pytest>=8,<9' -e .
+          python -m pip install --disable-pip-version-check -e '.[dev]'
           python -m pytest -q tests
           python -m mypy typecheck.py
           pyright typecheck.py
@@ -108,5 +110,5 @@ jobs:
           npm --prefix example/src-ts ci
           npm --prefix example/src-ts run check
           npm --prefix example/src-ts run build
+          npm --prefix example/src-ts test
           npm pack ./example/src-ts --dry-run
-          node --input-type=module --eval 'const { excitedGreeting, greet } = await import("./example/src-ts/build/example/index.js"); if (greet("Ada").message !== "Hello, Ada!") throw new Error("generated greeting failed"); if (excitedGreeting("Ada") !== "HELLO, ADA!") throw new Error("authored greeting failed");'

@@ -1,3 +1,11 @@
+//! Rust type analysis and host-neutral contract token generation.
+//!
+//! This module is the single authority for supported Rust signatures. It
+//! parses field constraints, validates their compatibility with the selected
+//! wire type, resolves `Result` success/error types, and emits deterministic
+//! native export names. Unsupported shapes fail closed with errors attached to
+//! the originating syntax span.
+
 use proc_macro2::{Span, TokenStream as TokenStream2};
 use quote::quote;
 use syn::{
@@ -11,6 +19,9 @@ use crate::attributes::{
     take_boundary_attr, type_last_ident,
 };
 
+// Callable signatures -------------------------------------------------------
+
+/// Render contract parameter definitions and remove consumed attributes.
 pub(super) fn params_tokens(
     inputs: &mut Punctuated<FnArg, Comma>,
 ) -> syn::Result<Vec<TokenStream2>> {
@@ -20,7 +31,7 @@ pub(super) fn params_tokens(
             continue;
         };
         let name = match argument.pat.as_ref() {
-            Pat::Ident(ident) => ident.ident.to_string(),
+            Pat::Ident(ident) => ident.ident.unraw().to_string(),
             other => {
                 return Err(syn::Error::new(
                     other.span(),
@@ -40,6 +51,7 @@ pub(super) fn params_tokens(
     Ok(params)
 }
 
+/// Resolve a callable return and render its value and typed-error contract.
 pub(super) fn return_tokens(
     output: &ReturnType,
     return_boundary: Option<&str>,
@@ -64,6 +76,7 @@ pub(super) fn return_tokens(
     Ok((type_ref_tokens(ty, return_boundary)?, quote!(None)))
 }
 
+/// Render one named model field and its validated constraints.
 pub(super) fn field_tokens(
     field: &syn::Field,
     rename_all: Option<SerdeRenameRule>,
@@ -73,6 +86,14 @@ pub(super) fn field_tokens(
     let serde = serde_field(&field.attrs)?;
     let docs = docs_tokens(&field.attrs);
     let options = field_options(&field.attrs)?;
+    if let Some(boundary) = options.boundary.as_deref() {
+        return Err(syn::Error::new(
+            field.ty.span(),
+            format!(
+                "`#[rspyts({boundary})]` is supported only on top-level exported parameters; move large binary values out of models"
+            ),
+        ));
+    }
     validate_field_options(field, &options, &serde)?;
     let wire_name = serde
         .rename
@@ -103,6 +124,9 @@ pub(super) fn field_tokens(
     }))
 }
 
+// Field defaults and constraints -------------------------------------------
+
+/// Scalar values accepted in declarative defaults and constraints.
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum ScalarValue {
     Bool(bool),
@@ -110,14 +134,17 @@ enum ScalarValue {
     String(String),
 }
 
+/// Parsed scalar together with its diagnostic source span.
 #[derive(Clone, Debug)]
 struct SpannedScalar {
     value: ScalarValue,
     span: Span,
 }
 
+/// Supported rspyts metadata collected from a model field.
 #[derive(Default)]
 pub(super) struct FieldOptions {
+    /// Optional direct boundary; rejected for non-transparent model fields.
     pub(super) boundary: Option<String>,
     required: bool,
     literal: Option<SpannedScalar>,
@@ -128,6 +155,28 @@ pub(super) struct FieldOptions {
     default: Option<SpannedScalar>,
 }
 
+/// Ensure a transparent alias does not silently discard field semantics.
+pub(super) fn validate_alias_field_options(
+    field: &syn::Field,
+    options: &FieldOptions,
+) -> syn::Result<()> {
+    if options.required
+        || options.literal.is_some()
+        || options.min_length.is_some()
+        || options.max_length.is_some()
+        || options.ge.is_some()
+        || options.le.is_some()
+        || options.default.is_some()
+    {
+        return Err(syn::Error::new(
+            field.span(),
+            "transparent aliases support only `#[rspyts(bytes)]` or `#[rspyts(buffer)]`; field constraints and defaults would otherwise be discarded",
+        ));
+    }
+    Ok(())
+}
+
+/// Parse field constraints and declarative defaults.
 pub(super) fn field_options(attrs: &[Attribute]) -> syn::Result<FieldOptions> {
     let mut options = FieldOptions::default();
     for attr in attrs.iter().filter(|attr| attr.path().is_ident("rspyts")) {
@@ -187,6 +236,7 @@ pub(super) fn field_options(attrs: &[Attribute]) -> syn::Result<FieldOptions> {
     Ok(options)
 }
 
+/// Parse a boolean, signed integer, or string literal with its source span.
 fn parse_scalar(expression: Expr) -> syn::Result<SpannedScalar> {
     let span = expression.span();
     let value = match expression {
@@ -232,12 +282,14 @@ fn parse_scalar(expression: Expr) -> syn::Result<SpannedScalar> {
     Ok(SpannedScalar { value, span })
 }
 
+/// Parse a positive literal into the signed scalar domain.
 fn parse_positive_i64(value: &syn::LitInt, label: &str) -> syn::Result<i64> {
     let parsed = value.base10_parse::<u128>()?;
     i64::try_from(parsed)
         .map_err(|_| syn::Error::new(value.span(), format!("{label} must fit in signed 64 bits")))
 }
 
+/// Parse a signed integer expression used by a constraint.
 fn parse_i64(expression: Expr, label: &str) -> syn::Result<i64> {
     let scalar = parse_scalar(expression)?;
     match scalar.value {
@@ -249,6 +301,7 @@ fn parse_i64(expression: Expr, label: &str) -> syn::Result<i64> {
     }
 }
 
+/// Parse a non-negative integer expression used by a length constraint.
 fn parse_u64(expression: Expr, label: &str) -> syn::Result<u64> {
     let span = expression.span();
     let Expr::Lit(literal) = expression else {
@@ -271,6 +324,7 @@ fn parse_u64(expression: Expr, label: &str) -> syn::Result<u64> {
     })
 }
 
+/// Coarse wire category used to validate field metadata.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum FieldKind {
     Bool,
@@ -282,6 +336,7 @@ enum FieldKind {
     Unknown,
 }
 
+/// Classify a field after accounting for an explicit direct boundary.
 fn field_kind(ty: &SynType, boundary: Option<&str>) -> FieldKind {
     match boundary {
         Some("bytes") => return FieldKind::Bytes,
@@ -316,6 +371,7 @@ fn field_kind(ty: &SynType, boundary: Option<&str>) -> FieldKind {
     }
 }
 
+/// Return the scalar value implied by Rust's `Default` for known primitives.
 fn rust_default_scalar(ty: &SynType) -> Option<ScalarValue> {
     let SynType::Path(path) = ty else {
         return None;
@@ -365,6 +421,7 @@ fn rust_default_scalar(ty: &SynType) -> Option<ScalarValue> {
     None
 }
 
+/// Validate all presence, range, and type-specific field options.
 fn validate_field_options(
     field: &syn::Field,
     options: &FieldOptions,
@@ -376,6 +433,7 @@ fn validate_field_options(
     validate_constraint_values(options, kind)
 }
 
+/// Validate required/default/Serde presence semantics as one coherent policy.
 fn validate_field_presence(
     field: &syn::Field,
     options: &FieldOptions,
@@ -439,6 +497,7 @@ fn validate_field_presence(
     Ok(())
 }
 
+/// Validate ordering and compatibility of numeric and length ranges.
 fn validate_constraint_ranges(
     field: &syn::Field,
     options: &FieldOptions,
@@ -458,19 +517,14 @@ fn validate_constraint_ranges(
         return Err(syn::Error::new(field.span(), "`ge` cannot exceed `le`"));
     }
     if (options.min_length.is_some() || options.max_length.is_some())
-        && !matches!(
-            kind,
-            FieldKind::String | FieldKind::List | FieldKind::Unknown
-        )
+        && !matches!(kind, FieldKind::String | FieldKind::List)
     {
         return Err(syn::Error::new(
             field.ty.span(),
             "`min_length` and `max_length` apply only to string or list fields",
         ));
     }
-    if (options.ge.is_some() || options.le.is_some())
-        && !matches!(kind, FieldKind::Integer | FieldKind::Unknown)
-    {
+    if (options.ge.is_some() || options.le.is_some()) && !matches!(kind, FieldKind::Integer) {
         return Err(syn::Error::new(
             field.ty.span(),
             "`ge` and `le` apply only to integer fields",
@@ -479,6 +533,7 @@ fn validate_constraint_ranges(
     Ok(())
 }
 
+/// Validate that constraints are legal for the selected field category.
 fn validate_constraint_values(options: &FieldOptions, kind: FieldKind) -> syn::Result<()> {
     if let Some(literal) = options.literal.as_ref() {
         validate_scalar_kind(literal, kind, "literal")?;
@@ -533,14 +588,14 @@ fn validate_constraint_values(options: &FieldOptions, kind: FieldKind) -> syn::R
     Ok(())
 }
 
+/// Validate one literal/default scalar against the field category.
 fn validate_scalar_kind(value: &SpannedScalar, kind: FieldKind, label: &str) -> syn::Result<()> {
-    let valid = matches!(kind, FieldKind::Unknown)
-        || matches!(
-            (&value.value, kind),
-            (ScalarValue::Bool(_), FieldKind::Bool)
-                | (ScalarValue::I64(_), FieldKind::Integer)
-                | (ScalarValue::String(_), FieldKind::String)
-        );
+    let valid = matches!(
+        (&value.value, kind),
+        (ScalarValue::Bool(_), FieldKind::Bool)
+            | (ScalarValue::I64(_), FieldKind::Integer)
+            | (ScalarValue::String(_), FieldKind::String)
+    );
     if valid {
         Ok(())
     } else {
@@ -551,6 +606,7 @@ fn validate_scalar_kind(value: &SpannedScalar, kind: FieldKind, label: &str) -> 
     }
 }
 
+/// Render an optional scalar as contract IR construction tokens.
 fn scalar_option_tokens(value: Option<&SpannedScalar>) -> TokenStream2 {
     match value.map(|value| &value.value) {
         Some(ScalarValue::Bool(value)) => {
@@ -566,14 +622,19 @@ fn scalar_option_tokens(value: Option<&SpannedScalar>) -> TokenStream2 {
     }
 }
 
+/// Render an optional unsigned integer as construction tokens.
 fn option_u64_tokens(value: Option<u64>) -> TokenStream2 {
     value.map_or_else(|| quote!(None), |value| quote!(Some(#value)))
 }
 
+/// Render an optional signed integer as construction tokens.
 fn option_i64_tokens(value: Option<i64>) -> TokenStream2 {
     value.map_or_else(|| quote!(None), |value| quote!(Some(#value)))
 }
 
+// Contract type references --------------------------------------------------
+
+/// Analyze a Rust type and render its host-neutral contract construction.
 pub(super) fn type_ref_tokens(ty: &SynType, boundary: Option<&str>) -> syn::Result<TokenStream2> {
     let fixed_bytes = fixed_byte_array_length(ty)?;
     match boundary {
@@ -631,6 +692,7 @@ pub(super) fn type_ref_tokens(ty: &SynType, boundary: Option<&str>) -> syn::Resu
     }
 }
 
+/// Require a byte boundary to use a supported owned, slice, or array shape.
 fn validate_bytes_type(ty: &SynType) -> syn::Result<()> {
     if fixed_byte_array_length(ty)?.is_some() || is_owned_bytes(ty) || is_borrowed_byte_slice(ty) {
         Ok(())
@@ -642,6 +704,7 @@ fn validate_bytes_type(ty: &SynType) -> syn::Result<()> {
     }
 }
 
+/// Return whether a type is an owned `Vec<u8>`.
 fn is_owned_bytes(ty: &SynType) -> bool {
     let SynType::Path(path) = ty else {
         return false;
@@ -660,6 +723,7 @@ fn is_owned_bytes(ty: &SynType) -> bool {
         && arguments.next().is_none()
 }
 
+/// Return whether a type is a borrowed `[u8]` slice.
 fn is_borrowed_byte_slice(ty: &SynType) -> bool {
     let SynType::Reference(reference) = ty else {
         return false;
@@ -670,6 +734,7 @@ fn is_borrowed_byte_slice(ty: &SynType) -> bool {
     matches!(reference.elem.as_ref(), SynType::Slice(slice) if is_u8(&slice.elem))
 }
 
+/// Return the length expression when a type is `[u8; N]` or `&[u8; N]`.
 fn fixed_byte_array_length(ty: &SynType) -> syn::Result<Option<&Expr>> {
     let ty = match ty {
         SynType::Reference(reference) if reference.mutability.is_none() => reference.elem.as_ref(),
@@ -687,6 +752,7 @@ fn fixed_byte_array_length(ty: &SynType) -> syn::Result<Option<&Expr>> {
     Ok(Some(&array.len))
 }
 
+/// Return whether a path denotes `Vec` through an accepted canonical spelling.
 fn is_vec_path(path: &syn::Path) -> bool {
     let segments = path
         .segments
@@ -702,6 +768,7 @@ fn is_vec_path(path: &syn::Path) -> bool {
     }
 }
 
+/// Return whether a type is the primitive byte type.
 fn is_u8(ty: &SynType) -> bool {
     let SynType::Path(path) = ty else {
         return false;
@@ -730,6 +797,7 @@ fn is_u8(ty: &SynType) -> bool {
             .all(|segment| matches!(segment.arguments, PathArguments::None))
 }
 
+/// Return the scalar element of a supported vector, slice, or array.
 fn sequence_scalar(ty: &SynType) -> Option<&SynType> {
     match ty {
         SynType::Reference(reference) => sequence_scalar(&reference.elem),
@@ -751,6 +819,7 @@ fn sequence_scalar(ty: &SynType) -> Option<&SynType> {
     }
 }
 
+/// Resolve `Result<T, E>` while enforcing an explicit stable error contract.
 pub(super) fn resolved_result_types(
     output: &ReturnType,
     declared_error: Option<&SynType>,
@@ -810,6 +879,7 @@ pub(super) fn resolved_result_types(
     }
 }
 
+/// Return whether the terminal path segment denotes `Option`.
 fn is_option(ty: &SynType) -> bool {
     matches!(
         ty,
@@ -817,6 +887,9 @@ fn is_option(ty: &SynType) -> bool {
     )
 }
 
+// Exported-signature validation --------------------------------------------
+
+/// Require an exported declaration to be public.
 pub(super) fn ensure_public(visibility: &syn::Visibility, span: Span) -> syn::Result<()> {
     if matches!(visibility, syn::Visibility::Public(_)) {
         Ok(())
@@ -828,6 +901,7 @@ pub(super) fn ensure_public(visibility: &syn::Visibility, span: Span) -> syn::Re
     }
 }
 
+/// Reject generic exported declarations, whose host shape is not closed.
 pub(super) fn reject_generics(generics: &syn::Generics, span: Span) -> syn::Result<()> {
     if generics.params.is_empty() && generics.where_clause.is_none() {
         Ok(())
@@ -839,6 +913,7 @@ pub(super) fn reject_generics(generics: &syn::Generics, span: Span) -> syn::Resu
     }
 }
 
+/// Reject ABI, variadic, async, unsafe, receiver, and generic forms.
 pub(super) fn reject_signature(signature: &syn::Signature) -> syn::Result<()> {
     reject_generics(&signature.generics, signature.ident.span())?;
     for argument in &signature.inputs {
@@ -861,7 +936,7 @@ pub(super) fn reject_signature(signature: &syn::Signature) -> syn::Result<()> {
     if signature.asyncness.is_some() {
         return Err(syn::Error::new(
             signature.span(),
-            "async exports are not supported in v1.0",
+            "async exports are not supported",
         ));
     }
     if signature.unsafety.is_some() || signature.variadic.is_some() {
@@ -873,8 +948,9 @@ pub(super) fn reject_signature(signature: &syn::Signature) -> syn::Result<()> {
     Ok(())
 }
 
+/// Reserve lifecycle method names implemented by generated resource wrappers.
 pub(super) fn reject_reserved_resource_method(method: &ImplItemFn) -> syn::Result<()> {
-    let name = method.sig.ident.to_string();
+    let name = method.sig.ident.unraw().to_string();
     if matches!(name.as_str(), "close" | "free") {
         return Err(syn::Error::new(
             method.sig.ident.span(),
@@ -884,6 +960,9 @@ pub(super) fn reject_reserved_resource_method(method: &ImplItemFn) -> syn::Resul
     Ok(())
 }
 
+// Stable native symbol names ------------------------------------------------
+
+/// Derive a deterministic, collision-resistant native export symbol.
 pub(super) fn native_export_name(span: Span, kind: &str, public_name: &str) -> String {
     let span = span.unwrap();
     let package = std::env::var("CARGO_PKG_NAME").unwrap_or_else(|_| "crate".to_owned());
@@ -920,6 +999,7 @@ pub(super) fn native_export_name(span: Span, kind: &str, public_name: &str) -> S
     )
 }
 
+/// Convert a compiler source path into a reproducible workspace-relative path.
 fn relative_source_path(
     file: &str,
     manifest_dir: Option<&str>,
@@ -941,10 +1021,12 @@ fn relative_source_path(
         .to_owned()
 }
 
+/// Return whether a source path is absolute on Unix or Windows.
 fn is_absolute_source_path(path: &str) -> bool {
     path.starts_with('/') || path.as_bytes().get(1) == Some(&b':')
 }
 
+/// Normalize platform separators and lexical dot segments in a source path.
 fn normalize_source_path(path: &str) -> String {
     let path = path.replace('\\', "/");
     let mut path = path.strip_prefix("//?/").unwrap_or(&path).to_owned();
@@ -958,6 +1040,7 @@ fn normalize_source_path(path: &str) -> String {
     path
 }
 
+/// Compute the deterministic FNV-1a hash used in generated symbol suffixes.
 fn stable_hash(bytes: &[u8]) -> u64 {
     let mut hash = 0xcbf2_9ce4_8422_2325_u64;
     for byte in bytes {
@@ -965,4 +1048,55 @@ fn stable_hash(bytes: &[u8]) -> u64 {
         hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
     }
     hash
+}
+
+#[cfg(test)]
+mod tests {
+    use quote::quote;
+    use syn::parse::Parser;
+
+    use super::*;
+
+    fn named_field(tokens: TokenStream2) -> syn::Field {
+        syn::Field::parse_named
+            .parse2(tokens)
+            .expect("parse named field")
+    }
+
+    #[test]
+    fn model_binary_fields_are_rejected() {
+        let field = named_field(quote!(
+            #[rspyts(bytes)]
+            payload: Vec<u8>
+        ));
+        let error = field_tokens(&field, None).expect_err("nested bytes must be rejected");
+
+        assert!(error.to_string().contains("top-level exported parameters"));
+    }
+
+    #[test]
+    fn constraints_fail_closed_for_unknown_field_types() {
+        let field = named_field(quote!(
+            #[rspyts(ge = 1)]
+            timestamp: chrono::DateTime<chrono::Utc>
+        ));
+        let error = field_tokens(&field, None).expect_err("unknown constraint must be rejected");
+
+        assert!(error.to_string().contains("apply only to integer fields"));
+    }
+
+    #[test]
+    fn transparent_alias_options_cannot_be_silently_discarded() {
+        let field = syn::Field::parse_unnamed
+            .parse2(quote!(
+                #[rspyts(min_length = 1)]
+                String
+            ))
+            .expect("parse tuple field");
+        let options = field_options(&field.attrs).expect("parse options");
+        let error = validate_alias_field_options(&field, &options)
+            .expect_err("alias constraints must be rejected");
+
+        assert!(error.to_string().contains("would otherwise be discarded"));
+    }
 }

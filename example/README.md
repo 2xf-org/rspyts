@@ -1,6 +1,6 @@
-# Example
+# Sensor readings example
 
-This directory is one complete rspyts application. Rust, Python, and TypeScript source live together without a separate consumer project.
+This is a complete rspyts project, not a standalone test fixture. Its Rust library summarizes, normalizes, encodes, and decodes sensor readings. The generated Python extension and TypeScript WebAssembly package expose the same API, while each language adds one handwritten `describe_readings` helper.
 
 ```text
 example/
@@ -14,49 +14,70 @@ example/
 │   │   ├── __init__.py
 │   │   └── convenience/
 │   │       └── __init__.py
-│   ├── tests/
-│   │   └── test_example.py
-│   └── typecheck.py
+│   └── tests/
+│       ├── test_boundaries.py
+│       └── test_readings.py
 └── src-ts/
     ├── package.json
     ├── tsconfig.json
-    └── example/
-        ├── index.ts
-        └── convenience/
-            └── index.ts
+    ├── example/
+    │   ├── index.ts
+    │   └── convenience/
+    │       └── index.ts
+    └── tests/
+        ├── boundaries.test.mjs
+        └── readings.test.mjs
 ```
 
 ## Build
 
-Run the generator from the repository root:
+From the repository root:
 
 ```console
 cargo run --locked -p rspyts-cli -- build
 cargo run --locked -p rspyts-cli -- check
 ```
 
-The build adds generated models, APIs, and runtimes beside the authored language code. It places the Python extension in `src-py/example/native` and the Wasm module directly in `src-ts/build/example/native`; neither language package needs an asset-copy script.
+rspyts generates the Python models, API, runtime, and native extension under `src-py/example`. It generates the equivalent TypeScript sources and WebAssembly module under `src-ts`. The manifests, package entrypoints, convenience modules, and tests remain user-owned.
 
 ## Python
 
-```console
-python -m pip install -e example/src-py
-python -c 'from example import excited_greeting, greet; print(greet("Ada").message); print(excited_greeting("Ada"))'
+```python
+import numpy as np
+
+from example import describe_readings, normalize_readings
+
+readings = np.array([12.0, 18.0, 15.0, 21.0], dtype=np.float64)
+print(describe_readings(readings))
+print(normalize_readings(readings))
 ```
 
-`greet` comes from Rust. `excited_greeting` is handwritten in `src-py/example/convenience/__init__.py` and calls the generated function.
+Install and test the package with standard Python tooling:
+
+```console
+python -m pip install -e 'example/src-py[dev]'
+python -m pytest -q example/src-py/tests
+```
 
 ## TypeScript
+
+```typescript
+import { describeReadings, normalizeReadings } from "example";
+
+const readings = new Float64Array([12, 18, 15, 21]);
+console.log(describeReadings(readings));
+console.log(normalizeReadings(readings));
+```
+
+Build and test the WebAssembly package with npm:
 
 ```console
 npm --prefix example/src-ts install
 npm --prefix example/src-ts run check
 npm --prefix example/src-ts run build
-node --input-type=module --eval 'const { excitedGreeting, greet } = await import("./example/src-ts/build/example/index.js"); console.log(greet("Ada").message); console.log(excitedGreeting("Ada"));'
+npm --prefix example/src-ts test
 ```
 
-The same Rust `greet` function runs through WebAssembly. The handwritten `src-ts/example/convenience/index.ts` module calls it and is re-exported by the package entrypoint.
+## What the tests cover
 
-## Change the example
-
-Edit `src/lib.rs` to change the generated API. Add ordinary Python or TypeScript modules under `src-py/example/convenience` or `src-ts/example/convenience`; rspyts preserves every path not listed in `rspyts.toml`.
+Rust unit tests verify the statistics, normalization, binary format, and invalid-input behavior without crossing a language boundary. Python and TypeScript integration tests exercise the installed native and WebAssembly packages, including generated models, typed errors, handwritten helpers, and exact byte/buffer results. Dedicated large-array regressions verify that the direct binary boundaries remain fast without adding artificial exports to the example API.

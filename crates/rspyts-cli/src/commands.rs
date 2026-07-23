@@ -1,4 +1,8 @@
 //! Command execution and user-visible reporting.
+//!
+//! This module is the orchestration boundary between parsed arguments and the
+//! build pipeline. Successful one-shot commands emit structured JSON; watch
+//! mode emits line-oriented operational status.
 
 use std::io::Write;
 use std::thread;
@@ -42,6 +46,7 @@ pub(crate) fn execute(
     }
 }
 
+/// Resolve a project from a command's optional configuration path.
 fn read_project(args: &ProjectArgs) -> Result<Project> {
     Project::read(&config::discover(args.config.as_deref())?)
 }
@@ -76,6 +81,7 @@ fn watch(config: std::path::PathBuf, stdout: &mut dyn Write, stderr: &mut dyn Wr
     }
 }
 
+/// Serialize one successful command result as pretty, newline-terminated JSON.
 fn write_json(output: &mut dyn Write, value: &impl Serialize) -> Result<()> {
     serde_json::to_writer_pretty(&mut *output, value)?;
     writeln!(output)?;

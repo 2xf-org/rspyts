@@ -197,6 +197,7 @@ version = "0.1.0"
 dependencies = [
  "rspyts",
  "serde",
+ "thiserror",
 ]
 
 [[package]]
@@ -495,6 +496,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "pythonize"
+version = "0.29.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6ec376e1216e0c929a74964ce2020012a1a39f32d80e78aa688721219ea7fb89"
+dependencies = [
+ "pyo3",
+ "serde",
+]
+
+[[package]]
 name = "quote"
 version = "1.0.47"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -531,11 +542,12 @@ dependencies = [
 
 [[package]]
 name = "rspyts"
-version = "3.0.1"
+version = "3.0.2"
 dependencies = [
  "chrono",
  "inventory",
  "pyo3",
+ "pythonize",
  "rspyts-macros",
  "serde",
  "serde-pyobject",
@@ -547,7 +559,7 @@ dependencies = [
 
 [[package]]
 name = "rspyts-cli"
-version = "3.0.1"
+version = "3.0.2"
 dependencies = [
  "anyhow",
  "clap",
@@ -565,7 +577,7 @@ dependencies = [
 
 [[package]]
 name = "rspyts-macros"
-version = "3.0.1"
+version = "3.0.2"
 dependencies = [
  "heck",
  "proc-macro2",

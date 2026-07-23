@@ -1,3 +1,9 @@
+//! Strict parsing and normalization of supported Serde and rspyts attributes.
+//!
+//! A generated API has one public name and one wire representation. Serde
+//! features that imply asymmetric serialization, aliases, or executable
+//! default functions are rejected here rather than approximated by a host.
+
 use heck::{ToKebabCase, ToLowerCamelCase, ToShoutySnakeCase, ToSnakeCase, ToUpperCamelCase};
 use proc_macro2::TokenStream as TokenStream2;
 use quote::quote;
@@ -5,6 +11,7 @@ use syn::{
     Attribute, Expr, Ident, ImplItemFn, LitStr, Meta, Token, Type as SynType, spanned::Spanned,
 };
 
+/// Serde's supported container rename rules.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum SerdeRenameRule {
     Lower,
@@ -18,6 +25,7 @@ pub(super) enum SerdeRenameRule {
 }
 
 impl SerdeRenameRule {
+    /// Parse the exact spelling accepted by Serde.
     fn parse(value: &LitStr) -> syn::Result<Self> {
         match value.value().as_str() {
             "lowercase" => Ok(Self::Lower),
@@ -38,6 +46,7 @@ impl SerdeRenameRule {
     }
 }
 
+/// Apply Serde's variant-oriented rename semantics.
 pub(super) fn apply_serde_variant_case(value: &str, rule: Option<SerdeRenameRule>) -> String {
     let Some(rule) = rule else {
         return value.to_owned();
@@ -46,7 +55,7 @@ pub(super) fn apply_serde_variant_case(value: &str, rule: Option<SerdeRenameRule
         SerdeRenameRule::Lower => value.to_ascii_lowercase(),
         SerdeRenameRule::Upper => value.to_ascii_uppercase(),
         SerdeRenameRule::Pascal => value.to_owned(),
-        SerdeRenameRule::Camel => value[..1].to_ascii_lowercase() + &value[1..],
+        SerdeRenameRule::Camel => lowercase_first(value),
         SerdeRenameRule::Snake => {
             let mut snake = String::new();
             for (index, character) in value.char_indices() {
@@ -69,6 +78,7 @@ pub(super) fn apply_serde_variant_case(value: &str, rule: Option<SerdeRenameRule
     }
 }
 
+/// Apply Serde's field-oriented rename semantics.
 pub(super) fn apply_serde_field_case(value: &str, rule: Option<SerdeRenameRule>) -> String {
     let Some(rule) = rule else {
         return value.to_owned();
@@ -93,21 +103,37 @@ pub(super) fn apply_serde_field_case(value: &str, rule: Option<SerdeRenameRule>)
         }
         SerdeRenameRule::Camel => {
             let pascal = apply_serde_field_case(value, Some(SerdeRenameRule::Pascal));
-            pascal[..1].to_ascii_lowercase() + &pascal[1..]
+            lowercase_first(&pascal)
         }
         SerdeRenameRule::Kebab => value.replace('_', "-"),
         SerdeRenameRule::ScreamingKebab => value.to_ascii_uppercase().replace('_', "-"),
     }
 }
 
+/// Lowercase the first Unicode scalar without slicing through UTF-8.
+fn lowercase_first(value: &str) -> String {
+    let Some(first) = value.chars().next() else {
+        return String::new();
+    };
+    let mut result = first.to_lowercase().collect::<String>();
+    result.push_str(&value[first.len_utf8()..]);
+    result
+}
+
+/// Supported Serde metadata collected from a model container.
 #[derive(Default)]
 pub(super) struct SerdeContainer {
+    /// Rename rule for fields or enum variants.
     pub(super) rename_all: Option<SerdeRenameRule>,
+    /// Rename rule for fields within enum variants.
     pub(super) rename_all_fields: Option<SerdeRenameRule>,
+    /// Internal-tag field used by a tagged enum.
     pub(super) tag: Option<String>,
+    /// Whether a one-field model is represented as its field directly.
     pub(super) transparent: bool,
 }
 
+/// Parse supported Serde container attributes and reject ambiguous features.
 pub(super) fn serde_container(attrs: &[Attribute]) -> syn::Result<SerdeContainer> {
     let mut result = SerdeContainer::default();
     for attr in attrs.iter().filter(|attr| attr.path().is_ident("serde")) {
@@ -158,6 +184,7 @@ pub(super) fn serde_container(attrs: &[Attribute]) -> syn::Result<SerdeContainer
     Ok(result)
 }
 
+/// Parse a field or variant's optional Serde wire-name override.
 pub(super) fn serde_rename(attrs: &[Attribute]) -> syn::Result<Option<String>> {
     let mut value = None;
     for attr in attrs.iter().filter(|attr| attr.path().is_ident("serde")) {
@@ -189,13 +216,18 @@ pub(super) fn serde_rename(attrs: &[Attribute]) -> syn::Result<Option<String>> {
     Ok(value)
 }
 
+/// Supported Serde metadata collected from a model field.
 #[derive(Default)]
 pub(super) struct SerdeField {
+    /// Explicit serialized field name.
     pub(super) rename: Option<String>,
+    /// Whether deserialization supplies `Default::default()` when absent.
     pub(super) default: bool,
+    /// Optional predicate accepted only when it preserves round trips.
     pub(super) skip_serializing_if: Option<LitStr>,
 }
 
+/// Parse supported Serde field attributes and reject lossy features.
 pub(super) fn serde_field(attrs: &[Attribute]) -> syn::Result<SerdeField> {
     let mut result = SerdeField::default();
     for attr in attrs.iter().filter(|attr| attr.path().is_ident("serde")) {
@@ -239,6 +271,7 @@ pub(super) fn serde_field(attrs: &[Attribute]) -> syn::Result<SerdeField> {
     Ok(result)
 }
 
+/// Parse a model's optional Rust-to-host representation override.
 pub(super) fn rspyts_host_override(attrs: &[Attribute]) -> syn::Result<Option<SynType>> {
     let mut result = None;
     for attr in attrs.iter().filter(|attr| attr.path().is_ident("rspyts")) {
@@ -254,6 +287,7 @@ pub(super) fn rspyts_host_override(attrs: &[Attribute]) -> syn::Result<Option<Sy
     Ok(result)
 }
 
+/// Parse an exported parameter's optional direct boundary.
 pub(super) fn boundary_attr(attrs: &[Attribute]) -> syn::Result<Option<String>> {
     let mut result = None;
     for attr in attrs.iter().filter(|attr| attr.path().is_ident("rspyts")) {
@@ -272,18 +306,23 @@ pub(super) fn boundary_attr(attrs: &[Attribute]) -> syn::Result<Option<String>> 
     Ok(result)
 }
 
+/// Parse and remove rspyts parameter attributes before re-emitting Rust code.
 pub(super) fn take_boundary_attr(attrs: &mut Vec<Attribute>) -> syn::Result<Option<String>> {
     let result = boundary_attr(attrs)?;
     attrs.retain(|attr| !attr.path().is_ident("rspyts"));
     Ok(result)
 }
 
+/// Options attached to an exported free function.
 #[derive(Default)]
 pub(super) struct FunctionOptions {
+    /// Optional direct return boundary (`bytes` or `buffer`).
     pub(super) returns: Option<String>,
+    /// Optional typed error carried by a `Result` return.
     pub(super) error: Option<SynType>,
 }
 
+/// Parse function-level rspyts attributes.
 pub(super) fn function_options(attrs: &[Attribute]) -> syn::Result<FunctionOptions> {
     let mut options = FunctionOptions::default();
     for attr in attrs.iter().filter(|attr| attr.path().is_ident("rspyts")) {
@@ -324,20 +363,27 @@ pub(super) fn function_options(attrs: &[Attribute]) -> syn::Result<FunctionOptio
     Ok(options)
 }
 
+/// Parse and remove rspyts function attributes before re-emitting Rust code.
 pub(super) fn take_function_options(attrs: &mut Vec<Attribute>) -> syn::Result<FunctionOptions> {
     let options = function_options(attrs)?;
     attrs.retain(|attr| !attr.path().is_ident("rspyts"));
     Ok(options)
 }
 
+/// Options attached to a method in an exported resource implementation.
 #[derive(Default)]
 pub(super) struct MethodOptions {
+    /// Whether the method is a resource factory.
     pub(super) constructor: bool,
+    /// Whether the method is omitted from the host API.
     pub(super) skip: bool,
+    /// Optional direct return boundary (`bytes` or `buffer`).
     pub(super) returns: Option<String>,
+    /// Optional typed error carried by a `Result` return.
     pub(super) error: Option<SynType>,
 }
 
+/// Parse method-level rspyts attributes.
 pub(super) fn method_options(attrs: &[Attribute]) -> syn::Result<MethodOptions> {
     let mut options = MethodOptions::default();
     for attr in attrs.iter().filter(|attr| attr.path().is_ident("rspyts")) {
@@ -385,12 +431,14 @@ pub(super) fn method_options(attrs: &[Attribute]) -> syn::Result<MethodOptions> 
     Ok(options)
 }
 
+/// Parse and remove rspyts method attributes before re-emitting Rust code.
 pub(super) fn take_method_options(attrs: &mut Vec<Attribute>) -> syn::Result<MethodOptions> {
     let options = method_options(attrs)?;
     attrs.retain(|attr| !attr.path().is_ident("rspyts"));
     Ok(options)
 }
 
+/// Return whether a method belongs to the constructor or ordinary-method set.
 pub(super) fn method_exported(method: &ImplItemFn, constructor: bool) -> syn::Result<bool> {
     let options = method_options(&method.attrs)?;
     if options.skip || options.constructor != constructor {
@@ -399,6 +447,7 @@ pub(super) fn method_exported(method: &ImplItemFn, constructor: bool) -> syn::Re
     Ok(true)
 }
 
+/// Render normalized Rust documentation as an optional owned string expression.
 pub(super) fn docs_tokens(attrs: &[Attribute]) -> TokenStream2 {
     match docs_text(attrs) {
         Some(docs) => quote!(Some(#docs.to_owned())),
@@ -406,6 +455,7 @@ pub(super) fn docs_tokens(attrs: &[Attribute]) -> TokenStream2 {
     }
 }
 
+/// Extract and normalize consecutive `#[doc = ...]` attributes.
 fn docs_text(attrs: &[Attribute]) -> Option<String> {
     let lines = attrs
         .iter()
@@ -435,6 +485,7 @@ fn docs_text(attrs: &[Attribute]) -> Option<String> {
     Some(lines[first..=last].join("\n"))
 }
 
+/// Apply a public-name case rule selected by an rspyts macro.
 pub(super) fn apply_case(value: &str, rule: Option<&str>) -> String {
     match rule {
         Some("camelCase") => value.to_lower_camel_case(),
@@ -448,6 +499,7 @@ pub(super) fn apply_case(value: &str, rule: Option<&str>) -> String {
     }
 }
 
+/// Return the terminal identifier of a named Rust type.
 pub(super) fn type_last_ident(ty: &SynType) -> syn::Result<&Ident> {
     let SynType::Path(path) = ty else {
         return Err(syn::Error::new(ty.span(), "expected a named Rust type"));
@@ -457,4 +509,19 @@ pub(super) fn type_last_ident(ty: &SynType) -> syn::Result<&Ident> {
         .last()
         .map(|segment| &segment.ident)
         .ok_or_else(|| syn::Error::new(ty.span(), "expected a named Rust type"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn camel_case_handles_empty_and_unicode_names_without_panicking() {
+        assert_eq!(lowercase_first(""), "");
+        assert_eq!(lowercase_first("Éclair"), "éclair");
+        assert_eq!(
+            apply_serde_variant_case("HTTPServer", Some(SerdeRenameRule::Camel)),
+            "hTTPServer"
+        );
+    }
 }

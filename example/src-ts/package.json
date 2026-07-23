@@ -2,11 +2,13 @@
   "//": "User-owned package configuration; rspyts never modifies this file. Keep version aligned with Cargo.toml and add dependencies here.",
   "name": "example",
   "version": "0.1.0",
+  "description": "A sensor-reading toolkit built with rspyts",
   "type": "module",
   "sideEffects": true,
   "scripts": {
     "build": "tsc",
-    "check": "tsc --noEmit"
+    "check": "tsc --noEmit",
+    "test": "node --test --test-concurrency=1 tests/*.test.mjs"
   },
   "exports": {
     ".": {

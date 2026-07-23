@@ -24,6 +24,7 @@ thiserror.workspace = true
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 pyo3.workspace = true
+pythonize.workspace = true
 serde-pyobject.workspace = true
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]

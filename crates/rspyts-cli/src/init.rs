@@ -1,3 +1,9 @@
+//! Transactional scaffolding for a new rspyts application.
+//!
+//! Initialization renders the complete project in a temporary sibling
+//! directory and publishes it with one rename. Existing destinations are
+//! rejected before any project file is created.
+
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -8,12 +14,14 @@ use serde::Serialize;
 use crate::config::CONFIG_TEMPLATE;
 use crate::output::{generated_gitignore, write};
 
+/// Machine-readable result returned after initialization succeeds.
 #[derive(Debug, Serialize)]
 pub(super) struct InitReport {
     status: &'static str,
     project: PathBuf,
 }
 
+/// Create a complete application without overwriting an existing path.
 pub(super) fn create(path: &Path, version: &Version) -> Result<InitReport> {
     if path.exists() {
         bail!(
@@ -94,12 +102,14 @@ pub(super) fn create(path: &Path, version: &Version) -> Result<InitReport> {
     })
 }
 
+/// Substitute the common project and version placeholders in a template.
 fn template(source: &str, project: &str, version: &str) -> String {
     source
         .replace("__PROJECT__", project)
         .replace("__VERSION__", version)
 }
 
+/// Validate the portable project-name grammar shared by Cargo and npm.
 fn validate_name(name: &str) -> Result<()> {
     let mut characters = name.chars();
     let starts_correctly = characters
@@ -116,6 +126,8 @@ fn validate_name(name: &str) -> Result<()> {
     }
     Ok(())
 }
+
+// User-owned scaffold templates --------------------------------------------
 
 const CARGO: &str = r#"[package]
 name = "__PROJECT__"

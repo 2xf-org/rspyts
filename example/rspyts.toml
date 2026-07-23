@@ -27,7 +27,7 @@
 
 [generated]
 # Fingerprint of the Rust/Cargo sources and active [application] settings.
-source_fingerprint = "dd411e4f033cdfd8a694b8dec5fcd999"
+source_fingerprint = "a3caaf8675607195d7c33ccdd5e5babd"
 
 [generated.python]
 # Python files owned by rspyts and safe to overwrite or remove.

@@ -1,7 +1,16 @@
+//! Cross-language validation of linked names, namespaces, and dependencies.
+//!
+//! Validation runs before rendering so generators can assume that every
+//! public name is legal and unique in both hosts. Python namespace dependency
+//! cycles are rejected because generated modules use eager imports.
+
 use std::collections::{BTreeMap, BTreeSet};
 
 use super::*;
 
+// Contract-wide validation -------------------------------------------------
+
+/// Validate that a discovered contract can be represented by both generators.
 pub(crate) fn validate_contract(project: &Project, manifest: &Manifest) -> Result<()> {
     if manifest.package_name != project.package_name
         || manifest.package_version != project.package_version
@@ -22,6 +31,7 @@ pub(crate) fn validate_contract(project: &Project, manifest: &Manifest) -> Resul
     Ok(())
 }
 
+/// Validate namespace derivation and public-name uniqueness for both hosts.
 pub(crate) fn validate_namespaces(manifest: &Manifest) -> Result<()> {
     let namespace_map = namespaces(manifest);
     let python_namespace_paths = namespace_map
@@ -61,6 +71,7 @@ pub(crate) fn validate_namespaces(manifest: &Manifest) -> Result<()> {
         }
     }
     for (namespace, items) in namespace_map {
+        validate_generated_type_names(&items)?;
         let namespace_path = namespace.python_segments();
         let child_package_names = python_namespace_paths
             .iter()
@@ -90,7 +101,7 @@ pub(crate) fn validate_namespaces(manifest: &Manifest) -> Result<()> {
         }
         let mut buffers = BTreeSet::new();
         for reference in namespace_refs(&items) {
-            crate::contract::collect_buffers(reference, &mut buffers);
+            crate::contract::collect_buffers_resolved(reference, manifest, &mut buffers)?;
         }
         if let Some(name) = child_package_names.iter().find(|name| {
             **name == "models"
@@ -124,6 +135,9 @@ pub(crate) fn validate_namespaces(manifest: &Manifest) -> Result<()> {
                 display_namespace(&namespace)
             );
         }
+        if let Some(name) = python_names.iter().find(|name| !is_python_identifier(name)) {
+            bail!("Python export name `{name}` is not a valid identifier");
+        }
         unique_public_names("Python", python_names.into_iter())
             .with_context(|| format!("in namespace `{}`", display_namespace(&namespace)))?;
 
@@ -145,12 +159,76 @@ pub(crate) fn validate_namespaces(manifest: &Manifest) -> Result<()> {
                 );
             }
         }
+        if let Some(name) = typescript_names
+            .iter()
+            .find(|name| !is_typescript_identifier(name))
+        {
+            bail!("TypeScript export name `{name}` is not a valid identifier");
+        }
         unique_public_names("TypeScript", typescript_names.into_iter())
             .with_context(|| format!("in namespace `{}`", display_namespace(&namespace)))?;
     }
     Ok(())
 }
 
+/// Reject model members that collide after Python identifier normalization.
+fn validate_generated_type_names(items: &crate::contract::NamespaceItems<'_>) -> Result<()> {
+    for definition in &items.types {
+        match &definition.shape {
+            rspyts::ir::TypeShape::Struct { fields } => {
+                validate_python_members(
+                    &definition.name,
+                    fields
+                        .iter()
+                        .map(|field| crate::python::safe_python_name(&field.rust_name)),
+                )?;
+            }
+            rspyts::ir::TypeShape::StringEnum { variants } => {
+                validate_python_members(
+                    &definition.name,
+                    variants
+                        .iter()
+                        .map(|variant| crate::python::safe_python_name(&variant.rust_name)),
+                )?;
+            }
+            rspyts::ir::TypeShape::TaggedEnum { tag, variants } => {
+                for variant in variants {
+                    validate_python_members(
+                        &format!("{}::{}", definition.name, variant.rust_name),
+                        std::iter::once(crate::python::safe_python_name(tag)).chain(
+                            variant
+                                .fields
+                                .iter()
+                                .map(|field| crate::python::safe_python_name(&field.rust_name)),
+                        ),
+                    )?;
+                }
+            }
+            rspyts::ir::TypeShape::Alias { .. } => {}
+        }
+    }
+    Ok(())
+}
+
+/// Validate one generated Python class's member namespace.
+fn validate_python_members(owner: &str, names: impl Iterator<Item = String>) -> Result<()> {
+    let mut seen = BTreeSet::new();
+    for name in names {
+        if name == "model_config" || name.starts_with("__pydantic_") {
+            bail!("Python member name `{name}` in `{owner}` is reserved by generated models");
+        }
+        if !seen.insert(name.clone()) {
+            bail!(
+                "Python member names in `{owner}` collide after identifier normalization at `{name}`"
+            );
+        }
+    }
+    Ok(())
+}
+
+// Namespace graph ----------------------------------------------------------
+
+/// Return the distinct Cargo-package and Rust-module origins in a manifest.
 pub(crate) fn export_origins(manifest: &Manifest) -> Vec<(&rspyts::ir::CargoPackageId, &str)> {
     let mut origins = manifest
         .types
@@ -186,6 +264,7 @@ pub(crate) fn export_origins(manifest: &Manifest) -> Vec<(&rspyts::ir::CargoPack
     origins
 }
 
+/// Reject cross-namespace model cycles that Python cannot import eagerly.
 pub(crate) fn validate_model_namespace_cycles(manifest: &Manifest) -> Result<()> {
     let mut graph = BTreeMap::<Namespace, BTreeSet<Namespace>>::new();
     for definition in &manifest.types {
@@ -222,6 +301,7 @@ pub(crate) fn validate_model_namespace_cycles(manifest: &Manifest) -> Result<()>
     Ok(())
 }
 
+/// Find one cycle reachable from `namespace` using depth-first traversal.
 pub(crate) fn namespace_cycle(
     namespace: &Namespace,
     graph: &BTreeMap<Namespace, BTreeSet<Namespace>>,
@@ -253,6 +333,7 @@ pub(crate) fn namespace_cycle(
     None
 }
 
+/// Render a namespace for diagnostics, naming the empty namespace explicitly.
 pub(crate) fn display_namespace(namespace: &Namespace) -> String {
     let namespace = namespace.display();
     if namespace.is_empty() {
@@ -262,6 +343,9 @@ pub(crate) fn display_namespace(namespace: &Namespace) -> String {
     }
 }
 
+// Public-name and package validation ---------------------------------------
+
+/// Require every generated name in one host scope to be unique.
 pub(crate) fn unique_public_names<S: AsRef<str>>(
     host: &str,
     names: impl Iterator<Item = S>,
@@ -276,6 +360,7 @@ pub(crate) fn unique_public_names<S: AsRef<str>>(
     Ok(())
 }
 
+/// Validate a dot-separated Python import package.
 pub(crate) fn validate_python_package(value: &str) -> Result<()> {
     if value.is_empty()
         || value
@@ -287,6 +372,7 @@ pub(crate) fn validate_python_package(value: &str) -> Result<()> {
     Ok(())
 }
 
+/// Validate an unscoped or npm-scoped TypeScript package name.
 pub(crate) fn validate_typescript_package(value: &str) -> Result<()> {
     let name = value.strip_prefix('@').unwrap_or(value);
     let parts = name.split('/').collect::<Vec<_>>();
@@ -307,6 +393,7 @@ pub(crate) fn validate_typescript_package(value: &str) -> Result<()> {
     Ok(())
 }
 
+/// Validate the portable application-name grammar used by generated symbols.
 pub(crate) fn validate_application_name(value: &str) -> Result<()> {
     let mut characters = value.chars();
     if !characters
@@ -325,6 +412,7 @@ pub(crate) fn validate_application_name(value: &str) -> Result<()> {
     Ok(())
 }
 
+/// Return whether `value` follows rspyts's portable ASCII identifier grammar.
 pub(crate) fn is_identifier(value: &str) -> bool {
     let mut chars = value.chars();
     chars
@@ -333,6 +421,7 @@ pub(crate) fn is_identifier(value: &str) -> bool {
         && chars.all(|character| character.is_ascii_alphanumeric() || character == '_')
 }
 
+/// Return whether `value` is a usable, non-keyword Python identifier.
 pub(crate) fn is_python_identifier(value: &str) -> bool {
     is_identifier(value)
         && !matches!(
@@ -375,6 +464,105 @@ pub(crate) fn is_python_identifier(value: &str) -> bool {
         )
 }
 
+/// Return whether `value` is a usable, non-keyword TypeScript identifier.
+pub(crate) fn is_typescript_identifier(value: &str) -> bool {
+    is_identifier(value)
+        && !matches!(
+            value,
+            "break"
+                | "case"
+                | "catch"
+                | "class"
+                | "const"
+                | "continue"
+                | "debugger"
+                | "default"
+                | "delete"
+                | "do"
+                | "else"
+                | "enum"
+                | "export"
+                | "extends"
+                | "false"
+                | "finally"
+                | "for"
+                | "function"
+                | "if"
+                | "import"
+                | "in"
+                | "instanceof"
+                | "new"
+                | "null"
+                | "return"
+                | "super"
+                | "switch"
+                | "this"
+                | "throw"
+                | "true"
+                | "try"
+                | "typeof"
+                | "var"
+                | "void"
+                | "while"
+                | "with"
+                | "as"
+                | "implements"
+                | "interface"
+                | "let"
+                | "package"
+                | "private"
+                | "protected"
+                | "public"
+                | "static"
+                | "yield"
+                | "any"
+                | "boolean"
+                | "constructor"
+                | "declare"
+                | "get"
+                | "module"
+                | "namespace"
+                | "never"
+                | "number"
+                | "readonly"
+                | "require"
+                | "set"
+                | "string"
+                | "symbol"
+                | "type"
+                | "undefined"
+                | "unknown"
+        )
+}
+
+/// Return whether Python reserves `value` as a package protocol attribute.
 pub(crate) fn is_python_package_attribute(value: &str) -> bool {
     value != "__version__" && value.starts_with("__") && value.ends_with("__")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn generated_member_validation_rejects_collisions_and_reserved_names() {
+        assert_eq!(crate::python::safe_python_name("event-type"), "event_type");
+        assert_eq!(crate::python::safe_python_name("class"), "class_value");
+        assert!(
+            validate_python_members(
+                "Model",
+                ["class_value".to_owned(), "class_value".to_owned()].into_iter(),
+            )
+            .is_err()
+        );
+        assert!(validate_python_members("Model", ["model_config".to_owned()].into_iter()).is_err());
+    }
+
+    #[test]
+    fn host_identifier_validation_rejects_language_keywords() {
+        assert!(!is_python_identifier("class"));
+        assert!(!is_typescript_identifier("type"));
+        assert!(is_python_identifier("Model"));
+        assert!(is_typescript_identifier("Model"));
+    }
 }

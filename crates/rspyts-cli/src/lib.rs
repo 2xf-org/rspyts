@@ -1,8 +1,17 @@
 //! Command-line entry points for the rspyts build orchestrator.
 //!
-//! Argument syntax lives in [`cli`], while command behavior lives in
-//! [`commands`]. This module owns only the process and embeddable I/O
-//! boundaries.
+//! The crate is organized as a small compiler pipeline:
+//!
+//! - `config` and `cargo` resolve authoritative user and workspace inputs;
+//! - `project` builds the synthetic bridge and validates the discovered IR;
+//! - `python` and `typescript` lower that IR into host packages;
+//! - `output` owns collision checks and transactional publication;
+//! - `cli` and `commands` provide the process-facing interface.
+//!
+//! This module owns only the process and embeddable I/O boundaries.
+
+#![deny(missing_docs, rustdoc::broken_intra_doc_links)]
+#![forbid(unsafe_op_in_unsafe_fn)]
 
 use std::ffi::OsString;
 use std::io::{self, Write};
@@ -10,10 +19,12 @@ use std::io::{self, Write};
 use anyhow::Result;
 use clap::Parser;
 
+mod cargo;
 mod cli;
 mod commands;
 mod config;
 mod contract;
+mod documentation;
 mod init;
 mod output;
 mod project;

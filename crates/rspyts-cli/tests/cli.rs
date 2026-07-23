@@ -1,3 +1,5 @@
+//! Black-box and embeddable-entry-point tests for the command-line interface.
+
 use std::ffi::OsString;
 use std::path::Path;
 use std::process::Command;

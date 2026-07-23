@@ -21,21 +21,28 @@ rspyts builds one Rust API as typed packages for Python and TypeScript. In Pytho
 
 rspyts requires Rust 1.88 or newer.
 
-```console
-cargo install rspyts-cli --locked
-rustup target add wasm32-unknown-unknown
+```bash
+cargo install rspyts-cli --locked && rustup target add wasm32-unknown-unknown
 ```
 
 ## Usage
 
-```console
-rspyts init example --version 0.1.0 && cd example
+`init` creates a working Rust `greet` example and gives Cargo, Python, and npm the same version.
+
+```bash
+rspyts init example --version 1.0.0
+```
+
+Once the project has been initialized, `build` compiles it for Python and WebAssembly, then writes the generated package files beside the Rust source.
+
+```bash
+cd example
 rspyts build
 ```
 
-`init` creates a working Rust `greet` example and gives Cargo, Python, and npm the same version. `build` compiles it for Python and WebAssembly, then writes the generated package files beside the Rust source.
+The ouputted structured will look like so:
 
-```text
+```bash
 example/
 ├── .gitignore
 ├── Cargo.toml
@@ -72,36 +79,57 @@ example/
                 └── native_bg.wasm
 ```
 
+The code that `init` generates has a basic greeting example:
+
+```rust
+use rspyts::Model;
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, Serialize, Deserialize, Model)]
+pub struct Greeting {
+    pub message: String,
+}
+
+#[rspyts::export]
+pub fn greet(name: String) -> Greeting {
+    Greeting {
+        message: format!("Hello, {name}!"),
+    }
+}
+```
+
 ### Generated Code
 
-rspyts replaces only the paths recorded in `rspyts.toml`. Generated text files carry an overwrite warning, while native and Wasm files are tracked by their paths. Package manifests, root entrypoints, and unlisted files remain under your control.
+rspyts replaces only the paths recorded in `rspyts.toml`. Generated text files carry an overwrite warning, while native and Wasm files are tracked by their paths. Package manifests, root entrypoints, and unlisted files remain under your control. This allos you to extend language-specific code as you see fit.
 
 #### Python
 
 Python models use Pydantic, and exported Rust functions call the compiled extension in `example/native`. The source project uses only `pyproject.toml`; its build backend packages the existing native artifact without compiling or copying it. Numeric `buffer` boundaries use NumPy arrays, while ordinary `Vec<T>` values become Python lists.
 
-```console
+```bash
 python -m pip install ./src-py
 ```
 
 ```python
 from example import greet
 
-print(greet("Ada").message)
+obj = greet("Ada")
+msg = obj.message
+print(msg)
 ```
 
 #### TypeScript
 
-The TypeScript package contains strict ESM source and declarations. Rust is compiled to WebAssembly (Wasm), which rspyts writes directly to `src-ts/build/example/native`; the generated `native.js` loads it and converts values at the boundary. The package has no runtime npm dependencies, and `npm run build` only runs the TypeScript compiler.
+The TypeScript package contains strict ESM source and declarations. Rust is compiled to WebAssembly (`wasm`), which rspyts writes directly to `src-ts/build/example/native`; the generated `native.js` loads it and converts values at the boundary. The package has no runtime npm dependencies, and `npm run build` only runs the TypeScript compiler.
 
-```console
+```bash
 npm --prefix src-ts install
 npm --prefix src-ts run build
 ```
 
 Install the built source project from your client:
 
-```console
+```bash
 npm install ../example/src-ts
 ```
 
@@ -110,7 +138,9 @@ Then import the package by name:
 ```typescript
 import { greet } from "example";
 
-console.log(greet("Ada").message);
+obj = greet("Ada")
+msg = obj.message
+console.log(msg);
 ```
 
 ### Custom Code
@@ -118,9 +148,7 @@ console.log(greet("Ada").message);
 Add Python files inside `src-py/example` and TypeScript files inside `src-ts/example`. rspyts preserves any file that is not listed under `[generated.python]` or `[generated.typescript]`.
 
 ```python
-# src-py/example/convenience/__init__.py
 from ..models import Greeting
-
 
 def shout(greeting: Greeting) -> str:
     return greeting.message.upper()

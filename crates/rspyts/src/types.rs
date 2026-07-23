@@ -1,3 +1,9 @@
+//! Built-in mappings from Rust types to the host-neutral contract IR.
+//!
+//! Implementations in this module describe ordinary Serde-shaped values.
+//! Direct `bytes` and numeric `buffer` boundaries are selected explicitly by
+//! export attributes and are therefore handled by the procedural macros.
+
 use std::collections::{BTreeMap, HashMap};
 use std::hash::BuildHasher;
 
