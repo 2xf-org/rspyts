@@ -6,7 +6,7 @@
 
 use super::*;
 use crate::documentation::{
-    CallableDocumentation, Documentation, contextualize_error_description,
+    CallableDocumentation, CallableReturn, Documentation, contextualize_error_description,
     remove_rustdoc_link_brackets,
 };
 
@@ -393,12 +393,14 @@ pub(crate) fn emit_python_callable_doc(
         blocks.push(format!("Args:\n{}", entries.join("\n")));
     }
 
-    if let Some(returns) = callable
-        .returns
-        .filter(|returns| !matches!(returns, TypeRef::Unit))
-    {
+    let rendered_return = match callable.returns {
+        CallableReturn::Omitted | CallableReturn::Contract(TypeRef::Unit) => None,
+        CallableReturn::Contract(returns) => Some(python_ref(returns, context)?),
+        CallableReturn::Resource(name) => Some(name.to_owned()),
+    };
+    if let Some(rendered_return) = rendered_return {
         let description = if documentation.returns.is_empty() {
-            format!("A value typed as ``{}``.", python_ref(returns, context)?)
+            format!("A value typed as ``{rendered_return}``.")
         } else {
             remove_rustdoc_link_brackets(&documentation.returns)
         };
@@ -684,7 +686,7 @@ mod tests {
                 ),
                 fallback_summary: "Fallback.".to_owned(),
                 params: &params,
-                returns: Some(&TypeRef::String),
+                returns: CallableReturn::Contract(&TypeRef::String),
                 error: Some(&error),
             },
             &context,

@@ -9,6 +9,17 @@ use std::collections::BTreeMap;
 
 use rspyts::ir::{DefinitionId, ParamDef, TypeRef};
 
+/// Return-value form used when documenting a generated callable.
+#[derive(Clone, Copy)]
+pub(crate) enum CallableReturn<'a> {
+    /// Do not emit return documentation, as for `__init__` and `close`.
+    Omitted,
+    /// Render an ordinary host contract type.
+    Contract(&'a TypeRef),
+    /// Render a stateful resource without treating it as a model definition.
+    Resource(&'a str),
+}
+
 /// Host-neutral inputs required to document one generated callable.
 pub(crate) struct CallableDocumentation<'a> {
     /// Authored Rustdoc, when present.
@@ -17,8 +28,8 @@ pub(crate) struct CallableDocumentation<'a> {
     pub(crate) fallback_summary: String,
     /// Public parameters in declaration order.
     pub(crate) params: &'a [ParamDef],
-    /// Public successful return value, or `None` for constructors.
-    pub(crate) returns: Option<&'a TypeRef>,
+    /// Public successful return value.
+    pub(crate) returns: CallableReturn<'a>,
     /// Typed error exposed by this callable, when any.
     pub(crate) error: Option<&'a DefinitionId>,
 }

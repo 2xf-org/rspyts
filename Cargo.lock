@@ -542,7 +542,7 @@ dependencies = [
 
 [[package]]
 name = "rspyts"
-version = "3.0.2"
+version = "3.0.3"
 dependencies = [
  "chrono",
  "inventory",
@@ -559,7 +559,7 @@ dependencies = [
 
 [[package]]
 name = "rspyts-cli"
-version = "3.0.2"
+version = "3.0.3"
 dependencies = [
  "anyhow",
  "clap",
@@ -577,7 +577,7 @@ dependencies = [
 
 [[package]]
 name = "rspyts-macros"
-version = "3.0.2"
+version = "3.0.3"
 dependencies = [
  "heck",
  "proc-macro2",

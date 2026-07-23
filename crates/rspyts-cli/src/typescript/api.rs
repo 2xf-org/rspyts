@@ -5,7 +5,7 @@
 //! remain on wasm-bindgen's direct vector ABI.
 
 use super::*;
-use crate::documentation::CallableDocumentation;
+use crate::documentation::{CallableDocumentation, CallableReturn};
 
 /// Render errors, functions, resources, and constants for one namespace.
 pub(super) fn typescript_api(
@@ -330,7 +330,7 @@ fn emit_typescript_function(
             docs: function.docs.as_deref(),
             fallback_summary: format!("Calls the Rust implementation of `{}`.", function.host_name),
             params: &function.params,
-            returns: Some(&function.returns),
+            returns: CallableReturn::Contract(&function.returns),
             error: function.error.as_ref(),
         },
         context,
@@ -402,7 +402,7 @@ fn emit_typescript_resource(
             docs: constructor.docs.as_deref(),
             fallback_summary: format!("Creates a `{}` instance.", resource.name),
             params: &constructor.params,
-            returns: None,
+            returns: CallableReturn::Omitted,
             error: constructor.error.as_ref(),
         },
         context,
@@ -446,7 +446,7 @@ fn emit_typescript_resource(
                 docs: factory.docs.as_deref(),
                 fallback_summary: format!("Creates a `{}` instance.", resource.name),
                 params: &factory.params,
-                returns: Some(&factory.returns),
+                returns: CallableReturn::Resource(&resource.name),
                 error: factory.error.as_ref(),
             },
             context,
@@ -503,7 +503,7 @@ fn emit_typescript_resource(
             docs: None,
             fallback_summary: "Releases the native resources owned by this instance.".to_owned(),
             params: &[],
-            returns: None,
+            returns: CallableReturn::Omitted,
             error: None,
         },
         context,
@@ -520,4 +520,67 @@ fn typescript_host_argument(param: &ParamDef) -> Result<String> {
         param.host_name,
         typescript_spec(&param.ty)?
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn resource_manifest() -> Manifest {
+        let owner = rspyts::ir::CargoPackageId::new("test");
+        let identity = rspyts::ir::DefinitionId::new("test", "test::Recorder");
+        let constructor = |rust_name: &str, host_name: &str| FunctionDef {
+            owner: owner.clone(),
+            rust_module: "test".to_owned(),
+            rust_name: rust_name.to_owned(),
+            host_name: host_name.to_owned(),
+            native_name: "native_recorder".to_owned(),
+            docs: Some(format!("Create a recorder with `{rust_name}`.")),
+            params: Vec::new(),
+            returns: TypeRef::Named {
+                identity: identity.clone(),
+            },
+            error: None,
+        };
+        Manifest {
+            package_name: "test".to_owned(),
+            package_version: "0.0.0".to_owned(),
+            module_name: "native".to_owned(),
+            types: Vec::new(),
+            errors: Vec::new(),
+            functions: Vec::new(),
+            resources: vec![ResourceDef {
+                owner: owner.clone(),
+                rust_module: "test".to_owned(),
+                name: "Recorder".to_owned(),
+                native_name: "native_recorder".to_owned(),
+                docs: Some("A stateful recorder.".to_owned()),
+                constructors: vec![
+                    constructor("new", "new"),
+                    constructor("from_default", "fromDefault"),
+                ],
+                methods: Vec::new(),
+            }],
+            constants: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn resource_factories_document_the_resource_without_model_resolution() {
+        let manifest = resource_manifest();
+        let namespace = Namespace::root();
+        let context = TypeScriptContext {
+            manifest: &manifest,
+            namespace: &namespace,
+        };
+        let items = NamespaceItems {
+            resources: vec![&manifest.resources[0]],
+            ..NamespaceItems::default()
+        };
+
+        let source = typescript_api(&items, &context).expect("render resource factory");
+
+        assert!(source.contains("static fromDefault(): Recorder"));
+        assert!(source.contains("@returns A value typed as `Recorder`."));
+    }
 }
